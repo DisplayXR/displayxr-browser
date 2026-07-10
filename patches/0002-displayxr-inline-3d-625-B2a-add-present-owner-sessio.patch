@@ -1,0 +1,203 @@
+From ff9dbd5301e52d11f45541fc764706b7da22e74f Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 26 Jun 2026 01:07:32 -0500
+Subject: [PATCH 02/15] [displayxr inline-3d #625 B2a] add present-owner
+ session + bindWindow (Level 4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes B2a: beyond instance creation, the browser-process client now creates a
+D3D11 device on the runtime's required adapter, finds content_shell's top-level
+HWND (Win32 enum — browser owns the window per the design), creates the
+present-owner session (D3D11 binding + win32 window binding, transparent, no
+shared texture — same shape as the CEF host) and calls xrWeaveBindWindowEXT.
+
+Validated on Leia: "present-owner session + xrWeaveBindWindowEXT(hwnd=...) -> 0
+— B2a PASSED (window-bound weave session live)". This is the exact session the
+per-frame weave (B2c) rides. Adds d3d11.lib/dxgi.lib to the source_set; COM
+device field marked RAW_PTR_EXCLUSION (manual lifetime).
+---
+ content/shell/BUILD.gn                        |   4 +
+ .../shell/browser/displayxr_weave_client.cc   | 130 +++++++++++++++++-
+ 2 files changed, 132 insertions(+), 2 deletions(-)
+
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 56c06e604af60..f2423637d1d5e 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -187,6 +187,10 @@ source_set("displayxr_weave") {
+   deps = [ "//base" ]
+   if (is_win) {
+     deps += [ "//third_party/displayxr:openxr_loader" ]
++    libs = [
++      "d3d11.lib",
++      "dxgi.lib",
++    ]
+   }
+ }
+ 
+diff --git a/content/shell/browser/displayxr_weave_client.cc b/content/shell/browser/displayxr_weave_client.cc
+index 428a15a6d561f..d1ed0647b3dab 100644
+--- a/content/shell/browser/displayxr_weave_client.cc
++++ b/content/shell/browser/displayxr_weave_client.cc
+@@ -7,12 +7,14 @@
+ #include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/logging.h"
++#include "base/memory/raw_ptr_exclusion.h"
+ #include "build/build_config.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+ #include <windows.h>
+ 
+ #include <d3d11.h>
++#include <dxgi1_2.h>
+ 
+ #include <cstring>
+ #include <string_view>
+@@ -46,9 +48,75 @@ struct WeaveClientState {
+   PFN_xrWeaveBindWindowEXT bind_window = nullptr;
+   PFN_xrWeaveSubmitEXT submit = nullptr;
+   PFN_xrWeaveSnapWindowRectEXT snap = nullptr;
++  // Manually ref-counted COM object (process-lifetime); excluded from raw_ptr.
++  RAW_PTR_EXCLUSION ID3D11Device* device = nullptr;  // runtime's adapter
++  XrSession session = XR_NULL_HANDLE;
++  HWND hwnd = nullptr;  // the bound content_shell top-level window
+   bool initialized = false;
+ };
+ 
++// Find this process's main top-level window (content_shell's browser window) so
++// the weave session can bind it for DP phase-snap. The browser process owns the
++// HWND directly (design doc Seam D), so a Win32 enumeration avoids pulling in
++// ui/views/aura. Picks the first visible, unowned, reasonably sized top-level.
++BOOL CALLBACK FindMainWindowProc(HWND hwnd, LPARAM lparam) {
++  DWORD wpid = 0;
++  ::GetWindowThreadProcessId(hwnd, &wpid);
++  if (wpid != ::GetCurrentProcessId() || !::IsWindowVisible(hwnd) ||
++      ::GetWindow(hwnd, GW_OWNER) != nullptr) {
++    return TRUE;
++  }
++  RECT r = {};
++  if (!::GetWindowRect(hwnd, &r) || (r.right - r.left) < 64 ||
++      (r.bottom - r.top) < 64) {
++    return TRUE;
++  }
++  *reinterpret_cast<HWND*>(lparam) = hwnd;
++  return FALSE;  // take the first qualifying window
++}
++
++HWND FindMainWindowForCurrentProcess() {
++  HWND found = nullptr;
++  ::EnumWindows(&FindMainWindowProc, reinterpret_cast<LPARAM>(&found));
++  return found;
++}
++
++// Create a D3D11 device on the adapter the runtime requires (shared handles only
++// work same-adapter). Mirrors the CEF host's GetD3D11GraphicsRequirements path.
++ID3D11Device* CreateD3D11DeviceOnAdapter(const LUID& luid) {
++  IDXGIFactory1* factory = nullptr;
++  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),
++                                reinterpret_cast<void**>(&factory))) ||
++      !factory) {
++    return nullptr;
++  }
++  IDXGIAdapter1* chosen = nullptr;
++  IDXGIAdapter1* it = nullptr;
++  for (UINT i = 0; factory->EnumAdapters1(i, &it) != DXGI_ERROR_NOT_FOUND;
++       ++i) {
++    DXGI_ADAPTER_DESC1 desc = {};
++    if (SUCCEEDED(it->GetDesc1(&desc)) &&
++        desc.AdapterLuid.LowPart == luid.LowPart &&
++        desc.AdapterLuid.HighPart == luid.HighPart) {
++      chosen = it;  // keep this ref
++      break;
++    }
++    it->Release();
++  }
++  ID3D11Device* device = nullptr;
++  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
++                                      D3D_FEATURE_LEVEL_11_0};
++  D3D_FEATURE_LEVEL got = {};
++  const HRESULT hr = D3D11CreateDevice(
++      chosen, chosen ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
++      nullptr, 0, levels, 2u, D3D11_SDK_VERSION, &device, &got, nullptr);
++  if (chosen) {
++    chosen->Release();
++  }
++  factory->Release();
++  return FAILED(hr) ? nullptr : device;
++}
++
+ WeaveClientState& State() {
+   static WeaveClientState* s = new WeaveClientState();
+   return *s;
+@@ -157,8 +225,66 @@ void InitializeWin() {
+   LOG(ERROR) << "[DisplayXR] instance + system OK; weave PFNs: bindWindow="
+              << (s.bind_window ? "ok" : "NULL")
+              << " submit=" << (s.submit ? "ok" : "NULL")
+-             << " snap=" << (s.snap ? "ok" : "NULL")
+-             << " — B2a linking/process de-risk PASSED";
++             << " snap=" << (s.snap ? "ok" : "NULL");
++  if (!s.bind_window || !s.submit) {
++    LOG(ERROR) << "[DisplayXR] failed to resolve weave entry points";
++    return;
++  }
++
++  // Create the present-owner session bound to content_shell's window, exactly
++  // as a texture-class present-owner does (real HWND + transparent + NO shared
++  // texture), then bind the window so the DP phase-snaps the interlace. This is
++  // the path the per-frame weave (B2c) rides.
++  PFN_xrGetD3D11GraphicsRequirementsKHR get_reqs = nullptr;
++  xrGetInstanceProcAddr(s.instance, "xrGetD3D11GraphicsRequirementsKHR",
++                        reinterpret_cast<PFN_xrVoidFunction*>(&get_reqs));
++  if (!get_reqs) {
++    LOG(ERROR) << "[DisplayXR] xrGetD3D11GraphicsRequirementsKHR unavailable";
++    return;
++  }
++  XrGraphicsRequirementsD3D11KHR reqs = {
++      XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
++  if (XR_FAILED(get_reqs(s.instance, s.system_id, &reqs))) {
++    LOG(ERROR) << "[DisplayXR] D3D11 graphics requirements query failed";
++    return;
++  }
++
++  s.device = CreateD3D11DeviceOnAdapter(reqs.adapterLuid);
++  if (!s.device) {
++    LOG(ERROR) << "[DisplayXR] failed to create D3D11 device on runtime adapter";
++    return;
++  }
++
++  s.hwnd = FindMainWindowForCurrentProcess();
++  if (!s.hwnd) {
++    LOG(ERROR) << "[DisplayXR] no top-level content_shell window for bindWindow";
++    return;
++  }
++
++  XrGraphicsBindingD3D11KHR gb = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
++  gb.device = s.device;
++  XrWin32WindowBindingCreateInfoEXT wb = {
++      XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
++  wb.windowHandle = reinterpret_cast<void*>(s.hwnd);
++  wb.sharedTextureHandle = nullptr;
++  wb.transparentBackgroundEnabled = XR_TRUE;
++  gb.next = &wb;
++
++  XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
++  sci.next = &gb;
++  sci.systemId = s.system_id;
++  XrResult sr = xrCreateSession(s.instance, &sci, &s.session);
++  if (XR_FAILED(sr)) {
++    LOG(ERROR) << "[DisplayXR] xrCreateSession failed: " << sr;
++    return;
++  }
++
++  XrResult br = s.bind_window(s.session, reinterpret_cast<void*>(s.hwnd));
++  LOG(ERROR) << "[DisplayXR] present-owner session + xrWeaveBindWindowEXT(hwnd="
++             << reinterpret_cast<void*>(s.hwnd) << ") -> " << br
++             << (XR_SUCCEEDED(br)
++                     ? "  — B2a PASSED (window-bound weave session live)"
++                     : "  — bindWindow FAILED");
+ }
+ 
+ #endif  // BUILDFLAG(IS_WIN)

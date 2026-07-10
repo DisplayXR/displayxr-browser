@@ -1,0 +1,1969 @@
+From 37137183ee37f9fe4ba36ad363cbd9fd91265928 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 5 Jul 2026 23:29:35 -0700
+Subject: [PATCH 06/15] B3: WebXR inline-3D JS surface + head-tracked 2-view
+ off-axis session + teardown (#625)
+
+Checkpoint of the full B3 slice on the displayxr-inline-3d patch branch (mirrors
+the B2a/B2b/B2c checkpoints). content_shell builds + links clean; feature-detection
+verified both polarities on Leia. Per-element weave + 2-view eyeball deferred to B4
+(content_shell page-flatten stops the per-element tag reaching Viz).
+
+B3a  per-element weave_target tag: cc::TextureLayer -> TextureLayerImpl ->
+     TextureDrawQuad -> quads.mojom (getter+Read) -> SkiaRenderer::DrawTextureQuad;
+     DisplayXRInline3D RuntimeEnabledFeature; tag carried pending->active.
+B3b  navigator.xr.requestSession('inline-3d') (Blink-local sensorless inline) +
+     XRDisplayLayer (ScriptWrappable) tagging the target canvas via
+     HTMLCanvasElement::SetInline3D.
+B3c  per-element committed rect (ExternalUseClient::ImageContext::weave_rect);
+     MaybeWeaveSubstitute loops all tagged contexts, per-target state keyed by
+     source canvas mailbox.
+B3d  two head-tracked eye views: is_inline_3d threaded through session creation;
+     UpdateInlineView builds 2 XRViewData with window-relative off-axis (Kooima)
+     projections (UpdateProjectionMatrixFromFoV) + per-eye poses (SetMojoFromView);
+     new blink-accessible DisplayXRService mojom (IsInline3DSupported, GetLatestEyes)
+     bound frame-scoped in content/shell; browser caches eyes + committed rect and
+     queries XR_EXT_display_info for the display geometry.
+B3e  isSessionSupported('inline-3d') routes through DisplayXRService (async, with a
+     disconnect-driven negative control); XRSession tracks + closes its
+     XRDisplayLayers on session end (untag); GPU displayxr_weave_state_ pruned each
+     frame for source mailboxes no longer tagged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ cc/layers/texture_layer.cc                    |   9 +
+ cc/layers/texture_layer.h                     |   9 +
+ cc/layers/texture_layer_impl.cc               |  14 ++
+ cc/layers/texture_layer_impl.h                |   4 +
+ .../viz/common/quads/texture_draw_quad.h      |   8 +
+ .../viz/service/display/external_use_client.h |  10 +
+ .../viz/service/display/skia_renderer.cc      |  21 +-
+ .../skia_output_surface_impl_on_gpu.cc        | 228 ++++++++++--------
+ .../skia_output_surface_impl_on_gpu.h         |  18 +-
+ content/shell/BUILD.gn                        |   3 +
+ .../shell/browser/displayxr_service_impl.cc   |  51 ++++
+ .../shell/browser/displayxr_service_impl.h    |  37 +++
+ .../shell/browser/displayxr_weave_client.cc   | 107 ++++++++
+ .../shell/browser/displayxr_weave_client.h    |  30 +++
+ .../browser/shell_content_browser_client.cc   |  18 ++
+ .../cpp/compositing/quads_mojom_traits.cc     |   3 +
+ .../cpp/compositing/quads_mojom_traits.h      |   7 +
+ .../viz/public/mojom/compositing/quads.mojom  |   4 +
+ third_party/blink/public/mojom/BUILD.gn       |  18 ++
+ .../public/mojom/xr/displayxr_service.mojom   |  40 +++
+ .../bindings/generated_in_modules.gni         |   4 +
+ .../renderer/bindings/idl_in_modules.gni      |   2 +
+ .../core/html/canvas/html_canvas_element.cc   |  14 ++
+ .../core/html/canvas/html_canvas_element.h    |  10 +
+ .../blink/renderer/modules/xr/BUILD.gn        |   4 +
+ .../renderer/modules/xr/xr_display_layer.cc   |  82 +++++++
+ .../renderer/modules/xr/xr_display_layer.h    |  69 ++++++
+ .../renderer/modules/xr/xr_display_layer.idl  |  27 +++
+ .../modules/xr/xr_display_layer_init.idl      |  10 +
+ .../blink/renderer/modules/xr/xr_session.cc   | 139 ++++++++++-
+ .../blink/renderer/modules/xr/xr_session.h    |  35 ++-
+ .../blink/renderer/modules/xr/xr_session.idl  |   4 +
+ .../blink/renderer/modules/xr/xr_system.cc    |  86 ++++++-
+ .../blink/renderer/modules/xr/xr_system.h     |  36 ++-
+ .../platform/runtime_enabled_features.json5   |   8 +
+ 35 files changed, 1050 insertions(+), 119 deletions(-)
+ create mode 100644 content/shell/browser/displayxr_service_impl.cc
+ create mode 100644 content/shell/browser/displayxr_service_impl.h
+ create mode 100644 third_party/blink/public/mojom/xr/displayxr_service.mojom
+ create mode 100644 third_party/blink/renderer/modules/xr/xr_display_layer.cc
+ create mode 100644 third_party/blink/renderer/modules/xr/xr_display_layer.h
+ create mode 100644 third_party/blink/renderer/modules/xr/xr_display_layer.idl
+ create mode 100644 third_party/blink/renderer/modules/xr/xr_display_layer_init.idl
+
+diff --git a/cc/layers/texture_layer.cc b/cc/layers/texture_layer.cc
+index 667f3a444d23d..7169bd59cd7dd 100644
+--- a/cc/layers/texture_layer.cc
++++ b/cc/layers/texture_layer.cc
+@@ -35,6 +35,7 @@ TextureLayer::TextureLayer(TextureLayerClient* client,
+       uv_bottom_right_(1.f, 1.f),
+       blend_background_color_(false),
+       force_texture_to_opaque_(false),
++      weave_target_(false),
+       prepare_resource_behavior_(prepare_resource_behavior),
+       needs_set_resource_(false) {}
+ 
+@@ -79,6 +80,13 @@ void TextureLayer::SetForceTextureToOpaque(bool opaque) {
+   SetNeedsCommit();
+ }
+ 
++void TextureLayer::SetWeaveTarget(bool weave_target) {
++  if (weave_target_.Read(*this) == weave_target)
++    return;
++  weave_target_.Write(*this) = weave_target;
++  SetNeedsCommit();
++}
++
+ void TextureLayer::SetTransferableResourceInternal(
+     const viz::TransferableResource& resource,
+     viz::ReleaseCallback release_callback,
+@@ -229,6 +237,7 @@ void TextureLayer::PushDirtyPropertiesTo(LayerImpl* layer,
+     texture_layer->SetBlendBackgroundColor(blend_background_color_.Read(*this));
+     texture_layer->SetForceTextureToOpaque(
+         force_texture_to_opaque_.Read(*this));
++    texture_layer->SetWeaveTarget(weave_target_.Read(*this));
+     if (needs_set_resource_.Read(*this)) {
+       viz::TransferableResource resource;
+       viz::ReleaseCallback release_callback;
+diff --git a/cc/layers/texture_layer.h b/cc/layers/texture_layer.h
+index bc8c38e505105..de1282eebc075 100644
+--- a/cc/layers/texture_layer.h
++++ b/cc/layers/texture_layer.h
+@@ -111,6 +111,13 @@ class CC_EXPORT TextureLayer : public Layer {
+   // This will blend texture with black color. Defaults to false.
+   void SetForceTextureToOpaque(bool opaque);
+ 
++  // DisplayXR inline-3D (#625, Step B / B3). Marks this canvas layer as a weave
++  // target: the emitted TextureDrawQuad carries the flag so Viz redirects it to
++  // the OS-woven (glasses-free 3D) texture. Set by the Blink XRDisplayLayer
++  // binding on the target canvas. Defaults to false; the whole path is dormant
++  // unless content_shell was launched with --enable-inline-3d.
++  void SetWeaveTarget(bool weave_target);
++
+   // Code path for plugins which supply their own mailbox.
+   void SetTransferableResource(const viz::TransferableResource& resource,
+                                viz::ReleaseCallback release_callback);
+@@ -158,6 +165,8 @@ class CC_EXPORT TextureLayer : public Layer {
+   // [bottom left, top left, top right, bottom right]
+   ProtectedSequenceReadable<bool> blend_background_color_;
+   ProtectedSequenceReadable<bool> force_texture_to_opaque_;
++  // DisplayXR inline-3D weave target tag (#625, Step B). See SetWeaveTarget().
++  ProtectedSequenceReadable<bool> weave_target_;
+ 
+   const PrepareResourceBehavior prepare_resource_behavior_;
+ 
+diff --git a/cc/layers/texture_layer_impl.cc b/cc/layers/texture_layer_impl.cc
+index 9a3a199736b97..f95243e7d3e0c 100644
+--- a/cc/layers/texture_layer_impl.cc
++++ b/cc/layers/texture_layer_impl.cc
+@@ -54,10 +54,16 @@ void TextureLayerImpl::CopyPropertiesTo(LayerImpl* layer) const {
+   texture_layer->SetUVBottomRight(uv_bottom_right_);
+   texture_layer->SetBlendBackgroundColor(blend_background_color_);
+   texture_layer->SetForceTextureToOpaque(force_texture_to_opaque_);
++  texture_layer->SetWeaveTarget(weave_target_);
+ }
+ 
+ void TextureLayerImpl::MovePropertiesToActiveLayer(LayerImpl* active_layer) {
+   LayerImpl::MovePropertiesToActiveLayer(active_layer);
++  // DisplayXR inline-3D (#625, Step B / B3): weave_target can change AFTER the
++  // active-tree impl was created (the canvas is tagged once it composites), and
++  // unlike uv/blend it is not fixed at creation — so the pending->active sync
++  // must carry it or the drawing (active) tree never sees the tag.
++  static_cast<TextureLayerImpl*>(active_layer)->SetWeaveTarget(weave_target_);
+   if (needs_set_resource_push_) {
+     TextureLayerImpl* texture_layer =
+         static_cast<TextureLayerImpl*>(active_layer);
+@@ -185,6 +191,10 @@ void TextureLayerImpl::AppendQuads(const AppendQuadsContext& context,
+                /*secure_output=*/false, gfx::ProtectedVideoType::kClear,
+                /*is_tex_coords_normalized=*/false);
+   quad->dynamic_range_limit = GetDynamicRangeLimit();
++  // DisplayXR inline-3D (#625, Step B / B3): carry the per-canvas weave-target
++  // tag onto the quad so Viz (SkiaRenderer::DrawTextureQuad) redirects it to the
++  // OS-woven texture. Preserved automatically through SurfaceAggregator.
++  quad->weave_target = weave_target_;
+   ValidateQuadResources(quad);
+ }
+ 
+@@ -232,6 +242,10 @@ void TextureLayerImpl::SetForceTextureToOpaque(bool opaque) {
+   force_texture_to_opaque_ = opaque;
+ }
+ 
++void TextureLayerImpl::SetWeaveTarget(bool weave_target) {
++  weave_target_ = weave_target;
++}
++
+ void TextureLayerImpl::SetUVTopLeft(const gfx::PointF& top_left) {
+   uv_top_left_ = top_left;
+ }
+diff --git a/cc/layers/texture_layer_impl.h b/cc/layers/texture_layer_impl.h
+index 1843f885a8af6..b33cf36c32345 100644
+--- a/cc/layers/texture_layer_impl.h
++++ b/cc/layers/texture_layer_impl.h
+@@ -55,6 +55,8 @@ class CC_EXPORT TextureLayerImpl : public LayerImpl {
+   void SetTextureId(unsigned id);
+   void SetBlendBackgroundColor(bool blend);
+   void SetForceTextureToOpaque(bool opaque);
++  // DisplayXR inline-3D (#625, Step B / B3). See TextureLayer::SetWeaveTarget().
++  void SetWeaveTarget(bool weave_target);
+   void SetUVTopLeft(const gfx::PointF& top_left);
+   void SetUVBottomRight(const gfx::PointF& bottom_right);
+   void SetHdrMetadata(const gfx::HDRMetadata& hdr_metadata);
+@@ -94,6 +96,8 @@ class CC_EXPORT TextureLayerImpl : public LayerImpl {
+ 
+   bool blend_background_color_ = false;
+   bool force_texture_to_opaque_ = false;
++  // DisplayXR inline-3D weave target tag (#625, Step B).
++  bool weave_target_ = false;
+ 
+   // True while the |transferable_resource_| is owned by this layer, and
+   // becomes false once it is passed to another layer or to the
+diff --git a/components/viz/common/quads/texture_draw_quad.h b/components/viz/common/quads/texture_draw_quad.h
+index 3c909cf0903fa..ff1748a866e94 100644
+--- a/components/viz/common/quads/texture_draw_quad.h
++++ b/components/viz/common/quads/texture_draw_quad.h
+@@ -126,6 +126,14 @@ class VIZ_COMMON_EXPORT TextureDrawQuad : public DrawQuad {
+   // This optional damage is in target render pass coordinate space.
+   std::optional<gfx::Rect> damage_rect;
+ 
++  // DisplayXR inline-3D (#625, Step B / B3). True when this canvas quad's Blink
++  // element opted into glasses-free 3D (via XRDisplayLayer). SkiaRenderer reads
++  // it to redirect the quad to the OS-woven texture. Set by TextureLayerImpl and
++  // preserved through SurfaceAggregator's default copy. Windows-only path; on
++  // other platforms it stays false. Not a bitfield to keep the default-copy
++  // simple.
++  bool weave_target = false;
++
+   struct VIZ_COMMON_EXPORT RoundedDisplayMasksInfo {
+     static constexpr size_t kMaxRoundedDisplayMasksCount = 2;
+     static constexpr size_t kOriginRoundedDisplayMaskIndex = 0;
+diff --git a/components/viz/service/display/external_use_client.h b/components/viz/service/display/external_use_client.h
+index f1be125de2ef8..f41dd2342728e 100644
+--- a/components/viz/service/display/external_use_client.h
++++ b/components/viz/service/display/external_use_client.h
+@@ -24,6 +24,7 @@
+ #include "third_party/skia/include/gpu/ganesh/GrBackendSurface.h"
+ #include "third_party/skia/include/gpu/ganesh/GrTypes.h"
+ #include "third_party/skia/include/gpu/graphite/TextureInfo.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+ namespace cc {
+@@ -115,6 +116,13 @@ class VIZ_SERVICE_EXPORT ExternalUseClient {
+     bool is_weave_target() const { return is_weave_target_; }
+     void set_weave_target(bool v) { is_weave_target_ = v; }
+ 
++    // DisplayXR inline-3D (#625, Step B / B3c, Seam D): the canvas quad's
++    // committed window-relative device-pixel rect, read in SkiaRenderer at draw
++    // time (DSF/zoom baked in) and consumed on the GPU thread as the weave's
++    // source + window-relative placement. Same thread-safety as the tag above.
++    const gfx::Rect& weave_rect() const { return weave_rect_; }
++    void set_weave_rect(const gfx::Rect& r) { weave_rect_ = r; }
++
+    private:
+     gpu::Mailbox mailbox_;
+     gpu::SyncToken sync_token_;
+@@ -142,6 +150,8 @@ class VIZ_SERVICE_EXPORT ExternalUseClient {
+ 
+     // DisplayXR inline-3D weave target tag (#625, Step B). See accessors above.
+     bool is_weave_target_ = false;
++    // DisplayXR inline-3D committed rect (#625, Step B / B3c). See accessors.
++    gfx::Rect weave_rect_;
+   };
+ 
+   // If |maybe_concurrent_reads| is true then there can be concurrent reads to
+diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
+index f9e9a97eea2cf..95303895f289d 100644
+--- a/components/viz/service/display/skia_renderer.cc
++++ b/components/viz/service/display/skia_renderer.cc
+@@ -2688,15 +2688,22 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
+     return;
+ 
+ #if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B / B2c.1): tag the canvas quad as a weave
+-  // target. B2c.1 hardcode = the first sufficiently large texture quad (the
+-  // single full-window canvas on the controlled test page); B3 replaces this
+-  // with an explicit per-element tag from Blink. The GPU thread acts on the tag
+-  // in SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute().
+-  if (DisplayXRInline3DEnabled() && quad->rect.width() >= 256 &&
+-      quad->rect.height() >= 256) {
++  // DisplayXR inline-3D (#625, Step B / B3): tag the canvas quad as a weave
++  // target when its Blink element opted into glasses-free 3D (XRDisplayLayer set
++  // TextureLayer::SetWeaveTarget, carried here on the quad). This replaces the
++  // B2c.1 "first quad >=256px" hardcode with an explicit per-element tag. The
++  // GPU thread acts on the tag in SkiaOutputSurfaceImplOnGpu::
++  // MaybeWeaveSubstitute().
++  if (DisplayXRInline3DEnabled() && quad->weave_target) {
+     if (auto* ic = builder.image_context()) {
+       ic->set_weave_target(true);
++      // Seam D (#625, B3c): the committed window-relative device-pixel rect for
++      // this element, read here at draw time so DSF / fractional-zoom are baked
++      // in (never from Blink layout — that is a frame stale). The root
++      // compositing surface sits at client (0,0), so this is already
++      // window-relative for the weave RPC. Consumed on the GPU thread.
++      ic->set_weave_rect(quad->shared_quad_state->quad_to_target_transform
++                             .MapRect(quad->visible_rect));
+     }
+   }
+ #endif
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index d3cd80a76e06d..845f7f26ecffc 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2675,112 +2675,150 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+   if (!provider) {
+     return;
+   }
+-  // Find the first canvas quad SkiaRenderer tagged as a weave target.
+-  ImageContextImpl* target = nullptr;
+-  for (ImageContextImpl* ctx : image_contexts) {
+-    if (ctx && ctx->is_weave_target()) {
+-      target = ctx;
+-      break;
+-    }
+-  }
+-  if (!target) {
+-    return;
+-  }
+-  static bool s_logged_target = false;
+-  if (!s_logged_target) {
+-    s_logged_target = true;
+-    LOG(ERROR) << "[DisplayXR] B2c.2 weave target found; driving canvas weave";
+-  }
+-
+-  // B2c.2: resolve the tagged canvas's ID3D11Texture2D on the GPU thread via a
+-  // SCANOUT-free overlay representation (a normal 2D canvas SI is DISPLAY_READ-
+-  // only, so ProduceOverlay's SCANOUT gate would reject it). Hold the scoped
+-  // read access alive across WeaveCanvas: it inserts the canvas-render acquire
+-  // sync on device X, and WeaveCanvas copies on that same device synchronously.
+-  auto overlay = shared_image_representation_factory_->ProduceOverlayForWeave(
+-      target->mailbox());
+-  if (!overlay) {
+-    return;
+-  }
+-  auto access = overlay->BeginScopedReadAccess();
+-  if (!access) {
+-    return;
+-  }
+-  std::optional<gl::DCLayerOverlayImage> overlay_image =
+-      access->GetDCLayerOverlayImage();
+-  if (!overlay_image ||
+-      overlay_image->type() != gl::DCLayerOverlayType::kD3D11Texture ||
+-      !overlay_image->d3d11_video_texture()) {
+-    return;
+-  }
+   Microsoft::WRL::ComPtr<ID3D11Device> device_x =
+       context_state_->GetD3D11Device();
+   if (!device_x) {
+     return;
+   }
++  const gfx::Rect window_bounds(size_);
++
++  // B3c multi-element: drive an independent weave for EVERY canvas quad
++  // SkiaRenderer tagged as a weave target (was B2c single-first-tag). Per-target
++  // woven/fence state is keyed by the source canvas mailbox in
++  // |displayxr_weave_state_|. NOTE (validated at B4 against the real service in
++  // chrome; content_shell flattens the page so this can't be exercised here):
++  // whether N submits accumulate into one window output or must serialize, and
++  // the sub-rect UV sampling / CSS-scale mapping for a woven output that is not
++  // element-sized, are finalized then. The full-window single-canvas path
++  // (weave_rect == window) is unchanged from B2c.2.
++  // B3e: source mailboxes tagged this frame, to prune stale woven state below.
++  base::flat_set<gpu::Mailbox> seen_this_frame;
++  for (ImageContextImpl* target : image_contexts) {
++    if (!target || !target->is_weave_target()) {
++      continue;
++    }
++    seen_this_frame.insert(target->mailbox());
++
++    // Seam D: the element's committed window-relative device-pixel rect (full
++    // window as a fallback for the flattened single-canvas bring-up), clamped to
++    // the window.
++    gfx::Rect rect = target->weave_rect();
++    if (rect.IsEmpty()) {
++      rect = window_bounds;
++    }
++    rect.Intersect(window_bounds);
++    if (rect.IsEmpty()) {
++      continue;
++    }
+ 
+-  // The full-window test canvas makes src_rect == window_rect; per-element
+-  // sub-rects (Seam D) come in B3.
+-  const DisplayXRWeaveProvider::Result r = provider->WeaveCanvas(
+-      device_x.Get(), overlay_image->d3d11_video_texture(),
+-      static_cast<UINT>(overlay_image->texture_array_slice()), gfx::Rect(size_),
+-      gfx::Rect(size_));
+-  if (!r.ok) {
+-    return;
+-  }
++    // Resolve the tagged canvas's ID3D11Texture2D on the GPU thread via a
++    // SCANOUT-free overlay representation (a normal 2D canvas SI is DISPLAY_READ-
++    // only, so ProduceOverlay's SCANOUT gate would reject it). Hold the scoped
++    // read access alive across WeaveCanvas: it inserts the canvas-render acquire
++    // sync on device X, and WeaveCanvas copies on that same device synchronously.
++    auto overlay = shared_image_representation_factory_->ProduceOverlayForWeave(
++        target->mailbox());
++    if (!overlay) {
++      continue;
++    }
++    auto access = overlay->BeginScopedReadAccess();
++    if (!access) {
++      continue;
++    }
++    std::optional<gl::DCLayerOverlayImage> overlay_image =
++        access->GetDCLayerOverlayImage();
++    if (!overlay_image ||
++        overlay_image->type() != gl::DCLayerOverlayType::kD3D11Texture ||
++        !overlay_image->d3d11_video_texture()) {
++      continue;
++    }
+ 
+-  // (Re)import the woven texture whenever a fresh handle arrives — that is the
+-  // first weave and again on re-allocation (window resize). Steady-state frames
+-  // return handle 0 and we reuse the imported SharedImage (the runtime re-weaves
+-  // into the same texture in place).
+-  if (r.woven_handle) {
+-    if (!displayxr_woven_mailbox_.IsZero()) {
+-      shared_image_factory_->DestroySharedImage(displayxr_woven_mailbox_);
+-      displayxr_woven_mailbox_ = gpu::Mailbox();
+-    }
+-    gfx::DXGIHandle dxgi(
+-        base::win::ScopedHandle(reinterpret_cast<HANDLE>(r.woven_handle)));
+-    gpu::Mailbox mailbox = gpu::Mailbox::Generate();
+-    gpu::SharedImageInfo si_info(
+-        SinglePlaneFormat::kRGBA_8888,
+-        gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height)),
+-        gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
+-        kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
+-        "DisplayXRWoven");
+-    if (shared_image_factory_->CreateSharedImage(
+-            mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
+-      displayxr_woven_mailbox_ = mailbox;
+-    } else {
+-      LOG(ERROR) << "[DisplayXR] B2c.1 failed to import woven SharedImage "
+-                 << r.width << "x" << r.height;
+-      return;
++    const DisplayXRWeaveProvider::Result r = provider->WeaveCanvas(
++        device_x.Get(), overlay_image->d3d11_video_texture(),
++        static_cast<UINT>(overlay_image->texture_array_slice()), rect, rect);
++    if (!r.ok) {
++      continue;
+     }
+-  }
+-  if (displayxr_woven_mailbox_.IsZero()) {
+-    return;
+-  }
+ 
+-  // (Re)open + GPU-wait the service->caller fence so the woven content is ready
+-  // before the canvas quad samples it. The woven texture has no keyed mutex
+-  // (fence-synced), so this wait is the sole synchronization.
+-  if (r.fence_handle) {
+-    displayxr_weave_fence_ = gfx::D3DSharedFence::CreateFromUnownedHandle(
+-        reinterpret_cast<HANDLE>(r.fence_handle));
+-    // CreateFromUnownedHandle duplicates; we still own the passed handle.
+-    ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
+-  }
+-  if (displayxr_weave_fence_) {
+-    displayxr_weave_fence_->Update(r.fence_value);
+-    Microsoft::WRL::ComPtr<ID3D11Device> wait_device =
+-        gl::GetDirectCompositionD3D11Device();
+-    if (wait_device) {
+-      displayxr_weave_fence_->WaitD3D11(wait_device);
++    DisplayXRWeaveTargetState& st = displayxr_weave_state_[target->mailbox()];
++
++    // (Re)import the woven texture whenever a fresh handle arrives — the first
++    // weave and again on re-allocation (resize). Steady-state frames return
++    // handle 0 and we reuse the imported SharedImage (the runtime re-weaves into
++    // the same texture in place).
++    if (r.woven_handle) {
++      if (!st.woven_mailbox.IsZero()) {
++        shared_image_factory_->DestroySharedImage(st.woven_mailbox);
++        st.woven_mailbox = gpu::Mailbox();
++      }
++      gfx::DXGIHandle dxgi(
++          base::win::ScopedHandle(reinterpret_cast<HANDLE>(r.woven_handle)));
++      gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++      gpu::SharedImageInfo si_info(
++          SinglePlaneFormat::kRGBA_8888,
++          gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height)),
++          gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++          kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++          "DisplayXRWoven");
++      if (shared_image_factory_->CreateSharedImage(
++              mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
++        st.woven_mailbox = mailbox;
++      } else {
++        LOG(ERROR) << "[DisplayXR] failed to import woven SharedImage " << r.width
++                   << "x" << r.height;
++        continue;
++      }
++    }
++    if (st.woven_mailbox.IsZero()) {
++      continue;
+     }
+-  }
+ 
+-  // Redirect the tagged context to the woven backing; the existing promise-image
+-  // fulfillment (below) then reads the woven texture instead of the canvas.
+-  target->SetWeaveOverrideMailbox(displayxr_woven_mailbox_);
++    // (Re)open + GPU-wait the service->caller fence so the woven content is ready
++    // before this element's quad samples it. The woven texture has no keyed mutex
++    // (fence-synced), so this wait is the sole synchronization.
++    if (r.fence_handle) {
++      st.fence = gfx::D3DSharedFence::CreateFromUnownedHandle(
++          reinterpret_cast<HANDLE>(r.fence_handle));
++      // CreateFromUnownedHandle duplicates; we still own the passed handle.
++      ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
++    }
++    if (st.fence) {
++      st.fence->Update(r.fence_value);
++      Microsoft::WRL::ComPtr<ID3D11Device> wait_device =
++          gl::GetDirectCompositionD3D11Device();
++      if (wait_device) {
++        st.fence->WaitD3D11(wait_device);
++      }
++    }
++
++    // Redirect this element's context to its woven backing; the existing
++    // promise-image fulfillment (below) then reads the woven texture instead of
++    // the canvas.
++    target->SetWeaveOverrideMailbox(st.woven_mailbox);
++  }
++
++  // B3e: prune woven state for source canvases no longer tagged this frame
++  // (canvas resize -> new mailbox, or the element untagged on layer close /
++  // session end). Otherwise the map grows unbounded and leaks the woven
++  // SharedImages (a fresh one is imported per source mailbox).
++  if (displayxr_weave_state_.size() > seen_this_frame.size()) {
++    std::vector<gpu::Mailbox> stale;
++    for (const auto& entry : displayxr_weave_state_) {
++      if (!seen_this_frame.contains(entry.first)) {
++        stale.push_back(entry.first);
++      }
++    }
++    for (const gpu::Mailbox& src : stale) {
++      auto it = displayxr_weave_state_.find(src);
++      if (it == displayxr_weave_state_.end()) {
++        continue;
++      }
++      if (!it->second.woven_mailbox.IsZero()) {
++        shared_image_factory_->DestroySharedImage(it->second.woven_mailbox);
++      }
++      displayxr_weave_state_.erase(it);
++    }
++  }
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 02ca43fbc7fe4..43115c4388c32 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -629,12 +629,18 @@ class SkiaOutputSurfaceImplOnGpu
+   base::flat_set<gpu::Mailbox> solid_color_images_;
+ 
+ #if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B / B2c.1) cross-frame weave state. The
+-  // imported woven SharedImage (window-sized; re-imported on resize) and the
+-  // service->caller shared fence we GPU-wait each frame. The SharedImage is
+-  // owned by shared_image_factory_ and destroyed with DestroyAllSharedImages().
+-  gpu::Mailbox displayxr_woven_mailbox_;
+-  scoped_refptr<gfx::D3DSharedFence> displayxr_weave_fence_;
++  // DisplayXR inline-3D (#625, Step B) cross-frame weave state, PER weave target
++  // element (B3c multi-element: keyed by the source canvas SharedImage mailbox,
++  // stable per canvas and re-keyed on resize). Each entry holds the imported
++  // woven SharedImage (re-imported when a fresh handle arrives) and the
++  // service->caller shared fence GPU-waited before the element's quad samples it.
++  // The woven SharedImages are owned by shared_image_factory_ and destroyed with
++  // DestroyAllSharedImages().
++  struct DisplayXRWeaveTargetState {
++    gpu::Mailbox woven_mailbox;
++    scoped_refptr<gfx::D3DSharedFence> fence;
++  };
++  base::flat_map<gpu::Mailbox, DisplayXRWeaveTargetState> displayxr_weave_state_;
+ #endif
+ 
+   THREAD_CHECKER(thread_checker_);
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 5e37a5fff624c..3bad6bb00b634 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -200,6 +200,8 @@ static_library("content_shell_lib") {
+     "browser/protocol/browser_handler.cc",
+     "browser/protocol/browser_handler.h",
+     "browser/protocol/domain_handler.h",
++    "browser/displayxr_service_impl.cc",
++    "browser/displayxr_service_impl.h",
+     "browser/displayxr_weaver_impl.cc",
+     "browser/displayxr_weaver_impl.h",
+     "browser/protocol/shell_devtools_session.cc",
+@@ -347,6 +349,7 @@ static_library("content_shell_lib") {
+     ":content_browsertests_mojom",
+     ":displayxr_weave",
+     ":displayxr_weave_mojom",
++    "//third_party/blink/public/mojom:displayxr_service_mojo_bindings",
+     ":protocol_sources",
+     ":resources",
+     ":rust_test_mojom",
+diff --git a/content/shell/browser/displayxr_service_impl.cc b/content/shell/browser/displayxr_service_impl.cc
+new file mode 100644
+index 0000000000000..862d2620bce15
+--- /dev/null
++++ b/content/shell/browser/displayxr_service_impl.cc
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/shell/browser/displayxr_service_impl.h"
++
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include "content/shell/browser/displayxr_weave_client.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace content {
++
++DisplayXRServiceImpl::DisplayXRServiceImpl() = default;
++DisplayXRServiceImpl::~DisplayXRServiceImpl() = default;
++
++// static
++void DisplayXRServiceImpl::Create(
++    mojo::PendingReceiver<blink::mojom::DisplayXRService> receiver) {
++  mojo::MakeSelfOwnedReceiver(std::make_unique<DisplayXRServiceImpl>(),
++                              std::move(receiver));
++}
++
++void DisplayXRServiceImpl::IsInline3DSupported(
++    IsInline3DSupportedCallback callback) {
++  std::move(callback).Run(DisplayXRWeaveClient::IsSupported());
++}
++
++void DisplayXRServiceImpl::GetLatestEyes(GetLatestEyesCallback callback) {
++  std::vector<float> eyes;
++  bool valid = false;
++  DisplayXRWeaveClient::DisplayInfo di;
++  DisplayXRWeaveClient::GetLatest(&eyes, &valid, &di);
++
++  auto info = blink::mojom::DisplayXRDisplayInfo::New();
++  info->display_width_m = di.display_width_m;
++  info->display_height_m = di.display_height_m;
++  info->display_width_px = di.display_width_px;
++  info->display_height_px = di.display_height_px;
++  info->element_display_rect =
++      gfx::Rect(di.element_x, di.element_y, static_cast<int>(di.element_w),
++                static_cast<int>(di.element_h));
++  info->rect_valid = di.element_rect_valid;
++
++  std::move(callback).Run(std::move(eyes), valid, std::move(info));
++}
++
++}  // namespace content
+diff --git a/content/shell/browser/displayxr_service_impl.h b/content/shell/browser/displayxr_service_impl.h
+new file mode 100644
+index 0000000000000..8afeb47d91d17
+--- /dev/null
++++ b/content/shell/browser/displayxr_service_impl.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
++#define CONTENT_SHELL_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
++
++// DisplayXR inline-3D (#625, Step B3d): frame-scoped renderer->browser service
++// answering the WebXR "inline-3d" session's feature detection + per-frame eye
++// pull from the browser-process weave client's cached state (the GPU sandbox
++// forbids the weave RPC, so the client lives in the browser). Self-owned;
++// bound via the frame's BrowserInterfaceBroker, gated on --enable-inline-3d.
++
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "third_party/blink/public/mojom/xr/displayxr_service.mojom.h"
++
++namespace content {
++
++class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
++ public:
++  DisplayXRServiceImpl();
++  ~DisplayXRServiceImpl() override;
++
++  DisplayXRServiceImpl(const DisplayXRServiceImpl&) = delete;
++  DisplayXRServiceImpl& operator=(const DisplayXRServiceImpl&) = delete;
++
++  static void Create(
++      mojo::PendingReceiver<blink::mojom::DisplayXRService> receiver);
++
++  // blink::mojom::DisplayXRService:
++  void IsInline3DSupported(IsInline3DSupportedCallback callback) override;
++  void GetLatestEyes(GetLatestEyesCallback callback) override;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_SHELL_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
+diff --git a/content/shell/browser/displayxr_weave_client.cc b/content/shell/browser/displayxr_weave_client.cc
+index 355578916754e..e8ac06aea7d06 100644
+--- a/content/shell/browser/displayxr_weave_client.cc
++++ b/content/shell/browser/displayxr_weave_client.cc
+@@ -53,6 +53,20 @@ struct WeaveClientState {
+   XrSession session = XR_NULL_HANDLE;
+   HWND hwnd = nullptr;  // the bound content_shell top-level window
+   bool initialized = false;
++
++  // B3d: static display geometry (XR_EXT_display_info via xrGetSystemProperties)
++  // + the latest weave frame, cached for the DisplayXRService renderer pull.
++  float display_w_m = 0.f;
++  float display_h_m = 0.f;
++  uint32_t display_px_w = 0;
++  uint32_t display_px_h = 0;
++  std::vector<float> latest_eyes;  // flattened xyz triples, display-space metres
++  bool latest_eyes_valid = false;
++  int32_t rect_x = 0;  // latest committed weave rect, window-relative device px
++  int32_t rect_y = 0;
++  uint32_t rect_w = 0;
++  uint32_t rect_h = 0;
++  bool rect_valid = false;
+ };
+ 
+ // Find this process's main top-level window (content_shell's browser window) so
+@@ -215,6 +229,24 @@ void InitializeWin() {
+     return;
+   }
+ 
++  // B3d: cache the physical display geometry for the off-axis projection the
++  // renderer builds. Chained to XrSystemProperties per XR_EXT_display_info.
++  if (has_display_info) {
++    XrDisplayInfoEXT di = {XR_TYPE_DISPLAY_INFO_EXT};
++    XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
++    props.next = &di;
++    if (XR_SUCCEEDED(
++            xrGetSystemProperties(s.instance, s.system_id, &props))) {
++      s.display_w_m = di.displaySizeMeters.width;
++      s.display_h_m = di.displaySizeMeters.height;
++      s.display_px_w = di.displayPixelWidth;
++      s.display_px_h = di.displayPixelHeight;
++      LOG(ERROR) << "[DisplayXR] display info: " << s.display_w_m << "x"
++                 << s.display_h_m << " m, " << s.display_px_w << "x"
++                 << s.display_px_h << " px";
++    }
++  }
++
+   xrGetInstanceProcAddr(s.instance, "xrWeaveBindWindowEXT",
+                         reinterpret_cast<PFN_xrVoidFunction*>(&s.bind_window));
+   xrGetInstanceProcAddr(s.instance, "xrWeaveSubmitEXT",
+@@ -342,9 +374,56 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+       result.eyes.push_back(eye.z);
+     }
+   }
++
++  // B3d: cache this frame's eyes + committed rect for the DisplayXRService pull.
++  s.latest_eyes = result.eyes;
++  s.latest_eyes_valid = result.eyes_valid;
++  s.rect_x = x;
++  s.rect_y = y;
++  s.rect_w = w > 0 ? static_cast<uint32_t>(w) : 0u;
++  s.rect_h = h > 0 ? static_cast<uint32_t>(h) : 0u;
++  s.rect_valid = (w > 0 && h > 0);
+   return result;
+ }
+ 
++bool IsSupportedWin() {
++  WeaveClientState& s = State();
++  return s.session != XR_NULL_HANDLE && s.submit != nullptr;
++}
++
++void GetLatestWin(std::vector<float>* eyes,
++                  bool* eyes_valid,
++                  DisplayXRWeaveClient::DisplayInfo* info) {
++  WeaveClientState& s = State();
++  if (eyes) {
++    *eyes = s.latest_eyes;
++  }
++  if (eyes_valid) {
++    *eyes_valid = s.latest_eyes_valid;
++  }
++  if (info) {
++    info->display_width_m = s.display_w_m;
++    info->display_height_m = s.display_h_m;
++    info->display_width_px = s.display_px_w;
++    info->display_height_px = s.display_px_h;
++    info->element_rect_valid = false;
++    // Convert the latest window-relative weave rect to physical-display device
++    // px by adding the bound window's client-area origin on the desktop. The
++    // weave display is assumed to host the window (same assumption bindWindow's
++    // phase-snap already makes); exact multi-monitor mapping is a B4 refinement.
++    if (s.rect_valid && s.hwnd) {
++      POINT origin = {0, 0};
++      if (::ClientToScreen(s.hwnd, &origin)) {
++        info->element_x = origin.x + s.rect_x;
++        info->element_y = origin.y + s.rect_y;
++        info->element_w = s.rect_w;
++        info->element_h = s.rect_h;
++        info->element_rect_valid = true;
++      }
++    }
++  }
++}
++
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+ }  // namespace
+@@ -363,6 +442,34 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::Submit(
+ #endif
+ }
+ 
++// static
++bool DisplayXRWeaveClient::IsSupported() {
++#if BUILDFLAG(IS_WIN)
++  return IsSupportedWin();
++#else
++  return false;
++#endif
++}
++
++// static
++void DisplayXRWeaveClient::GetLatest(std::vector<float>* eyes,
++                                     bool* eyes_valid,
++                                     DisplayInfo* info) {
++#if BUILDFLAG(IS_WIN)
++  GetLatestWin(eyes, eyes_valid, info);
++#else
++  if (eyes) {
++    eyes->clear();
++  }
++  if (eyes_valid) {
++    *eyes_valid = false;
++  }
++  if (info) {
++    *info = DisplayInfo();
++  }
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+   if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
+diff --git a/content/shell/browser/displayxr_weave_client.h b/content/shell/browser/displayxr_weave_client.h
+index 6bbd9ea0f551f..429f966f987ec 100644
+--- a/content/shell/browser/displayxr_weave_client.h
++++ b/content/shell/browser/displayxr_weave_client.h
+@@ -52,6 +52,36 @@ class DisplayXRWeaveClient {
+                                   int32_t y,
+                                   int32_t w,
+                                   int32_t h);
++
++  // DisplayXR inline-3D (#625, Step B3d): the display + committed-element
++  // geometry the renderer's off-axis (Kooima) projection needs, delivered via
++  // the renderer<-browser DisplayXRService mojom. OpenXR-free so this header
++  // stays includable from chromium_code TUs.
++  struct DisplayInfo {
++    float display_width_m = 0.f;
++    float display_height_m = 0.f;
++    uint32_t display_width_px = 0;
++    uint32_t display_height_px = 0;
++    // The latest woven element rect, converted to physical-display device px
++    // (bound-window client origin + the committed window-relative weave rect).
++    int32_t element_x = 0;
++    int32_t element_y = 0;
++    uint32_t element_w = 0;
++    uint32_t element_h = 0;
++    bool element_rect_valid = false;
++  };
++
++  // True iff a glasses-free-3D display + runtime is present and the weave
++  // session is live (the same session/submit guard SubmitWin uses). Backs
++  // WebXR isSessionSupported('inline-3d').
++  static bool IsSupported();
++
++  // Latest tracked eyes (flattened xyz triples, display-space metres) + the
++  // display/element geometry, as cached from the most recent weave submission.
++  // |*eyes| is empty and |*eyes_valid| false until tracking is available.
++  static void GetLatest(std::vector<float>* eyes,
++                        bool* eyes_valid,
++                        DisplayInfo* info);
+ };
+ 
+ }  // namespace content
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 0dc94cb81b1e9..b5c47f019fc0b 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -18,7 +18,9 @@
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/shell/browser/displayxr_service_impl.h"
+ #include "content/shell/browser/displayxr_weaver_impl.h"
++#include "third_party/blink/public/mojom/xr/displayxr_service.mojom.h"
+ #include "base/containers/fixed_flat_set.h"
+ #include "base/containers/flat_set.h"
+ #include "base/feature_list.h"
+@@ -208,6 +210,20 @@ void BindRustTestServiceReceiver(
+   content::rust_test::BindRustTestService(std::move(pipe));
+ }
+ 
++// DisplayXR inline-3D (#625, Step B3d): bind the renderer's per-frame
++// DisplayXRService to the browser-process weave client's cached state. Dormant
++// unless --enable-inline-3d — dropping the receiver makes the renderer's remote
++// disconnect, so isSessionSupported('inline-3d') resolves false (negative
++// control).
++void BindDisplayXRService(
++    content::RenderFrameHost* render_frame_host,
++    mojo::PendingReceiver<blink::mojom::DisplayXRService> receiver) {
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    return;
++  }
++  DisplayXRServiceImpl::Create(std::move(receiver));
++}
++
+ void BindNetworkHintsHandler(
+     content::RenderFrameHost* frame_host,
+     mojo::PendingReceiver<network_hints::mojom::NetworkHintsHandler> receiver) {
+@@ -646,6 +662,8 @@ void ShellContentBrowserClient::RegisterBrowserInterfaceBindersForFrame(
+   map->Add<network_hints::mojom::NetworkHintsHandler>(&BindNetworkHintsHandler);
+   map->Add<content::rust_test::mojom::RustTestService>(
+       base::BindRepeating(&BindRustTestServiceReceiver));
++  map->Add<blink::mojom::DisplayXRService>(
++      base::BindRepeating(&BindDisplayXRService));
+ #if BUILDFLAG(IS_WIN)
+   map->Add<media::mojom::MediaFoundationPreferences>(
+       &BindMediaFoundationPreferences);
+diff --git a/services/viz/public/cpp/compositing/quads_mojom_traits.cc b/services/viz/public/cpp/compositing/quads_mojom_traits.cc
+index 5b38e2dc51ca4..c57cf96ce0700 100644
+--- a/services/viz/public/cpp/compositing/quads_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/quads_mojom_traits.cc
+@@ -201,6 +201,9 @@ bool StructTraits<viz::mojom::TextureQuadStateDataView, viz::DrawQuad>::Read(
+   if (!data.ReadDamageRect(&quad->damage_rect))
+     return false;
+ 
++  // DisplayXR inline-3D (#625, Step B / B3).
++  quad->weave_target = data.weave_target();
++
+   return true;
+ }
+ 
+diff --git a/services/viz/public/cpp/compositing/quads_mojom_traits.h b/services/viz/public/cpp/compositing/quads_mojom_traits.h
+index dfeb6e60565e6..48815bf1e36c4 100644
+--- a/services/viz/public/cpp/compositing/quads_mojom_traits.h
++++ b/services/viz/public/cpp/compositing/quads_mojom_traits.h
+@@ -473,6 +473,13 @@ struct StructTraits<viz::mojom::TextureQuadStateDataView, viz::DrawQuad> {
+     return quad->damage_rect;
+   }
+ 
++  // DisplayXR inline-3D (#625, Step B / B3).
++  static bool weave_target(const viz::DrawQuad& input) {
++    const viz::TextureDrawQuad* quad =
++        viz::TextureDrawQuad::MaterialCast(&input);
++    return quad->weave_target;
++  }
++
+   static bool Read(viz::mojom::TextureQuadStateDataView data,
+                    viz::DrawQuad* out);
+ };
+diff --git a/services/viz/public/mojom/compositing/quads.mojom b/services/viz/public/mojom/compositing/quads.mojom
+index 4169c4cf760c9..e9613a87aeee7 100644
+--- a/services/viz/public/mojom/compositing/quads.mojom
++++ b/services/viz/public/mojom/compositing/quads.mojom
+@@ -98,6 +98,10 @@ struct TextureQuadState {
+   gfx.mojom.Rect? damage_rect;
+   OverlayPriority overlay_priority_hint;
+   RoundedDisplayMasksInfo rounded_display_masks_info;
++  // DisplayXR inline-3D (#625, Step B / B3): the canvas element opted into
++  // glasses-free 3D (XRDisplayLayer). Carried renderer cc -> Viz so
++  // SkiaRenderer redirects the quad to the OS-woven texture.
++  bool weave_target;
+ };
+ 
+ struct TileQuadState {
+diff --git a/third_party/blink/public/mojom/BUILD.gn b/third_party/blink/public/mojom/BUILD.gn
+index d045fffd7825d..cabc0cb15b009 100644
+--- a/third_party/blink/public/mojom/BUILD.gn
++++ b/third_party/blink/public/mojom/BUILD.gn
+@@ -1930,6 +1930,24 @@ mojom("color_scheme_mojo_bindings") {
+   export_header = "third_party/blink/public/common/common_export.h"
+ }
+ 
++# DisplayXR inline-3D (#625, Step B): renderer<->browser interface for the
++# glasses-free-3D "inline-3d" WebXR session. Plain mojom() with NO export
++# attributes: each variant has exactly one consuming component — the regular
++# variant only content/shell (browser), the _blink variant only the Blink xr
++# module — so the bindings compile directly into that single consumer with no
++# dllimport/export split (a component export macro would give LNK4217 since the
++# bindings land in the same component as the consumer).
++mojom("displayxr_service_mojo_bindings") {
++  sources = [ "xr/displayxr_service.mojom" ]
++
++  public_deps = [ "//ui/gfx/geometry/mojom" ]
++
++  visibility_blink = [
++    "//third_party/blink/renderer/modules",
++    "//third_party/blink/renderer/modules/xr",
++  ]
++}
++
+ mojom_component("credentialmanagement_mojo_bindings") {
+   generate_java = true
+ 
+diff --git a/third_party/blink/public/mojom/xr/displayxr_service.mojom b/third_party/blink/public/mojom/xr/displayxr_service.mojom
+new file mode 100644
+index 0000000000000..89222ac4a1cf2
+--- /dev/null
++++ b/third_party/blink/public/mojom/xr/displayxr_service.mojom
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module blink.mojom;
++
++import "ui/gfx/geometry/mojom/geometry.mojom";
++
++// DisplayXR inline-3D (#625, Step B): the glasses-free-3D display + runtime
++// geometry the WebXR "inline-3d" session needs, delivered renderer<-browser.
++struct DisplayXRDisplayInfo {
++  // Physical display dimensions.
++  float display_width_m;
++  float display_height_m;
++  uint32 display_width_px;
++  uint32 display_height_px;
++
++  // The woven canvas element's rect in physical-display device pixels
++  // (bound-window client origin + the GPU's latest committed weave rect). Only
++  // meaningful when |rect_valid| is true.
++  gfx.mojom.Rect element_display_rect;
++  bool rect_valid;
++};
++
++// Renderer -> browser, frame-scoped (bound via BrowserInterfaceBroker). The
++// browser process hosts the OpenXR weave client — the GPU sandbox forbids the
++// per-frame weave RPC to displayxr-service — so the inline-3d session pulls the
++// tracked eyes + committed element rect from here to build its off-axis
++// (Kooima) projections. Windows-only in practice; on other platforms the
++// interface is simply never bound and IsInline3DSupported() resolves false.
++interface DisplayXRService {
++  // True iff a glasses-free-3D display + runtime is present and a weave session
++  // is live. WebXR navigator.xr.isSessionSupported('inline-3d') resolves to it.
++  IsInline3DSupported() => (bool supported);
++
++  // Latest tracked eye positions in display-space metres, flattened xyz
++  // triples (empty and |valid| == false until tracking is available). |info|
++  // carries the display + element geometry for the per-eye off-axis projection.
++  GetLatestEyes() => (array<float> eyes, bool valid, DisplayXRDisplayInfo info);
++};
+diff --git a/third_party/blink/renderer/bindings/generated_in_modules.gni b/third_party/blink/renderer/bindings/generated_in_modules.gni
+index 6e947a9177298..6fafee3bda3fc 100644
+--- a/third_party/blink/renderer/bindings/generated_in_modules.gni
++++ b/third_party/blink/renderer/bindings/generated_in_modules.gni
+@@ -1428,6 +1428,8 @@ generated_dictionary_sources_in_modules = [
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_cylinder_layer_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_state_init.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_state_init.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_init.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_init.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_equirect_layer_init.cc",
+@@ -3200,6 +3202,8 @@ generated_interface_sources_in_modules = [
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_cpu_depth_information.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_information.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_information.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_state.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_state.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_equirect_layer.cc",
+diff --git a/third_party/blink/renderer/bindings/idl_in_modules.gni b/third_party/blink/renderer/bindings/idl_in_modules.gni
+index 1228ae367d3b6..e13bc4c8fa197 100644
+--- a/third_party/blink/renderer/bindings/idl_in_modules.gni
++++ b/third_party/blink/renderer/bindings/idl_in_modules.gni
+@@ -1231,6 +1231,8 @@ static_idl_files_in_modules = [
+   "//third_party/blink/renderer/modules/xr/xr_cylinder_layer.idl",
+   "//third_party/blink/renderer/modules/xr/xr_depth_information.idl",
+   "//third_party/blink/renderer/modules/xr/xr_depth_state_init.idl",
++  "//third_party/blink/renderer/modules/xr/xr_display_layer.idl",
++  "//third_party/blink/renderer/modules/xr/xr_display_layer_init.idl",
+   "//third_party/blink/renderer/modules/xr/xr_dom_overlay_init.idl",
+   "//third_party/blink/renderer/modules/xr/xr_dom_overlay_state.idl",
+   "//third_party/blink/renderer/modules/xr/xr_equirect_layer.idl",
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index ce8231f02d134..226fde99134c6 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -1648,10 +1648,24 @@ cc::TextureLayer* HTMLCanvasElement::GetOrCreateCcLayerForCanvas2DIfNeeded() {
+     cc_layer_->SetHitTestable(true);
+     cc_layer_->SetContentsOpaque(is_opaque_);
+     cc_layer_->SetBlendBackgroundColor(!is_opaque_);
++    // DisplayXR inline-3D (#625, Step B / B3): re-apply the sticky weave-target
++    // tag when the layer is (re)created (e.g. after a resize).
++    cc_layer_->SetWeaveTarget(inline_3d_);
+   }
+   return cc_layer_.get();
+ }
+ 
++void HTMLCanvasElement::SetInline3D(bool enabled) {
++  inline_3d_ = enabled;
++  // Apply to the composited 2D canvas layer (its creation re-applies the sticky
++  // tag). (WebGL is a follow-up; B3 targets a 2D SBS canvas.)
++  if (IsRenderingContext2D() && context_ && context_->IsComposited()) {
++    GetOrCreateCcLayerForCanvas2DIfNeeded()->SetWeaveTarget(enabled);
++  } else if (cc_layer_) {
++    cc_layer_->SetWeaveTarget(enabled);
++  }
++}
++
+ void HTMLCanvasElement::ClearCanvas2DLayerTexture() {
+   CHECK(IsRenderingContext2D());
+   if (cc_layer_) {
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
+index 2b023e1a62915..e98c081b0d08f 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
+@@ -189,6 +189,12 @@ class CORE_EXPORT HTMLCanvasElement final
+ 
+   cc::TextureLayer* GetOrCreateCcLayerForCanvas2DIfNeeded();
+   cc::TextureLayer* GetCanvas2DCcLayerForTesting() { return cc_layer_.get(); }
++
++  // DisplayXR inline-3D (#625, Step B / B3). Tag/untag this canvas's compositor
++  // layer as a weave target so Viz redirects it to the OS-woven (glasses-free
++  // 3D) texture. Set by the WebXR XRDisplayLayer binding. The tag is re-applied
++  // whenever the 2D layer is (re)created. Windows inline-3D path.
++  void SetInline3D(bool enabled);
+   void ClearCanvas2DLayerTexture() override;
+ 
+   void SetNeedsPushProperties();
+@@ -433,6 +439,10 @@ class CORE_EXPORT HTMLCanvasElement final
+ 
+   scoped_refptr<cc::TextureLayer> cc_layer_;
+ 
++  // DisplayXR inline-3D (#625, Step B / B3): sticky weave-target tag applied to
++  // cc_layer_ on (re)creation. See SetInline3D().
++  bool inline_3d_ = false;
++
+   bool is_opaque_ = false;
+   bool is_displayed_ = false;
+   unsigned frames_since_last_commit_ = 0;
+diff --git a/third_party/blink/renderer/modules/xr/BUILD.gn b/third_party/blink/renderer/modules/xr/BUILD.gn
+index e1dc92acea9ce..caa5f31329549 100644
+--- a/third_party/blink/renderer/modules/xr/BUILD.gn
++++ b/third_party/blink/renderer/modules/xr/BUILD.gn
+@@ -38,6 +38,8 @@ blink_modules_sources("xr") {
+     "xr_depth_information.h",
+     "xr_depth_manager.cc",
+     "xr_depth_manager.h",
++    "xr_display_layer.cc",
++    "xr_display_layer.h",
+     "xr_dom_overlay_state.cc",
+     "xr_dom_overlay_state.h",
+     "xr_enter_fullscreen_observer.cc",
+@@ -184,6 +186,8 @@ blink_modules_sources("xr") {
+   deps = [
+     "//device/vr/buildflags",
+     "//device/vr/public/mojom:vr_service_blink",
++    # DisplayXR inline-3D (#625, Step B): renderer<-browser eyes/display info.
++    "//third_party/blink/public/mojom:displayxr_service_mojo_bindings_blink",
+     "//services/metrics/public/cpp:ukm_builders",
+   ]
+ 
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+new file mode 100644
+index 0000000000000..8f96534a99554
+--- /dev/null
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/xr/xr_display_layer.h"
++
++#include "third_party/blink/renderer/core/dom/element.h"
++#include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
++#include "third_party/blink/renderer/modules/xr/xr_session.h"
++#include "third_party/blink/renderer/modules/xr/xr_view.h"
++#include "third_party/blink/renderer/modules/xr/xr_viewport.h"
++#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++
++namespace blink {
++
++// static
++XRDisplayLayer* XRDisplayLayer::Create(XRSession* session,
++                                       Element* target,
++                                       const XRDisplayLayerInit* init,
++                                       ExceptionState& exception_state) {
++  auto* canvas = DynamicTo<HTMLCanvasElement>(target);
++  if (!canvas) {
++    exception_state.ThrowTypeError(
++        "XRDisplayLayer target must be an HTMLCanvasElement.");
++    return nullptr;
++  }
++  return MakeGarbageCollected<XRDisplayLayer>(session, target);
++}
++
++XRDisplayLayer::XRDisplayLayer(XRSession* session, Element* target)
++    : session_(session), target_(target) {
++  // Tag the target canvas's compositor layer as a weave target; Viz redirects
++  // it to the OS-woven texture (see cc::TextureLayer::SetWeaveTarget).
++  if (auto* canvas = DynamicTo<HTMLCanvasElement>(target_.Get())) {
++    canvas->SetInline3D(true);
++    active_ = true;
++    // Track with the session so session-end untags the canvas (#625, B3e).
++    if (session_) {
++      session_->RegisterDisplayLayer(this);
++    }
++  }
++}
++
++XRDisplayLayer::~XRDisplayLayer() = default;
++
++XRViewport* XRDisplayLayer::getViewport(XRView* view) {
++  if (!view || view->session() != session_.Get()) {
++    return nullptr;
++  }
++  auto* canvas = DynamicTo<HTMLCanvasElement>(target_.Get());
++  if (!canvas) {
++    return nullptr;
++  }
++  // Side-by-side split of the target's backing store: left eye (index 0) = left
++  // half, right eye (index 1) = right half.
++  const int w = static_cast<int>(canvas->width());
++  const int h = static_cast<int>(canvas->height());
++  const int half = w / 2;
++  const int x = (view->index() == 0) ? 0 : half;
++  return MakeGarbageCollected<XRViewport>(x, 0, half, h);
++}
++
++void XRDisplayLayer::close() {
++  if (!active_) {
++    return;
++  }
++  if (auto* canvas = DynamicTo<HTMLCanvasElement>(target_.Get())) {
++    canvas->SetInline3D(false);
++  }
++  active_ = false;
++  if (session_) {
++    session_->UnregisterDisplayLayer(this);
++  }
++}
++
++void XRDisplayLayer::Trace(Visitor* visitor) const {
++  visitor->Trace(session_);
++  visitor->Trace(target_);
++  ScriptWrappable::Trace(visitor);
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.h b/third_party/blink/renderer/modules/xr/xr_display_layer.h
+new file mode 100644
+index 0000000000000..b7519da9c69e6
+--- /dev/null
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.h
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_XR_XR_DISPLAY_LAYER_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_XR_XR_DISPLAY_LAYER_H_
++
++#include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/heap/member.h"
++#include "third_party/blink/renderer/platform/heap/visitor.h"
++
++namespace blink {
++
++class Element;
++class ExceptionState;
++class XRDisplayLayerInit;
++class XRSession;
++class XRView;
++class XRViewport;
++
++// DisplayXR inline-3D (#625, Step B / B3). Binds a WebXR 'inline-3d' session to a
++// DOM element (a canvas), opting that element into glasses-free 3D: the browser
++// weaves the element's rendered stereo pair through the OS weave RPC and
++// composites the woven result at the element's on-screen rect.
++//
++// This is intentionally a LIGHTWEIGHT binding, not a subclass of the WebXR
++// Layers XRCompositionLayer: the actual weave is driven Viz-side off a per-layer
++// compositor tag (cc::TextureLayer::SetWeaveTarget), so wiring the heavyweight XR
++// Layers compositor backend would be pure overhead and the browser contains no
++// weave/vendor code (ADR-007/019). Constructing the layer tags the target
++// canvas; close() (or session end) untags it. Multiple layers -> multiple 3D
++// elements. The whole path is dormant unless content_shell was launched with
++// --enable-inline-3d; the JS surface is gated by the DisplayXRInline3D
++// RuntimeEnabledFeature.
++class XRDisplayLayer final : public ScriptWrappable {
++  DEFINE_WRAPPERTYPEINFO();
++
++ public:
++  static XRDisplayLayer* Create(XRSession* session,
++                                Element* target,
++                                const XRDisplayLayerInit* init,
++                                ExceptionState& exception_state);
++
++  XRDisplayLayer(XRSession* session, Element* target);
++  ~XRDisplayLayer() override;
++
++  // The DOM element shown in 3D.
++  Element* target() const { return target_.Get(); }
++
++  // Per-eye viewport into the target: left eye = left half, right eye = right
++  // half (side-by-side). Null if |view| is not from this layer's session.
++  XRViewport* getViewport(XRView* view);
++
++  // Stop weaving the target (untag its compositor layer). Idempotent.
++  void close();
++
++  void Trace(Visitor*) const override;
++
++ private:
++  Member<XRSession> session_;
++  Member<Element> target_;
++  // True while the target is tagged as a weave target.
++  bool active_ = false;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_XR_XR_DISPLAY_LAYER_H_
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.idl b/third_party/blink/renderer/modules/xr/xr_display_layer.idl
+new file mode 100644
+index 0000000000000..08cc0c0ad6b4d
+--- /dev/null
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.idl
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// DisplayXR inline-3D (#625, Step B). Binds a WebXR 'inline-3d' session to a DOM
++// element (a canvas), opting it into glasses-free 3D via the OS weave RPC. See
++// docs/roadmap/webxr-displayxr-explainer.md. Deliberately NOT a subclass of
++// XRCompositionLayer for this reference implementation (the weave is compositor-
++// tag-driven; the Layers backend is not involved).
++[
++  SecureContext,
++  Exposed=Window,
++  RuntimeEnabled=DisplayXRInline3D
++] interface XRDisplayLayer {
++  [RaisesException]
++  constructor(XRSession session, Element target,
++              optional XRDisplayLayerInit init = {});
++
++  // The DOM element shown in 3D.
++  readonly attribute Element target;
++
++  // Per-eye viewport into the target (side-by-side halves).
++  XRViewport? getViewport(XRView view);
++
++  // Stop weaving the target.
++  undefined close();
++};
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer_init.idl b/third_party/blink/renderer/modules/xr/xr_display_layer_init.idl
+new file mode 100644
+index 0000000000000..fc24a2d829651
+--- /dev/null
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer_init.idl
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// DisplayXR inline-3D (#625, Step B). Options for XRDisplayLayer.
++dictionary XRDisplayLayerInit {
++  // Backing-store device pixels per CSS pixel (DPI / fractional zoom). Reserved
++  // for device-pixel-exact weave alignment; unused in the B3 reference path.
++  double pixelScale = 1.0;
++};
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 99edb90a4f56f..cc97fbac8a5d4 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -5,6 +5,7 @@
+ #include "third_party/blink/renderer/modules/xr/xr_session.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <memory>
+ #include <string>
+ #include <utility>
+@@ -58,6 +59,8 @@
+ #include "third_party/blink/renderer/modules/xr/xr_render_state.h"
+ #include "third_party/blink/renderer/modules/xr/xr_session_event.h"
+ #include "third_party/blink/renderer/modules/xr/xr_session_viewport_scaler.h"
++#include "third_party/blink/public/mojom/xr/displayxr_service.mojom-blink.h"
++#include "third_party/blink/renderer/modules/xr/xr_display_layer.h"
+ #include "third_party/blink/renderer/modules/xr/xr_system.h"
+ #include "third_party/blink/renderer/modules/xr/xr_transient_input_hit_test_source.h"
+ #include "third_party/blink/renderer/modules/xr/xr_utils.h"
+@@ -363,7 +366,8 @@ XRSession::XRSession(
+     device::mojom::blink::XRSessionDeviceConfigPtr device_config,
+     bool sensorless_session,
+     XRSessionFeatureSet enabled_feature_set,
+-    uint64_t trace_id)
++    uint64_t trace_id,
++    bool is_inline_3d)
+     : ActiveScriptWrappable<XRSession>({}),
+       frame_tracked_images_(
+           MakeGarbageCollected<FrozenArray<XRImageTrackingResult>>()),
+@@ -388,6 +392,7 @@ XRSession::XRSession(
+       supports_viewport_scaling_(immersive() &&
+                                  device_config_->supports_viewport_scaling),
+       sensorless_session_(sensorless_session),
++      is_inline_3d_(is_inline_3d),
+       trace_id_(trace_id) {
+   FrozenArray<IDLString>::VectorType enabled_features;
+   for (const auto& feature : enabled_feature_set_) {
+@@ -1591,6 +1596,17 @@ void XRSession::ForceEnd(ShutdownPolicy shutdown_policy) {
+     canvas_input_provider_ = nullptr;
+   }
+ 
++  // DisplayXR inline-3D (#625, Step B3e): untag every canvas bound to this
++  // session so the weave stops on session end. close() is the only untag hook
++  // and nothing else invokes it; iterate a copy since close() deregisters.
++  {
++    HeapHashSet<Member<XRDisplayLayer>> layers;
++    layers.swap(display_layers_);
++    for (const auto& layer : layers) {
++      layer->close();
++    }
++  }
++
+   xr_->ExitPresent(
+       BindOnce(&XRSession::OnExitPresent, WrapWeakPersistent(this)));
+ 
+@@ -2426,6 +2442,27 @@ void XRSession::UpdateInlineView() {
+     views_.clear();
+     canvas_was_resized_ = false;
+   }
++
++  // DisplayXR inline-3D (#625, Step B3d): drive two head-tracked off-axis eye
++  // views from the runtime's tracked eyes. Kick off the async eye pull for the
++  // next frame and build this frame from the latest cached eyes; fall back to
++  // the single mono view until eyes + element geometry are available (also the
++  // negative control: no service -> stays mono, inert).
++  if (is_inline_3d_) {
++    RequestInline3DState();
++    if (inline_3d_eyes_valid_ && inline_3d_info_ &&
++        inline_3d_info_->rect_valid && output_width_ > 0 &&
++        output_height_ > 0) {
++      UpdateInline3DViews();
++      return;
++    }
++  }
++
++  // Mono inline path. If we were previously in the 2-view inline-3d layout,
++  // drop it so we rebuild a single view.
++  if (views_.size() != 1) {
++    views_.clear();
++  }
+   if (views_.empty()) {
+     views_.emplace_back(MakeGarbageCollected<XRViewData>(
+         /*index=*/0, device::mojom::blink::XREye::kNone,
+@@ -2451,6 +2488,105 @@ void XRSession::UpdateInlineView() {
+       render_state_->depthFar());
+ }
+ 
++void XRSession::RequestInline3DState() {
++  mojom::blink::DisplayXRService* svc = xr_->EnsureDisplayXRService();
++  if (!svc) {
++    return;
++  }
++  svc->GetLatestEyes(
++      BindOnce(&XRSession::OnInline3DState, WrapWeakPersistent(this)));
++}
++
++void XRSession::OnInline3DState(const Vector<float>& eyes,
++                               bool valid,
++                               mojom::blink::DisplayXRDisplayInfoPtr info) {
++  inline_3d_eyes_ = eyes;
++  inline_3d_eyes_valid_ = valid;
++  inline_3d_info_ = std::move(info);
++}
++
++void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
++  display_layers_.insert(layer);
++}
++
++void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
++  display_layers_.erase(layer);
++}
++
++// DisplayXR inline-3D (#625, Step B3d): build two eye views with window-relative
++// off-axis (Kooima) projections + per-eye poses from the tracked eyes. The
++// element is treated as a physical window into the scene: the frustum edges are
++// the element rect projected through each eye (docs/architecture/
++// kooima-projection.md §7 + "Windowed Mode"). Head motion moves the eye, which
++// shifts both the pose and the asymmetric frustum -> glasses-free look-around.
++void XRSession::UpdateInline3DViews() {
++  const int w = output_width_;
++  const int h = output_height_;
++  const int half_w = w / 2;
++  if (views_.size() != 2) {
++    views_.clear();
++    views_.emplace_back(MakeGarbageCollected<XRViewData>(
++        /*index=*/0, device::mojom::blink::XREye::kLeft,
++        gfx::Rect(0, 0, half_w, h), graphics_api_));
++    views_.emplace_back(MakeGarbageCollected<XRViewData>(
++        /*index=*/1, device::mojom::blink::XREye::kRight,
++        gfx::Rect(half_w, 0, w - half_w, h), graphics_api_));
++  }
++
++  const mojom::blink::DisplayXRDisplayInfo& di = *inline_3d_info_;
++  const float near_depth = static_cast<float>(render_state_->depthNear());
++  const float far_depth = static_cast<float>(render_state_->depthFar());
++
++  // Metres per device pixel (square pixels; derive from height).
++  const float pixel_m = di.display_height_px > 0
++                            ? di.display_height_m / di.display_height_px
++                            : 0.f;
++
++  // Element rect centre offset from the display centre + half-size, in
++  // display-space metres (+x right, +y up; screen y is top-down).
++  const gfx::Rect& er = di.element_display_rect;
++  const float disp_cx = di.display_width_px * 0.5f;
++  const float disp_cy = di.display_height_px * 0.5f;
++  const float elem_cx_m = (er.x() + er.width() * 0.5f - disp_cx) * pixel_m;
++  const float elem_cy_m = (disp_cy - (er.y() + er.height() * 0.5f)) * pixel_m;
++  const float half_w_m = er.width() * pixel_m * 0.5f;
++  const float half_h_m = er.height() * pixel_m * 0.5f;
++
++  const wtf_size_t eye_count =
++      static_cast<wtf_size_t>(inline_3d_eyes_.size() / 3u);
++  for (wtf_size_t i = 0; i < 2u; ++i) {
++    // eyes are ordered [left, right]; reuse eye 0 for both if only one tracked.
++    const wtf_size_t e = (eye_count >= 2u) ? i : 0u;
++    float ex = 0.f, ey = 0.f, ez = 0.5f;  // nominal 0.5 m if untracked
++    if (e < eye_count) {
++      ex = inline_3d_eyes_[e * 3u + 0u];
++      ey = inline_3d_eyes_[e * 3u + 1u];
++      ez = inline_3d_eyes_[e * 3u + 2u];
++    }
++    // Eye relative to the element centre; element plane at z = 0.
++    const float rx = ex - elem_cx_m;
++    const float ry = ey - elem_cy_m;
++    float rz = ez;
++    if (rz < 0.001f) {
++      rz = 0.65f;  // arm's-length fallback (avoid divide-by-zero, doc §7)
++    }
++    // Asymmetric half-angles: each element edge projected through the eye.
++    const float left_rad = std::atan2(half_w_m + rx, rz);
++    const float right_rad = std::atan2(half_w_m - rx, rz);
++    const float up_rad = std::atan2(half_h_m - ry, rz);
++    const float down_rad = std::atan2(half_h_m + ry, rz);
++
++    XRViewData* view = views_[i];
++    view->UpdateProjectionMatrixFromFoV(up_rad, down_rad, left_rad, right_rad,
++                                        near_depth, far_depth);
++    // Per-eye pose: place the eye at its display-space position (world origin =
++    // element centre), identity orientation. View faces -z toward the element.
++    gfx::Transform mojo_from_view;
++    mojo_from_view.Translate3d(rx, ry, rz);
++    view->SetMojoFromView(mojo_from_view);
++  }
++}
++
+ // Called when the canvas element for this session's output context is resized.
+ void XRSession::UpdateCanvasDimensions(Element* element) {
+   DCHECK(element);
+@@ -2741,6 +2877,7 @@ void XRSession::OnTransferComplete(const Vector<device::LayerId>& layer_ids) {
+ 
+ void XRSession::Trace(Visitor* visitor) const {
+   visitor->Trace(xr_);
++  visitor->Trace(display_layers_);
+   visitor->Trace(render_state_);
+   visitor->Trace(world_light_probe_);
+   visitor->Trace(pending_render_state_);
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
+index e0df056010dcf..10392883b4d2f 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.h
++++ b/third_party/blink/renderer/modules/xr/xr_session.h
+@@ -12,6 +12,7 @@
+ #include "device/vr/public/mojom/layer_id.h"
+ #include "device/vr/public/mojom/vr_service.mojom-blink.h"
+ #include "device/vr/public/mojom/xr_session.mojom-blink.h"
++#include "third_party/blink/public/mojom/xr/displayxr_service.mojom-blink-forward.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "third_party/blink/renderer/bindings/core/v8/active_script_wrappable.h"
+ #include "third_party/blink/renderer/bindings/core/v8/idl_types.h"
+@@ -57,6 +58,7 @@ class V8XRVisibilityState;
+ class XRAnchor;
+ class XRAnchorSet;
+ class XRCanvasInputProvider;
++class XRDisplayLayer;
+ class XRDOMOverlayState;
+ class XRHitTestOptionsInit;
+ class XRHitTestSource;
+@@ -144,7 +146,8 @@ class XRSession final : public EventTarget,
+             device::mojom::blink::XRSessionDeviceConfigPtr device_config,
+             bool sensorless_session,
+             XRSessionFeatureSet enabled_feature_set,
+-            uint64_t trace_id);
++            uint64_t trace_id,
++            bool is_inline_3d = false);
+   ~XRSession() override = default;
+ 
+   XRSystem* xr() const { return xr_.Get(); }
+@@ -328,6 +331,12 @@ class XRSession final : public EventTarget,
+ 
+   XRViewData* ViewDataForEye(device::mojom::blink::XREye eye);
+ 
++  // DisplayXR inline-3D (#625, Step B3e): track live XRDisplayLayers bound to
++  // this session so session-end untags their canvases (XRDisplayLayer::close is
++  // the only untag hook, otherwise the canvas stays a weave target until GC).
++  void RegisterDisplayLayer(XRDisplayLayer* layer);
++  void UnregisterDisplayLayer(XRDisplayLayer* layer);
++
+   void AddTransientInputSource(XRInputSource* input_source);
+   void RemoveTransientInputSource(XRInputSource* input_source);
+ 
+@@ -460,6 +469,14 @@ class XRSession final : public EventTarget,
+   using XRVisibilityState = device::mojom::blink::XRVisibilityState;
+ 
+   void UpdateInlineView();
++  // DisplayXR inline-3D (#625, Step B3d): build/refresh two head-tracked
++  // off-axis (Kooima) eye views from the latest tracked eyes; kick off + cache
++  // the per-frame renderer<-browser eye pull.
++  void UpdateInline3DViews();
++  void RequestInline3DState();
++  void OnInline3DState(const Vector<float>& eyes,
++                       bool valid,
++                       mojom::blink::DisplayXRDisplayInfoPtr info);
+   void UpdateCanvasDimensions(Element*);
+   void ApplyPendingRenderState();
+ 
+@@ -691,6 +708,17 @@ class XRSession final : public EventTarget,
+   int output_width_ = 1;
+   int output_height_ = 1;
+ 
++  // DisplayXR inline-3D (#625, Step B3d): latest tracked eyes (display-space
++  // metres, flattened xyz triples) + display/element geometry, pulled per
++  // animation frame from XRSystem's DisplayXRService and consumed by
++  // UpdateInline3DViews. |inline_3d_info_| is null until the first reply.
++  Vector<float> inline_3d_eyes_;
++  bool inline_3d_eyes_valid_ = false;
++  mojom::blink::DisplayXRDisplayInfoPtr inline_3d_info_;
++
++  // DisplayXR inline-3D (#625, Step B3e): live layers bound to this session.
++  HeapHashSet<Member<XRDisplayLayer>> display_layers_;
++
+   // Corresponds to mojo XRSession.supportsViewportScaling
+   bool supports_viewport_scaling_ = false;
+ 
+@@ -702,6 +730,11 @@ class XRSession final : public EventTarget,
+   // identity reference space.
+   bool sensorless_session_ = false;
+ 
++  // DisplayXR inline-3D (#625, Step B): this sensorless inline session drives a
++  // 3D display — build two eye views with head-tracked off-axis (Kooima)
++  // projections instead of a single mono view. Set from the "inline-3d" mode.
++  bool is_inline_3d_ = false;
++
+   int16_t last_frame_id_ = -1;
+ 
+   device::LayerId::Generator layer_id_generator_;
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.idl b/third_party/blink/renderer/modules/xr/xr_session.idl
+index 97b1caab3d1fb..cc5fd8777180b 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.idl
++++ b/third_party/blink/renderer/modules/xr/xr_session.idl
+@@ -8,6 +8,10 @@ enum XRSessionMode {
+   "inline",
+   "immersive-vr",
+   "immersive-ar",
++  // DisplayXR inline-3D (#625, Step B). Non-immersive glasses-free 3D via
++  // XRDisplayLayer + the OS weave RPC. Gated by the DisplayXRInline3D
++  // RuntimeEnabledFeature; internally a sensorless inline session.
++  "inline-3d",
+ };
+ 
+ enum XREnvironmentBlendMode {
+diff --git a/third_party/blink/renderer/modules/xr/xr_system.cc b/third_party/blink/renderer/modules/xr/xr_system.cc
+index 4ad2f0739d346..05335c02119e5 100644
+--- a/third_party/blink/renderer/modules/xr/xr_system.cc
++++ b/third_party/blink/renderer/modules/xr/xr_system.cc
+@@ -111,6 +111,11 @@ device::mojom::blink::XRSessionMode V8EnumToSessionMode(
+       return device::mojom::blink::XRSessionMode::kImmersiveVr;
+     case V8XRSessionMode::Enum::kImmersiveAr:
+       return device::mojom::blink::XRSessionMode::kImmersiveAr;
++    case V8XRSessionMode::Enum::kInline3d:
++      // DisplayXR inline-3D (#625, Step B): a sensorless inline session under the
++      // hood (no device runtime); the 3D behavior comes from XRDisplayLayer
++      // tagging the target canvas, not from a distinct device mode.
++      return device::mojom::blink::XRSessionMode::kInline;
+   }
+ }
+ 
+@@ -825,6 +830,7 @@ XRSystem::XRSystem(Navigator& navigator)
+       ExecutionContextLifecycleObserver(navigator.DomWindow()),
+       FocusChangedObserver(navigator.DomWindow()->GetFrame()->GetPage()),
+       service_(navigator.DomWindow()),
++      displayxr_service_(navigator.DomWindow()),
+       environment_provider_(navigator.DomWindow()),
+       receiver_(this, navigator.DomWindow()),
+       navigation_start_(navigator.DomWindow()
+@@ -954,6 +960,25 @@ ScriptPromise<IDLBoolean> XRSystem::isSessionSupported(
+   PendingSupportsSessionQuery* query =
+       MakeGarbageCollected<PendingSupportsSessionQuery>(resolver, session_mode);
+ 
++  // DisplayXR inline-3D (#625, Step B3e): "inline-3d" collapses to kInline, so
++  // the generic "inline is always supported" branch below would blindly resolve
++  // true. Instead ask the browser whether a glasses-free-3D display + live
++  // weave session is actually present. Without --enable-inline-3d the browser
++  // never binds the service → the remote disconnects → we resolve false (the
++  // negative control).
++  if (mode.AsEnum() == V8XRSessionMode::Enum::kInline3d) {
++    mojom::blink::DisplayXRService* svc = EnsureDisplayXRService();
++    if (!svc) {
++      query->Resolve(false);
++      return promise;
++    }
++    outstanding_inline3d_queries_.insert(query);
++    svc->IsInline3DSupported(BindOnce(&XRSystem::OnInline3DSupportedResult,
++                                      WrapPersistent(this),
++                                      WrapPersistent(query)));
++    return promise;
++  }
++
+   if (session_mode == device::mojom::blink::XRSessionMode::kImmersiveAr &&
+       !IsImmersiveArAllowed()) {
+     DVLOG(2) << __func__
+@@ -1165,7 +1190,7 @@ void XRSystem::RequestInlineSession(PendingRequestSessionQuery* query,
+   if (sensor_requirement == SensorRequirement::kNone ||
+       (!service_.is_bound() &&
+        sensor_requirement != SensorRequirement::kRequired)) {
+-    query->Resolve(CreateSensorlessInlineSession());
++    query->Resolve(CreateSensorlessInlineSession(query->IsInline3D()));
+     return;
+   }
+ 
+@@ -1263,6 +1288,11 @@ ScriptPromise<XRSession> XRSystem::requestSession(
+   device::mojom::blink::XRSessionMode session_mode =
+       V8EnumToSessionMode(mode.AsEnum());
+ 
++  // DisplayXR inline-3D (#625, Step B): V8EnumToSessionMode collapses the
++  // "inline-3d" mode to plain kInline, so capture the distinction here (before
++  // the collapse is visible downstream) and carry it on the query.
++  const bool is_inline_3d = mode.AsEnum() == V8XRSessionMode::Enum::kInline3d;
++
+   // If the request is for immersive-ar, ensure that feature is enabled.
+   if (session_mode == device::mojom::blink::XRSessionMode::kImmersiveAr &&
+       !IsImmersiveArAllowed()) {
+@@ -1336,6 +1366,7 @@ ScriptPromise<XRSession> XRSystem::requestSession(
+       MakeGarbageCollected<PendingRequestSessionQuery>(
+           DomWindow()->UkmSourceID(), resolver, session_mode,
+           std::move(required_features), std::move(optional_features));
++  query->SetInline3D(is_inline_3d);
+ 
+   if (query->HasFeature(device::mojom::XRSessionFeature::DOM_OVERLAY)) {
+     // Prerequisites were checked by IsFeatureValidForMode and IDL.
+@@ -1482,6 +1513,42 @@ void XRSystem::OnSupportsSessionReturned(PendingSupportsSessionQuery* query,
+   query->Resolve(supports_session);
+ }
+ 
++mojom::blink::DisplayXRService* XRSystem::EnsureDisplayXRService() {
++  if (displayxr_service_.is_bound()) {
++    return displayxr_service_.get();
++  }
++  if (displayxr_service_disconnected_ || is_context_destroyed_ ||
++      !DomWindow()) {
++    return nullptr;
++  }
++  DomWindow()->GetBrowserInterfaceBroker().GetInterface(
++      displayxr_service_.BindNewPipeAndPassReceiver(
++          DomWindow()->GetTaskRunner(TaskType::kMiscPlatformAPI)));
++  displayxr_service_.set_disconnect_handler(BindOnce(
++      &XRSystem::OnDisplayXRServiceDisconnected, WrapWeakPersistent(this)));
++  return displayxr_service_.get();
++}
++
++void XRSystem::OnInline3DSupportedResult(PendingSupportsSessionQuery* query,
++                                         bool supported) {
++  DCHECK(outstanding_inline3d_queries_.Contains(query));
++  outstanding_inline3d_queries_.erase(query);
++  query->Resolve(supported);
++}
++
++void XRSystem::OnDisplayXRServiceDisconnected() {
++  // The browser declined to bind the service (e.g. --enable-inline-3d off) or
++  // the pipe dropped. Latch it, reset, and fail every pending inline-3d support
++  // query as unsupported — the mojo replies will never arrive.
++  displayxr_service_disconnected_ = true;
++  displayxr_service_.reset();
++  HeapHashSet<Member<PendingSupportsSessionQuery>> queries;
++  queries.swap(outstanding_inline3d_queries_);
++  for (const auto& query : queries) {
++    query->Resolve(false);
++  }
++}
++
+ void XRSystem::OnRequestSessionReturned(
+     PendingRequestSessionQuery* query,
+     device::mojom::blink::RequestSessionResultPtr result) {
+@@ -1568,7 +1635,7 @@ void XRSystem::FinishSessionCreation(
+     // sensorless session.
+     if (query->GetSensorRequirement() != SensorRequirement::kRequired) {
+       DVLOG(2) << __func__ << ": session creation failed - creating sensorless";
+-      XRSession* session = CreateSensorlessInlineSession();
++      XRSession* session = CreateSensorlessInlineSession(query->IsInline3D());
+       query->Resolve(session);
+       return;
+     }
+@@ -1595,7 +1662,8 @@ void XRSystem::FinishSessionCreation(
+       query->mode(), session_ptr->enviroment_blend_mode,
+       session_ptr->interaction_mode, std::move(session_ptr->client_receiver),
+       std::move(session_ptr->device_config), enabled_features,
+-      result->get_success()->trace_id);
++      result->get_success()->trace_id,
++      /*sensorless_session=*/false, query->IsInline3D());
+ 
+   frameProvider()->OnSessionStarted(session, std::move(session_ptr));
+ 
+@@ -1693,16 +1761,17 @@ XRSession* XRSystem::CreateSession(
+     device::mojom::blink::XRSessionDeviceConfigPtr device_config,
+     XRSessionFeatureSet enabled_features,
+     uint64_t trace_id,
+-    bool sensorless_session) {
++    bool sensorless_session,
++    bool is_inline_3d) {
+   XRSession* session = MakeGarbageCollected<XRSession>(
+       this, std::move(client_receiver), mode, blend_mode, interaction_mode,
+       std::move(device_config), sensorless_session, std::move(enabled_features),
+-      trace_id);
++      trace_id, is_inline_3d);
+   sessions_.insert(session);
+   return session;
+ }
+ 
+-XRSession* XRSystem::CreateSensorlessInlineSession() {
++XRSession* XRSystem::CreateSensorlessInlineSession(bool is_inline_3d) {
+   // TODO(https://crbug.com/944936): The blend mode could be "additive".
+   device::mojom::blink::XREnvironmentBlendMode blend_mode =
+       device::mojom::blink::XREnvironmentBlendMode::kOpaque;
+@@ -1715,7 +1784,8 @@ XRSession* XRSystem::CreateSensorlessInlineSession() {
+                        mojo::NullReceiver() /* client receiver */,
+                        std::move(device_config),
+                        {device::mojom::XRSessionFeature::REF_SPACE_VIEWER},
+-                       kInvalidTraceId, true /* sensorless_session */);
++                       kInvalidTraceId, true /* sensorless_session */,
++                       is_inline_3d);
+ }
+ 
+ void XRSystem::Dispose(DisposeType dispose_type) {
+@@ -1821,11 +1891,13 @@ void XRSystem::Trace(Visitor* visitor) const {
+   visitor->Trace(frame_provider_);
+   visitor->Trace(sessions_);
+   visitor->Trace(service_);
++  visitor->Trace(displayxr_service_);
+   visitor->Trace(environment_provider_);
+   visitor->Trace(receiver_);
+   visitor->Trace(webxr_internals_renderer_listener_);
+   visitor->Trace(outstanding_support_queries_);
+   visitor->Trace(outstanding_request_queries_);
++  visitor->Trace(outstanding_inline3d_queries_);
+   visitor->Trace(fullscreen_enter_observer_);
+   visitor->Trace(fullscreen_exit_observer_);
+   Supplement<Navigator>::Trace(visitor);
+diff --git a/third_party/blink/renderer/modules/xr/xr_system.h b/third_party/blink/renderer/modules/xr/xr_system.h
+index f3c6b42ee335f..2041618bf740f 100644
+--- a/third_party/blink/renderer/modules/xr/xr_system.h
++++ b/third_party/blink/renderer/modules/xr/xr_system.h
+@@ -10,6 +10,7 @@
+ #include "device/vr/public/mojom/xr_session.mojom-blink.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "third_party/blink/public/mojom/devtools/console_message.mojom-blink.h"
++#include "third_party/blink/public/mojom/xr/displayxr_service.mojom-blink.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_init.h"
+@@ -103,6 +104,12 @@ class XRSystem final : public EventTarget,
+ 
+   device::mojom::blink::VRService* BrowserService();
+ 
++  // DisplayXR inline-3D (#625, Step B3d): lazily bind + return the browser's
++  // DisplayXRService (eyes + display info for the inline-3d off-axis
++  // projection). Returns nullptr if unavailable / disconnected. Used by
++  // XRSession's per-frame eye pull and isSessionSupported('inline-3d').
++  mojom::blink::DisplayXRService* EnsureDisplayXRService();
++
+   // VRServiceClient overrides.
+   void OnDeviceChanged() override;
+ 
+@@ -276,6 +283,11 @@ class XRSystem final : public EventTarget,
+ 
+     bool MatchDepthView() const { return match_depth_view_; }
+ 
++    // DisplayXR inline-3D (#625, Step B): captured from the raw "inline-3d" V8
++    // enum before V8EnumToSessionMode collapses it to plain kInline.
++    void SetInline3D(bool v) { is_inline_3d_ = v; }
++    bool IsInline3D() const { return is_inline_3d_; }
++
+     uint64_t TraceId() const { return trace_id_; }
+ 
+     void Trace(Visitor*) const;
+@@ -310,6 +322,7 @@ class XRSystem final : public EventTarget,
+     Vector<device::mojom::XRDepthDataFormat> preferred_format_;
+     Vector<device::mojom::XRDepthType> depth_type_request_;
+     bool match_depth_view_;
++    bool is_inline_3d_ = false;
+   };
+ 
+   static device::mojom::blink::XRSessionOptionsPtr XRSessionOptionsFromQuery(
+@@ -411,6 +424,12 @@ class XRSystem final : public EventTarget,
+   void FinishSessionCreation(
+       PendingRequestSessionQuery*,
+       device::mojom::blink::RequestSessionResultPtr result);
++  // DisplayXR inline-3D (#625, Step B3d): reply + disconnect handling for the
++  // async isSessionSupported('inline-3d') round-trip to the browser.
++  void OnInline3DSupportedResult(PendingSupportsSessionQuery* query,
++                                 bool supported);
++  void OnDisplayXRServiceDisconnected();
++
+   void OnSupportsSessionReturned(PendingSupportsSessionQuery*,
+                                  bool supports_session);
+   void ResolveSessionRequest(
+@@ -432,9 +451,10 @@ class XRSystem final : public EventTarget,
+       device::mojom::blink::XRSessionDeviceConfigPtr device_config,
+       XRSessionFeatureSet enabled_features,
+       uint64_t trace_id,
+-      bool sensorless_session = false);
++      bool sensorless_session = false,
++      bool is_inline_3d = false);
+ 
+-  XRSession* CreateSensorlessInlineSession();
++  XRSession* CreateSensorlessInlineSession(bool is_inline_3d = false);
+ 
+   enum class DisposeType {
+     kContextDestroyed = 0,
+@@ -463,12 +483,24 @@ class XRSystem final : public EventTarget,
+   HeapHashSet<Member<PendingRequestSessionQuery>> outstanding_request_queries_;
+   bool has_outstanding_immersive_request_ = false;
+ 
++  // DisplayXR inline-3D (#625, Step B3d): the inline-3d support queries awaiting
++  // the browser's async reply (kept separate from |outstanding_support_queries_|
++  // so a disconnect only fails the inline-3d ones). |displayxr_service_| itself
++  // is declared next to |service_| below to keep ctor init order valid.
++  // |displayxr_service_disconnected_| latches so we don't churn rebinding a
++  // service the browser declined to bind (negative control).
++  HeapHashSet<Member<PendingSupportsSessionQuery>> outstanding_inline3d_queries_;
++  bool displayxr_service_disconnected_ = false;
++
+   Vector<EnvironmentProviderErrorCallback>
+       environment_provider_error_callbacks_;
+ 
+   Member<XRFrameProvider> frame_provider_;
+   HeapHashSet<WeakMember<XRSession>> sessions_;
+   HeapMojoRemote<device::mojom::blink::VRService> service_;
++  // DisplayXR inline-3D (#625, Step B3d) — declared here so ctor init order
++  // matches (initialized right after |service_|).
++  HeapMojoRemote<mojom::blink::DisplayXRService> displayxr_service_;
+   HeapMojoAssociatedRemote<
+       device::mojom::blink::XREnvironmentIntegrationProvider>
+       environment_provider_;
+diff --git a/third_party/blink/renderer/platform/runtime_enabled_features.json5 b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+index 5e580db63b6a4..e456cc8198668 100644
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -2336,6 +2336,14 @@
+       base_feature: "none",
+       public: true,
+     },
++    {
++      // DisplayXR inline-3D (#625, Step B): the WebXR 'inline-3d' session mode +
++      // XRDisplayLayer that opt a canvas into glasses-free 3D via the OS weave
++      // RPC. Experimental + off by default; the native weave pipe is
++      // additionally gated by the --enable-inline-3d command-line switch.
++      name: "DisplayXRInline3D",
++      status: "experimental",
++    },
+     {
+       // https://chromestatus.com/feature/5067126381215744
+       name: "DocumentActiveViewTransition",

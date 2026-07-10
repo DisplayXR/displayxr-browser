@@ -1,0 +1,1077 @@
+From c1753d518a77be2f32eca4a52c01c5e1ab71f371 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Mon, 6 Jul 2026 09:36:12 -0700
+Subject: [PATCH 07/15] [displayxr inline-3d #625 B4a] chrome port: shared
+ component + hooks; per-element weave premise disproven
+
+Extract the six content/shell-only weave files into a shared components/displayxr/
+component (browser weave client + weaver/service mojom impls + GPU provider +
+weave mojom), consumed by BOTH content_shell and the chrome target. Wire the
+weave into the chrome/ layer: ChromeBrowserMainParts (deferred weave-client init
+after the first window is shown), ChromeContentBrowserClient (BindGpuHostReceiver
++ AppendExtraCommandLineSwitches + DisplayXRService frame binder), and
+ChromeContentGpuClient::PostCompositorThreadCreated (GPU weave provider). All
+gated on --enable-inline-3d. content_shell still builds (regression vehicle).
+
+`chrome` builds + links clean and the wiring is fully live on Leia: weave client
+init, xrWeaveBindWindowEXT -> 0, GPU provider registered, isSessionSupported(
+'inline-3d') true, XRDisplayLayer constructs + tags the canvas.
+
+KEY B4 FINDING (design premise disproven): the per-element weave never fires in
+chrome. The canvas never becomes a taggable SkiaRenderer TextureDrawQuad --
+- a sub-page 2D OR WebGL canvas is squashed into the page content layer (no
+  distinct compositing layer / quad; will-change makes a layer but still no
+  canvas TextureDrawQuad);
+- a full-window canvas is drawn via the overlay/root path (zero DrawTextureQuad
+  calls);
+- the whole web-contents reaches SkiaRenderer as ONE ~1800x1200 kTextureContent
+  quad.
+So Seam B (tag + substitute at SkiaRenderer::DrawTextureQuad) does not match how
+chrome composites canvas elements (squash-into-page or DComp overlay). Checkpoint
++ pause for a Seam-B redesign (likely the OverlayProcessorWin / DCLayerOverlay
+path). Diagnostic evidence in docs/roadmap/webxr-step-b-design.md.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ chrome/browser/BUILD.gn                       |  7 +++
+ .../chrome_browser_interface_binders.cc       | 23 +++++++++
+ chrome/browser/chrome_browser_main.cc         | 21 ++++++++
+ .../browser/chrome_content_browser_client.cc  |  9 ++++
+ ...ontent_browser_client_receiver_bindings.cc | 21 ++++++++
+ chrome/gpu/BUILD.gn                           |  9 ++++
+ chrome/gpu/chrome_content_gpu_client.cc       | 28 +++++++++-
+ chrome/gpu/chrome_content_gpu_client.h        | 12 +++++
+ components/displayxr/browser/BUILD.gn         | 51 +++++++++++++++++++
+ .../browser/displayxr_service_impl.cc         |  8 +--
+ .../browser/displayxr_service_impl.h          | 10 ++--
+ .../browser/displayxr_weave_client.cc         | 14 ++---
+ .../browser/displayxr_weave_client.h          | 12 ++---
+ .../browser/displayxr_weaver_impl.cc          | 12 ++---
+ .../browser/displayxr_weaver_impl.h           | 24 ++++-----
+ components/displayxr/common/BUILD.gn          | 18 +++++++
+ .../displayxr}/common/displayxr_weave.mojom   |  2 +-
+ components/displayxr/gpu/BUILD.gn             | 29 +++++++++++
+ .../displayxr}/gpu/displayxr_weave_gpu.cc     | 11 ++--
+ .../displayxr}/gpu/displayxr_weave_gpu.h      | 14 ++---
+ content/shell/BUILD.gn                        | 50 ++----------------
+ .../shell/browser/shell_browser_main_parts.cc |  4 +-
+ .../browser/shell_content_browser_client.cc   | 12 +++--
+ content/shell/gpu/shell_content_gpu_client.cc |  2 +-
+ content/shell/gpu/shell_content_gpu_client.h  |  4 +-
+ 25 files changed, 298 insertions(+), 109 deletions(-)
+ create mode 100644 components/displayxr/browser/BUILD.gn
+ rename {content/shell => components/displayxr}/browser/displayxr_service_impl.cc (89%)
+ rename {content/shell => components/displayxr}/browser/displayxr_service_impl.h (83%)
+ rename {content/shell => components/displayxr}/browser/displayxr_weave_client.cc (97%)
+ rename {content/shell => components/displayxr}/browser/displayxr_weave_client.h (92%)
+ rename {content/shell => components/displayxr}/browser/displayxr_weaver_impl.cc (88%)
+ rename {content/shell => components/displayxr}/browser/displayxr_weaver_impl.h (65%)
+ create mode 100644 components/displayxr/common/BUILD.gn
+ rename {content/shell => components/displayxr}/common/displayxr_weave.mojom (98%)
+ create mode 100644 components/displayxr/gpu/BUILD.gn
+ rename {content/shell => components/displayxr}/gpu/displayxr_weave_gpu.cc (96%)
+ rename {content/shell => components/displayxr}/gpu/displayxr_weave_gpu.h (89%)
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 311a3dfebc076..29bdd8e0cf74c 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -894,6 +894,13 @@ source_set("core") {
+     "//components/data_sharing/public:features",
+     "//components/desktop_to_mobile_promos",
+     "//components/device_event_log",
++
++    # DisplayXR inline-3D (#625, Step B / B4): browser-process weave client +
++    # mojom impls, the GPU->browser weave bridge mojom, and the renderer<->browser
++    # inline-3d service bindings (a standalone blink mojom, not in the aggregate).
++    "//components/displayxr/browser",
++    "//components/displayxr/common:displayxr_weave_mojom",
++    "//third_party/blink/public/mojom:displayxr_service_mojo_bindings",
+     "//components/dom_distiller/content/browser",
+     "//components/dom_distiller/content/common/mojom",
+     "//components/embedder_support",
+diff --git a/chrome/browser/chrome_browser_interface_binders.cc b/chrome/browser/chrome_browser_interface_binders.cc
+index 249444ea27a2b..4108113c99312 100644
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "build/build_config.h"
+@@ -38,6 +39,7 @@
+ #include "components/dom_distiller/content/browser/distiller_javascript_service_impl.h"
+ #include "components/dom_distiller/content/common/mojom/distillability_service.mojom.h"
+ #include "components/dom_distiller/content/common/mojom/distiller_javascript_service.mojom.h"
++#include "components/displayxr/browser/displayxr_service_impl.h"
+ #include "components/dom_distiller/core/dom_distiller_service.h"
+ #include "components/language_detection/content/common/language_detection.mojom.h"
+ #include "components/live_caption/caption_util.h"
+@@ -71,6 +73,7 @@
+ #include "third_party/blink/public/mojom/lcp_critical_path_predictor/lcp_critical_path_predictor.mojom.h"
+ #include "third_party/blink/public/mojom/loader/navigation_predictor.mojom.h"
+ #include "third_party/blink/public/mojom/payments/payment_request.mojom.h"
++#include "third_party/blink/public/mojom/xr/displayxr_service.mojom.h"
+ #include "third_party/blink/public/mojom/payments/secure_payment_confirmation_service.mojom.h"
+ #include "third_party/blink/public/mojom/persistent_renderer_prefs.mojom.h"
+ #include "third_party/blink/public/mojom/prerender/prerender.mojom.h"
+@@ -436,6 +439,20 @@ void BindCredentialManager(
+   content_credential_manager->BindRequest(frame_host, std::move(receiver));
+ }
+ 
++// DisplayXR inline-3D (#625, Step B / B4): bind the renderer's per-frame
++// DisplayXRService to the browser-process weave client's cached state. Dormant
++// unless --enable-inline-3d — dropping the receiver makes the renderer's remote
++// disconnect, so isSessionSupported('inline-3d') resolves false (negative
++// control). Mirrors content/shell's BindDisplayXRService.
++void BindDisplayXRService(
++    content::RenderFrameHost* render_frame_host,
++    mojo::PendingReceiver<blink::mojom::DisplayXRService> receiver) {
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    return;
++  }
++  displayxr::DisplayXRServiceImpl::Create(std::move(receiver));
++}
++
+ }  // namespace
+ 
+ void PopulateChromeFrameBinders(
+@@ -443,6 +460,12 @@ void PopulateChromeFrameBinders(
+     content::RenderFrameHost* render_frame_host) {
+   map->Add<image_annotation::mojom::Annotator>(&BindImageAnnotator);
+ 
++  // DisplayXR inline-3D (#625, Step B / B4): frame-scoped renderer->browser
++  // service for the WebXR "inline-3d" session (feature-detect + per-frame eye
++  // pull). Gated inside the binder on --enable-inline-3d.
++  map->Add<blink::mojom::DisplayXRService>(
++      base::BindRepeating(&BindDisplayXRService));
++
+   map->Add<blink::mojom::ScriptToolHost>(
+       &actor::ActorScriptToolReceiver::Create);
+ 
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 057be98e715c6..8e2d74ba5d98c 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -96,6 +96,10 @@
+ #include "chrome/installer/util/google_update_settings.h"
+ #include "components/color/color_mixers.h"
+ #include "components/device_event_log/device_event_log.h"
++#if BUILDFLAG(IS_WIN)
++// DisplayXR inline-3D (#625, Step B / B4): browser-process weave client.
++#include "components/displayxr/browser/displayxr_weave_client.h"
++#endif
+ #include "components/embedder_support/origin_trials/component_updater_utils.h"
+ #include "components/embedder_support/origin_trials/origin_trials_settings_storage.h"
+ #include "components/heap_profiling/in_process/heap_profiler_controller.h"
+@@ -1690,6 +1694,23 @@ void ChromeBrowserMainParts::PostBrowserStart() {
+   // We setup to observe to the initial page load here to defer running
+   // task posted via PostAfterStartupTask until its complete.
+   AfterStartupTaskUtils::StartMonitoringStartup();
++
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B4): initialize the browser-process weave
++  // client after the first browser window is up. Deferred to a delayed UI-thread
++  // task because at PostBrowserStart the initial window's HWND exists but is not
++  // yet shown (the message loop hasn't pumped its ShowWindow), and the client's
++  // one-shot bindWindow needs a visible top-level window. Dormant unless
++  // --enable-inline-3d. (content_shell can call this synchronously because it
++  // shows its window synchronously in PreMainMessageLoopRun; chrome does not.)
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    content::GetUIThreadTaskRunner({})->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(
++            &displayxr::DisplayXRWeaveClient::MaybeInitializeFromCommandLine),
++        base::Seconds(2));
++  }
++#endif
+ }
+ 
+ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index edab63d18ffd0..d791d1896ac5b 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2831,6 +2831,15 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+     base::CommandLine* command_line,
+     int child_process_id) {
+   crash_keys::AppendStringAnnotationsCommandLineSwitch(command_line);
++
++  // DisplayXR inline-3D (#625, Step B / B4): forward the opt-in to child
++  // processes so the GPU/Viz process registers the weave provider + tags the
++  // canvas quad. Dormant unless requested.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d") &&
++      !command_line->HasSwitch("enable-inline-3d")) {
++    command_line->AppendSwitch("enable-inline-3d");
++  }
++
+ #if BUILDFLAG(IS_MAC)
+   std::unique_ptr<metrics::ClientInfo> client_info =
+       GoogleUpdateSettings::LoadMetricsClientInfo();
+diff --git a/chrome/browser/chrome_content_browser_client_receiver_bindings.cc b/chrome/browser/chrome_content_browser_client_receiver_bindings.cc
+index 1107bc8a8f984..bdd26accdd048 100644
+--- a/chrome/browser/chrome_content_browser_client_receiver_bindings.cc
++++ b/chrome/browser/chrome_content_browser_client_receiver_bindings.cc
+@@ -52,6 +52,13 @@
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
+ #include "third_party/widevine/cdm/buildflags.h"
+ 
++#if BUILDFLAG(IS_WIN)
++// DisplayXR inline-3D (#625, Step B / B4): GPU -> browser weave bridge.
++#include "base/command_line.h"
++#include "components/displayxr/browser/displayxr_weaver_impl.h"
++#include "components/displayxr/common/displayxr_weave.mojom.h"
++#endif
++
+ #if BUILDFLAG(IS_ANDROID)
+ #include "chrome/browser/plugins/plugin_observer_android.h"
+ #elif BUILDFLAG(IS_WIN)
+@@ -635,6 +642,20 @@ void ChromeContentBrowserClient::BindGpuHostReceiver(
+     return;
+   }
+ 
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B4): GPU process -> browser weave bridge.
++  // Dormant unless --enable-inline-3d. Called on the IO thread; the impl binds on
++  // the UI thread (mirrors content/shell's ShellContentBrowserClient).
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    if (auto r = receiver.As<displayxr::mojom::DisplayXRWeaver>()) {
++      content::GetUIThreadTaskRunner({})->PostTask(
++          FROM_HERE,
++          base::BindOnce(&displayxr::DisplayXRWeaverImpl::Bind, std::move(r)));
++      return;
++    }
++  }
++#endif
++
+ #if BUILDFLAG(IS_CHROMEOS)
+   if (auto r = receiver.As<chromeos::cdm::mojom::BrowserCdmFactory>())
+     chromeos::CdmFactoryDaemonProxyAsh::Create(std::move(r));
+diff --git a/chrome/gpu/BUILD.gn b/chrome/gpu/BUILD.gn
+index 1ee3dd2a36109..242e6140eef63 100644
+--- a/chrome/gpu/BUILD.gn
++++ b/chrome/gpu/BUILD.gn
+@@ -41,4 +41,13 @@ static_library("gpu") {
+       deps += [ "//chromeos/ash/experiences/arc/video_accelerator" ]
+     }
+   }
++
++  if (is_win) {
++    # DisplayXR inline-3D (#625, Step B / B4): the GPU-side weave provider and the
++    # Viz provider setter ChromeContentGpuClient registers it through.
++    deps += [
++      "//components/displayxr/gpu",
++      "//components/viz/service",
++    ]
++  }
+ }
+diff --git a/chrome/gpu/chrome_content_gpu_client.cc b/chrome/gpu/chrome_content_gpu_client.cc
+index cdb343224119e..fcb8556287010 100644
+--- a/chrome/gpu/chrome_content_gpu_client.cc
++++ b/chrome/gpu/chrome_content_gpu_client.cc
+@@ -10,6 +10,7 @@
+ #include "base/check.h"
+ #include "base/command_line.h"
+ #include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/profiler/thread_group_profiler.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/token.h"
+@@ -28,6 +29,11 @@
+ #include "media/media_buildflags.h"
+ #include "services/tracing/public/cpp/stack_sampling/tracing_sampler_profiler.h"
+ 
++#if BUILDFLAG(IS_WIN)
++// DisplayXR inline-3D (#625, Step B / B4): the Viz weave-provider setter.
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
++#endif
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ #include "chromeos/ash/experiences/arc/video_accelerator/protected_buffer_manager.h"
+ #include "chromeos/components/cdm_factory_daemon/chromeos_cdm_factory.h"
+@@ -54,7 +60,13 @@ ChromeContentGpuClient::ChromeContentGpuClient() {
+ #endif
+ }
+ 
+-ChromeContentGpuClient::~ChromeContentGpuClient() = default;
++ChromeContentGpuClient::~ChromeContentGpuClient() {
++#if BUILDFLAG(IS_WIN)
++  if (weave_gpu_) {
++    viz::SetDisplayXRWeaveProvider(nullptr);
++  }
++#endif
++}
+ 
+ void ChromeContentGpuClient::GpuServiceInitialized() {
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -134,6 +146,20 @@ void ChromeContentGpuClient::PostCompositorThreadCreated(
+                                     CreateOnChildThreadWithCustomUnwinders,
+                                 base::BindRepeating(
+                                     &CreateCoreUnwindersFactory)));
++
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B4 / B2c): create the GPU-side weave
++  // provider on the GPU main thread (where ChildThread + the DirectComposition
++  // device live), bind its Mojo remote to the browser weave bridge, and register
++  // it so Viz (SkiaOutputSurfaceImplOnGpu) can drive the per-frame weave. Dormant
++  // unless opted in — the browser only binds the bridge under --enable-inline-3d.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    weave_gpu_ = std::make_unique<displayxr::DisplayXRWeaveGpu>();
++    weave_gpu_->Bind();
++    viz::SetDisplayXRWeaveProvider(weave_gpu_.get());
++    LOG(ERROR) << "[DisplayXR] B2c GPU weave provider registered";
++  }
++#endif
+ }
+ 
+ void ChromeContentGpuClient::PostDisplayCompositorGpuThreadCreated(
+diff --git a/chrome/gpu/chrome_content_gpu_client.h b/chrome/gpu/chrome_content_gpu_client.h
+index ad99da0de82f1..08f496d0c6665 100644
+--- a/chrome/gpu/chrome_content_gpu_client.h
++++ b/chrome/gpu/chrome_content_gpu_client.h
+@@ -9,8 +9,14 @@
+ 
+ #include "base/memory/scoped_refptr.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "build/build_config.h"
+ #include "content/public/gpu/content_gpu_client.h"
+ 
++#if BUILDFLAG(IS_WIN)
++// DisplayXR inline-3D (#625, Step B / B4): GPU-side weave provider.
++#include "components/displayxr/gpu/displayxr_weave_gpu.h"
++#endif
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ namespace arc {
+ class ProtectedBufferManager;
+@@ -56,6 +62,12 @@ class ChromeContentGpuClient : public content::ContentGpuClient {
+ #if BUILDFLAG(IS_CHROMEOS)
+   scoped_refptr<arc::ProtectedBufferManager> protected_buffer_manager_;
+ #endif
++
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B4): created + registered with Viz in
++  // PostCompositorThreadCreated when --enable-inline-3d is set.
++  std::unique_ptr<displayxr::DisplayXRWeaveGpu> weave_gpu_;
++#endif
+ };
+ 
+ #endif  // CHROME_GPU_CHROME_CONTENT_GPU_CLIENT_H_
+diff --git a/components/displayxr/browser/BUILD.gn b/components/displayxr/browser/BUILD.gn
+new file mode 100644
+index 0000000000000..b979631cca412
+--- /dev/null
++++ b/components/displayxr/browser/BUILD.gn
+@@ -0,0 +1,51 @@
++# Copyright 2026 The Chromium Authors / DisplayXR
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# The OpenXR weave client (browser process, #625 Step B). Isolated source_set so
++# the vendored OpenXR headers compile with relaxed (non-chromium) warnings; the
++# header it exposes is OpenXR-free so consumers stay chromium_code. Lives in the
++# unsandboxed browser process because the per-frame weave RPC to displayxr-service
++# is IPC the GPU sandbox blocks.
++source_set("weave_client") {
++  sources = [
++    "displayxr_weave_client.cc",
++    "displayxr_weave_client.h",
++  ]
++  configs -= [ "//build/config/compiler:chromium_code" ]
++  configs += [ "//build/config/compiler:no_chromium_code" ]
++  deps = [ "//base" ]
++  if (is_win) {
++    deps += [ "//third_party/displayxr:openxr_loader" ]
++    libs = [
++      "d3d11.lib",
++      "dxgi.lib",
++    ]
++  }
++}
++
++# Browser-process Mojo impls: the GPU->browser weave bridge (DisplayXRWeaver) and
++# the frame-scoped renderer->browser inline-3d service (blink DisplayXRService).
++# Embedders (content_shell, chrome) wire these into their ContentBrowserClient
++# (BindGpuHostReceiver + the per-frame BrowserInterfaceBroker), gated
++# --enable-inline-3d.
++source_set("browser") {
++  sources = [
++    "displayxr_service_impl.cc",
++    "displayxr_service_impl.h",
++    "displayxr_weaver_impl.cc",
++    "displayxr_weaver_impl.h",
++  ]
++
++  # public_dep: the embedder's browser-main hook includes displayxr_weave_client.h
++  # directly (to initialize the client), so consumers of :browser must see it.
++  public_deps = [ ":weave_client" ]
++  deps = [
++    "//base",
++    "//components/displayxr/common:displayxr_weave_mojom",
++    "//mojo/public/cpp/bindings",
++    "//third_party/blink/public/mojom:displayxr_service_mojo_bindings",
++    "//ui/gfx",
++    "//ui/gfx/geometry",
++  ]
++}
+diff --git a/content/shell/browser/displayxr_service_impl.cc b/components/displayxr/browser/displayxr_service_impl.cc
+similarity index 89%
+rename from content/shell/browser/displayxr_service_impl.cc
+rename to components/displayxr/browser/displayxr_service_impl.cc
+index 862d2620bce15..140f8dd28dcae 100644
+--- a/content/shell/browser/displayxr_service_impl.cc
++++ b/components/displayxr/browser/displayxr_service_impl.cc
+@@ -2,17 +2,17 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "content/shell/browser/displayxr_service_impl.h"
++#include "components/displayxr/browser/displayxr_service_impl.h"
+ 
+ #include <memory>
+ #include <utility>
+ #include <vector>
+ 
+-#include "content/shell/browser/displayxr_weave_client.h"
++#include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ #include "ui/gfx/geometry/rect.h"
+ 
+-namespace content {
++namespace displayxr {
+ 
+ DisplayXRServiceImpl::DisplayXRServiceImpl() = default;
+ DisplayXRServiceImpl::~DisplayXRServiceImpl() = default;
+@@ -48,4 +48,4 @@ void DisplayXRServiceImpl::GetLatestEyes(GetLatestEyesCallback callback) {
+   std::move(callback).Run(std::move(eyes), valid, std::move(info));
+ }
+ 
+-}  // namespace content
++}  // namespace displayxr
+diff --git a/content/shell/browser/displayxr_service_impl.h b/components/displayxr/browser/displayxr_service_impl.h
+similarity index 83%
+rename from content/shell/browser/displayxr_service_impl.h
+rename to components/displayxr/browser/displayxr_service_impl.h
+index 8afeb47d91d17..94160d154b6c6 100644
+--- a/content/shell/browser/displayxr_service_impl.h
++++ b/components/displayxr/browser/displayxr_service_impl.h
+@@ -2,8 +2,8 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#ifndef CONTENT_SHELL_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
+-#define CONTENT_SHELL_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
++#ifndef COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
++#define COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
+ 
+ // DisplayXR inline-3D (#625, Step B3d): frame-scoped renderer->browser service
+ // answering the WebXR "inline-3d" session's feature detection + per-frame eye
+@@ -14,7 +14,7 @@
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "third_party/blink/public/mojom/xr/displayxr_service.mojom.h"
+ 
+-namespace content {
++namespace displayxr {
+ 
+ class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
+  public:
+@@ -32,6 +32,6 @@ class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
+   void GetLatestEyes(GetLatestEyesCallback callback) override;
+ };
+ 
+-}  // namespace content
++}  // namespace displayxr
+ 
+-#endif  // CONTENT_SHELL_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
++#endif  // COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_SERVICE_IMPL_H_
+diff --git a/content/shell/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+similarity index 97%
+rename from content/shell/browser/displayxr_weave_client.cc
+rename to components/displayxr/browser/displayxr_weave_client.cc
+index e8ac06aea7d06..fb7a14bf414af 100644
+--- a/content/shell/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "content/shell/browser/displayxr_weave_client.h"
++#include "components/displayxr/browser/displayxr_weave_client.h"
+ 
+ #include "base/command_line.h"
+ #include "base/compiler_specific.h"
+@@ -30,7 +30,7 @@
+ #include <openxr/XR_EXT_win32_window_binding.h>
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+-namespace content {
++namespace displayxr {
+ 
+ namespace {
+ 
+@@ -51,7 +51,7 @@ struct WeaveClientState {
+   // Manually ref-counted COM object (process-lifetime); excluded from raw_ptr.
+   RAW_PTR_EXCLUSION ID3D11Device* device = nullptr;  // runtime's adapter
+   XrSession session = XR_NULL_HANDLE;
+-  HWND hwnd = nullptr;  // the bound content_shell top-level window
++  HWND hwnd = nullptr;  // the bound browser top-level window
+   bool initialized = false;
+ 
+   // B3d: static display geometry (XR_EXT_display_info via xrGetSystemProperties)
+@@ -69,7 +69,7 @@ struct WeaveClientState {
+   bool rect_valid = false;
+ };
+ 
+-// Find this process's main top-level window (content_shell's browser window) so
++// Find this process's main top-level window (the browser's main window) so
+ // the weave session can bind it for DP phase-snap. The browser process owns the
+ // HWND directly (design doc Seam D), so a Win32 enumeration avoids pulling in
+ // ui/views/aura. Picks the first visible, unowned, reasonably sized top-level.
+@@ -263,7 +263,7 @@ void InitializeWin() {
+     return;
+   }
+ 
+-  // Create the present-owner session bound to content_shell's window, exactly
++  // Create the present-owner session bound to the browser's window, exactly
+   // as a texture-class present-owner does (real HWND + transparent + NO shared
+   // texture), then bind the window so the DP phase-snaps the interlace. This is
+   // the path the per-frame weave (B2c) rides.
+@@ -289,7 +289,7 @@ void InitializeWin() {
+ 
+   s.hwnd = FindMainWindowForCurrentProcess();
+   if (!s.hwnd) {
+-    LOG(ERROR) << "[DisplayXR] no top-level content_shell window for bindWindow";
++    LOG(ERROR) << "[DisplayXR] no top-level browser window for bindWindow";
+     return;
+   }
+ 
+@@ -483,4 +483,4 @@ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+ #endif
+ }
+ 
+-}  // namespace content
++}  // namespace displayxr
+diff --git a/content/shell/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+similarity index 92%
+rename from content/shell/browser/displayxr_weave_client.h
+rename to components/displayxr/browser/displayxr_weave_client.h
+index 429f966f987ec..df58798fc2dea 100644
+--- a/content/shell/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -2,13 +2,13 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#ifndef CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVE_CLIENT_H_
+-#define CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVE_CLIENT_H_
++#ifndef COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_H_
++#define COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_H_
+ 
+ // DisplayXR inline-3D weave client (#625, Step B). Lives in the browser process
+ // (unsandboxed) because the per-frame weave RPC to displayxr-service is IPC the
+ // GPU sandbox blocks (see docs/roadmap/webxr-step-b-design.md). B2a scope: link
+-// the OpenXR loader into content_shell, create a forced-IPC instance, and
++// the OpenXR loader into the browser, create a forced-IPC instance, and
+ // confirm XR_EXT_weave is available — the Seam-C linking/process de-risk. The
+ // per-frame weave + Mojo bridge to the GPU process land in B2b/B2c.
+ //
+@@ -18,7 +18,7 @@
+ #include <cstdint>
+ #include <vector>
+ 
+-namespace content {
++namespace displayxr {
+ 
+ class DisplayXRWeaveClient {
+  public:
+@@ -84,6 +84,6 @@ class DisplayXRWeaveClient {
+                         DisplayInfo* info);
+ };
+ 
+-}  // namespace content
++}  // namespace displayxr
+ 
+-#endif  // CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVE_CLIENT_H_
++#endif  // COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_H_
+diff --git a/content/shell/browser/displayxr_weaver_impl.cc b/components/displayxr/browser/displayxr_weaver_impl.cc
+similarity index 88%
+rename from content/shell/browser/displayxr_weaver_impl.cc
+rename to components/displayxr/browser/displayxr_weaver_impl.cc
+index ff56faae87d3e..1340e5f63e97f 100644
+--- a/content/shell/browser/displayxr_weaver_impl.cc
++++ b/components/displayxr/browser/displayxr_weaver_impl.cc
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "content/shell/browser/displayxr_weaver_impl.h"
++#include "components/displayxr/browser/displayxr_weaver_impl.h"
+ 
+ #include <memory>
+ #include <utility>
+@@ -15,16 +15,16 @@
+ #include <optional>
+ 
+ #include "base/win/scoped_handle.h"
+-#include "content/shell/browser/displayxr_weave_client.h"
++#include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+ #endif
+ 
+-namespace content {
++namespace displayxr {
+ 
+ // static
+ void DisplayXRWeaverImpl::Bind(
+-    mojo::PendingReceiver<shell::mojom::DisplayXRWeaver> receiver) {
++    mojo::PendingReceiver<mojom::DisplayXRWeaver> receiver) {
+   mojo::MakeSelfOwnedReceiver(std::make_unique<DisplayXRWeaverImpl>(),
+                               std::move(receiver));
+ }
+@@ -61,7 +61,7 @@ void DisplayXRWeaverImpl::WeaveSubmit(gfx::DXGIHandle texture,
+     return;
+   }
+ 
+-  auto out = shell::mojom::DisplayXRWeaveResult::New();
++  auto out = mojom::DisplayXRWeaveResult::New();
+   out->woven = WrapHandle(r.woven_handle);
+   out->fence = WrapHandle(r.fence_handle);
+   out->fence_value = r.fence_value;
+@@ -73,4 +73,4 @@ void DisplayXRWeaverImpl::WeaveSubmit(gfx::DXGIHandle texture,
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+-}  // namespace content
++}  // namespace displayxr
+diff --git a/content/shell/browser/displayxr_weaver_impl.h b/components/displayxr/browser/displayxr_weaver_impl.h
+similarity index 65%
+rename from content/shell/browser/displayxr_weaver_impl.h
+rename to components/displayxr/browser/displayxr_weaver_impl.h
+index d84af6bd92dbd..13f755f5c9521 100644
+--- a/content/shell/browser/displayxr_weaver_impl.h
++++ b/components/displayxr/browser/displayxr_weaver_impl.h
+@@ -2,26 +2,26 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#ifndef CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
+-#define CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
++#ifndef COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
++#define COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
+ 
+ #include "build/build_config.h"
+-#include "content/shell/common/displayxr_weave.mojom.h"
++#include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ 
+-namespace content {
++namespace displayxr {
+ 
+ // Browser-process implementation of the GPU->browser weave bridge (#625, Step B).
+ // B2c: forwards each WeaveSubmit to the OpenXR weave session (DisplayXRWeaveClient
+ // ::Submit, the B2a present-owner session) and returns the woven texture + fence
+ // + tracked eyes. The whole inline-3D path is Windows-only; on other platforms
+ // this is an inert (method-less) self-owned receiver.
+-class DisplayXRWeaverImpl : public shell::mojom::DisplayXRWeaver {
++class DisplayXRWeaverImpl : public mojom::DisplayXRWeaver {
+  public:
+-  // Bind a receiver to a fresh self-owned impl. Call on the UI thread
+-  // (ShellContentBrowserClient::BindGpuHostReceiver hops here from the IO thread).
+-  static void Bind(
+-      mojo::PendingReceiver<shell::mojom::DisplayXRWeaver> receiver);
++  // Bind a receiver to a fresh self-owned impl. Call on the UI thread (the
++  // embedder's ContentBrowserClient::BindGpuHostReceiver hops here from the IO
++  // thread).
++  static void Bind(mojo::PendingReceiver<mojom::DisplayXRWeaver> receiver);
+ 
+   DisplayXRWeaverImpl();
+   DisplayXRWeaverImpl(const DisplayXRWeaverImpl&) = delete;
+@@ -29,13 +29,13 @@ class DisplayXRWeaverImpl : public shell::mojom::DisplayXRWeaver {
+   ~DisplayXRWeaverImpl() override;
+ 
+ #if BUILDFLAG(IS_WIN)
+-  // shell::mojom::DisplayXRWeaver:
++  // mojom::DisplayXRWeaver:
+   void WeaveSubmit(gfx::DXGIHandle texture,
+                    const gfx::Rect& rect,
+                    WeaveSubmitCallback callback) override;
+ #endif
+ };
+ 
+-}  // namespace content
++}  // namespace displayxr
+ 
+-#endif  // CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
++#endif  // COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
+diff --git a/components/displayxr/common/BUILD.gn b/components/displayxr/common/BUILD.gn
+new file mode 100644
+index 0000000000000..a69a21d5ca99f
+--- /dev/null
++++ b/components/displayxr/common/BUILD.gn
+@@ -0,0 +1,18 @@
++# Copyright 2026 The Chromium Authors / DisplayXR
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//mojo/public/tools/bindings/mojom.gni")
++
++# DisplayXR inline-3D weave bridge (#625, Step B): GPU/Viz -> browser per-frame
++# weave RPC, consumed by the browser (weaver impl) + GPU (weave provider) sides
++# of this shared component. Plain mojom() with NO export attributes — the regular
++# variant has a single consumer path, so the bindings compile straight into it; a
++# component export macro would be LNK4217. See docs/roadmap/webxr-step-b-design.md.
++mojom("displayxr_weave_mojom") {
++  sources = [ "displayxr_weave.mojom" ]
++  public_deps = [
++    "//ui/gfx/geometry/mojom",
++    "//ui/gfx/mojom",
++  ]
++}
+diff --git a/content/shell/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
+similarity index 98%
+rename from content/shell/common/displayxr_weave.mojom
+rename to components/displayxr/common/displayxr_weave.mojom
+index 51311a9a778d6..77a241017672e 100644
+--- a/content/shell/common/displayxr_weave.mojom
++++ b/components/displayxr/common/displayxr_weave.mojom
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-module content.shell.mojom;
++module displayxr.mojom;
+ 
+ import "ui/gfx/geometry/mojom/geometry.mojom";
+ import "ui/gfx/mojom/native_handle_types.mojom";
+diff --git a/components/displayxr/gpu/BUILD.gn b/components/displayxr/gpu/BUILD.gn
+new file mode 100644
+index 0000000000000..a890fbf91f730
+--- /dev/null
++++ b/components/displayxr/gpu/BUILD.gn
+@@ -0,0 +1,29 @@
++# Copyright 2026 The Chromium Authors / DisplayXR
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# GPU-process weave provider (#625 Step B, B2c). Windows-only (the whole file
++# self-guards on IS_WIN). Registered by the embedder's ContentGpuClient
++# ::PostCompositorThreadCreated; drives the per-frame weave via the browser
++# bridge and hands woven handles to Viz (SkiaOutputSurfaceImplOnGpu).
++source_set("gpu") {
++  sources = [
++    "displayxr_weave_gpu.cc",
++    "displayxr_weave_gpu.h",
++  ]
++  deps = [
++    "//base",
++    "//components/displayxr/common:displayxr_weave_mojom",
++    "//components/viz/service",
++    "//content/public/child",
++    "//mojo/public/cpp/bindings",
++    "//ui/gfx",
++    "//ui/gfx/geometry",
++  ]
++  if (is_win) {
++    libs = [
++      "d3d11.lib",
++      "dxgi.lib",
++    ]
++  }
++}
+diff --git a/content/shell/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+similarity index 96%
+rename from content/shell/gpu/displayxr_weave_gpu.cc
+rename to components/displayxr/gpu/displayxr_weave_gpu.cc
+index 970e6e3a91d59..38787273cf8fd 100644
+--- a/content/shell/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "content/shell/gpu/displayxr_weave_gpu.h"
++#include "components/displayxr/gpu/displayxr_weave_gpu.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+ 
+@@ -15,7 +15,7 @@
+ #include "content/public/child/child_thread.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+ 
+-namespace content {
++namespace displayxr {
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+@@ -29,7 +29,8 @@ DisplayXRWeaveGpu::~DisplayXRWeaveGpu() {
+ }
+ 
+ void DisplayXRWeaveGpu::Bind() {
+-  ChildThread::Get()->BindHostReceiver(weaver_.BindNewPipeAndPassReceiver());
++  content::ChildThread::Get()->BindHostReceiver(
++      weaver_.BindNewPipeAndPassReceiver());
+ }
+ 
+ bool DisplayXRWeaveGpu::EnsureInput(ID3D11Device* device,
+@@ -175,7 +176,7 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
+   }
+   gfx::DXGIHandle input{base::win::ScopedHandle(dup)};
+ 
+-  shell::mojom::DisplayXRWeaveResultPtr result;
++  mojom::DisplayXRWeaveResultPtr result;
+   if (!weaver_->WeaveSubmit(std::move(input), window_rect, &result)) {
+     LOG(ERROR) << "[DisplayXR] B2c.2 weave: Sync WeaveSubmit call failed";
+     return out;
+@@ -199,6 +200,6 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
+   return out;
+ }
+ 
+-}  // namespace content
++}  // namespace displayxr
+ 
+ #endif  // BUILDFLAG(IS_WIN)
+diff --git a/content/shell/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+similarity index 89%
+rename from content/shell/gpu/displayxr_weave_gpu.h
+rename to components/displayxr/gpu/displayxr_weave_gpu.h
+index 207a743a02f72..f984f91ff473d 100644
+--- a/content/shell/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -2,8 +2,8 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#ifndef CONTENT_SHELL_GPU_DISPLAYXR_WEAVE_GPU_H_
+-#define CONTENT_SHELL_GPU_DISPLAYXR_WEAVE_GPU_H_
++#ifndef COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_H_
++#define COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_H_
+ 
+ #include "build/build_config.h"
+ 
+@@ -16,12 +16,12 @@
+ 
+ #include <cstdint>
+ 
++#include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+-#include "content/shell/common/displayxr_weave.mojom.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "ui/gfx/geometry/rect.h"
+ 
+-namespace content {
++namespace displayxr {
+ 
+ // GPU-process implementation of viz::DisplayXRWeaveProvider (#625 Step B, B2c.1).
+ //
+@@ -61,7 +61,7 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+                    uint32_t w,
+                    uint32_t h);
+ 
+-  mojo::Remote<shell::mojom::DisplayXRWeaver> weaver_;
++  mojo::Remote<mojom::DisplayXRWeaver> weaver_;
+ 
+   // The Viz GPU-main D3D11 device (device X, == the canvas SharedImage's device)
+   // the input lives on, plus its immediate context (used for the canvas->input
+@@ -79,8 +79,8 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   bool logged_canvas_desc_ = false;
+ };
+ 
+-}  // namespace content
++}  // namespace displayxr
+ 
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+-#endif  // CONTENT_SHELL_GPU_DISPLAYXR_WEAVE_GPU_H_
++#endif  // COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_H_
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 3bad6bb00b634..b7acdec95f7cd 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -175,35 +175,12 @@ inspector_protocol_generate("protocol_sources") {
+ }
+ 
+ # DisplayXR inline-3D weave client (#625, Step B). Isolated source_set so the
+-# vendored OpenXR headers compile with relaxed (non-chromium) warnings; the
+-# header it exposes is OpenXR-free so content_shell_lib stays chromium_code.
+-source_set("displayxr_weave") {
+-  sources = [
+-    "browser/displayxr_weave_client.cc",
+-    "browser/displayxr_weave_client.h",
+-  ]
+-  configs -= [ "//build/config/compiler:chromium_code" ]
+-  configs += [ "//build/config/compiler:no_chromium_code" ]
+-  deps = [ "//base" ]
+-  if (is_win) {
+-    deps += [ "//third_party/displayxr:openxr_loader" ]
+-    libs = [
+-      "d3d11.lib",
+-      "dxgi.lib",
+-    ]
+-  }
+-}
+-
+ static_library("content_shell_lib") {
+   testonly = true
+   sources = [
+     "browser/protocol/browser_handler.cc",
+     "browser/protocol/browser_handler.h",
+     "browser/protocol/domain_handler.h",
+-    "browser/displayxr_service_impl.cc",
+-    "browser/displayxr_service_impl.h",
+-    "browser/displayxr_weaver_impl.cc",
+-    "browser/displayxr_weaver_impl.h",
+     "browser/protocol/shell_devtools_session.cc",
+     "browser/protocol/shell_devtools_session.h",
+     "browser/shell.cc",
+@@ -347,8 +324,8 @@ static_library("content_shell_lib") {
+   ]
+   deps = [
+     ":content_browsertests_mojom",
+-    ":displayxr_weave",
+-    ":displayxr_weave_mojom",
++    "//components/displayxr/browser",
++    "//components/displayxr/common:displayxr_weave_mojom",
+     "//third_party/blink/public/mojom:displayxr_service_mojo_bindings",
+     ":protocol_sources",
+     ":resources",
+@@ -438,21 +415,14 @@ static_library("content_shell_lib") {
+     sources += [
+       "common/v8_crashpad_support_win.cc",
+       "common/v8_crashpad_support_win.h",
+-
+-      # DisplayXR inline-3D (#625, Step B / B2c): GPU-side weave provider +
+-      # synthetic SBS input. Drives the per-frame weave via the browser bridge
+-      # and hands woven handles to Viz (SkiaOutputSurfaceImplOnGpu).
+-      "gpu/displayxr_weave_gpu.cc",
+-      "gpu/displayxr_weave_gpu.h",
+     ]
+     deps += [
++      # DisplayXR inline-3D (#625, Step B / B2c): GPU-side weave provider (now a
++      # shared component) + the Viz provider setter used by ShellContentGpuClient.
++      "//components/displayxr/gpu",
+       "//components/viz/service",
+       "//gin",
+     ]
+-    libs = [
+-      "d3d11.lib",
+-      "dxgi.lib",
+-    ]
+   }
+ 
+   if (is_linux) {
+@@ -1202,16 +1172,6 @@ mojom("shell_controller_mojom") {
+   public_deps = [ "//mojo/public/mojom/base" ]
+ }
+ 
+-# DisplayXR inline-3D weave bridge (#625, Step B): GPU/Viz -> browser per-frame
+-# weave RPC. See docs/roadmap/webxr-step-b-design.md.
+-mojom("displayxr_weave_mojom") {
+-  sources = [ "common/displayxr_weave.mojom" ]
+-  public_deps = [
+-    "//ui/gfx/geometry/mojom",
+-    "//ui/gfx/mojom",
+-  ]
+-}
+-
+ mojom("rust_test_mojom") {
+   testonly = true
+   sources = [ "common/rust_test.test-mojom" ]
+diff --git a/content/shell/browser/shell_browser_main_parts.cc b/content/shell/browser/shell_browser_main_parts.cc
+index 25c70f474ed55..65681c4c62f01 100644
+--- a/content/shell/browser/shell_browser_main_parts.cc
++++ b/content/shell/browser/shell_browser_main_parts.cc
+@@ -31,7 +31,7 @@
+ #include "content/public/common/url_constants.h"
+ #include "content/shell/android/shell_descriptors.h"
+ #include "content/shell/browser/shell.h"
+-#include "content/shell/browser/displayxr_weave_client.h"
++#include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "content/shell/browser/shell_browser_context.h"
+ #include "content/shell/browser/shell_devtools_manager_delegate.h"
+ #include "content/shell/browser/shell_platform_delegate.h"
+@@ -193,7 +193,7 @@ int ShellBrowserMainParts::PreMainMessageLoopRun() {
+   InitializeMessageLoopContext();
+   // DisplayXR inline-3D (#625, Step B): opt-in via --enable-inline-3d. No-op
+   // otherwise. The first Shell window now exists (InitializeMessageLoopContext).
+-  DisplayXRWeaveClient::MaybeInitializeFromCommandLine();
++  displayxr::DisplayXRWeaveClient::MaybeInitializeFromCommandLine();
+   return 0;
+ }
+ 
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index b5c47f019fc0b..880554db7806c 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -18,8 +18,9 @@
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "content/public/browser/browser_thread.h"
+-#include "content/shell/browser/displayxr_service_impl.h"
+-#include "content/shell/browser/displayxr_weaver_impl.h"
++#include "components/displayxr/browser/displayxr_service_impl.h"
++#include "components/displayxr/browser/displayxr_weaver_impl.h"
++#include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "third_party/blink/public/mojom/xr/displayxr_service.mojom.h"
+ #include "base/containers/fixed_flat_set.h"
+ #include "base/containers/flat_set.h"
+@@ -221,7 +222,7 @@ void BindDisplayXRService(
+   if (!base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
+     return;
+   }
+-  DisplayXRServiceImpl::Create(std::move(receiver));
++  displayxr::DisplayXRServiceImpl::Create(std::move(receiver));
+ }
+ 
+ void BindNetworkHintsHandler(
+@@ -368,9 +369,10 @@ void ShellContentBrowserClient::BindGpuHostReceiver(
+   if (!base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
+     return;
+   }
+-  if (auto r = receiver.As<shell::mojom::DisplayXRWeaver>()) {
++  if (auto r = receiver.As<displayxr::mojom::DisplayXRWeaver>()) {
+     GetUIThreadTaskRunner({})->PostTask(
+-        FROM_HERE, base::BindOnce(&DisplayXRWeaverImpl::Bind, std::move(r)));
++        FROM_HERE,
++        base::BindOnce(&displayxr::DisplayXRWeaverImpl::Bind, std::move(r)));
+   }
+ }
+ 
+diff --git a/content/shell/gpu/shell_content_gpu_client.cc b/content/shell/gpu/shell_content_gpu_client.cc
+index a005110f5e54c..9a7f8fff86b46 100644
+--- a/content/shell/gpu/shell_content_gpu_client.cc
++++ b/content/shell/gpu/shell_content_gpu_client.cc
+@@ -52,7 +52,7 @@ void ShellContentGpuClient::PostCompositorThreadCreated(
+   if (!base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
+     return;
+   }
+-  weave_gpu_ = std::make_unique<DisplayXRWeaveGpu>();
++  weave_gpu_ = std::make_unique<displayxr::DisplayXRWeaveGpu>();
+   weave_gpu_->Bind();
+   viz::SetDisplayXRWeaveProvider(weave_gpu_.get());
+   LOG(ERROR) << "[DisplayXR] B2c GPU weave provider registered";
+diff --git a/content/shell/gpu/shell_content_gpu_client.h b/content/shell/gpu/shell_content_gpu_client.h
+index 8505e1b3ca07d..4a2f47ccebee8 100644
+--- a/content/shell/gpu/shell_content_gpu_client.h
++++ b/content/shell/gpu/shell_content_gpu_client.h
+@@ -11,7 +11,7 @@
+ #include "content/public/gpu/content_gpu_client.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+-#include "content/shell/gpu/displayxr_weave_gpu.h"
++#include "components/displayxr/gpu/displayxr_weave_gpu.h"
+ #endif
+ 
+ namespace content {
+@@ -39,7 +39,7 @@ class ShellContentGpuClient : public ContentGpuClient {
+       base::SingleThreadTaskRunner* task_runner) override;
+ 
+  private:
+-  std::unique_ptr<DisplayXRWeaveGpu> weave_gpu_;
++  std::unique_ptr<displayxr::DisplayXRWeaveGpu> weave_gpu_;
+ #endif
+ };
+ 

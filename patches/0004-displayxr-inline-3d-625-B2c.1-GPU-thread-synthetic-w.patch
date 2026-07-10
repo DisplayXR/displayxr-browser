@@ -1,0 +1,1316 @@
+From 1f110e06893af3b5255986668ae37de23c1d809d Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 26 Jun 2026 03:29:28 -0500
+Subject: [PATCH 04/15] [displayxr inline-3d #625 B2c.1] GPU-thread synthetic
+ weave pipe + Viz substitution
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wire the full B2c.1 pipe: a synthetic side-by-side input woven via the real
+xrWeaveSubmitEXT and substituted for the canvas quad in Viz, all driven from the
+GPU thread (SkiaOutputSurfaceImplOnGpu) — the same thread the B2b Mojo remote is
+bound on. (Design: docs/roadmap/webxr-step-b-design.md §7.)
+
+Pipe (validated firing end-to-end on Leia):
+- mojom: WeaveSubmit(DXGIHandle texture, Rect) => (DisplayXRWeaveResult? {woven,
+  fence, fence_value, w/h, eyes}) — [Sync], win-gated.
+- Browser DisplayXRWeaverImpl drives the real xrWeaveSubmitEXT on the B2a
+  present-owner session (DisplayXRWeaveClient::Submit, OpenXR-free facade) and
+  returns the woven texture/fence/eyes.
+- GPU DisplayXRWeaveGpu (impl of new viz::DisplayXRWeaveProvider): owns the Mojo
+  remote + a keyed-mutex synthetic SBS input (left=red/right=blue test pattern on
+  its own D3D11 device), drives the [Sync] weave, hands woven handles to Viz.
+  Registered process-globally in ShellContentGpuClient::PostCompositorThreadCreated.
+- Viz: SkiaRenderer tags the canvas TextureDrawQuad (ExternalUseClient::
+  ImageContext::set_weave_target); SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute
+  (both Ganesh + Graphite paths) calls the provider, imports the woven handle as a
+  SharedImage (D3DImageBackingFactory), GPU-waits the fence (D3DSharedFence), and
+  redirects the tagged ImageContextImpl to the woven backing via an override
+  mailbox (size check relaxed; woven is window-sized).
+- Forward --enable-inline-3d to child processes so the GPU/Viz process registers
+  the provider + tags the quad.
+
+Validated on Leia (content_shell --enable-inline-3d, with
+--disable-direct-composition so Viz draws quads via SkiaRenderer rather than
+delegating them to DComp visuals): DrawTextureQuad tags the canvas → provider
+found → synthetic SBS input created → Mojo [Sync] → browser → real
+xrWeaveSubmitEXT called with a valid NT handle + window-relative rect. Both
+content_shell and the service confirmed High integrity (handle dup OK).
+
+KNOWN BLOCKER (runtime-side, not this patch): xrWeaveSubmitEXT returns -2
+(XR_ERROR_RUNTIME_FAILURE) — comp_d3d11_service_weave_submit hits a silent
+early-return (no service-side log reached: no OpenSharedResource / "server
+output"). The browser passes a valid handle, so the import/fence/substitute path
+is not yet exercised. Pinpointing needs a service-side entry log (runtime
+rebuild). The null-DACL on the synthetic input's CreateSharedHandle (so the
+external service can open a sandboxed-GPU-created handle) is a precaution for the
+B2c.2 canvas export; it did not change the -2 and is unverified.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ components/viz/service/BUILD.gn               |   3 +
+ .../viz/service/display/external_use_client.h |  10 +
+ .../viz/service/display/skia_renderer.cc      |  32 +++
+ .../displayxr_weave_provider.cc               |  27 +++
+ .../displayxr_weave_provider.h                |  60 ++++++
+ .../display_embedder/image_context_impl.cc    |  27 ++-
+ .../display_embedder/image_context_impl.h     |  14 ++
+ .../skia_output_surface_impl_on_gpu.cc        | 108 ++++++++++
+ .../skia_output_surface_impl_on_gpu.h         |  23 +++
+ content/shell/BUILD.gn                        |  20 +-
+ .../shell/browser/displayxr_weave_client.cc   |  72 +++++++
+ .../shell/browser/displayxr_weave_client.h    |  30 +++
+ .../shell/browser/displayxr_weaver_impl.cc    |  52 ++++-
+ content/shell/browser/displayxr_weaver_impl.h |  13 +-
+ .../browser/shell_content_browser_client.cc   |   7 +
+ content/shell/common/displayxr_weave.mojom    |  42 +++-
+ content/shell/gpu/displayxr_weave_gpu.cc      | 190 ++++++++++++++++++
+ content/shell/gpu/displayxr_weave_gpu.h       |  73 +++++++
+ content/shell/gpu/shell_content_gpu_client.cc |  37 ++--
+ content/shell/gpu/shell_content_gpu_client.h  |  12 +-
+ 20 files changed, 816 insertions(+), 36 deletions(-)
+ create mode 100644 components/viz/service/display_embedder/displayxr_weave_provider.cc
+ create mode 100644 components/viz/service/display_embedder/displayxr_weave_provider.h
+ create mode 100644 content/shell/gpu/displayxr_weave_gpu.cc
+ create mode 100644 content/shell/gpu/displayxr_weave_gpu.h
+
+diff --git a/components/viz/service/BUILD.gn b/components/viz/service/BUILD.gn
+index 2488069770015..0bebcfe074d5d 100644
+--- a/components/viz/service/BUILD.gn
++++ b/components/viz/service/BUILD.gn
+@@ -149,6 +149,8 @@ viz_component("service") {
+     "display_embedder/buffer_queue.h",
+     "display_embedder/compositor_gpu_thread.cc",
+     "display_embedder/compositor_gpu_thread.h",
++    "display_embedder/displayxr_weave_provider.cc",
++    "display_embedder/displayxr_weave_provider.h",
+     "display_embedder/image_context_impl.cc",
+     "display_embedder/image_context_impl.h",
+     "display_embedder/output_presenter.h",
+@@ -332,6 +334,7 @@ viz_component("service") {
+     "//ui/display/types",
+     "//ui/gfx/animation",
+     "//ui/gfx/animation/keyframe",
++    "//ui/gl",
+   ]
+ 
+   public_deps = [
+diff --git a/components/viz/service/display/external_use_client.h b/components/viz/service/display/external_use_client.h
+index 45928e1d5f6d7..f1be125de2ef8 100644
+--- a/components/viz/service/display/external_use_client.h
++++ b/components/viz/service/display/external_use_client.h
+@@ -108,6 +108,13 @@ class VIZ_SERVICE_EXPORT ExternalUseClient {
+       clear_color_ = color;
+     }
+ 
++    // DisplayXR inline-3D (#625, Step B): SkiaRenderer tags the canvas quad's
++    // context (compositor thread); SkiaOutputSurfaceImplOnGpu reads the tag on
++    // the GPU thread to redirect it to the woven texture. A plain bool set before
++    // |image_| is set, so it obeys the thread-safety invariants above.
++    bool is_weave_target() const { return is_weave_target_; }
++    void set_weave_target(bool v) { is_weave_target_ = v; }
++
+    private:
+     gpu::Mailbox mailbox_;
+     gpu::SyncToken sync_token_;
+@@ -132,6 +139,9 @@ class VIZ_SERVICE_EXPORT ExternalUseClient {
+     std::vector<skgpu::graphite::TextureInfo> texture_infos_;
+     raw_ptr<const cc::PaintOpBuffer> paint_op_buffer_ = nullptr;
+     std::optional<SkColor4f> clear_color_;
++
++    // DisplayXR inline-3D weave target tag (#625, Step B). See accessors above.
++    bool is_weave_target_ = false;
+   };
+ 
+   // If |maybe_concurrent_reads| is true then there can be concurrent reads to
+diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
+index 9da0682f44848..f9e9a97eea2cf 100644
+--- a/components/viz/service/display/skia_renderer.cc
++++ b/components/viz/service/display/skia_renderer.cc
+@@ -115,6 +115,17 @@ namespace viz {
+ 
+ namespace {
+ 
++#if BUILDFLAG(IS_WIN)
++// DisplayXR inline-3D (#625, Step B). True when content_shell was launched with
++// --enable-inline-3d; evaluated once. Gates tagging the canvas quad as a weave
++// target so the patch is fully dormant by default.
++bool DisplayXRInline3DEnabled() {
++  static const bool enabled =
++      base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d");
++  return enabled;
++}
++#endif
++
+ // Feature to temporarily create a dump in the case where we try and sample from
+ // a render pass that has never been drawn to.
+ // See: crbug.com/344458294, crbug.com/345673794
+@@ -682,11 +693,17 @@ class SkiaRenderer::ScopedSkImageBuilder {
+   const SkImage* sk_image() const { return sk_image_.get(); }
+   const cc::PaintOpBuffer* paint_op_buffer() const { return paint_op_buffer_; }
+   const std::optional<SkColor4f>& clear_color() const { return clear_color_; }
++  // DisplayXR inline-3D (#625, Step B): the locked context, so DrawTextureQuad
++  // can tag it as a weave target.
++  ExternalUseClient::ImageContext* image_context() const {
++    return image_context_;
++  }
+ 
+  private:
+   sk_sp<SkImage> sk_image_;
+   raw_ptr<const cc::PaintOpBuffer> paint_op_buffer_ = nullptr;
+   std::optional<SkColor4f> clear_color_;
++  raw_ptr<ExternalUseClient::ImageContext> image_context_ = nullptr;
+ };
+ 
+ SkiaRenderer::ScopedSkImageBuilder::ScopedSkImageBuilder(
+@@ -704,6 +721,7 @@ SkiaRenderer::ScopedSkImageBuilder::ScopedSkImageBuilder(
+ 
+   auto* image_context = skia_renderer->lock_set_for_external_use_.LockResource(
+       resource_id, maybe_concurrent_reads, raw_draw_if_possible);
++  image_context_ = image_context;
+ 
+   // |ImageContext::image| provides thread safety: (a) this ImageContext is
+   // only accessed by GPU thread after |image| is set and (b) the fields of
+@@ -2669,6 +2687,20 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
+   if (!image)
+     return;
+ 
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B2c.1): tag the canvas quad as a weave
++  // target. B2c.1 hardcode = the first sufficiently large texture quad (the
++  // single full-window canvas on the controlled test page); B3 replaces this
++  // with an explicit per-element tag from Blink. The GPU thread acts on the tag
++  // in SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute().
++  if (DisplayXRInline3DEnabled() && quad->rect.width() >= 256 &&
++      quad->rect.height() >= 256) {
++    if (auto* ic = builder.image_context()) {
++      ic->set_weave_target(true);
++    }
++  }
++#endif
++
+   gfx::RectF uv_rect = quad->GetUnnormalizedTexCoords(
+       gfx::Size(image->width(), image->height()));
+   params->vis_tex_coords = cc::MathUtil::ScaleRectProportional(
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+new file mode 100644
+index 0000000000000..c49902cf79a9e
+--- /dev/null
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
++
++#if BUILDFLAG(IS_WIN)
++
++namespace viz {
++
++namespace {
++// GPU-process-global, GPU-main-thread only. Owned by the embedder
++// (ShellContentGpuClient); cleared in its destructor.
++DisplayXRWeaveProvider* g_provider = nullptr;
++}  // namespace
++
++void SetDisplayXRWeaveProvider(DisplayXRWeaveProvider* p) {
++  g_provider = p;
++}
++
++DisplayXRWeaveProvider* GetDisplayXRWeaveProvider() {
++  return g_provider;
++}
++
++}  // namespace viz
++
++#endif  // BUILDFLAG(IS_WIN)
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+new file mode 100644
+index 0000000000000..10b7b4d7ff188
+--- /dev/null
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_DISPLAYXR_WEAVE_PROVIDER_H_
++#define COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_DISPLAYXR_WEAVE_PROVIDER_H_
++
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_WIN)
++
++#include <cstdint>
++
++#include "components/viz/service/viz_service_export.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace viz {
++
++// DisplayXR inline-3D (#625, Step B) GPU-side weave hook.
++//
++// The per-frame weave RPC client lives in the BROWSER process (the GPU sandbox
++// blocks it; see docs/roadmap/webxr-step-b-design.md), but the woven texture
++// import + composite must run in the GPU process where the SharedImage factory
++// and the present live (SkiaOutputSurfaceImplOnGpu). Viz can't reach up to the
++// content/shell Mojo remote, so the embedder (ShellContentGpuClient) implements
++// this interface and registers it process-globally; Viz calls it on the GPU
++// main thread when a canvas quad is tagged as a weave target.
++class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
++ public:
++  // Outcome of one weave (mirrors XrWeaveOutputEXT). All handles are Win32
++  // HANDLEs carried as uintptr_t; ownership transfers to the Viz caller, which
++  // is responsible for closing them. |woven_handle| / |fence_handle| are 0 on
++  // steady-state frames (reuse the previously imported texture / opened fence).
++  struct Result {
++    bool ok = false;
++    uintptr_t woven_handle = 0;
++    uintptr_t fence_handle = 0;
++    uint64_t fence_value = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++  };
++
++  virtual ~DisplayXRWeaveProvider() = default;
++
++  // B2c.1: drive a weave from a synthetic (test-pattern) pre-weave SBS input the
++  // provider owns. |window_rect| is the element's window-relative device-pixel
++  // placement. Runs on the GPU main thread (blocks on the synchronous RPC).
++  virtual Result WeaveSynthetic(const gfx::Rect& window_rect) = 0;
++};
++
++// Register / fetch the process-global provider (GPU process, GPU main thread).
++// Passing nullptr clears it. Not owned.
++VIZ_SERVICE_EXPORT void SetDisplayXRWeaveProvider(DisplayXRWeaveProvider* p);
++VIZ_SERVICE_EXPORT DisplayXRWeaveProvider* GetDisplayXRWeaveProvider();
++
++}  // namespace viz
++
++#endif  // BUILDFLAG(IS_WIN)
++
++#endif  // COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_DISPLAYXR_WEAVE_PROVIDER_H_
+diff --git a/components/viz/service/display_embedder/image_context_impl.cc b/components/viz/service/display_embedder/image_context_impl.cc
+index 21c009b185357..2b0001b3099eb 100644
+--- a/components/viz/service/display_embedder/image_context_impl.cc
++++ b/components/viz/service/display_embedder/image_context_impl.cc
+@@ -367,11 +367,29 @@ bool ImageContextImpl::BeginRasterAccess(
+   return true;
+ }
+ 
++void ImageContextImpl::SetWeaveOverrideMailbox(const gpu::Mailbox& mailbox) {
++  weave_override_mailbox_ = mailbox;
++}
++
+ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+     gpu::SharedContextState* context_state,
+     gpu::SharedImageRepresentationFactory* representation_factory,
+     std::vector<GrBackendSemaphore>* begin_semaphores,
+     std::vector<GrBackendSemaphore>* end_semaphores) {
++  // DisplayXR inline-3D (#625, Step B / B2c.1): fulfill from the woven backing
++  // when one is set. If the woven mailbox changed (window resize), drop the
++  // cached representation so it is re-produced from the new backing.
++  const bool weave_override = !weave_override_mailbox_.IsZero();
++  if (weave_override && representation_ &&
++      weave_produced_mailbox_ != weave_override_mailbox_) {
++    representation_scoped_read_access_.reset();
++    representation_.reset();
++    promise_image_textures_.clear();
++    graphite_textures_.clear();
++  }
++  const gpu::Mailbox& use_mailbox =
++      weave_override ? weave_override_mailbox_ : mailbox();
++
+   // Skip the context if it has been processed.
+   if (representation_scoped_read_access_) {
+     CHECK(owned_promise_image_textures_.empty());
+@@ -396,7 +414,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+ 
+   if (!representation_) {
+     auto representation = representation_factory->ProduceSkia(
+-        mailbox(), context_state,
++        use_mailbox, context_state,
+         /*required_usages=*/{gpu::SHARED_IMAGE_USAGE_DISPLAY_READ});
+     if (!representation) {
+       DLOG(ERROR) << "Failed to fulfill the promise texture - SharedImage "
+@@ -404,7 +422,10 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+       return false;
+     }
+ 
+-    if (representation->size() != size()) {
++    // The woven backing is window-sized and intentionally differs from the
++    // canvas resource size, so only enforce the equality check for normal
++    // (non-weave) fulfillment.
++    if (!weave_override && representation->size() != size()) {
+       DLOG(ERROR) << "Failed to fulfill the promise texture - SharedImage "
+                      "size does not match TransferableResource size: "
+                   << representation->size().ToString() << " vs "
+@@ -413,6 +434,8 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+     }
+ 
+     representation_ = std::move(representation);
++    weave_produced_mailbox_ = weave_override ? weave_override_mailbox_
++                                             : gpu::Mailbox();
+   }
+ 
+   representation_scoped_read_access_ =
+diff --git a/components/viz/service/display_embedder/image_context_impl.h b/components/viz/service/display_embedder/image_context_impl.h
+index e53873c82fbc7..fe70cd76b73a4 100644
+--- a/components/viz/service/display_embedder/image_context_impl.h
++++ b/components/viz/service/display_embedder/image_context_impl.h
+@@ -88,6 +88,13 @@ class ImageContextImpl final : public ExternalUseClient::ImageContext {
+   void SetPromiseImageTextures(
+       std::vector<sk_sp<GrPromiseImageTexture>> promise_image_textures);
+ 
++  // DisplayXR inline-3D (#625, Step B / B2c.1): redirect this context to weave
++  // |mailbox| instead of its own resource. Set on the GPU thread each frame by
++  // SkiaOutputSurfaceImplOnGpu before BeginAccess. A zero mailbox clears it. The
++  // woven texture is window-sized (differs from the canvas resource size), so
++  // the usual fulfillment size check is relaxed while an override is active.
++  void SetWeaveOverrideMailbox(const gpu::Mailbox& mailbox);
++
+   void BeginAccessIfNecessary(
+       gpu::SharedContextState* context_state,
+       gpu::SharedImageRepresentationFactory* representation_factory,
+@@ -153,6 +160,13 @@ class ImageContextImpl final : public ExternalUseClient::ImageContext {
+   // Viz for the promise image and the YCbCr info computed at the time of
+   // fulfilling the promise image.
+   bool graphite_ycbcr_info_mismatch_ = false;
++
++  // DisplayXR inline-3D weave override (#625, Step B). |weave_override_mailbox_|
++  // is the woven backing to fulfill from (zero = none). |weave_produced_mailbox_|
++  // records which mailbox |representation_| was produced for, so a change (window
++  // resize -> new woven SharedImage) drops the cached representation.
++  gpu::Mailbox weave_override_mailbox_;
++  gpu::Mailbox weave_produced_mailbox_;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index b833608be6455..d2d8eda177072 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -100,8 +100,16 @@
+ #include "url/gurl.h"
+ 
+ #if BUILDFLAG(IS_WIN)
++#include <windows.h>
++
++#include "base/win/scoped_handle.h"
++#include "components/viz/common/resources/shared_image_format.h"
+ #include "components/viz/service/display/dc_layer_overlay.h"
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #include "components/viz/service/display_embedder/skia_output_device_dcomp.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
++#include "ui/gfx/win/d3d_shared_fence.h"
++#include "ui/gl/direct_composition_support.h"
+ #endif
+ 
+ #if BUILDFLAG(ENABLE_VULKAN)
+@@ -490,6 +498,11 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+ 
+   if (graphite_recording) {
+     CHECK(return_release_fence_cb.is_null());
++#if BUILDFLAG(IS_WIN)
++    // DisplayXR inline-3D (#625, Step B / B2c.1): same weave substitution on the
++    // Graphite path (content_shell may default to Graphite-Dawn).
++    MaybeWeaveSubstitute(image_contexts);
++#endif
+     promise_image_access_helper_.BeginAccess(std::move(image_contexts),
+                                              /*begin_semaphores=*/nullptr,
+                                              /*end_semaphores=*/nullptr);
+@@ -514,6 +527,12 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+ 
+     std::vector<GrBackendSemaphore> begin_semaphores;
+     std::vector<GrBackendSemaphore> end_semaphores;
++#if BUILDFLAG(IS_WIN)
++    // DisplayXR inline-3D (#625, Step B / B2c.1): if a canvas quad is tagged as
++    // a weave target, drive the weave + import the woven texture and redirect
++    // the tagged image context to it, before promise images are fulfilled below.
++    MaybeWeaveSubstitute(image_contexts);
++#endif
+     promise_image_access_helper_.BeginAccess(
+         std::move(image_contexts), &begin_semaphores, &end_semaphores);
+     if (!begin_semaphores.empty()) {
+@@ -2647,6 +2666,95 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+   return {};
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
++    const std::vector<raw_ptr<ImageContextImpl, VectorExperimental>>&
++        image_contexts) {
++  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++  auto* provider = GetDisplayXRWeaveProvider();
++  if (!provider) {
++    return;
++  }
++  // Find the first canvas quad SkiaRenderer tagged as a weave target.
++  ImageContextImpl* target = nullptr;
++  for (ImageContextImpl* ctx : image_contexts) {
++    if (ctx && ctx->is_weave_target()) {
++      target = ctx;
++      break;
++    }
++  }
++  if (!target) {
++    return;
++  }
++  static bool s_logged_target = false;
++  if (!s_logged_target) {
++    s_logged_target = true;
++    LOG(ERROR) << "[DisplayXR] B2c.1 weave target found; driving synthetic weave";
++  }
++
++  // B2c.1: weave the full window from a synthetic SBS input. (B2c.2 will pass
++  // the real canvas texture + the element's sub-rect.)
++  const DisplayXRWeaveProvider::Result r =
++      provider->WeaveSynthetic(gfx::Rect(size_));
++  if (!r.ok) {
++    return;
++  }
++
++  // (Re)import the woven texture whenever a fresh handle arrives — that is the
++  // first weave and again on re-allocation (window resize). Steady-state frames
++  // return handle 0 and we reuse the imported SharedImage (the runtime re-weaves
++  // into the same texture in place).
++  if (r.woven_handle) {
++    if (!displayxr_woven_mailbox_.IsZero()) {
++      shared_image_factory_->DestroySharedImage(displayxr_woven_mailbox_);
++      displayxr_woven_mailbox_ = gpu::Mailbox();
++    }
++    gfx::DXGIHandle dxgi(
++        base::win::ScopedHandle(reinterpret_cast<HANDLE>(r.woven_handle)));
++    gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++    gpu::SharedImageInfo si_info(
++        SinglePlaneFormat::kRGBA_8888,
++        gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height)),
++        gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++        kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++        "DisplayXRWoven");
++    if (shared_image_factory_->CreateSharedImage(
++            mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
++      displayxr_woven_mailbox_ = mailbox;
++    } else {
++      LOG(ERROR) << "[DisplayXR] B2c.1 failed to import woven SharedImage "
++                 << r.width << "x" << r.height;
++      return;
++    }
++  }
++  if (displayxr_woven_mailbox_.IsZero()) {
++    return;
++  }
++
++  // (Re)open + GPU-wait the service->caller fence so the woven content is ready
++  // before the canvas quad samples it. The woven texture has no keyed mutex
++  // (fence-synced), so this wait is the sole synchronization.
++  if (r.fence_handle) {
++    displayxr_weave_fence_ = gfx::D3DSharedFence::CreateFromUnownedHandle(
++        reinterpret_cast<HANDLE>(r.fence_handle));
++    // CreateFromUnownedHandle duplicates; we still own the passed handle.
++    ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
++  }
++  if (displayxr_weave_fence_) {
++    displayxr_weave_fence_->Update(r.fence_value);
++    Microsoft::WRL::ComPtr<ID3D11Device> wait_device =
++        gl::GetDirectCompositionD3D11Device();
++    if (wait_device) {
++      displayxr_weave_fence_->WaitD3D11(wait_device);
++    }
++  }
++
++  // Redirect the tagged context to the woven backing; the existing promise-image
++  // fulfillment (below) then reads the woven texture instead of the canvas.
++  target->SetWeaveOverrideMailbox(displayxr_woven_mailbox_);
++}
++#endif  // BUILDFLAG(IS_WIN)
++
+ void SkiaOutputSurfaceImplOnGpu::CreateSharedImage(
+     gpu::Mailbox mailbox,
+     SharedImageFormat format,
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 1236539ebebf9..02ca43fbc7fe4 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -59,6 +59,9 @@ namespace mojom {
+ class DelegatedInkPointRenderer;
+ }  // namespace mojom
+ class ColorSpace;
++#if BUILDFLAG(IS_WIN)
++class D3DSharedFence;
++#endif
+ }  // namespace gfx
+ 
+ namespace gl {
+@@ -479,6 +482,17 @@ class SkiaOutputSurfaceImplOnGpu
+   // returns a newly produced one and caches it.
+   gpu::SkiaImageRepresentation* GetSkiaRepresentation(gpu::Mailbox mailbox);
+ 
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B2c.1). If any image context is tagged
++  // as a weave target, drive the weave via the registered DisplayXRWeaveProvider,
++  // import the woven texture as a SharedImage, GPU-wait its fence, and point the
++  // tagged context at the woven backing. GPU main thread; called before promise
++  // images are fulfilled in FinishPaintCurrentFrame.
++  void MaybeWeaveSubstitute(
++      const std::vector<raw_ptr<ImageContextImpl, VectorExperimental>>&
++          image_contexts);
++#endif
++
+   class ReleaseCurrent {
+    public:
+     ReleaseCurrent(scoped_refptr<gl::GLSurface> gl_surface,
+@@ -614,6 +628,15 @@ class SkiaOutputSurfaceImplOnGpu
+   // destructor.
+   base::flat_set<gpu::Mailbox> solid_color_images_;
+ 
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B2c.1) cross-frame weave state. The
++  // imported woven SharedImage (window-sized; re-imported on resize) and the
++  // service->caller shared fence we GPU-wait each frame. The SharedImage is
++  // owned by shared_image_factory_ and destroyed with DestroyAllSharedImages().
++  gpu::Mailbox displayxr_woven_mailbox_;
++  scoped_refptr<gfx::D3DSharedFence> displayxr_weave_fence_;
++#endif
++
+   THREAD_CHECKER(thread_checker_);
+ 
+ #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 0d86b8bb1ed44..5e37a5fff624c 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -435,8 +435,21 @@ static_library("content_shell_lib") {
+     sources += [
+       "common/v8_crashpad_support_win.cc",
+       "common/v8_crashpad_support_win.h",
++
++      # DisplayXR inline-3D (#625, Step B / B2c): GPU-side weave provider +
++      # synthetic SBS input. Drives the per-frame weave via the browser bridge
++      # and hands woven handles to Viz (SkiaOutputSurfaceImplOnGpu).
++      "gpu/displayxr_weave_gpu.cc",
++      "gpu/displayxr_weave_gpu.h",
++    ]
++    deps += [
++      "//components/viz/service",
++      "//gin",
++    ]
++    libs = [
++      "d3d11.lib",
++      "dxgi.lib",
+     ]
+-    deps += [ "//gin" ]
+   }
+ 
+   if (is_linux) {
+@@ -1190,7 +1203,10 @@ mojom("shell_controller_mojom") {
+ # weave RPC. See docs/roadmap/webxr-step-b-design.md.
+ mojom("displayxr_weave_mojom") {
+   sources = [ "common/displayxr_weave.mojom" ]
+-  public_deps = [ "//ui/gfx/geometry/mojom" ]
++  public_deps = [
++    "//ui/gfx/geometry/mojom",
++    "//ui/gfx/mojom",
++  ]
+ }
+ 
+ mojom("rust_test_mojom") {
+diff --git a/content/shell/browser/displayxr_weave_client.cc b/content/shell/browser/displayxr_weave_client.cc
+index d1ed0647b3dab..355578916754e 100644
+--- a/content/shell/browser/displayxr_weave_client.cc
++++ b/content/shell/browser/displayxr_weave_client.cc
+@@ -287,10 +287,82 @@ void InitializeWin() {
+                      : "  — bindWindow FAILED");
+ }
+ 
++// Drive one weave on the live present-owner session. Returns ok=false unless the
++// session + submit PFN came up in InitializeWin(). The runtime opens the input
++// handle synchronously inside xrWeaveSubmitEXT, so borrowing it for the call is
++// safe; the returned woven/fence handles are owned by the caller.
++DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
++                                                  int32_t x,
++                                                  int32_t y,
++                                                  int32_t w,
++                                                  int32_t h) {
++  DisplayXRWeaveClient::WeaveSubmitResult result;
++  WeaveClientState& s = State();
++  if (s.session == XR_NULL_HANDLE || !s.submit) {
++    return result;  // ok=false: dormant / failed init
++  }
++
++  XrWeaveSubmitInfoEXT in = {XR_TYPE_WEAVE_SUBMIT_INFO_EXT};
++  in.inputTexture = reinterpret_cast<void*>(input_handle);
++  in.inputIsDxgi = XR_FALSE;  // NT handle (keyed-mutex), not a legacy DXGI handle
++  in.rect.offset.x = x;
++  in.rect.offset.y = y;
++  in.rect.extent.width = w;
++  in.rect.extent.height = h;
++
++  XrWeaveOutputEXT out = {XR_TYPE_WEAVE_OUTPUT_EXT};
++  const XrResult sr = s.submit(s.session, &in, &out);
++  if (XR_FAILED(sr)) {
++    static int s_fail = 0;
++    if (s_fail < 3) {
++      ++s_fail;
++      LOG(ERROR) << "[DisplayXR] xrWeaveSubmitEXT failed: " << sr
++                 << " (in_handle=" << in.inputTexture << " rect=" << w << "x"
++                 << h << ")";
++    }
++    return result;
++  }
++
++  result.ok = true;
++  result.woven_handle = reinterpret_cast<uintptr_t>(out.weavedTexture);
++  result.fence_handle = reinterpret_cast<uintptr_t>(out.fence);
++  result.fence_value = out.fenceValue;
++  result.width = out.width;
++  result.height = out.height;
++  result.eyes_valid = (out.eyesValid == XR_TRUE);
++  if (result.eyes_valid && out.eyeCount > 0) {
++    const uint32_t n =
++        out.eyeCount > XR_WEAVE_MAX_EYES_EXT ? XR_WEAVE_MAX_EYES_EXT
++                                             : out.eyeCount;
++    result.eyes.reserve(n * 3u);
++    for (uint32_t i = 0; i < n; ++i) {
++      const XrVector3f& eye = UNSAFE_TODO(out.eyes[i]);
++      result.eyes.push_back(eye.x);
++      result.eyes.push_back(eye.y);
++      result.eyes.push_back(eye.z);
++    }
++  }
++  return result;
++}
++
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+ }  // namespace
+ 
++// static
++DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::Submit(
++    uintptr_t input_handle,
++    int32_t x,
++    int32_t y,
++    int32_t w,
++    int32_t h) {
++#if BUILDFLAG(IS_WIN)
++  return SubmitWin(input_handle, x, y, w, h);
++#else
++  return {};
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+   if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
+diff --git a/content/shell/browser/displayxr_weave_client.h b/content/shell/browser/displayxr_weave_client.h
+index a7ad6a18fe629..6bbd9ea0f551f 100644
+--- a/content/shell/browser/displayxr_weave_client.h
++++ b/content/shell/browser/displayxr_weave_client.h
+@@ -15,6 +15,9 @@
+ // This header is intentionally OpenXR-free so it can be included from ordinary
+ // (chromium_code) translation units; all OpenXR types stay in the .cc.
+ 
++#include <cstdint>
++#include <vector>
++
+ namespace content {
+ 
+ class DisplayXRWeaveClient {
+@@ -22,6 +25,33 @@ class DisplayXRWeaveClient {
+   // If --enable-inline-3d is on the command line, initialize the weave client
+   // (idempotent, browser process only). Safe no-op otherwise or on non-Windows.
+   static void MaybeInitializeFromCommandLine();
++
++  // OpenXR-free result of one weave submission (mirrors XrWeaveOutputEXT). All
++  // handles are Win32 HANDLEs carried as uintptr_t so this header stays
++  // platform/OpenXR-free; the caller (DisplayXRWeaverImpl) owns them and is
++  // responsible for closing/transferring them. woven_handle / fence_handle are
++  // 0 on steady-state frames (reuse the previously returned handles).
++  struct WeaveSubmitResult {
++    bool ok = false;
++    uintptr_t woven_handle = 0;
++    uintptr_t fence_handle = 0;
++    uint64_t fence_value = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    std::vector<float> eyes;  // flattened xyz triples
++    bool eyes_valid = false;
++  };
++
++  // Drive one xrWeaveSubmitEXT on the B2a present-owner session. |input_handle|
++  // is a pre-weave SBS keyed-mutex shared-texture HANDLE (borrowed for the
++  // duration of the call; the runtime opens it synchronously). |x,y,w,h| is the
++  // element's window-relative device-pixel rect. Returns ok=false if the weave
++  // session isn't live. Windows-only; a stub elsewhere.
++  static WeaveSubmitResult Submit(uintptr_t input_handle,
++                                  int32_t x,
++                                  int32_t y,
++                                  int32_t w,
++                                  int32_t h);
+ };
+ 
+ }  // namespace content
+diff --git a/content/shell/browser/displayxr_weaver_impl.cc b/content/shell/browser/displayxr_weaver_impl.cc
+index b81f71ce3147a..ff56faae87d3e 100644
+--- a/content/shell/browser/displayxr_weaver_impl.cc
++++ b/content/shell/browser/displayxr_weaver_impl.cc
+@@ -8,8 +8,17 @@
+ #include <utility>
+ 
+ #include "base/logging.h"
++#include "build/build_config.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++#if BUILDFLAG(IS_WIN)
++#include <optional>
++
++#include "base/win/scoped_handle.h"
++#include "content/shell/browser/displayxr_weave_client.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
++#endif
+ 
+ namespace content {
+ 
+@@ -23,12 +32,45 @@ void DisplayXRWeaverImpl::Bind(
+ DisplayXRWeaverImpl::DisplayXRWeaverImpl() = default;
+ DisplayXRWeaverImpl::~DisplayXRWeaverImpl() = default;
+ 
+-void DisplayXRWeaverImpl::WeaveSubmit(const gfx::Rect& rect,
++#if BUILDFLAG(IS_WIN)
++namespace {
++
++// Wrap a caller-owned Win32 shared HANDLE (from xrWeaveSubmitEXT) as a
++// gfx::DXGIHandle for return across Mojo to the GPU process. 0 -> nullopt
++// (steady-state frames, where the GPU side reuses the prior handles).
++std::optional<gfx::DXGIHandle> WrapHandle(uintptr_t handle) {
++  if (!handle) {
++    return std::nullopt;
++  }
++  return gfx::DXGIHandle(
++      base::win::ScopedHandle(reinterpret_cast<HANDLE>(handle)));
++}
++
++}  // namespace
++
++void DisplayXRWeaverImpl::WeaveSubmit(gfx::DXGIHandle texture,
++                                      const gfx::Rect& rect,
+                                       WeaveSubmitCallback callback) {
+-  // B2b: prove the GPU->browser bridge. B2c forwards to xrWeaveSubmitEXT.
+-  LOG(ERROR) << "[DisplayXR] B2b WeaveSubmit received in BROWSER from GPU: rect="
+-             << rect.ToString() << " — GPU<->browser bridge OK";
+-  std::move(callback).Run(/*ok=*/true);
++  // |texture| owns the input handle for the duration of this call; the runtime
++  // opens it synchronously inside xrWeaveSubmitEXT, so borrowing it is safe.
++  const DisplayXRWeaveClient::WeaveSubmitResult r = DisplayXRWeaveClient::Submit(
++      reinterpret_cast<uintptr_t>(texture.buffer_handle()), rect.x(), rect.y(),
++      rect.width(), rect.height());
++  if (!r.ok) {
++    std::move(callback).Run(/*result=*/nullptr);
++    return;
++  }
++
++  auto out = shell::mojom::DisplayXRWeaveResult::New();
++  out->woven = WrapHandle(r.woven_handle);
++  out->fence = WrapHandle(r.fence_handle);
++  out->fence_value = r.fence_value;
++  out->width = r.width;
++  out->height = r.height;
++  out->eyes = r.eyes;
++  out->eyes_valid = r.eyes_valid;
++  std::move(callback).Run(std::move(out));
+ }
++#endif  // BUILDFLAG(IS_WIN)
+ 
+ }  // namespace content
+diff --git a/content/shell/browser/displayxr_weaver_impl.h b/content/shell/browser/displayxr_weaver_impl.h
+index 00099b5fcb557..d84af6bd92dbd 100644
+--- a/content/shell/browser/displayxr_weaver_impl.h
++++ b/content/shell/browser/displayxr_weaver_impl.h
+@@ -5,14 +5,17 @@
+ #ifndef CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
+ #define CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
+ 
++#include "build/build_config.h"
+ #include "content/shell/common/displayxr_weave.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ 
+ namespace content {
+ 
+ // Browser-process implementation of the GPU->browser weave bridge (#625, Step B).
+-// B2b: logs the cross-process call + returns ok, proving the channel. B2c will
+-// forward WeaveSubmit to the OpenXR weave session (DisplayXRWeaveClient).
++// B2c: forwards each WeaveSubmit to the OpenXR weave session (DisplayXRWeaveClient
++// ::Submit, the B2a present-owner session) and returns the woven texture + fence
++// + tracked eyes. The whole inline-3D path is Windows-only; on other platforms
++// this is an inert (method-less) self-owned receiver.
+ class DisplayXRWeaverImpl : public shell::mojom::DisplayXRWeaver {
+  public:
+   // Bind a receiver to a fresh self-owned impl. Call on the UI thread
+@@ -25,8 +28,12 @@ class DisplayXRWeaverImpl : public shell::mojom::DisplayXRWeaver {
+   DisplayXRWeaverImpl& operator=(const DisplayXRWeaverImpl&) = delete;
+   ~DisplayXRWeaverImpl() override;
+ 
++#if BUILDFLAG(IS_WIN)
+   // shell::mojom::DisplayXRWeaver:
+-  void WeaveSubmit(const gfx::Rect& rect, WeaveSubmitCallback callback) override;
++  void WeaveSubmit(gfx::DXGIHandle texture,
++                   const gfx::Rect& rect,
++                   WeaveSubmitCallback callback) override;
++#endif
+ };
+ 
+ }  // namespace content
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index a24a648d50863..0dc94cb81b1e9 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -446,6 +446,13 @@ void ShellContentBrowserClient::AppendExtraCommandLineSwitches(
+   command_line->CopySwitchesFrom(*base::CommandLine::ForCurrentProcess(),
+                                  kForwardSwitches);
+ 
++  // DisplayXR inline-3D (#625, Step B): forward the opt-in to child processes so
++  // the GPU/Viz process registers the weave provider + tags the canvas quad.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d") &&
++      !command_line->HasSwitch("enable-inline-3d")) {
++    command_line->AppendSwitch("enable-inline-3d");
++  }
++
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+           switches::kEnableCrashReporter)) {
+diff --git a/content/shell/common/displayxr_weave.mojom b/content/shell/common/displayxr_weave.mojom
+index 9e44edb40d9f7..51311a9a778d6 100644
+--- a/content/shell/common/displayxr_weave.mojom
++++ b/content/shell/common/displayxr_weave.mojom
+@@ -5,16 +5,48 @@
+ module content.shell.mojom;
+ 
+ import "ui/gfx/geometry/mojom/geometry.mojom";
++import "ui/gfx/mojom/native_handle_types.mojom";
+ 
+ // DisplayXR inline-3D weave bridge (#625, Step B). The GPU/Viz process (where the
+ // canvas SharedImage + present live) calls this per frame; the BROWSER process
+ // hosts it (it owns the unsandboxed OpenXR weave session — the GPU sandbox blocks
+ // the per-frame RPC to displayxr-service; see docs/roadmap/webxr-step-b-design.md).
+ //
+-// B2b proves the channel with just the window-relative rect. B2c extends
+-// WeaveSubmit to carry the pre-weave gfx.mojom.DXGIHandle in, and return the
+-// woven DXGIHandle + fence + tracked eyes.
++// B2c: the GPU process hands a pre-weave side-by-side (SBS) shared texture +
++// the element's window-relative rect; the browser drives xrWeaveSubmitEXT on the
++// B2a present-owner session and returns the woven shared texture + fence + the
++// tracked eyes. Windows-only (the whole inline-3D path is Step-B Windows-only).
++
++// The result of one xrWeaveSubmitEXT (mirrors XrWeaveOutputEXT). The woven
++// texture + fence are valid on the FIRST submit and again on re-allocation
++// (window resize); they are null on steady-state frames where the caller reuses
++// the handles it already opened. fence_value / width / height are valid on every
++// successful submit. The caller (GPU process) takes ownership of the handles.
++[EnableIf=is_win]
++struct DisplayXRWeaveResult {
++  // Woven shared-texture HANDLE (window-sized, premultiplied alpha). Null on
++  // steady-state frames.
++  gfx.mojom.DXGIHandle? woven;
++  // Service->caller shared fence HANDLE. Null on steady-state frames.
++  gfx.mojom.DXGIHandle? fence;
++  // Value the caller GPU-waits the fence to before sampling the woven texture.
++  uint64 fence_value;
++  // Woven texture dimensions (bound-window client area).
++  uint32 width;
++  uint32 height;
++  // Current tracked eye positions (display-space metres), flattened xyz triples,
++  // for the caller's next-frame off-axis projection. Empty until tracked.
++  array<float> eyes;
++  bool eyes_valid;
++};
++
+ interface DisplayXRWeaver {
+-  // Returns true once the browser-side weave client has handled the submission.
+-  WeaveSubmit(gfx.mojom.Rect rect) => (bool ok);
++  // Weave one window sub-rect. |texture| is the pre-weave SBS keyed-mutex shared
++  // texture; |rect| is its window-relative device-pixel placement. Returns the
++  // woven output, or null if the weave failed / the session isn't live.
++  // Synchronous: the GPU thread blocks on the per-frame weave (the CEF-host
++  // model), so the woven texture is ready to sample when the call returns.
++  [Sync, EnableIf=is_win]
++  WeaveSubmit(gfx.mojom.DXGIHandle texture, gfx.mojom.Rect rect)
++      => (DisplayXRWeaveResult? result);
+ };
+diff --git a/content/shell/gpu/displayxr_weave_gpu.cc b/content/shell/gpu/displayxr_weave_gpu.cc
+new file mode 100644
+index 0000000000000..77f615f97d4c5
+--- /dev/null
++++ b/content/shell/gpu/displayxr_weave_gpu.cc
+@@ -0,0 +1,190 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/shell/gpu/displayxr_weave_gpu.h"
++
++#if BUILDFLAG(IS_WIN)
++
++#include <dxgi1_2.h>
++
++#include <utility>
++#include <vector>
++
++#include "base/logging.h"
++#include "base/win/scoped_handle.h"
++#include "content/public/child/child_thread.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
++
++namespace content {
++
++using Microsoft::WRL::ComPtr;
++
++namespace {
++// Static SBS test pattern (B2c.1): left half red, right half blue, in BGRA8 to
++// match the runtime's pre-weave input format. Distinct halves give the woven
++// interlace real left/right parallax, so a successful weave is visible as 3D.
++constexpr uint32_t kLeft = 0xFFFF0000u;   // BGRA bytes 00,00,FF,FF = red
++constexpr uint32_t kRight = 0xFF0000FFu;  // BGRA bytes FF,00,00,FF = blue
++}  // namespace
++
++DisplayXRWeaveGpu::DisplayXRWeaveGpu() = default;
++
++DisplayXRWeaveGpu::~DisplayXRWeaveGpu() {
++  if (input_handle_) {
++    ::CloseHandle(input_handle_);
++    input_handle_ = nullptr;
++  }
++}
++
++void DisplayXRWeaveGpu::Bind() {
++  ChildThread::Get()->BindHostReceiver(weaver_.BindNewPipeAndPassReceiver());
++}
++
++bool DisplayXRWeaveGpu::EnsureSyntheticInput(uint32_t w, uint32_t h) {
++  if (input_tex_ && input_w_ == w && input_h_ == h) {
++    return true;  // already sized + filled
++  }
++  input_tex_.Reset();
++  input_mutex_.Reset();
++  if (input_handle_) {
++    ::CloseHandle(input_handle_);
++    input_handle_ = nullptr;
++  }
++
++  if (!device_) {
++    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
++                                        D3D_FEATURE_LEVEL_11_0};
++    D3D_FEATURE_LEVEL got = {};
++    const HRESULT hr = ::D3D11CreateDevice(
++        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2u,
++        D3D11_SDK_VERSION, &device_, &got, &context_);
++    if (FAILED(hr) || !device_) {
++      LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: D3D11CreateDevice "
++                    "failed: 0x"
++                 << std::hex << hr;
++      return false;
++    }
++  }
++
++  D3D11_TEXTURE2D_DESC td = {};
++  td.Width = w;
++  td.Height = h;
++  td.MipLevels = 1;
++  td.ArraySize = 1;
++  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++  td.SampleDesc.Count = 1;
++  td.Usage = D3D11_USAGE_DEFAULT;
++  td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++  td.MiscFlags =
++      D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
++  HRESULT hr = device_->CreateTexture2D(&td, nullptr, &input_tex_);
++  if (FAILED(hr) || !input_tex_) {
++    LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: CreateTexture2D failed: 0x"
++               << std::hex << hr;
++    return false;
++  }
++  if (FAILED(input_tex_.As(&input_mutex_))) {
++    LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: no keyed mutex";
++    return false;
++  }
++  // The shared handle is opened by the EXTERNAL displayxr-service (not a Chromium
++  // process), and this texture is created in the sandboxed GPU process — its
++  // restricted token would otherwise give the object a DACL the service can't
++  // open. Grant an explicit null DACL (any process may open) so the service can
++  // OpenSharedResource1 it. (Same need will apply to the real canvas export in
++  // B2c.2.)
++  SECURITY_DESCRIPTOR sd = {};
++  ::InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
++  ::SetSecurityDescriptorDacl(&sd, TRUE, /*pDacl=*/nullptr,
++                              /*bDaclDefaulted=*/FALSE);
++  SECURITY_ATTRIBUTES sa = {};
++  sa.nLength = sizeof(sa);
++  sa.lpSecurityDescriptor = &sd;
++  sa.bInheritHandle = FALSE;
++  ComPtr<IDXGIResource1> res1;
++  if (FAILED(input_tex_.As(&res1)) ||
++      FAILED(res1->CreateSharedHandle(
++          &sa, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
++          &input_handle_))) {
++    LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: CreateSharedHandle failed";
++    return false;
++  }
++
++  // Build the SBS test pattern on the CPU and upload it once. Acquire/release
++  // key 0 so the texture is handed off in the "caller done writing" state the
++  // runtime acquires (key 0 = runtime may read).
++  std::vector<uint32_t> pixels(static_cast<size_t>(w) * h);
++  const uint32_t mid = w / 2u;
++  for (uint32_t y = 0; y < h; ++y) {
++    const size_t row = static_cast<size_t>(y) * w;
++    for (uint32_t x = 0; x < w; ++x) {
++      pixels[row + x] = (x < mid) ? kLeft : kRight;
++    }
++  }
++  if (input_mutex_->AcquireSync(0, 1000) != S_OK) {
++    LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: AcquireSync(0) failed";
++    return false;
++  }
++  context_->UpdateSubresource(input_tex_.Get(), 0, nullptr, pixels.data(),
++                              w * 4u, 0);
++  context_->Flush();
++  input_mutex_->ReleaseSync(0);
++
++  input_w_ = w;
++  input_h_ = h;
++  LOG(ERROR) << "[DisplayXR] B2c.1 synthetic SBS input ready " << w << "x" << h
++             << " (NT handle=" << input_handle_ << ")";
++  return true;
++}
++
++viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveSynthetic(
++    const gfx::Rect& window_rect) {
++  Result out;
++  if (!weaver_.is_bound() || window_rect.IsEmpty()) {
++    return out;
++  }
++  if (!EnsureSyntheticInput(static_cast<uint32_t>(window_rect.width()),
++                            static_cast<uint32_t>(window_rect.height()))) {
++    return out;
++  }
++
++  // Duplicate the input handle for the Mojo message (it consumes/duplicates the
++  // handle into the browser process); keep our own for reuse.
++  HANDLE dup = nullptr;
++  if (!::DuplicateHandle(::GetCurrentProcess(), input_handle_,
++                         ::GetCurrentProcess(), &dup, 0, FALSE,
++                         DUPLICATE_SAME_ACCESS) ||
++      !dup) {
++    LOG(ERROR) << "[DisplayXR] B2c.1 weave: DuplicateHandle(input) failed";
++    return out;
++  }
++  gfx::DXGIHandle input{base::win::ScopedHandle(dup)};
++
++  shell::mojom::DisplayXRWeaveResultPtr result;
++  if (!weaver_->WeaveSubmit(std::move(input), window_rect, &result)) {
++    LOG(ERROR) << "[DisplayXR] B2c.1 weave: Sync WeaveSubmit call failed";
++    return out;
++  }
++  if (!result) {
++    return out;  // browser-side weave failed / session not live
++  }
++
++  out.ok = true;
++  out.fence_value = result->fence_value;
++  out.width = result->width;
++  out.height = result->height;
++  if (result->woven) {
++    out.woven_handle = reinterpret_cast<uintptr_t>(
++        result->woven->TakeBufferHandle().release());
++  }
++  if (result->fence) {
++    out.fence_handle = reinterpret_cast<uintptr_t>(
++        result->fence->TakeBufferHandle().release());
++  }
++  return out;
++}
++
++}  // namespace content
++
++#endif  // BUILDFLAG(IS_WIN)
+diff --git a/content/shell/gpu/displayxr_weave_gpu.h b/content/shell/gpu/displayxr_weave_gpu.h
+new file mode 100644
+index 0000000000000..bf450c21698da
+--- /dev/null
++++ b/content/shell/gpu/displayxr_weave_gpu.h
+@@ -0,0 +1,73 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_GPU_DISPLAYXR_WEAVE_GPU_H_
++#define CONTENT_SHELL_GPU_DISPLAYXR_WEAVE_GPU_H_
++
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_WIN)
++
++#include <windows.h>
++
++#include <d3d11.h>
++#include <wrl/client.h>
++
++#include <cstdint>
++
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
++#include "content/shell/common/displayxr_weave.mojom.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace content {
++
++// GPU-process implementation of viz::DisplayXRWeaveProvider (#625 Step B, B2c.1).
++//
++// Owns: (a) the Mojo remote to the browser-process weave bridge (DisplayXRWeaver,
++// which drives the real xrWeaveSubmitEXT), and (b) a synthetic, GPU-owned
++// keyed-mutex side-by-side (SBS) input texture (a static test pattern) standing
++// in for the real canvas texture until B2c.2. Per weave it hands the synthetic
++// input + rect to the browser and returns the woven texture/fence handles to Viz
++// (SkiaOutputSurfaceImplOnGpu), which imports + composites them.
++//
++// Created, bound, and called on the GPU main thread.
++class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
++ public:
++  DisplayXRWeaveGpu();
++  DisplayXRWeaveGpu(const DisplayXRWeaveGpu&) = delete;
++  DisplayXRWeaveGpu& operator=(const DisplayXRWeaveGpu&) = delete;
++  ~DisplayXRWeaveGpu() override;
++
++  // Bind the Mojo remote to the browser weave bridge. Call once on the GPU main
++  // thread (ChildThread must exist).
++  void Bind();
++
++  // viz::DisplayXRWeaveProvider:
++  Result WeaveSynthetic(const gfx::Rect& window_rect) override;
++
++ private:
++  // Lazily (re)create the synthetic SBS input + its shared NT handle at |w|x|h|
++  // and fill the static test pattern. Returns false on failure.
++  bool EnsureSyntheticInput(uint32_t w, uint32_t h);
++
++  mojo::Remote<shell::mojom::DisplayXRWeaver> weaver_;
++
++  // Own D3D11 device (runtime adapter) for the synthetic input, so we never poke
++  // Viz's DirectComposition device/context. The shared NT handle crosses devices
++  // to the service, which opens it on its own device.
++  Microsoft::WRL::ComPtr<ID3D11Device> device_;
++  Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
++  Microsoft::WRL::ComPtr<ID3D11Texture2D> input_tex_;
++  Microsoft::WRL::ComPtr<IDXGIKeyedMutex> input_mutex_;
++  HANDLE input_handle_ = nullptr;  // NT shared handle (owned)
++  uint32_t input_w_ = 0;
++  uint32_t input_h_ = 0;
++};
++
++}  // namespace content
++
++#endif  // BUILDFLAG(IS_WIN)
++
++#endif  // CONTENT_SHELL_GPU_DISPLAYXR_WEAVE_GPU_H_
+diff --git a/content/shell/gpu/shell_content_gpu_client.cc b/content/shell/gpu/shell_content_gpu_client.cc
+index f021e101c0666..a005110f5e54c 100644
+--- a/content/shell/gpu/shell_content_gpu_client.cc
++++ b/content/shell/gpu/shell_content_gpu_client.cc
+@@ -12,16 +12,24 @@
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
+ #if BUILDFLAG(IS_WIN)
++#include <memory>
++
++#include "base/command_line.h"
+ #include "base/logging.h"
+-#include "content/public/child/child_thread.h"
+-#include "ui/gfx/geometry/rect.h"
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #endif
+ 
+ namespace content {
+ 
+ ShellContentGpuClient::ShellContentGpuClient() = default;
+ 
+-ShellContentGpuClient::~ShellContentGpuClient() = default;
++ShellContentGpuClient::~ShellContentGpuClient() {
++#if BUILDFLAG(IS_WIN)
++  if (weave_gpu_) {
++    viz::SetDisplayXRWeaveProvider(nullptr);
++  }
++#endif
++}
+ 
+ void ShellContentGpuClient::ExposeInterfacesToBrowser(
+     viz::GpuServiceImpl* gpu_service,
+@@ -36,17 +44,18 @@ void ShellContentGpuClient::ExposeInterfacesToBrowser(
+ #if BUILDFLAG(IS_WIN)
+ void ShellContentGpuClient::PostCompositorThreadCreated(
+     base::SingleThreadTaskRunner* task_runner) {
+-  // #625 Step B (B2b): one-shot probe proving the GPU->browser weave bridge.
+-  // Runs on the GPU main thread (where ChildThread lives). The browser only
+-  // binds the receiver when --enable-inline-3d is set, so this is dormant
+-  // otherwise (the reply never arrives). B2c replaces this with the per-frame
+-  // weave driven from Viz.
+-  ChildThread::Get()->BindHostReceiver(weaver_.BindNewPipeAndPassReceiver());
+-  weaver_->WeaveSubmit(
+-      gfx::Rect(0, 0, 1, 1), base::BindOnce([](bool ok) {
+-        LOG(ERROR) << "[DisplayXR] B2b GPU->browser WeaveSubmit reply ok=" << ok
+-                   << " — GPU<->browser bridge PASSED";
+-      }));
++  // #625 Step B (B2c): create the GPU-side weave provider on the GPU main thread
++  // (where ChildThread + the DirectComposition device live), bind its Mojo
++  // remote to the browser weave bridge, and register it so Viz
++  // (SkiaOutputSurfaceImplOnGpu) can drive the per-frame weave. Dormant unless
++  // opted in — the browser only binds the bridge under --enable-inline-3d.
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    return;
++  }
++  weave_gpu_ = std::make_unique<DisplayXRWeaveGpu>();
++  weave_gpu_->Bind();
++  viz::SetDisplayXRWeaveProvider(weave_gpu_.get());
++  LOG(ERROR) << "[DisplayXR] B2c GPU weave provider registered";
+ }
+ #endif
+ 
+diff --git a/content/shell/gpu/shell_content_gpu_client.h b/content/shell/gpu/shell_content_gpu_client.h
+index fc5d8418ddd86..8505e1b3ca07d 100644
+--- a/content/shell/gpu/shell_content_gpu_client.h
++++ b/content/shell/gpu/shell_content_gpu_client.h
+@@ -5,12 +5,13 @@
+ #ifndef CONTENT_SHELL_GPU_SHELL_CONTENT_GPU_CLIENT_H_
+ #define CONTENT_SHELL_GPU_SHELL_CONTENT_GPU_CLIENT_H_
+ 
++#include <memory>
++
+ #include "build/build_config.h"
+ #include "content/public/gpu/content_gpu_client.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+-#include "content/shell/common/displayxr_weave.mojom.h"
+-#include "mojo/public/cpp/bindings/remote.h"
++#include "content/shell/gpu/displayxr_weave_gpu.h"
+ #endif
+ 
+ namespace content {
+@@ -31,13 +32,14 @@ class ShellContentGpuClient : public ContentGpuClient {
+       const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
+       mojo::BinderMap* binders) override;
+ #if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B): fire a one-shot probe to the browser's
+-  // weave bridge once the compositor thread exists (B2b channel proof).
++  // DisplayXR inline-3D (#625, Step B): create + register the GPU-side weave
++  // provider once the compositor (GPU main) thread exists, so Viz can drive the
++  // per-frame weave (B2c). Gated on --enable-inline-3d.
+   void PostCompositorThreadCreated(
+       base::SingleThreadTaskRunner* task_runner) override;
+ 
+  private:
+-  mojo::Remote<shell::mojom::DisplayXRWeaver> weaver_;
++  std::unique_ptr<DisplayXRWeaveGpu> weave_gpu_;
+ #endif
+ };
+ 

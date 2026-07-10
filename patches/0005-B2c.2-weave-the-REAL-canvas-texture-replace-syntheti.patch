@@ -1,0 +1,532 @@
+From 656af477c0d3c4a1b327fcde010da4b9f0489c64 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sat, 27 Jun 2026 17:18:17 -0500
+Subject: [PATCH 05/15] B2c.2: weave the REAL canvas texture (replace synthetic
+ SBS input)
+
+#625 Step B. Replaces the B2c.1 synthetic test-pattern input with the
+real tagged canvas texture, so the woven 3D shows the page's own canvas
+pixels.
+
+GPU-thread path (design doc webxr-step-b-design.md s7, step 2):
+- Viz MaybeWeaveSubstitute resolves the tagged canvas quad's
+  ID3D11Texture2D on the GPU thread via a SCANOUT-free overlay
+  representation, then drives the weave from the real canvas.
+- New provider entry WeaveCanvas(device, canvas_tex, slice, src, window)
+  replaces WeaveSynthetic: the input keyed-mutex SBS texture is now
+  allocated on the Viz GPU-main D3D11 device X (== the canvas device)
+  and the canvas sub-rect is CopySubresourceRegion'd into it before the
+  unchanged Mojo weave RPC / woven import / fence-wait / substitute.
+
+Key findings baked into the change:
+- Device identity: content_shell's Graphite-Dawn runs the D3D11 backend
+  (kSkiaGraphiteDawnUseD3D12 default-off) which shares ANGLE's D3D11
+  device, so canvas SI, DComp and context_state_->GetD3D11Device() are
+  one device -> the CopySubresourceRegion is same-device. The provider
+  no longer owns a private device.
+- A normal 2D canvas SI is DISPLAY_READ-only (no SCANOUT), so the manager
+  ProduceOverlay SCANOUT gate would reject it. Added Win-only
+  ProduceOverlayForWeave (SharedImageManager + SharedImageRepresentation-
+  Factory) = ProduceOverlay minus the SCANOUT enforcement; it still
+  yields the D3D overlay representation whose GetDCLayerOverlayImage
+  exposes the canvas ID3D11Texture2D.
+- Input texture format taken from the canvas desc so the copy is always
+  format-legal; canvas desc/format logged once for the BGRA-vs-RGBA risk.
+
+Status: code-complete + builds clean. Live Leia eyeball still PENDING --
+content_shell does not produce compositor frames under the automation
+harness (rAF stuck at 0; foreground/resize/screencast/focus-emulation all
+fail to tick the compositor), the same wall the B2c.1 runtime -2 was
+diagnosed around. The full pipe is proven live up to the bind this
+session: B2a window-bound weave session + GPU provider registered. The
+canvas-pixels-in-3D eyeball needs a genuinely interactive desktop launch.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../displayxr_weave_provider.h                |  18 ++-
+ .../skia_output_surface_impl_on_gpu.cc        |  39 ++++-
+ content/shell/gpu/displayxr_weave_gpu.cc      | 134 ++++++++++--------
+ content/shell/gpu/displayxr_weave_gpu.h       |  37 +++--
+ .../shared_image/shared_image_factory.cc      |   8 ++
+ .../shared_image/shared_image_factory.h       |   7 +
+ .../shared_image/shared_image_manager.cc      |  29 ++++
+ .../shared_image/shared_image_manager.h       |  11 ++
+ 8 files changed, 202 insertions(+), 81 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index 10b7b4d7ff188..c06e73f853b22 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -9,6 +9,8 @@
+ 
+ #if BUILDFLAG(IS_WIN)
+ 
++#include <d3d11.h>
++
+ #include <cstdint>
+ 
+ #include "components/viz/service/viz_service_export.h"
+@@ -42,10 +44,18 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+ 
+   virtual ~DisplayXRWeaveProvider() = default;
+ 
+-  // B2c.1: drive a weave from a synthetic (test-pattern) pre-weave SBS input the
+-  // provider owns. |window_rect| is the element's window-relative device-pixel
+-  // placement. Runs on the GPU main thread (blocks on the synchronous RPC).
+-  virtual Result WeaveSynthetic(const gfx::Rect& window_rect) = 0;
++  // B2c.2: drive a weave from the REAL canvas texture. |device| is the Viz GPU-
++  // main D3D11 device (== the canvas SharedImage's device, so the copy below is
++  // same-device); |canvas_tex| / |array_slice| are the canvas overlay texture
++  // resolved on the GPU thread; |src_rect| is the canvas region to weave;
++  // |window_rect| is its window-relative device-pixel placement. The provider
++  // copies |src_rect| into an owned keyed-mutex SBS input on |device| and drives
++  // the synchronous weave RPC. Runs on the GPU main thread.
++  virtual Result WeaveCanvas(ID3D11Device* device,
++                             ID3D11Texture2D* canvas_tex,
++                             UINT array_slice,
++                             const gfx::Rect& src_rect,
++                             const gfx::Rect& window_rect) = 0;
+ };
+ 
+ // Register / fetch the process-global provider (GPU process, GPU main thread).
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index d2d8eda177072..d3cd80a76e06d 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2689,13 +2689,42 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+   static bool s_logged_target = false;
+   if (!s_logged_target) {
+     s_logged_target = true;
+-    LOG(ERROR) << "[DisplayXR] B2c.1 weave target found; driving synthetic weave";
++    LOG(ERROR) << "[DisplayXR] B2c.2 weave target found; driving canvas weave";
+   }
+ 
+-  // B2c.1: weave the full window from a synthetic SBS input. (B2c.2 will pass
+-  // the real canvas texture + the element's sub-rect.)
+-  const DisplayXRWeaveProvider::Result r =
+-      provider->WeaveSynthetic(gfx::Rect(size_));
++  // B2c.2: resolve the tagged canvas's ID3D11Texture2D on the GPU thread via a
++  // SCANOUT-free overlay representation (a normal 2D canvas SI is DISPLAY_READ-
++  // only, so ProduceOverlay's SCANOUT gate would reject it). Hold the scoped
++  // read access alive across WeaveCanvas: it inserts the canvas-render acquire
++  // sync on device X, and WeaveCanvas copies on that same device synchronously.
++  auto overlay = shared_image_representation_factory_->ProduceOverlayForWeave(
++      target->mailbox());
++  if (!overlay) {
++    return;
++  }
++  auto access = overlay->BeginScopedReadAccess();
++  if (!access) {
++    return;
++  }
++  std::optional<gl::DCLayerOverlayImage> overlay_image =
++      access->GetDCLayerOverlayImage();
++  if (!overlay_image ||
++      overlay_image->type() != gl::DCLayerOverlayType::kD3D11Texture ||
++      !overlay_image->d3d11_video_texture()) {
++    return;
++  }
++  Microsoft::WRL::ComPtr<ID3D11Device> device_x =
++      context_state_->GetD3D11Device();
++  if (!device_x) {
++    return;
++  }
++
++  // The full-window test canvas makes src_rect == window_rect; per-element
++  // sub-rects (Seam D) come in B3.
++  const DisplayXRWeaveProvider::Result r = provider->WeaveCanvas(
++      device_x.Get(), overlay_image->d3d11_video_texture(),
++      static_cast<UINT>(overlay_image->texture_array_slice()), gfx::Rect(size_),
++      gfx::Rect(size_));
+   if (!r.ok) {
+     return;
+   }
+diff --git a/content/shell/gpu/displayxr_weave_gpu.cc b/content/shell/gpu/displayxr_weave_gpu.cc
+index 77f615f97d4c5..970e6e3a91d59 100644
+--- a/content/shell/gpu/displayxr_weave_gpu.cc
++++ b/content/shell/gpu/displayxr_weave_gpu.cc
+@@ -9,7 +9,6 @@
+ #include <dxgi1_2.h>
+ 
+ #include <utility>
+-#include <vector>
+ 
+ #include "base/logging.h"
+ #include "base/win/scoped_handle.h"
+@@ -20,14 +19,6 @@ namespace content {
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+-namespace {
+-// Static SBS test pattern (B2c.1): left half red, right half blue, in BGRA8 to
+-// match the runtime's pre-weave input format. Distinct halves give the woven
+-// interlace real left/right parallax, so a successful weave is visible as 3D.
+-constexpr uint32_t kLeft = 0xFFFF0000u;   // BGRA bytes 00,00,FF,FF = red
+-constexpr uint32_t kRight = 0xFF0000FFu;  // BGRA bytes FF,00,00,FF = blue
+-}  // namespace
+-
+ DisplayXRWeaveGpu::DisplayXRWeaveGpu() = default;
+ 
+ DisplayXRWeaveGpu::~DisplayXRWeaveGpu() {
+@@ -41,9 +32,13 @@ void DisplayXRWeaveGpu::Bind() {
+   ChildThread::Get()->BindHostReceiver(weaver_.BindNewPipeAndPassReceiver());
+ }
+ 
+-bool DisplayXRWeaveGpu::EnsureSyntheticInput(uint32_t w, uint32_t h) {
+-  if (input_tex_ && input_w_ == w && input_h_ == h) {
+-    return true;  // already sized + filled
++bool DisplayXRWeaveGpu::EnsureInput(ID3D11Device* device,
++                                    DXGI_FORMAT format,
++                                    uint32_t w,
++                                    uint32_t h) {
++  if (input_tex_ && device_.Get() == device && input_w_ == w &&
++      input_h_ == h && input_format_ == format) {
++    return true;  // already sized + bound to this device/format
+   }
+   input_tex_.Reset();
+   input_mutex_.Reset();
+@@ -52,27 +47,20 @@ bool DisplayXRWeaveGpu::EnsureSyntheticInput(uint32_t w, uint32_t h) {
+     input_handle_ = nullptr;
+   }
+ 
+-  if (!device_) {
+-    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
+-                                        D3D_FEATURE_LEVEL_11_0};
+-    D3D_FEATURE_LEVEL got = {};
+-    const HRESULT hr = ::D3D11CreateDevice(
+-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2u,
+-        D3D11_SDK_VERSION, &device_, &got, &context_);
+-    if (FAILED(hr) || !device_) {
+-      LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: D3D11CreateDevice "
+-                    "failed: 0x"
+-                 << std::hex << hr;
+-      return false;
+-    }
+-  }
++  // Bind to the Viz GPU-main device (device X) and its immediate context. That
++  // is the same device the canvas overlay texture lives on, so the per-frame
++  // CopySubresourceRegion is a legal same-device copy, serialized with the
++  // canvas render on the one immediate context.
++  device_ = device;
++  context_.Reset();
++  device_->GetImmediateContext(&context_);
+ 
+   D3D11_TEXTURE2D_DESC td = {};
+   td.Width = w;
+   td.Height = h;
+   td.MipLevels = 1;
+   td.ArraySize = 1;
+-  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++  td.Format = format;
+   td.SampleDesc.Count = 1;
+   td.Usage = D3D11_USAGE_DEFAULT;
+   td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+@@ -80,20 +68,19 @@ bool DisplayXRWeaveGpu::EnsureSyntheticInput(uint32_t w, uint32_t h) {
+       D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+   HRESULT hr = device_->CreateTexture2D(&td, nullptr, &input_tex_);
+   if (FAILED(hr) || !input_tex_) {
+-    LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: CreateTexture2D failed: 0x"
++    LOG(ERROR) << "[DisplayXR] B2c.2 input: CreateTexture2D failed: 0x"
+                << std::hex << hr;
+     return false;
+   }
+   if (FAILED(input_tex_.As(&input_mutex_))) {
+-    LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: no keyed mutex";
++    LOG(ERROR) << "[DisplayXR] B2c.2 input: no keyed mutex";
+     return false;
+   }
+   // The shared handle is opened by the EXTERNAL displayxr-service (not a Chromium
+   // process), and this texture is created in the sandboxed GPU process — its
+   // restricted token would otherwise give the object a DACL the service can't
+   // open. Grant an explicit null DACL (any process may open) so the service can
+-  // OpenSharedResource1 it. (Same need will apply to the real canvas export in
+-  // B2c.2.)
++  // OpenSharedResource1 it.
+   SECURITY_DESCRIPTOR sd = {};
+   ::InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+   ::SetSecurityDescriptorDacl(&sd, TRUE, /*pDacl=*/nullptr,
+@@ -107,47 +94,74 @@ bool DisplayXRWeaveGpu::EnsureSyntheticInput(uint32_t w, uint32_t h) {
+       FAILED(res1->CreateSharedHandle(
+           &sa, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+           &input_handle_))) {
+-    LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: CreateSharedHandle failed";
++    LOG(ERROR) << "[DisplayXR] B2c.2 input: CreateSharedHandle failed";
+     return false;
+   }
+ 
+-  // Build the SBS test pattern on the CPU and upload it once. Acquire/release
+-  // key 0 so the texture is handed off in the "caller done writing" state the
+-  // runtime acquires (key 0 = runtime may read).
+-  std::vector<uint32_t> pixels(static_cast<size_t>(w) * h);
+-  const uint32_t mid = w / 2u;
+-  for (uint32_t y = 0; y < h; ++y) {
+-    const size_t row = static_cast<size_t>(y) * w;
+-    for (uint32_t x = 0; x < w; ++x) {
+-      pixels[row + x] = (x < mid) ? kLeft : kRight;
+-    }
+-  }
+-  if (input_mutex_->AcquireSync(0, 1000) != S_OK) {
+-    LOG(ERROR) << "[DisplayXR] B2c.1 synthetic input: AcquireSync(0) failed";
+-    return false;
+-  }
+-  context_->UpdateSubresource(input_tex_.Get(), 0, nullptr, pixels.data(),
+-                              w * 4u, 0);
+-  context_->Flush();
+-  input_mutex_->ReleaseSync(0);
+-
+   input_w_ = w;
+   input_h_ = h;
+-  LOG(ERROR) << "[DisplayXR] B2c.1 synthetic SBS input ready " << w << "x" << h
+-             << " (NT handle=" << input_handle_ << ")";
++  input_format_ = format;
++  LOG(ERROR) << "[DisplayXR] B2c.2 canvas weave input ready " << w << "x" << h
++             << " fmt=" << format << " (NT handle=" << input_handle_ << ")";
+   return true;
+ }
+ 
+-viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveSynthetic(
++viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
++    ID3D11Device* device,
++    ID3D11Texture2D* canvas_tex,
++    UINT array_slice,
++    const gfx::Rect& src_rect,
+     const gfx::Rect& window_rect) {
+   Result out;
+-  if (!weaver_.is_bound() || window_rect.IsEmpty()) {
++  if (!weaver_.is_bound() || window_rect.IsEmpty() || !device || !canvas_tex) {
+     return out;
+   }
+-  if (!EnsureSyntheticInput(static_cast<uint32_t>(window_rect.width()),
+-                            static_cast<uint32_t>(window_rect.height()))) {
++
++  D3D11_TEXTURE2D_DESC cd = {};
++  canvas_tex->GetDesc(&cd);
++  if (!logged_canvas_desc_) {
++    logged_canvas_desc_ = true;
++    LOG(ERROR) << "[DisplayXR] B2c.2 canvas tex " << cd.Width << "x" << cd.Height
++               << " fmt=" << cd.Format << " slice=" << array_slice
++               << " src=" << src_rect.ToString()
++               << " win=" << window_rect.ToString();
++  }
++
++  const uint32_t w = static_cast<uint32_t>(window_rect.width());
++  const uint32_t h = static_cast<uint32_t>(window_rect.height());
++  // Match the input format to the canvas so CopySubresourceRegion is always
++  // legal (a cross-format copy would silently fail -> black).
++  if (!EnsureInput(device, cd.Format, w, h)) {
++    return out;
++  }
++
++  // Copy the canvas sub-rect into the owned keyed-mutex input on device X.
++  // Acquire/release key 0 so the texture is handed off in the "caller done
++  // writing" state the service acquires (key 0 = service may read).
++  D3D11_BOX box = {};
++  box.left = static_cast<UINT>(src_rect.x());
++  box.top = static_cast<UINT>(src_rect.y());
++  box.front = 0;
++  box.right = static_cast<UINT>(src_rect.right());
++  box.bottom = static_cast<UINT>(src_rect.bottom());
++  box.back = 1;
++  // Defensive clamp to the canvas extent (a one-pixel overrun would fail copy).
++  if (box.right > cd.Width) {
++    box.right = cd.Width;
++  }
++  if (box.bottom > cd.Height) {
++    box.bottom = cd.Height;
++  }
++
++  if (input_mutex_->AcquireSync(0, 1000) != S_OK) {
++    LOG(ERROR) << "[DisplayXR] B2c.2 weave: AcquireSync(0) failed";
+     return out;
+   }
++  context_->CopySubresourceRegion(input_tex_.Get(), /*DstSubresource=*/0,
++                                  /*DstX=*/0, /*DstY=*/0, /*DstZ=*/0, canvas_tex,
++                                  array_slice, &box);
++  context_->Flush();
++  input_mutex_->ReleaseSync(0);
+ 
+   // Duplicate the input handle for the Mojo message (it consumes/duplicates the
+   // handle into the browser process); keep our own for reuse.
+@@ -156,14 +170,14 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveSynthetic(
+                          ::GetCurrentProcess(), &dup, 0, FALSE,
+                          DUPLICATE_SAME_ACCESS) ||
+       !dup) {
+-    LOG(ERROR) << "[DisplayXR] B2c.1 weave: DuplicateHandle(input) failed";
++    LOG(ERROR) << "[DisplayXR] B2c.2 weave: DuplicateHandle(input) failed";
+     return out;
+   }
+   gfx::DXGIHandle input{base::win::ScopedHandle(dup)};
+ 
+   shell::mojom::DisplayXRWeaveResultPtr result;
+   if (!weaver_->WeaveSubmit(std::move(input), window_rect, &result)) {
+-    LOG(ERROR) << "[DisplayXR] B2c.1 weave: Sync WeaveSubmit call failed";
++    LOG(ERROR) << "[DisplayXR] B2c.2 weave: Sync WeaveSubmit call failed";
+     return out;
+   }
+   if (!result) {
+diff --git a/content/shell/gpu/displayxr_weave_gpu.h b/content/shell/gpu/displayxr_weave_gpu.h
+index bf450c21698da..207a743a02f72 100644
+--- a/content/shell/gpu/displayxr_weave_gpu.h
++++ b/content/shell/gpu/displayxr_weave_gpu.h
+@@ -26,11 +26,12 @@ namespace content {
+ // GPU-process implementation of viz::DisplayXRWeaveProvider (#625 Step B, B2c.1).
+ //
+ // Owns: (a) the Mojo remote to the browser-process weave bridge (DisplayXRWeaver,
+-// which drives the real xrWeaveSubmitEXT), and (b) a synthetic, GPU-owned
+-// keyed-mutex side-by-side (SBS) input texture (a static test pattern) standing
+-// in for the real canvas texture until B2c.2. Per weave it hands the synthetic
+-// input + rect to the browser and returns the woven texture/fence handles to Viz
+-// (SkiaOutputSurfaceImplOnGpu), which imports + composites them.
++// which drives the real xrWeaveSubmitEXT), and (b) a GPU-owned keyed-mutex
++// side-by-side (SBS) input texture, allocated on the Viz GPU-main D3D11 device
++// (device X), into which the real canvas texture is copied each frame (B2c.2).
++// Per weave it hands the input + rect to the browser and returns the woven
++// texture/fence handles to Viz (SkiaOutputSurfaceImplOnGpu), which imports +
++// composites them.
+ //
+ // Created, bound, and called on the GPU main thread.
+ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+@@ -45,18 +46,28 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   void Bind();
+ 
+   // viz::DisplayXRWeaveProvider:
+-  Result WeaveSynthetic(const gfx::Rect& window_rect) override;
++  Result WeaveCanvas(ID3D11Device* device,
++                     ID3D11Texture2D* canvas_tex,
++                     UINT array_slice,
++                     const gfx::Rect& src_rect,
++                     const gfx::Rect& window_rect) override;
+ 
+  private:
+-  // Lazily (re)create the synthetic SBS input + its shared NT handle at |w|x|h|
+-  // and fill the static test pattern. Returns false on failure.
+-  bool EnsureSyntheticInput(uint32_t w, uint32_t h);
++  // Lazily (re)create the keyed-mutex SBS input + its shared NT handle on
++  // |device| at |w|x|h| with |format|. Recreated on any device/size/format
++  // change. Returns false on failure.
++  bool EnsureInput(ID3D11Device* device,
++                   DXGI_FORMAT format,
++                   uint32_t w,
++                   uint32_t h);
+ 
+   mojo::Remote<shell::mojom::DisplayXRWeaver> weaver_;
+ 
+-  // Own D3D11 device (runtime adapter) for the synthetic input, so we never poke
+-  // Viz's DirectComposition device/context. The shared NT handle crosses devices
+-  // to the service, which opens it on its own device.
++  // The Viz GPU-main D3D11 device (device X, == the canvas SharedImage's device)
++  // the input lives on, plus its immediate context (used for the canvas->input
++  // copy + keyed-mutex acquire/release). Held to detect a device change. The
++  // input's shared NT handle crosses to the external service, which opens it on
++  // its own device.
+   Microsoft::WRL::ComPtr<ID3D11Device> device_;
+   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
+   Microsoft::WRL::ComPtr<ID3D11Texture2D> input_tex_;
+@@ -64,6 +75,8 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   HANDLE input_handle_ = nullptr;  // NT shared handle (owned)
+   uint32_t input_w_ = 0;
+   uint32_t input_h_ = 0;
++  DXGI_FORMAT input_format_ = DXGI_FORMAT_UNKNOWN;
++  bool logged_canvas_desc_ = false;
+ };
+ 
+ }  // namespace content
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.cc b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+index 024b928341808..1af4b17e4e399 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+@@ -1194,6 +1194,14 @@ SharedImageRepresentationFactory::ProduceOverlay(const gpu::Mailbox& mailbox) {
+   return manager_->ProduceOverlay(mailbox, memory_type_tracker_.get());
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++std::unique_ptr<OverlayImageRepresentation>
++SharedImageRepresentationFactory::ProduceOverlayForWeave(
++    const gpu::Mailbox& mailbox) {
++  return manager_->ProduceOverlayForWeave(mailbox, memory_type_tracker_.get());
++}
++#endif
++
+ std::unique_ptr<MemoryImageRepresentation>
+ SharedImageRepresentationFactory::ProduceMemory(const gpu::Mailbox& mailbox) {
+   return manager_->ProduceMemory(mailbox, memory_type_tracker_.get());
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.h b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+index 30d7b8811058b..f8aca62c5ceb5 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+@@ -305,6 +305,13 @@ class GPU_GLES2_EXPORT SharedImageRepresentationFactory {
+       scoped_refptr<SharedContextState> context_state);
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox);
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B2c.2): SCANOUT-free overlay produce used
++  // to read a (DISPLAY_READ-only) canvas texture on the GPU thread for the weave
++  // copy. See SharedImageManager::ProduceOverlayForWeave.
++  std::unique_ptr<OverlayImageRepresentation> ProduceOverlayForWeave(
++      const Mailbox& mailbox);
++#endif
+   std::unique_ptr<MemoryImageRepresentation> ProduceMemory(
+       const Mailbox& mailbox);
+   std::unique_ptr<RasterImageRepresentation> ProduceRaster(
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.cc b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+index efa9b5af0509b..5b25867dac708 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+@@ -384,6 +384,35 @@ std::unique_ptr<OverlayImageRepresentation> SharedImageManager::ProduceOverlay(
+   return representation;
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++std::unique_ptr<OverlayImageRepresentation>
++SharedImageManager::ProduceOverlayForWeave(const gpu::Mailbox& mailbox,
++                                           gpu::MemoryTypeTracker* tracker) {
++  CALLED_ON_VALID_THREAD();
++
++  AutoLock autolock(this);
++  auto* backing = GetBacking(mailbox);
++  if (!backing) {
++    LOG(ERROR) << "SharedImageManager::ProduceOverlayForWeave: non-existent "
++                  "mailbox.";
++    return nullptr;
++  }
++
++  // No SCANOUT enforcement here (see header): the canvas SI is DISPLAY_READ-only
++  // but the D3D overlay representation still exposes its ID3D11Texture2D, which
++  // is all the weave copy needs.
++  auto representation = backing->ProduceOverlay(this, tracker);
++  if (!representation) {
++    LOG(ERROR) << "SharedImageManager::ProduceOverlayForWeave: incompatible "
++                  "backing: "
++               << backing->GetName();
++    return nullptr;
++  }
++
++  return representation;
++}
++#endif  // BUILDFLAG(IS_WIN)
++
+ std::unique_ptr<MemoryImageRepresentation> SharedImageManager::ProduceMemory(
+     const Mailbox& mailbox,
+     MemoryTypeTracker* tracker) {
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.h b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+index f871108f5afeb..40fd5bfea6163 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+@@ -117,6 +117,17 @@ class GPU_GLES2_EXPORT SharedImageManager
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B2c.2). Identical to ProduceOverlay but
++  // WITHOUT the SCANOUT usage enforcement: a normal 2D canvas SharedImage is
++  // allocated DISPLAY_READ-only (no SCANOUT), yet the overlay representation is
++  // the GPU-thread path that exposes the canvas ID3D11Texture2D (via
++  // GetDCLayerOverlayImage). Used only to read the canvas texture for the weave
++  // copy; never to actually scan out. Win-only, feature-gated by the caller.
++  std::unique_ptr<OverlayImageRepresentation> ProduceOverlayForWeave(
++      const Mailbox& mailbox,
++      MemoryTypeTracker* ref);
++#endif
+   std::unique_ptr<MemoryImageRepresentation> ProduceMemory(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);

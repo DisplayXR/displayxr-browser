@@ -1,0 +1,509 @@
+From 44d39f2d939bad69e151b0bf34effe6d7ee7c2b4 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 9 Jul 2026 16:50:07 -0700
+Subject: [PATCH 15/15] =?UTF-8?q?inline-3d(#625)=20B4d:=20GPU-resident=20w?=
+ =?UTF-8?q?eave=20=E2=80=94=20skip=20the=20per-frame=20CPU=20readback=20(D?=
+ =?UTF-8?q?Comp)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace the DComp weave path's GPU->CPU->GPU sub-rect readback (SkSurface::readPixels /
+Graphite asyncRescaleAndReadPixelsAndSubmit -> DisplayXRWeaveProvider::WeavePixels) with a
+GPU-resident copy: the composited sub-rect is Skia-copied into an owned scratch
+D3DImageBacking, its ID3D11Texture2D is obtained via ProduceOverlayForWeave, and
+CopySubresourceRegion'd straight into the keyed-mutex weave input via the already-present
+(previously dead) WeaveCanvas provider primitive. Eliminates the synchronous
+compositor-GPU-thread readback stall — the real cost, which scales with the multi-element
+spatial-desktop vision, not the ~7.6 MB.
+
+WeaveCompositedSurface gains a prefer_zero_copy arg: true from MaybeWeaveRootRenderPass
+(DComp root pass, D3D-backed), false from MaybeWeaveOutput (the GL
+--disable-direct-composition path keeps the WeavePixels readback — the ANGLE backbuffer has
+no extractable texture). Any zero-copy step failing falls back to WeavePixels for that rect
+(still correct); the first fallback reason logs once at VLOG(1).
+
+Two structural gotchas resolved under Graphite-Dawn:
+- SCANOUT passes ProduceOverlay's manager gate but forces want_dcomp_texture
+  (d3d_image_backing_factory.cc), so the overlay image is a DComp visual
+  (kDCompVisualContent), not a raw texture. The scratch is therefore non-SCANOUT and read
+  via ProduceOverlayForWeave — ProduceOverlay minus the SCANOUT enforcement — restored to
+  SharedImageManager/RepresentationFactory (added in B2c.2 656af477, removed as dead code in
+  B4b 14efab4d).
+- A plain DISPLAY-only image is claimed by WrappedSkImageBackingFactory (no overlay) before
+  D3DImageBackingFactory. Adding CPU_READ usage (in D3D's supported set, absent from
+  WrappedSkImage's Graphite set and DComp's, and not a want_dcomp_texture trigger) routes the
+  scratch to a plain, overlay-exposable D3DImageBacking (kD3D11Texture).
+
+Validated on Leia (RTX 3080): DComp run logs "weave: GPU-resident scratch path (no CPU
+readback)" + WeaveCanvas + service leia_dp_d3d11_process_atlas weave, zero 0x80070057, user
+eyeball glasses-free 3D. GL run (--disable-direct-composition) unchanged: WeavePixels
+fallback, GPU-resident marker + root-pass hook absent.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 267 +++++++++++++++---
+ .../skia_output_surface_impl_on_gpu.h         |  24 +-
+ .../shared_image/shared_image_factory.cc      |   8 +
+ .../shared_image/shared_image_factory.h       |   7 +
+ .../shared_image/shared_image_manager.cc      |  30 ++
+ .../shared_image/shared_image_manager.h       |  12 +
+ 6 files changed, 302 insertions(+), 46 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 93e3a629589f1..8ed4872ea2a9b 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -109,6 +109,7 @@
+ #include "components/viz/service/display_embedder/skia_output_device_dcomp.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+ #include "ui/gfx/win/d3d_shared_fence.h"
++#include "ui/gl/dc_layer_overlay_image.h"
+ #include "ui/gl/direct_composition_support.h"
+ #endif
+ 
+@@ -2709,7 +2710,9 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+   if (!output || !out_canvas) {
+     return;
+   }
+-  WeaveCompositedSurface(output, out_canvas);
++  // GL output-device backbuffer (ANGLE): no easily-extractable ID3D11Texture2D,
++  // so keep the WeavePixels CPU readback here.
++  WeaveCompositedSurface(output, out_canvas, /*prefer_zero_copy=*/false);
+ }
+ 
+ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+@@ -2731,11 +2734,17 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+             << surface->width() << "x" << surface->height()
+             << " rects=" << inline_3d_rects_.size();
+   }
+-  WeaveCompositedSurface(surface, surface->getCanvas());
++  // DComp root backing is a D3D-backed swap-chain image — prefer the GPU-
++  // resident weave (Skia scratch copy -> ProduceOverlay -> WeaveCanvas), no CPU
++  // readback. Falls back to WeavePixels per-rect if the scratch overlay route
++  // fails.
++  WeaveCompositedSurface(surface, surface->getCanvas(),
++                         /*prefer_zero_copy=*/true);
+ }
+ 
+ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+-                                                        SkCanvas* out_canvas) {
++                                                        SkCanvas* out_canvas,
++                                                        bool prefer_zero_copy) {
+   auto* provider = GetDisplayXRWeaveProvider();
+   if (!provider) {
+     return;
+@@ -2773,6 +2782,19 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   }
+   displayxr_woven_state_.resize(inline_3d_rects_.size());
+ 
++  // Same prune for the B4d GPU-resident weave scratch SharedImages.
++  if (displayxr_scratch_state_.size() > inline_3d_rects_.size()) {
++    for (size_t i = inline_3d_rects_.size();
++         i < displayxr_scratch_state_.size(); ++i) {
++      if (!displayxr_scratch_state_[i].mailbox.IsZero()) {
++        shared_image_factory_->DestroySharedImage(
++            displayxr_scratch_state_[i].mailbox);
++        skia_representations_.erase(displayxr_scratch_state_[i].mailbox);
++      }
++    }
++  }
++  displayxr_scratch_state_.resize(inline_3d_rects_.size());
++
+   // (D) Per rect: weave the composited sub-rect and draw the woven result back
+   // over the output. Serialized (the provider reuses one keyed-mutex input +
+   // one woven output), mirroring the CEF host's per-element loop.
+@@ -2808,52 +2830,209 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       continue;
+     }
+ 
+-    // Read the composited sub-rect back to CPU (BGRA8), then upload it into the
+-    // weave input. Ganesh has a synchronous SkSurface::readPixels; Graphite has
+-    // no sync readback, so it uses the blocking-async path. Read from the output
+-    // SkSurface (it knows its own recording context and flushes as needed). We
+-    // read before drawing the woven back, so there is no read/write hazard.
+     const int rw = rect.width();
+     const int rh = rect.height();
+-    const SkImageInfo info = SkImageInfo::Make(
+-        rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+-        SkColorSpace::MakeSRGB());
+-
+-    const uint8_t* src_pixels = nullptr;
+-    size_t src_stride = 0;
+-    std::vector<uint8_t> ganesh_pixels;    // owns the Ganesh sync-read pixels
+-    WeaveReadPixelsContext read_ctx;       // owns the Graphite async-read result
+-    if (auto* graphite = context_state_->graphite_shared_context()) {
+-      // Graphite: blocking-async rescale+read of the sub-rect (identity scale —
+-      // dst dims == src rect dims), submitting + waiting so the pixels are ready
+-      // synchronously. FlushGraphiteRecorder() first so the just-drawn output is
+-      // committed before the read.
+-      context_state_->FlushGraphiteRecorder();
+-      graphite->asyncRescaleAndReadPixelsAndSubmit(
+-          output, info, SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh),
+-          SkImage::RescaleGamma::kSrc, SkImage::RescaleMode::kRepeatedLinear,
+-          base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone), &read_ctx);
+-      if (!read_ctx.finished || !read_ctx.async_result ||
+-          read_ctx.async_result->count() != 1) {
+-        continue;
+-      }
+-      src_pixels =
+-          reinterpret_cast<const uint8_t*>(read_ctx.async_result->data(0));
+-      src_stride = read_ctx.async_result->rowBytes(0);
+-    } else {
+-      // Ganesh: synchronous readback into a local buffer.
+-      const size_t stride = static_cast<size_t>(rw) * 4;
+-      ganesh_pixels.resize(stride * rh);
+-      if (!output->readPixels(info, ganesh_pixels.data(), stride, rect.x(),
+-                              rect.y())) {
+-        continue;
++
++    DisplayXRWeaveProvider::Result r;
++    bool wove = false;
++
++    // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the composited
++    // sub-rect on the GPU instead of the readPixels roundtrip: Skia-copy it into
++    // an owned SCANOUT scratch D3DImageBacking, ProduceOverlay its raw
++    // ID3D11Texture2D, and WeaveCanvas it straight into the keyed-mutex weave
++    // input. No hazard with the root backing's open write access — we snapshot
++    // |output| (as readPixels already does) and only ProduceOverlay a *separate*
++    // scratch mailbox. Any step failing falls through to the CPU readback below.
++    if (prefer_zero_copy) {
++      wove = [&]() -> bool {
++        // If any step fails we fall back to the WeavePixels CPU readback (still
++        // correct), logging the first reason once at VLOG(1) so a future
++        // regression is diagnosable without spamming default chrome.
++        static bool logged_fail = false;
++        auto fail = [&](const char* why) -> bool {
++          if (!logged_fail) {
++            logged_fail = true;
++            VLOG(1) << "[DisplayXR] B4d zero-copy fell back to WeavePixels: "
++                    << why;
++          }
++          return false;
++        };
++        DisplayXRScratchState& sc = displayxr_scratch_state_[i];
++        // (1) Ensure an owned DISPLAY_READ/WRITE (NON-SCANOUT) D3DImageBacking
++        // scratch sized to |rect|. Non-scanout is deliberate: a SCANOUT backing
++        // on Windows becomes a DComp visual (want_dcomp_texture in
++        // d3d_image_backing_factory.cc) whose overlay image is NOT a raw texture
++        // (kDCompVisualContent); a plain DISPLAY backing keeps a sampleable
++        // ID3D11Texture2D, read below via the SCANOUT-gate-free
++        // ProduceOverlayForWeave. BGRA8 matches |output|.
++        if (sc.mailbox.IsZero() || sc.size != rect.size()) {
++          if (!sc.mailbox.IsZero()) {
++            shared_image_factory_->DestroySharedImage(sc.mailbox);
++            skia_representations_.erase(sc.mailbox);
++            sc.mailbox = gpu::Mailbox();
++          }
++          gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++          gpu::SharedImageInfo si_info(
++              SinglePlaneFormat::kBGRA_8888, rect.size(),
++              gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++              kPremul_SkAlphaType,
++              gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++                  gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE |
++                  // CPU_READ forces D3DImageBackingFactory: under Graphite-Dawn a
++                  // plain DISPLAY-only image is claimed by WrappedSkImageBacking
++                  // (no overlay). CPU_READ is in D3D's supported set but not
++                  // WrappedSkImage's / DComp's, and (unlike SCANOUT) does NOT set
++                  // want_dcomp_texture, so the backing stays a plain, overlay-
++                  // exposable ID3D11Texture2D (kD3D11Texture).
++                  gpu::SHARED_IMAGE_USAGE_CPU_READ,
++              "DisplayXRScratch");
++          if (!shared_image_factory_->CreateSharedImage(
++                  mailbox, si_info, gpu::kNullSurfaceHandle)) {
++            return fail("CreateSharedImage(scratch)");
++          }
++          sc.mailbox = mailbox;
++          sc.size = rect.size();
++        }
++
++        // (2) GPU Skia-copy the composited sub-rect into the scratch surface.
++        {
++          auto scratch_rep = shared_image_representation_factory_->ProduceSkia(
++              sc.mailbox, context_state_.get());
++          if (!scratch_rep) {
++            return fail("ProduceSkia(scratch)");
++          }
++          std::vector<GrBackendSemaphore> sbegin, send;
++          SkSurfaceProps props;
++          auto scratch_write = scratch_rep->BeginScopedWriteAccess(
++              /*final_msaa_count=*/0, props, &sbegin, &send,
++              gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++          if (!scratch_write || !scratch_write->surface()) {
++            return fail("BeginScopedWriteAccess(scratch)");
++          }
++          SkSurface* scratch_surface = scratch_write->surface();
++          if (!sbegin.empty()) {
++            scratch_surface->wait(sbegin.size(), sbegin.data(),
++                                  /*deleteSemaphoresAfterWait=*/false);
++          }
++          // Commit the just-drawn output before snapshotting it (Graphite is
++          // deferred; Ganesh handles this in makeImageSnapshot).
++          if (context_state_->graphite_shared_context()) {
++            context_state_->FlushGraphiteRecorder();
++          }
++          sk_sp<SkImage> src_img = output->makeImageSnapshot(
++              SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
++          if (!src_img) {
++            return fail("makeImageSnapshot");
++          }
++          SkPaint paint;
++          paint.setBlendMode(SkBlendMode::kSrc);
++          scratch_surface->getCanvas()->drawImageRect(
++              src_img.get(), SkRect::MakeWH(rw, rh), SkRect::MakeWH(rw, rh),
++              SkSamplingOptions(SkFilterMode::kNearest), &paint,
++              SkCanvas::kStrict_SrcRectConstraint);
++          FlushSurface(scratch_surface, send, scratch_write.get());
++          if (gr_context()) {
++            gr_context()->submit();
++          }
++          if (graphite_shared_context()) {
++            graphite_shared_context()->submit();
++          }
++          // scratch_write / scratch_rep release here; content is submitted.
++        }
++
++        // (3) ProduceOverlayForWeave the scratch (SCANOUT-gate-free) to get its
++        // raw ID3D11Texture2D.
++        auto overlay_rep =
++            shared_image_representation_factory_->ProduceOverlayForWeave(
++                sc.mailbox);
++        if (!overlay_rep) {
++          return fail("ProduceOverlayForWeave(scratch)");
++        }
++        auto overlay_read = overlay_rep->BeginScopedReadAccess();
++        if (!overlay_read) {
++          return fail("overlay BeginScopedReadAccess");
++        }
++        std::optional<gl::DCLayerOverlayImage> ov =
++            overlay_read->GetDCLayerOverlayImage();
++        if (!ov || ov->type() != gl::DCLayerOverlayType::kD3D11Texture ||
++            !ov->d3d11_video_texture()) {
++          if (!logged_fail) {
++            logged_fail = true;
++            VLOG(1) << "[DisplayXR] B4d zero-copy fell back to WeavePixels: "
++                       "overlay not kD3D11Texture (has_value="
++                    << ov.has_value() << " type="
++                    << (ov ? static_cast<int>(ov->type()) : -1) << ")";
++          }
++          return false;  // not a raw texture -> caller falls back to readback
++        }
++
++        // (4) GPU-resident weave: CopySubresourceRegion scratch -> keyed-mutex
++        // input, then submit to the service. WeaveCanvas is synchronous, so the
++        // overlay read access stays valid across it.
++        r = provider->WeaveCanvas(
++            device_x.Get(), ov->d3d11_video_texture(),
++            static_cast<UINT>(ov->texture_array_slice()),
++            gfx::Rect(0, 0, rw, rh), rect);
++        static bool logged_zc = false;
++        if (r.ok && !logged_zc) {
++          logged_zc = true;
++          VLOG(1) << "[DisplayXR] weave: GPU-resident scratch path (no CPU "
++                     "readback) "
++                  << rw << "x" << rh;
++        }
++        return r.ok;
++      }();
++    }
++
++    if (!wove) {
++      // CPU-readback fallback (GL output device, or a failed zero-copy step):
++      // read the composited sub-rect back to CPU (BGRA8) and upload it into the
++      // weave input. Ganesh has a synchronous SkSurface::readPixels; Graphite
++      // has no sync readback, so it uses the blocking-async path. Read from the
++      // output SkSurface (it knows its own recording context and flushes as
++      // needed) before drawing the woven back, so there is no read/write hazard.
++      const SkImageInfo info = SkImageInfo::Make(
++          rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
++          SkColorSpace::MakeSRGB());
++
++      const uint8_t* src_pixels = nullptr;
++      size_t src_stride = 0;
++      std::vector<uint8_t> ganesh_pixels;  // owns the Ganesh sync-read pixels
++      WeaveReadPixelsContext read_ctx;     // owns the Graphite async-read result
++      if (auto* graphite = context_state_->graphite_shared_context()) {
++        // Graphite: blocking-async rescale+read of the sub-rect (identity scale
++        // — dst dims == src rect dims), submitting + waiting so the pixels are
++        // ready synchronously. FlushGraphiteRecorder() first so the just-drawn
++        // output is committed before the read.
++        context_state_->FlushGraphiteRecorder();
++        graphite->asyncRescaleAndReadPixelsAndSubmit(
++            output, info, SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh),
++            SkImage::RescaleGamma::kSrc, SkImage::RescaleMode::kRepeatedLinear,
++            base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone),
++            &read_ctx);
++        if (!read_ctx.finished || !read_ctx.async_result ||
++            read_ctx.async_result->count() != 1) {
++          continue;
++        }
++        src_pixels =
++            reinterpret_cast<const uint8_t*>(read_ctx.async_result->data(0));
++        src_stride = read_ctx.async_result->rowBytes(0);
++      } else {
++        // Ganesh: synchronous readback into a local buffer.
++        const size_t stride = static_cast<size_t>(rw) * 4;
++        ganesh_pixels.resize(stride * rh);
++        if (!output->readPixels(info, ganesh_pixels.data(), stride, rect.x(),
++                                rect.y())) {
++          continue;
++        }
++        src_pixels = ganesh_pixels.data();
++        src_stride = stride;
+       }
+-      src_pixels = ganesh_pixels.data();
+-      src_stride = stride;
++
++      r = provider->WeavePixels(device_x.Get(), src_pixels,
++                                static_cast<uint32_t>(src_stride), rect);
+     }
+ 
+-    const DisplayXRWeaveProvider::Result r = provider->WeavePixels(
+-        device_x.Get(), src_pixels, static_cast<uint32_t>(src_stride), rect);
+     if (!r.ok) {
+       continue;
+     }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 78670455d090e..50dce6fd8e90f 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -510,8 +510,15 @@ class SkiaOutputSurfaceImplOnGpu
+ 
+   // Shared weave loop for both output paths: for each inline_3d_rects_ entry,
+   // read the composited sub-rect out of |output|, weave it, and draw the woven
+-  // result back over |out_canvas| at that rect.
+-  void WeaveCompositedSurface(SkSurface* output, SkCanvas* out_canvas);
++  // result back over |out_canvas| at that rect. When |prefer_zero_copy| is true
++  // (DComp root render-pass path, where |output| is D3D-backed) the sub-rect is
++  // moved to the weave input GPU-resident (Skia copy into an owned scratch
++  // D3DImageBacking -> ProduceOverlay ID3D11Texture2D -> WeaveCanvas), skipping
++  // the GPU->CPU->GPU readback; false (GL output-device path) keeps the
++  // WeavePixels CPU readback (the ANGLE backbuffer has no extractable texture).
++  void WeaveCompositedSurface(SkSurface* output,
++                              SkCanvas* out_canvas,
++                              bool prefer_zero_copy);
+ #endif
+ 
+   class ReleaseCurrent {
+@@ -666,6 +673,19 @@ class SkiaOutputSurfaceImplOnGpu
+     scoped_refptr<gfx::D3DSharedFence> fence;
+   };
+   std::vector<DisplayXRWovenState> displayxr_woven_state_;
++
++  // DisplayXR inline-3D (#625, Step B / B4d — GPU-resident weave) scratch
++  // SharedImage state. Per inline-3d rect (index-keyed), |mailbox| is an owned
++  // SCANOUT D3DImageBacking sized to the rect: the composited sub-rect is GPU
++  // Skia-copied into it, then ProduceOverlay yields its ID3D11Texture2D for a
++  // same-device CopySubresourceRegion into the keyed-mutex weave input
++  // (WeaveCanvas). Only used on the DComp (prefer_zero_copy) path. Owned by
++  // shared_image_factory_ and destroyed with DestroyAllSharedImages().
++  struct DisplayXRScratchState {
++    gpu::Mailbox mailbox;
++    gfx::Size size;
++  };
++  std::vector<DisplayXRScratchState> displayxr_scratch_state_;
+ #endif
+ 
+   THREAD_CHECKER(thread_checker_);
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.cc b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+index 024b928341808..1af4b17e4e399 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+@@ -1194,6 +1194,14 @@ SharedImageRepresentationFactory::ProduceOverlay(const gpu::Mailbox& mailbox) {
+   return manager_->ProduceOverlay(mailbox, memory_type_tracker_.get());
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++std::unique_ptr<OverlayImageRepresentation>
++SharedImageRepresentationFactory::ProduceOverlayForWeave(
++    const gpu::Mailbox& mailbox) {
++  return manager_->ProduceOverlayForWeave(mailbox, memory_type_tracker_.get());
++}
++#endif
++
+ std::unique_ptr<MemoryImageRepresentation>
+ SharedImageRepresentationFactory::ProduceMemory(const gpu::Mailbox& mailbox) {
+   return manager_->ProduceMemory(mailbox, memory_type_tracker_.get());
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.h b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+index 30d7b8811058b..dfe39d8c629d5 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+@@ -305,6 +305,13 @@ class GPU_GLES2_EXPORT SharedImageRepresentationFactory {
+       scoped_refptr<SharedContextState> context_state);
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox);
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B): SCANOUT-free overlay produce used to read
++  // a (DISPLAY_READ/WRITE, non-SCANOUT) D3DImageBacking's ID3D11Texture2D on the
++  // GPU thread for the weave copy. See SharedImageManager::ProduceOverlayForWeave.
++  std::unique_ptr<OverlayImageRepresentation> ProduceOverlayForWeave(
++      const Mailbox& mailbox);
++#endif
+   std::unique_ptr<MemoryImageRepresentation> ProduceMemory(
+       const Mailbox& mailbox);
+   std::unique_ptr<RasterImageRepresentation> ProduceRaster(
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.cc b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+index efa9b5af0509b..4422c45111df0 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+@@ -384,6 +384,36 @@ std::unique_ptr<OverlayImageRepresentation> SharedImageManager::ProduceOverlay(
+   return representation;
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++std::unique_ptr<OverlayImageRepresentation>
++SharedImageManager::ProduceOverlayForWeave(const gpu::Mailbox& mailbox,
++                                           gpu::MemoryTypeTracker* tracker) {
++  CALLED_ON_VALID_THREAD();
++
++  AutoLock autolock(this);
++  auto* backing = GetBacking(mailbox);
++  if (!backing) {
++    LOG(ERROR) << "SharedImageManager::ProduceOverlayForWeave: non-existent "
++                  "mailbox.";
++    return nullptr;
++  }
++
++  // No SCANOUT enforcement here (see header): the weave source SI is
++  // DISPLAY_READ/WRITE-only (no SCANOUT, so it stays a plain D3DImageBacking
++  // rather than a DComp visual), yet the D3D overlay representation still
++  // exposes its ID3D11Texture2D, which is all the weave copy needs.
++  auto representation = backing->ProduceOverlay(this, tracker);
++  if (!representation) {
++    LOG(ERROR) << "SharedImageManager::ProduceOverlayForWeave: incompatible "
++                  "backing: "
++               << backing->GetName();
++    return nullptr;
++  }
++
++  return representation;
++}
++#endif  // BUILDFLAG(IS_WIN)
++
+ std::unique_ptr<MemoryImageRepresentation> SharedImageManager::ProduceMemory(
+     const Mailbox& mailbox,
+     MemoryTypeTracker* tracker) {
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.h b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+index f871108f5afeb..62ecba1d8f867 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+@@ -117,6 +117,18 @@ class GPU_GLES2_EXPORT SharedImageManager
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B). Identical to ProduceOverlay but WITHOUT
++  // the SCANOUT usage enforcement: the overlay representation is the GPU-thread
++  // path that exposes a backing's ID3D11Texture2D (via GetDCLayerOverlayImage),
++  // which is all the weave copy needs. A SCANOUT backing on Windows becomes a
++  // DComp visual (want_dcomp_texture), so the weave source is a DISPLAY_READ/
++  // WRITE (non-SCANOUT) D3DImageBacking read through this gate-free path; never
++  // to actually scan out. Win-only, feature-gated by the caller.
++  std::unique_ptr<OverlayImageRepresentation> ProduceOverlayForWeave(
++      const Mailbox& mailbox,
++      MemoryTypeTracker* ref);
++#endif
+   std::unique_ptr<MemoryImageRepresentation> ProduceMemory(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);

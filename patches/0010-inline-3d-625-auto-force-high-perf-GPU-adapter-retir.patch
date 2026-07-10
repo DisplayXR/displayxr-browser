@@ -1,0 +1,145 @@
+From 3622143ef39e0a71977f8df68f72bca661b113e4 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 7 Jul 2026 18:43:26 -0700
+Subject: [PATCH 10/15] =?UTF-8?q?inline-3d(#625):=20auto-force=20high-perf?=
+ =?UTF-8?q?=20GPU=20adapter=20=E2=80=94=20retire=20--force=5Fhigh=5Fperfor?=
+ =?UTF-8?q?mance=5Fgpu?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Blocker #5 (dual-GPU cross-adapter NT-handle share). The DisplayXR service
+creates the NT-shared keyed-mutex weave input on the runtime's adapter (the
+high-performance NVIDIA GPU, per xrGetD3D11GraphicsRequirementsKHR). On a
+dual-GPU laptop chrome's GPU process defaulted to the Intel iGPU, so the
+service's OpenSharedResource(NT) failed cross-adapter (E_INVALIDARG /
+0x80070057). The manual --force_high_performance_gpu launch flag aligned them.
+
+Make it automatic under --enable-inline-3d: the existing DisplayXR block in
+ContentBrowserClient::AppendExtraCommandLineSwitches (chrome + content_shell)
+now appends the FORCE_HIGH_PERFORMANCE_GPU driver-bug workaround switch to the
+gpu-process child command line. This is provably equivalent to the flag — the
+underscore --force_high_performance_gpu IS that workaround name, which
+gpu_process_host.cc translates the dashed switches::kForceHighPerformanceGPU
+into; both converge on FORCE_HIGH_PERFORMANCE_GPU, driving ANGLE EGL_HIGH_POWER
+and Dawn HighPerformance adapter selection in the GPU process.
+
+Added //gpu/config to content_shell's is_win deps (chrome/browser already had
+it) for gpu::GpuDriverBugWorkaroundTypeToString.
+
+Verified on the Leia box with the flag removed: the GPU weave device's adapter
+LUID matched the runtime's (…0001b9d9) and the weave fired
+(leia_dp_d3d11_process_atlas weave: vp=(374,920 1810x1054)) with zero
+0x80070057. The three --disable-features crutches (TreesInViz, SkiaGraphite)
+remain as separate follow-ups.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../browser/chrome_content_browser_client.cc  | 26 ++++++++++++++++---
+ content/shell/BUILD.gn                        |  4 +++
+ .../browser/shell_content_browser_client.cc   | 26 ++++++++++++++++---
+ 3 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index d791d1896ac5b..59563cbd9dcdd 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -382,6 +382,7 @@
+ #include "extensions/common/switches.h"
+ #include "google_apis/gaia/gaia_urls.h"
+ #include "google_apis/google_api_keys.h"
++#include "gpu/config/gpu_driver_bug_workaround_type.h"
+ #include "gpu/config/gpu_switches.h"
+ #include "ipc/ipc_channel_proxy.h"
+ #include "media/base/media_switches.h"
+@@ -2835,9 +2836,28 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+   // DisplayXR inline-3D (#625, Step B / B4): forward the opt-in to child
+   // processes so the GPU/Viz process registers the weave provider + tags the
+   // canvas quad. Dormant unless requested.
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d") &&
+-      !command_line->HasSwitch("enable-inline-3d")) {
+-    command_line->AppendSwitch("enable-inline-3d");
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    if (!command_line->HasSwitch("enable-inline-3d")) {
++      command_line->AppendSwitch("enable-inline-3d");
++    }
++#if BUILDFLAG(IS_WIN)
++    // The weave input is an NT-shared keyed-mutex D3D11 texture the DisplayXR
++    // service creates on the runtime's adapter — the high-performance discrete
++    // GPU, selected by xrGetD3D11GraphicsRequirementsKHR. On a dual-GPU laptop
++    // chrome's GPU process defaults to the integrated GPU, so the service's
++    // OpenSharedResource(NT) on that handle fails cross-adapter (E_INVALIDARG).
++    // Force the GPU process onto the high-performance adapter so its device
++    // (context_state_->GetD3D11Device(), used for the weave input) shares the
++    // runtime's adapter. This is the automatic equivalent of the manual
++    // --force_high_performance_gpu launch flag (#625 blocker #5).
++    const std::string force_hp_gpu = gpu::GpuDriverBugWorkaroundTypeToString(
++        gpu::FORCE_HIGH_PERFORMANCE_GPU);
++    if (command_line->GetSwitchValueASCII(switches::kProcessType) ==
++            switches::kGpuProcess &&
++        !command_line->HasSwitch(force_hp_gpu)) {
++      command_line->AppendSwitch(force_hp_gpu);
++    }
++#endif  // BUILDFLAG(IS_WIN)
+   }
+ 
+ #if BUILDFLAG(IS_MAC)
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index b7acdec95f7cd..a4ec6e5f11a0c 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -421,6 +421,10 @@ static_library("content_shell_lib") {
+       # shared component) + the Viz provider setter used by ShellContentGpuClient.
+       "//components/displayxr/gpu",
+       "//components/viz/service",
++      # DisplayXR inline-3D (#625, Step B / B4b): FORCE_HIGH_PERFORMANCE_GPU
++      # workaround-type helper appended to the GPU-process command line in
++      # ShellContentBrowserClient::AppendExtraCommandLineSwitches.
++      "//gpu/config",
+       "//gin",
+     ]
+   }
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 880554db7806c..ebf4438a26338 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -79,6 +79,7 @@
+ #include "content/shell/common/shell_controller.test-mojom.h"
+ #include "content/shell/common/shell_paths.h"
+ #include "content/shell/common/shell_switches.h"
++#include "gpu/config/gpu_driver_bug_workaround_type.h"
+ #include "media/mojo/buildflags.h"
+ #include "media/mojo/mojom/media_service.mojom.h"
+ #include "mojo/public/cpp/bindings/binder_map.h"
+@@ -466,9 +467,28 @@ void ShellContentBrowserClient::AppendExtraCommandLineSwitches(
+ 
+   // DisplayXR inline-3D (#625, Step B): forward the opt-in to child processes so
+   // the GPU/Viz process registers the weave provider + tags the canvas quad.
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d") &&
+-      !command_line->HasSwitch("enable-inline-3d")) {
+-    command_line->AppendSwitch("enable-inline-3d");
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    if (!command_line->HasSwitch("enable-inline-3d")) {
++      command_line->AppendSwitch("enable-inline-3d");
++    }
++#if BUILDFLAG(IS_WIN)
++    // The weave input is an NT-shared keyed-mutex D3D11 texture the DisplayXR
++    // service creates on the runtime's adapter — the high-performance discrete
++    // GPU, selected by xrGetD3D11GraphicsRequirementsKHR. On a dual-GPU laptop
++    // chrome's GPU process defaults to the integrated GPU, so the service's
++    // OpenSharedResource(NT) on that handle fails cross-adapter (E_INVALIDARG).
++    // Force the GPU process onto the high-performance adapter so its device
++    // (context_state_->GetD3D11Device(), used for the weave input) shares the
++    // runtime's adapter. Automatic equivalent of the manual
++    // --force_high_performance_gpu launch flag (#625 blocker #5).
++    const std::string force_hp_gpu = gpu::GpuDriverBugWorkaroundTypeToString(
++        gpu::FORCE_HIGH_PERFORMANCE_GPU);
++    if (command_line->GetSwitchValueASCII(switches::kProcessType) ==
++            switches::kGpuProcess &&
++        !command_line->HasSwitch(force_hp_gpu)) {
++      command_line->AppendSwitch(force_hp_gpu);
++    }
++#endif  // BUILDFLAG(IS_WIN)
+   }
+ 
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)

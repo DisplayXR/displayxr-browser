@@ -1,0 +1,987 @@
+From 14efab4d45aaaa03505966b97e0b294ef46461a6 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 7 Jul 2026 15:25:13 -0700
+Subject: [PATCH 09/15] B4b cleanup: strip bring-up diagnostics + drop the dead
+ weave_target plumbing (#625)
+
+Post-eyeball cleanup of the B4b per-element inline-3D weave (CEF sub-rect model).
+Weave re-verified firing end-to-end after the removal (service leia_dp_d3d11_
+process_atlas weave lines, browser bindWindow -> 0).
+
+Strip: all bring-up LOG diagnostics + the one-shot BGRA dump (+ its Sk includes)
+across skia_output_surface_impl_on_gpu.cc, xr_session.cc, xr_frame_provider.cc,
+display.cc, layer_tree_host_impl.cc, surface_aggregator.cc, and the CFM traits.
+Kept the error-only logs (woven import / WeavePixels failures).
+
+Drop the now-dead B3a Seam-A/B weave_target tag path (the CEF sub-rect model
+reads the composited output sub-rect via CompositorFrameMetadata::inline_3d_rects
+instead of tagging a per-canvas quad, which Windows chrome never produces):
+- Blink: HTMLCanvasElement::SetInline3D + inline_3d_ + the TextureLayer::
+  SetWeaveTarget wiring; XRDisplayLayer now only registers/deregisters with the
+  session (no canvas tag).
+- cc: TextureLayer / TextureLayerImpl weave_target_ + SetWeaveTarget + the
+  quad stamp + the pending->active propagation.
+- viz: TextureDrawQuad::weave_target; quads.mojom weave_target + traits;
+  ExternalUseClient::ImageContext is_weave_target/weave_rect + members;
+  SkiaRenderer's tag bridge + DisplayXRInline3DEnabled; ImageContextImpl's
+  SetWeaveOverrideMailbox + weave_override_mailbox_/weave_produced_mailbox_ +
+  the fulfillment override.
+- gpu: SharedImageManager/RepresentationFactory::ProduceOverlayForWeave (the
+  readback path no longer needs a D3D-texture overlay of the canvas).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ cc/layers/texture_layer.cc                    |  9 --
+ cc/layers/texture_layer.h                     |  9 --
+ cc/layers/texture_layer_impl.cc               | 14 ---
+ cc/layers/texture_layer_impl.h                |  4 -
+ cc/trees/layer_tree_host_impl.cc              |  7 --
+ .../viz/common/quads/texture_draw_quad.h      |  8 --
+ components/viz/service/display/display.cc     |  5 --
+ .../viz/service/display/external_use_client.h | 19 ----
+ .../viz/service/display/skia_renderer.cc      | 33 -------
+ .../viz/service/display/surface_aggregator.cc |  8 --
+ .../display_embedder/image_context_impl.cc    | 27 +-----
+ .../display_embedder/image_context_impl.h     | 14 ---
+ .../skia_output_surface_impl_on_gpu.cc        | 88 ++-----------------
+ .../shared_image/shared_image_factory.cc      |  8 --
+ .../shared_image/shared_image_factory.h       |  7 --
+ .../shared_image/shared_image_manager.cc      | 29 ------
+ .../shared_image/shared_image_manager.h       | 11 ---
+ .../compositor_frame_metadata_mojom_traits.cc |  8 --
+ .../cpp/compositing/quads_mojom_traits.cc     |  3 -
+ .../cpp/compositing/quads_mojom_traits.h      |  7 --
+ .../viz/public/mojom/compositing/quads.mojom  |  4 -
+ .../core/html/canvas/html_canvas_element.cc   | 14 ---
+ .../core/html/canvas/html_canvas_element.h    |  9 --
+ .../renderer/modules/xr/xr_display_layer.cc   | 13 ++-
+ .../renderer/modules/xr/xr_display_layer.h    | 16 ++--
+ .../renderer/modules/xr/xr_frame_provider.cc  | 25 ------
+ .../blink/renderer/modules/xr/xr_session.cc   | 19 ----
+ 27 files changed, 24 insertions(+), 394 deletions(-)
+
+diff --git a/cc/layers/texture_layer.cc b/cc/layers/texture_layer.cc
+index 7169bd59cd7dd..667f3a444d23d 100644
+--- a/cc/layers/texture_layer.cc
++++ b/cc/layers/texture_layer.cc
+@@ -35,7 +35,6 @@ TextureLayer::TextureLayer(TextureLayerClient* client,
+       uv_bottom_right_(1.f, 1.f),
+       blend_background_color_(false),
+       force_texture_to_opaque_(false),
+-      weave_target_(false),
+       prepare_resource_behavior_(prepare_resource_behavior),
+       needs_set_resource_(false) {}
+ 
+@@ -80,13 +79,6 @@ void TextureLayer::SetForceTextureToOpaque(bool opaque) {
+   SetNeedsCommit();
+ }
+ 
+-void TextureLayer::SetWeaveTarget(bool weave_target) {
+-  if (weave_target_.Read(*this) == weave_target)
+-    return;
+-  weave_target_.Write(*this) = weave_target;
+-  SetNeedsCommit();
+-}
+-
+ void TextureLayer::SetTransferableResourceInternal(
+     const viz::TransferableResource& resource,
+     viz::ReleaseCallback release_callback,
+@@ -237,7 +229,6 @@ void TextureLayer::PushDirtyPropertiesTo(LayerImpl* layer,
+     texture_layer->SetBlendBackgroundColor(blend_background_color_.Read(*this));
+     texture_layer->SetForceTextureToOpaque(
+         force_texture_to_opaque_.Read(*this));
+-    texture_layer->SetWeaveTarget(weave_target_.Read(*this));
+     if (needs_set_resource_.Read(*this)) {
+       viz::TransferableResource resource;
+       viz::ReleaseCallback release_callback;
+diff --git a/cc/layers/texture_layer.h b/cc/layers/texture_layer.h
+index de1282eebc075..bc8c38e505105 100644
+--- a/cc/layers/texture_layer.h
++++ b/cc/layers/texture_layer.h
+@@ -111,13 +111,6 @@ class CC_EXPORT TextureLayer : public Layer {
+   // This will blend texture with black color. Defaults to false.
+   void SetForceTextureToOpaque(bool opaque);
+ 
+-  // DisplayXR inline-3D (#625, Step B / B3). Marks this canvas layer as a weave
+-  // target: the emitted TextureDrawQuad carries the flag so Viz redirects it to
+-  // the OS-woven (glasses-free 3D) texture. Set by the Blink XRDisplayLayer
+-  // binding on the target canvas. Defaults to false; the whole path is dormant
+-  // unless content_shell was launched with --enable-inline-3d.
+-  void SetWeaveTarget(bool weave_target);
+-
+   // Code path for plugins which supply their own mailbox.
+   void SetTransferableResource(const viz::TransferableResource& resource,
+                                viz::ReleaseCallback release_callback);
+@@ -165,8 +158,6 @@ class CC_EXPORT TextureLayer : public Layer {
+   // [bottom left, top left, top right, bottom right]
+   ProtectedSequenceReadable<bool> blend_background_color_;
+   ProtectedSequenceReadable<bool> force_texture_to_opaque_;
+-  // DisplayXR inline-3D weave target tag (#625, Step B). See SetWeaveTarget().
+-  ProtectedSequenceReadable<bool> weave_target_;
+ 
+   const PrepareResourceBehavior prepare_resource_behavior_;
+ 
+diff --git a/cc/layers/texture_layer_impl.cc b/cc/layers/texture_layer_impl.cc
+index f95243e7d3e0c..9a3a199736b97 100644
+--- a/cc/layers/texture_layer_impl.cc
++++ b/cc/layers/texture_layer_impl.cc
+@@ -54,16 +54,10 @@ void TextureLayerImpl::CopyPropertiesTo(LayerImpl* layer) const {
+   texture_layer->SetUVBottomRight(uv_bottom_right_);
+   texture_layer->SetBlendBackgroundColor(blend_background_color_);
+   texture_layer->SetForceTextureToOpaque(force_texture_to_opaque_);
+-  texture_layer->SetWeaveTarget(weave_target_);
+ }
+ 
+ void TextureLayerImpl::MovePropertiesToActiveLayer(LayerImpl* active_layer) {
+   LayerImpl::MovePropertiesToActiveLayer(active_layer);
+-  // DisplayXR inline-3D (#625, Step B / B3): weave_target can change AFTER the
+-  // active-tree impl was created (the canvas is tagged once it composites), and
+-  // unlike uv/blend it is not fixed at creation — so the pending->active sync
+-  // must carry it or the drawing (active) tree never sees the tag.
+-  static_cast<TextureLayerImpl*>(active_layer)->SetWeaveTarget(weave_target_);
+   if (needs_set_resource_push_) {
+     TextureLayerImpl* texture_layer =
+         static_cast<TextureLayerImpl*>(active_layer);
+@@ -191,10 +185,6 @@ void TextureLayerImpl::AppendQuads(const AppendQuadsContext& context,
+                /*secure_output=*/false, gfx::ProtectedVideoType::kClear,
+                /*is_tex_coords_normalized=*/false);
+   quad->dynamic_range_limit = GetDynamicRangeLimit();
+-  // DisplayXR inline-3D (#625, Step B / B3): carry the per-canvas weave-target
+-  // tag onto the quad so Viz (SkiaRenderer::DrawTextureQuad) redirects it to the
+-  // OS-woven texture. Preserved automatically through SurfaceAggregator.
+-  quad->weave_target = weave_target_;
+   ValidateQuadResources(quad);
+ }
+ 
+@@ -242,10 +232,6 @@ void TextureLayerImpl::SetForceTextureToOpaque(bool opaque) {
+   force_texture_to_opaque_ = opaque;
+ }
+ 
+-void TextureLayerImpl::SetWeaveTarget(bool weave_target) {
+-  weave_target_ = weave_target;
+-}
+-
+ void TextureLayerImpl::SetUVTopLeft(const gfx::PointF& top_left) {
+   uv_top_left_ = top_left;
+ }
+diff --git a/cc/layers/texture_layer_impl.h b/cc/layers/texture_layer_impl.h
+index b33cf36c32345..1843f885a8af6 100644
+--- a/cc/layers/texture_layer_impl.h
++++ b/cc/layers/texture_layer_impl.h
+@@ -55,8 +55,6 @@ class CC_EXPORT TextureLayerImpl : public LayerImpl {
+   void SetTextureId(unsigned id);
+   void SetBlendBackgroundColor(bool blend);
+   void SetForceTextureToOpaque(bool opaque);
+-  // DisplayXR inline-3D (#625, Step B / B3). See TextureLayer::SetWeaveTarget().
+-  void SetWeaveTarget(bool weave_target);
+   void SetUVTopLeft(const gfx::PointF& top_left);
+   void SetUVBottomRight(const gfx::PointF& bottom_right);
+   void SetHdrMetadata(const gfx::HDRMetadata& hdr_metadata);
+@@ -96,8 +94,6 @@ class CC_EXPORT TextureLayerImpl : public LayerImpl {
+ 
+   bool blend_background_color_ = false;
+   bool force_texture_to_opaque_ = false;
+-  // DisplayXR inline-3D weave target tag (#625, Step B).
+-  bool weave_target_ = false;
+ 
+   // True while the |transferable_resource_| is owned by this layer, and
+   // becomes false once it is passed to another layer or to the
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index 93419b319fca0..123052d1f4398 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -2448,13 +2448,6 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+   // DisplayXR inline-3D (#625, Step B / B4b): carry the page's inline-3d canvas
+   // rects (window-relative device px) so Viz can weave those output sub-rects.
+   metadata.inline_3d_rects = active_tree()->inline_3d_rects();
+-  {
+-    static int g_mcfm = 0;
+-    if (!metadata.inline_3d_rects.empty() || (++g_mcfm % 120 == 1)) {
+-      LOG(ERROR) << "[DisplayXR] MakeCompositorFrameMetadata inline_3d_rects="
+-                 << metadata.inline_3d_rects.size();
+-    }
+-  }
+   if (settings().trees_in_viz_in_viz_process) {
+     metadata.tracked_element_rects = tracked_element_rects_from_client_;
+   } else {
+diff --git a/components/viz/common/quads/texture_draw_quad.h b/components/viz/common/quads/texture_draw_quad.h
+index ff1748a866e94..3c909cf0903fa 100644
+--- a/components/viz/common/quads/texture_draw_quad.h
++++ b/components/viz/common/quads/texture_draw_quad.h
+@@ -126,14 +126,6 @@ class VIZ_COMMON_EXPORT TextureDrawQuad : public DrawQuad {
+   // This optional damage is in target render pass coordinate space.
+   std::optional<gfx::Rect> damage_rect;
+ 
+-  // DisplayXR inline-3D (#625, Step B / B3). True when this canvas quad's Blink
+-  // element opted into glasses-free 3D (via XRDisplayLayer). SkiaRenderer reads
+-  // it to redirect the quad to the OS-woven texture. Set by TextureLayerImpl and
+-  // preserved through SurfaceAggregator's default copy. Windows-only path; on
+-  // other platforms it stays false. Not a bitfield to keep the default-copy
+-  // simple.
+-  bool weave_target = false;
+-
+   struct VIZ_COMMON_EXPORT RoundedDisplayMasksInfo {
+     static constexpr size_t kMaxRoundedDisplayMasksCount = 2;
+     static constexpr size_t kOriginRoundedDisplayMaskIndex = 0;
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index 56e7fbab76e43..464a6afe51812 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -988,11 +988,6 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+     // FinishPaintCurrentFrame), so the post-paint output weave loop reads the
+     // rects that match this frame's composited pixels.
+     if (skia_output_surface_) {
+-      static int g_das = 0;
+-      if (++g_das % 60 == 1) {
+-        LOG(ERROR) << "[DisplayXR] Display::DrawAndSwap inline_3d_rects="
+-                   << frame.inline_3d_rects.size();
+-      }
+       skia_output_surface_->SetInline3DRects(frame.inline_3d_rects);
+     }
+     renderer_->DrawFrame(&frame.render_pass_list, device_scale_factor_,
+diff --git a/components/viz/service/display/external_use_client.h b/components/viz/service/display/external_use_client.h
+index f41dd2342728e..ecc0c8c97c7dd 100644
+--- a/components/viz/service/display/external_use_client.h
++++ b/components/viz/service/display/external_use_client.h
+@@ -109,20 +109,6 @@ class VIZ_SERVICE_EXPORT ExternalUseClient {
+       clear_color_ = color;
+     }
+ 
+-    // DisplayXR inline-3D (#625, Step B): SkiaRenderer tags the canvas quad's
+-    // context (compositor thread); SkiaOutputSurfaceImplOnGpu reads the tag on
+-    // the GPU thread to redirect it to the woven texture. A plain bool set before
+-    // |image_| is set, so it obeys the thread-safety invariants above.
+-    bool is_weave_target() const { return is_weave_target_; }
+-    void set_weave_target(bool v) { is_weave_target_ = v; }
+-
+-    // DisplayXR inline-3D (#625, Step B / B3c, Seam D): the canvas quad's
+-    // committed window-relative device-pixel rect, read in SkiaRenderer at draw
+-    // time (DSF/zoom baked in) and consumed on the GPU thread as the weave's
+-    // source + window-relative placement. Same thread-safety as the tag above.
+-    const gfx::Rect& weave_rect() const { return weave_rect_; }
+-    void set_weave_rect(const gfx::Rect& r) { weave_rect_ = r; }
+-
+    private:
+     gpu::Mailbox mailbox_;
+     gpu::SyncToken sync_token_;
+@@ -147,11 +133,6 @@ class VIZ_SERVICE_EXPORT ExternalUseClient {
+     std::vector<skgpu::graphite::TextureInfo> texture_infos_;
+     raw_ptr<const cc::PaintOpBuffer> paint_op_buffer_ = nullptr;
+     std::optional<SkColor4f> clear_color_;
+-
+-    // DisplayXR inline-3D weave target tag (#625, Step B). See accessors above.
+-    bool is_weave_target_ = false;
+-    // DisplayXR inline-3D committed rect (#625, Step B / B3c). See accessors.
+-    gfx::Rect weave_rect_;
+   };
+ 
+   // If |maybe_concurrent_reads| is true then there can be concurrent reads to
+diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
+index 95303895f289d..facb72165f13d 100644
+--- a/components/viz/service/display/skia_renderer.cc
++++ b/components/viz/service/display/skia_renderer.cc
+@@ -13,7 +13,6 @@
+ #include <variant>
+ 
+ #include "base/auto_reset.h"
+-#include "base/command_line.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/debug/dump_without_crashing.h"
+ #include "base/feature_list.h"
+@@ -115,17 +114,6 @@ namespace viz {
+ 
+ namespace {
+ 
+-#if BUILDFLAG(IS_WIN)
+-// DisplayXR inline-3D (#625, Step B). True when content_shell was launched with
+-// --enable-inline-3d; evaluated once. Gates tagging the canvas quad as a weave
+-// target so the patch is fully dormant by default.
+-bool DisplayXRInline3DEnabled() {
+-  static const bool enabled =
+-      base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d");
+-  return enabled;
+-}
+-#endif
+-
+ // Feature to temporarily create a dump in the case where we try and sample from
+ // a render pass that has never been drawn to.
+ // See: crbug.com/344458294, crbug.com/345673794
+@@ -2687,27 +2675,6 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
+   if (!image)
+     return;
+ 
+-#if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B / B3): tag the canvas quad as a weave
+-  // target when its Blink element opted into glasses-free 3D (XRDisplayLayer set
+-  // TextureLayer::SetWeaveTarget, carried here on the quad). This replaces the
+-  // B2c.1 "first quad >=256px" hardcode with an explicit per-element tag. The
+-  // GPU thread acts on the tag in SkiaOutputSurfaceImplOnGpu::
+-  // MaybeWeaveSubstitute().
+-  if (DisplayXRInline3DEnabled() && quad->weave_target) {
+-    if (auto* ic = builder.image_context()) {
+-      ic->set_weave_target(true);
+-      // Seam D (#625, B3c): the committed window-relative device-pixel rect for
+-      // this element, read here at draw time so DSF / fractional-zoom are baked
+-      // in (never from Blink layout — that is a frame stale). The root
+-      // compositing surface sits at client (0,0), so this is already
+-      // window-relative for the weave RPC. Consumed on the GPU thread.
+-      ic->set_weave_rect(quad->shared_quad_state->quad_to_target_transform
+-                             .MapRect(quad->visible_rect));
+-    }
+-  }
+-#endif
+-
+   gfx::RectF uv_rect = quad->GetUnnormalizedTexCoords(
+       gfx::Size(image->width(), image->height()));
+   params->vis_tex_coords = cc::MathUtil::ScaleRectProportional(
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index a88fac079e73e..e68dc4659288d 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2501,14 +2501,6 @@ void SurfaceAggregator::CollectTrackedElementRects(
+   }
+   // DisplayXR inline-3D (#625, Step B / B4b): collect the inline-3d canvas rects
+   // alongside tracked elements, transformed into the root render pass space.
+-  {
+-    static int g_cter = 0;
+-    if (++g_cter % 90 == 1) {
+-      LOG(ERROR) << "[DisplayXR] SurfaceAggregator::CollectTrackedElementRects"
+-                 << " inline=" << frame_metadata.inline_3d_rects.size()
+-                 << " tracked=" << frame_metadata.tracked_element_rects.size();
+-    }
+-  }
+   for (const gfx::Rect& rect : frame_metadata.inline_3d_rects) {
+     inline_3d_rects_.push_back(TransformRectToDestRootTargetSpace(
+         rect, target_transform, transform_to_root_target,
+diff --git a/components/viz/service/display_embedder/image_context_impl.cc b/components/viz/service/display_embedder/image_context_impl.cc
+index 2b0001b3099eb..21c009b185357 100644
+--- a/components/viz/service/display_embedder/image_context_impl.cc
++++ b/components/viz/service/display_embedder/image_context_impl.cc
+@@ -367,29 +367,11 @@ bool ImageContextImpl::BeginRasterAccess(
+   return true;
+ }
+ 
+-void ImageContextImpl::SetWeaveOverrideMailbox(const gpu::Mailbox& mailbox) {
+-  weave_override_mailbox_ = mailbox;
+-}
+-
+ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+     gpu::SharedContextState* context_state,
+     gpu::SharedImageRepresentationFactory* representation_factory,
+     std::vector<GrBackendSemaphore>* begin_semaphores,
+     std::vector<GrBackendSemaphore>* end_semaphores) {
+-  // DisplayXR inline-3D (#625, Step B / B2c.1): fulfill from the woven backing
+-  // when one is set. If the woven mailbox changed (window resize), drop the
+-  // cached representation so it is re-produced from the new backing.
+-  const bool weave_override = !weave_override_mailbox_.IsZero();
+-  if (weave_override && representation_ &&
+-      weave_produced_mailbox_ != weave_override_mailbox_) {
+-    representation_scoped_read_access_.reset();
+-    representation_.reset();
+-    promise_image_textures_.clear();
+-    graphite_textures_.clear();
+-  }
+-  const gpu::Mailbox& use_mailbox =
+-      weave_override ? weave_override_mailbox_ : mailbox();
+-
+   // Skip the context if it has been processed.
+   if (representation_scoped_read_access_) {
+     CHECK(owned_promise_image_textures_.empty());
+@@ -414,7 +396,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+ 
+   if (!representation_) {
+     auto representation = representation_factory->ProduceSkia(
+-        use_mailbox, context_state,
++        mailbox(), context_state,
+         /*required_usages=*/{gpu::SHARED_IMAGE_USAGE_DISPLAY_READ});
+     if (!representation) {
+       DLOG(ERROR) << "Failed to fulfill the promise texture - SharedImage "
+@@ -422,10 +404,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+       return false;
+     }
+ 
+-    // The woven backing is window-sized and intentionally differs from the
+-    // canvas resource size, so only enforce the equality check for normal
+-    // (non-weave) fulfillment.
+-    if (!weave_override && representation->size() != size()) {
++    if (representation->size() != size()) {
+       DLOG(ERROR) << "Failed to fulfill the promise texture - SharedImage "
+                      "size does not match TransferableResource size: "
+                   << representation->size().ToString() << " vs "
+@@ -434,8 +413,6 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+     }
+ 
+     representation_ = std::move(representation);
+-    weave_produced_mailbox_ = weave_override ? weave_override_mailbox_
+-                                             : gpu::Mailbox();
+   }
+ 
+   representation_scoped_read_access_ =
+diff --git a/components/viz/service/display_embedder/image_context_impl.h b/components/viz/service/display_embedder/image_context_impl.h
+index fe70cd76b73a4..e53873c82fbc7 100644
+--- a/components/viz/service/display_embedder/image_context_impl.h
++++ b/components/viz/service/display_embedder/image_context_impl.h
+@@ -88,13 +88,6 @@ class ImageContextImpl final : public ExternalUseClient::ImageContext {
+   void SetPromiseImageTextures(
+       std::vector<sk_sp<GrPromiseImageTexture>> promise_image_textures);
+ 
+-  // DisplayXR inline-3D (#625, Step B / B2c.1): redirect this context to weave
+-  // |mailbox| instead of its own resource. Set on the GPU thread each frame by
+-  // SkiaOutputSurfaceImplOnGpu before BeginAccess. A zero mailbox clears it. The
+-  // woven texture is window-sized (differs from the canvas resource size), so
+-  // the usual fulfillment size check is relaxed while an override is active.
+-  void SetWeaveOverrideMailbox(const gpu::Mailbox& mailbox);
+-
+   void BeginAccessIfNecessary(
+       gpu::SharedContextState* context_state,
+       gpu::SharedImageRepresentationFactory* representation_factory,
+@@ -160,13 +153,6 @@ class ImageContextImpl final : public ExternalUseClient::ImageContext {
+   // Viz for the promise image and the YCbCr info computed at the time of
+   // fulfilling the promise image.
+   bool graphite_ycbcr_info_mismatch_ = false;
+-
+-  // DisplayXR inline-3D weave override (#625, Step B). |weave_override_mailbox_|
+-  // is the woven backing to fulfill from (zero = none). |weave_produced_mailbox_|
+-  // records which mailbox |representation_| was produced for, so a change (window
+-  // resize -> new woven SharedImage) drops the cached representation.
+-  gpu::Mailbox weave_override_mailbox_;
+-  gpu::Mailbox weave_produced_mailbox_;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index c2533668bbc4b..1c8286eb2a5f0 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -70,7 +70,6 @@
+ #include "skia/ext/rgba_to_yuva.h"
+ #include "third_party/libyuv/include/libyuv/planar_functions.h"
+ #include "third_party/skia/include/core/SkAlphaType.h"
+-#include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkBlendMode.h"
+ #include "third_party/skia/include/core/SkCanvas.h"
+ #include "third_party/skia/include/core/SkColor.h"
+@@ -79,10 +78,8 @@
+ #include "third_party/skia/include/core/SkColorType.h"
+ #include "third_party/skia/include/core/SkImageInfo.h"
+ #include "third_party/skia/include/core/SkSamplingOptions.h"
+-#include "third_party/skia/include/core/SkStream.h"
+ #include "third_party/skia/include/core/SkSwizzle.h"
+ #include "third_party/skia/include/core/SkYUVAInfo.h"
+-#include "third_party/skia/include/encode/SkPngEncoder.h"
+ #include "third_party/skia/include/gpu/GpuTypes.h"
+ #include "third_party/skia/include/gpu/ganesh/GrTypes.h"
+ #include "third_party/skia/include/gpu/ganesh/SkSurfaceGanesh.h"
+@@ -2677,26 +2674,12 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+ 
+ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
+     std::vector<gfx::Rect> rects) {
+-  static int g_sir = 0;
+-  if (!rects.empty() || (++g_sir % 120 == 1)) {
+-    LOG(ERROR) << "[DisplayXR] GPU SetInline3DRects n=" << rects.size();
+-  }
+   inline_3d_rects_ = std::move(rects);
+ }
+ 
+ #if BUILDFLAG(IS_WIN)
+ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+-  // B4b bring-up diagnostics (first frames unthrottled to catch the import +
+-  // fence, then throttled ~1/120).
+-  static int g_wo_frame = 0;
+-  ++g_wo_frame;
+-  const bool dbg = (g_wo_frame <= 20) || (g_wo_frame % 120 == 1);
+-  if (dbg) {
+-    LOG(ERROR) << "[DisplayXR] MaybeWeaveOutput #" << g_wo_frame
+-               << " rects=" << inline_3d_rects_.size()
+-               << " provider=" << (GetDisplayXRWeaveProvider() ? 1 : 0);
+-  }
+   if (inline_3d_rects_.empty()) {
+     return;
+   }
+@@ -2724,23 +2707,13 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+ 
+   // CEF sub-rect model (design §13.3): the composited page (2D chrome + each
+   // inline-3d canvas's flat SBS pixels, already squashed together) is now in the
+-  // output surface — this is exactly the Step-A CEF host's `pageTex`. Snapshot it
+-  // (copy-on-write), stage it into an owned full-window scratch SharedImage whose
+-  // D3D texture we can hand to the weave, then per rect: weave the sub-rect and
+-  // draw the woven result back over the output at that rect.
+-  // (A) Per rect, read the composited sub-rect's pixels back to CPU and upload
+-  // them into the weave input. Under this config the output device is
+-  // SkiaOutputDeviceGL (Ganesh/ANGLE, forced by --disable-direct-composition),
+-  // so a synchronous SkSurface::readPixels is valid; the zero-copy D3D-texture
+-  // route is a follow-up. We read before drawing the woven result back, so no
+-  // snapshot is needed to avoid a read/write hazard.
+-  if (dbg) {
+-    LOG(ERROR) << "[DisplayXR] MaybeWeaveOutput page snapshot "
+-               << window_bounds.size().ToString()
+-               << " rects=" << inline_3d_rects_.size()
+-               << " gr_context=" << (gr_context() ? 1 : 0)
+-               << " graphite=" << (graphite_recorder() ? 1 : 0);
+-  }
++  // output surface — this is exactly the Step-A CEF host's `pageTex`. Per rect we
++  // read the composited sub-rect's pixels back to CPU and upload them into the
++  // weave input, weave, then draw the woven result back over the output. Under
++  // this config the output device is SkiaOutputDeviceGL (Ganesh/ANGLE, forced by
++  // --disable-direct-composition), so a synchronous SkSurface::readPixels is
++  // valid; the zero-copy D3D-texture route + Graphite async readback are
++  // follow-ups. We read before drawing the woven back, so no read/write hazard.
+ 
+   // Prune woven state beyond the current rect count (canvas removed / count
+   // shrank) before (re)sizing, so the woven SharedImages are not leaked.
+@@ -2773,7 +2746,8 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+     }
+ 
+     // Read the composited sub-rect back to CPU (BGRA8), then upload it into the
+-    // weave input. |page| is the full composited output; read from (rect.x,y).
++    // weave input. Read from the output SkSurface (it knows its own recording
++    // context and flushes as needed).
+     const int rw = rect.width();
+     const int rh = rect.height();
+     const size_t stride = static_cast<size_t>(rw) * 4;
+@@ -2781,24 +2755,12 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+     const SkImageInfo info = SkImageInfo::Make(
+         rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+         SkColorSpace::MakeSRGB());
+-    // Read from the output SkSurface (it knows its own recording context and
+-    // flushes as needed); more reliable than SkImage::readPixels for a GPU
+-    // snapshot.
+     if (!output->readPixels(info, pixels.data(), stride, rect.x(), rect.y())) {
+-      if (dbg) {
+-        LOG(ERROR) << "[DisplayXR] readPixels failed rect=" << rect.ToString();
+-      }
+       continue;
+     }
+ 
+     const DisplayXRWeaveProvider::Result r = provider->WeavePixels(
+         device_x.Get(), pixels.data(), static_cast<uint32_t>(stride), rect);
+-    if (dbg) {
+-      LOG(ERROR) << "[DisplayXR] weave rect=" << rect.ToString()
+-                 << " ok=" << r.ok << " woven=" << r.woven_handle
+-                 << " fence=" << r.fence_handle << " " << r.width << "x"
+-                 << r.height;
+-    }
+     if (!r.ok) {
+       continue;
+     }
+@@ -2833,11 +2795,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+     if (st.woven_mailbox.IsZero()) {
+       continue;
+     }
+-    if (dbg) {
+-      LOG(ERROR) << "[DisplayXR] woven ready mailbox_set=1 fence_state="
+-                 << (st.fence ? 1 : 0) << " r.fence_h=" << r.fence_handle
+-                 << " r.fence_v=" << r.fence_value;
+-    }
+ 
+     // (Re)open + GPU-wait the service->caller fence so the woven content is ready
+     // before we sample it (fence-synced, no keyed mutex).
+@@ -2874,30 +2831,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+     if (!woven_img) {
+       continue;
+     }
+-    // B4b one-shot dump (frame 200): raw BGRA of the input we send + the woven we
+-    // get back, to confirm the service actually interlaced (vs SBS passthrough /
+-    // stale). Raw bytes (no PNG encoder linked); converted offline.
+-    if (g_wo_frame == 200) {
+-      {
+-        SkFILEWStream f(
+-            "C:\\Users\\SPARKS~1\\AppData\\Local\\Temp\\b4_input.bgra");
+-        f.write(pixels.data(), pixels.size());
+-      }
+-      SkBitmap wb;
+-      if (wb.tryAllocPixels(SkImageInfo::Make(
+-              static_cast<int>(r.width), static_cast<int>(r.height),
+-              kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+-              SkColorSpace::MakeSRGB())) &&
+-          woven_img->readPixels(gr_context(), wb.pixmap(), 0, 0)) {
+-        SkFILEWStream f(
+-            "C:\\Users\\SPARKS~1\\AppData\\Local\\Temp\\b4_woven.bgra");
+-        f.write(wb.getPixels(), wb.computeByteSize());
+-        LOG(ERROR) << "[DisplayXR] dumped b4_input.bgra (" << rw << "x" << rh
+-                   << ") + b4_woven.bgra (" << r.width << "x" << r.height << ")";
+-      } else {
+-        LOG(ERROR) << "[DisplayXR] woven readPixels for dump failed";
+-      }
+-    }
+     if (!wbegin_sem.empty()) {
+       output->wait(wbegin_sem.size(), wbegin_sem.data(),
+                    /*deleteSemaphoresAfterWait=*/false);
+@@ -2929,9 +2862,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+     }
+   }
+   // held_reps / held_accesses release here, after the submit.
+-  if (dbg) {
+-    LOG(ERROR) << "[DisplayXR] MaybeWeaveOutput drew_any=" << drew_any;
+-  }
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.cc b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+index 1af4b17e4e399..024b928341808 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+@@ -1194,14 +1194,6 @@ SharedImageRepresentationFactory::ProduceOverlay(const gpu::Mailbox& mailbox) {
+   return manager_->ProduceOverlay(mailbox, memory_type_tracker_.get());
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
+-std::unique_ptr<OverlayImageRepresentation>
+-SharedImageRepresentationFactory::ProduceOverlayForWeave(
+-    const gpu::Mailbox& mailbox) {
+-  return manager_->ProduceOverlayForWeave(mailbox, memory_type_tracker_.get());
+-}
+-#endif
+-
+ std::unique_ptr<MemoryImageRepresentation>
+ SharedImageRepresentationFactory::ProduceMemory(const gpu::Mailbox& mailbox) {
+   return manager_->ProduceMemory(mailbox, memory_type_tracker_.get());
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.h b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+index f8aca62c5ceb5..30d7b8811058b 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+@@ -305,13 +305,6 @@ class GPU_GLES2_EXPORT SharedImageRepresentationFactory {
+       scoped_refptr<SharedContextState> context_state);
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox);
+-#if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B / B2c.2): SCANOUT-free overlay produce used
+-  // to read a (DISPLAY_READ-only) canvas texture on the GPU thread for the weave
+-  // copy. See SharedImageManager::ProduceOverlayForWeave.
+-  std::unique_ptr<OverlayImageRepresentation> ProduceOverlayForWeave(
+-      const Mailbox& mailbox);
+-#endif
+   std::unique_ptr<MemoryImageRepresentation> ProduceMemory(
+       const Mailbox& mailbox);
+   std::unique_ptr<RasterImageRepresentation> ProduceRaster(
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.cc b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+index 5b25867dac708..efa9b5af0509b 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+@@ -384,35 +384,6 @@ std::unique_ptr<OverlayImageRepresentation> SharedImageManager::ProduceOverlay(
+   return representation;
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
+-std::unique_ptr<OverlayImageRepresentation>
+-SharedImageManager::ProduceOverlayForWeave(const gpu::Mailbox& mailbox,
+-                                           gpu::MemoryTypeTracker* tracker) {
+-  CALLED_ON_VALID_THREAD();
+-
+-  AutoLock autolock(this);
+-  auto* backing = GetBacking(mailbox);
+-  if (!backing) {
+-    LOG(ERROR) << "SharedImageManager::ProduceOverlayForWeave: non-existent "
+-                  "mailbox.";
+-    return nullptr;
+-  }
+-
+-  // No SCANOUT enforcement here (see header): the canvas SI is DISPLAY_READ-only
+-  // but the D3D overlay representation still exposes its ID3D11Texture2D, which
+-  // is all the weave copy needs.
+-  auto representation = backing->ProduceOverlay(this, tracker);
+-  if (!representation) {
+-    LOG(ERROR) << "SharedImageManager::ProduceOverlayForWeave: incompatible "
+-                  "backing: "
+-               << backing->GetName();
+-    return nullptr;
+-  }
+-
+-  return representation;
+-}
+-#endif  // BUILDFLAG(IS_WIN)
+-
+ std::unique_ptr<MemoryImageRepresentation> SharedImageManager::ProduceMemory(
+     const Mailbox& mailbox,
+     MemoryTypeTracker* tracker) {
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.h b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+index 40fd5bfea6163..f871108f5afeb 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+@@ -117,17 +117,6 @@ class GPU_GLES2_EXPORT SharedImageManager
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);
+-#if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B / B2c.2). Identical to ProduceOverlay but
+-  // WITHOUT the SCANOUT usage enforcement: a normal 2D canvas SharedImage is
+-  // allocated DISPLAY_READ-only (no SCANOUT), yet the overlay representation is
+-  // the GPU-thread path that exposes the canvas ID3D11Texture2D (via
+-  // GetDCLayerOverlayImage). Used only to read the canvas texture for the weave
+-  // copy; never to actually scan out. Win-only, feature-gated by the caller.
+-  std::unique_ptr<OverlayImageRepresentation> ProduceOverlayForWeave(
+-      const Mailbox& mailbox,
+-      MemoryTypeTracker* ref);
+-#endif
+   std::unique_ptr<MemoryImageRepresentation> ProduceMemory(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);
+diff --git a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
+index f661e0c95675a..0d93a983e87e6 100644
+--- a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
+@@ -6,7 +6,6 @@
+ 
+ #include <algorithm>
+ 
+-#include "base/logging.h"
+ #include "build/build_config.h"
+ #include "services/viz/public/cpp/compositing/begin_frame_args_mojom_traits.h"
+ #include "services/viz/public/cpp/compositing/compositor_frame_transition_directive_mojom_traits.h"
+@@ -87,13 +86,6 @@ bool StructTraits<viz::mojom::CompositorFrameMetadataDataView,
+         data.ReadInline3dRects(&out->inline_3d_rects))) {
+     return false;
+   }
+-  {
+-    static int g_rd = 0;
+-    if (!out->inline_3d_rects.empty() || (++g_rd % 120 == 1)) {
+-      LOG(ERROR) << "[DisplayXR] CFM traits Read inline_3d_rects="
+-                 << out->inline_3d_rects.size();
+-    }
+-  }
+ 
+   // Verify that OffsetTagDefinition providers are referenced surfaces.
+   for (auto& tag_def : out->offset_tag_definitions) {
+diff --git a/services/viz/public/cpp/compositing/quads_mojom_traits.cc b/services/viz/public/cpp/compositing/quads_mojom_traits.cc
+index c57cf96ce0700..5b38e2dc51ca4 100644
+--- a/services/viz/public/cpp/compositing/quads_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/quads_mojom_traits.cc
+@@ -201,9 +201,6 @@ bool StructTraits<viz::mojom::TextureQuadStateDataView, viz::DrawQuad>::Read(
+   if (!data.ReadDamageRect(&quad->damage_rect))
+     return false;
+ 
+-  // DisplayXR inline-3D (#625, Step B / B3).
+-  quad->weave_target = data.weave_target();
+-
+   return true;
+ }
+ 
+diff --git a/services/viz/public/cpp/compositing/quads_mojom_traits.h b/services/viz/public/cpp/compositing/quads_mojom_traits.h
+index 48815bf1e36c4..dfeb6e60565e6 100644
+--- a/services/viz/public/cpp/compositing/quads_mojom_traits.h
++++ b/services/viz/public/cpp/compositing/quads_mojom_traits.h
+@@ -473,13 +473,6 @@ struct StructTraits<viz::mojom::TextureQuadStateDataView, viz::DrawQuad> {
+     return quad->damage_rect;
+   }
+ 
+-  // DisplayXR inline-3D (#625, Step B / B3).
+-  static bool weave_target(const viz::DrawQuad& input) {
+-    const viz::TextureDrawQuad* quad =
+-        viz::TextureDrawQuad::MaterialCast(&input);
+-    return quad->weave_target;
+-  }
+-
+   static bool Read(viz::mojom::TextureQuadStateDataView data,
+                    viz::DrawQuad* out);
+ };
+diff --git a/services/viz/public/mojom/compositing/quads.mojom b/services/viz/public/mojom/compositing/quads.mojom
+index e9613a87aeee7..4169c4cf760c9 100644
+--- a/services/viz/public/mojom/compositing/quads.mojom
++++ b/services/viz/public/mojom/compositing/quads.mojom
+@@ -98,10 +98,6 @@ struct TextureQuadState {
+   gfx.mojom.Rect? damage_rect;
+   OverlayPriority overlay_priority_hint;
+   RoundedDisplayMasksInfo rounded_display_masks_info;
+-  // DisplayXR inline-3D (#625, Step B / B3): the canvas element opted into
+-  // glasses-free 3D (XRDisplayLayer). Carried renderer cc -> Viz so
+-  // SkiaRenderer redirects the quad to the OS-woven texture.
+-  bool weave_target;
+ };
+ 
+ struct TileQuadState {
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 226fde99134c6..ce8231f02d134 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -1648,24 +1648,10 @@ cc::TextureLayer* HTMLCanvasElement::GetOrCreateCcLayerForCanvas2DIfNeeded() {
+     cc_layer_->SetHitTestable(true);
+     cc_layer_->SetContentsOpaque(is_opaque_);
+     cc_layer_->SetBlendBackgroundColor(!is_opaque_);
+-    // DisplayXR inline-3D (#625, Step B / B3): re-apply the sticky weave-target
+-    // tag when the layer is (re)created (e.g. after a resize).
+-    cc_layer_->SetWeaveTarget(inline_3d_);
+   }
+   return cc_layer_.get();
+ }
+ 
+-void HTMLCanvasElement::SetInline3D(bool enabled) {
+-  inline_3d_ = enabled;
+-  // Apply to the composited 2D canvas layer (its creation re-applies the sticky
+-  // tag). (WebGL is a follow-up; B3 targets a 2D SBS canvas.)
+-  if (IsRenderingContext2D() && context_ && context_->IsComposited()) {
+-    GetOrCreateCcLayerForCanvas2DIfNeeded()->SetWeaveTarget(enabled);
+-  } else if (cc_layer_) {
+-    cc_layer_->SetWeaveTarget(enabled);
+-  }
+-}
+-
+ void HTMLCanvasElement::ClearCanvas2DLayerTexture() {
+   CHECK(IsRenderingContext2D());
+   if (cc_layer_) {
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
+index e98c081b0d08f..40e408f57861f 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
+@@ -190,11 +190,6 @@ class CORE_EXPORT HTMLCanvasElement final
+   cc::TextureLayer* GetOrCreateCcLayerForCanvas2DIfNeeded();
+   cc::TextureLayer* GetCanvas2DCcLayerForTesting() { return cc_layer_.get(); }
+ 
+-  // DisplayXR inline-3D (#625, Step B / B3). Tag/untag this canvas's compositor
+-  // layer as a weave target so Viz redirects it to the OS-woven (glasses-free
+-  // 3D) texture. Set by the WebXR XRDisplayLayer binding. The tag is re-applied
+-  // whenever the 2D layer is (re)created. Windows inline-3D path.
+-  void SetInline3D(bool enabled);
+   void ClearCanvas2DLayerTexture() override;
+ 
+   void SetNeedsPushProperties();
+@@ -439,10 +434,6 @@ class CORE_EXPORT HTMLCanvasElement final
+ 
+   scoped_refptr<cc::TextureLayer> cc_layer_;
+ 
+-  // DisplayXR inline-3D (#625, Step B / B3): sticky weave-target tag applied to
+-  // cc_layer_ on (re)creation. See SetInline3D().
+-  bool inline_3d_ = false;
+-
+   bool is_opaque_ = false;
+   bool is_displayed_ = false;
+   unsigned frames_since_last_commit_ = 0;
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+index 8f96534a99554..71de41af4198b 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.cc
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+@@ -29,12 +29,12 @@ XRDisplayLayer* XRDisplayLayer::Create(XRSession* session,
+ 
+ XRDisplayLayer::XRDisplayLayer(XRSession* session, Element* target)
+     : session_(session), target_(target) {
+-  // Tag the target canvas's compositor layer as a weave target; Viz redirects
+-  // it to the OS-woven texture (see cc::TextureLayer::SetWeaveTarget).
+-  if (auto* canvas = DynamicTo<HTMLCanvasElement>(target_.Get())) {
+-    canvas->SetInline3D(true);
++  // Register the target canvas with the session; each frame the session reports
++  // its window-relative rect to the compositor (XRSession::ReportInline3DRects),
++  // and Viz weaves that output sub-rect (B4b, design §13.3). Session-end
++  // deregisters (#625, B3e).
++  if (IsA<HTMLCanvasElement>(target_.Get())) {
+     active_ = true;
+-    // Track with the session so session-end untags the canvas (#625, B3e).
+     if (session_) {
+       session_->RegisterDisplayLayer(this);
+     }
+@@ -64,9 +64,6 @@ void XRDisplayLayer::close() {
+   if (!active_) {
+     return;
+   }
+-  if (auto* canvas = DynamicTo<HTMLCanvasElement>(target_.Get())) {
+-    canvas->SetInline3D(false);
+-  }
+   active_ = false;
+   if (session_) {
+     session_->UnregisterDisplayLayer(this);
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.h b/third_party/blink/renderer/modules/xr/xr_display_layer.h
+index b7519da9c69e6..716ccc5b027a6 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.h
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.h
+@@ -25,14 +25,14 @@ class XRViewport;
+ // composites the woven result at the element's on-screen rect.
+ //
+ // This is intentionally a LIGHTWEIGHT binding, not a subclass of the WebXR
+-// Layers XRCompositionLayer: the actual weave is driven Viz-side off a per-layer
+-// compositor tag (cc::TextureLayer::SetWeaveTarget), so wiring the heavyweight XR
+-// Layers compositor backend would be pure overhead and the browser contains no
+-// weave/vendor code (ADR-007/019). Constructing the layer tags the target
+-// canvas; close() (or session end) untags it. Multiple layers -> multiple 3D
+-// elements. The whole path is dormant unless content_shell was launched with
+-// --enable-inline-3d; the JS surface is gated by the DisplayXRInline3D
+-// RuntimeEnabledFeature.
++// Layers XRCompositionLayer: the actual weave is driven Viz-side (design §13.3,
++// the CEF sub-rect model) from the canvas rect the session reports each frame
++// into CompositorFrameMetadata, so wiring the heavyweight XR Layers compositor
++// backend would be pure overhead and the browser contains no weave/vendor code
++// (ADR-007/019). Constructing the layer registers the target canvas with the
++// session; close() (or session end) deregisters it. Multiple layers -> multiple
++// 3D elements. The whole path is dormant unless launched with --enable-inline-3d;
++// the JS surface is gated by the DisplayXRInline3D RuntimeEnabledFeature.
+ class XRDisplayLayer final : public ScriptWrappable {
+   DEFINE_WRAPPERTYPEINFO();
+ 
+diff --git a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
+index 0466fd423ee5a..939e6af99c425 100644
+--- a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
++++ b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
+@@ -508,24 +508,6 @@ void XRFrameProvider::ProcessScheduledFrame(
+   TRACE_EVENT2("gpu", "XRFrameProvider::ProcessScheduledFrame", "frame",
+                frame_id_, "timestamp", high_res_now_ms);
+ 
+-  {
+-    static int g_psf = 0;
+-    if (++g_psf <= 10) {
+-      bool inl = false;
+-      for (auto& r : requesting_sessions_) {
+-        if (r.key && r.key->is_inline_3d()) {
+-          inl = true;
+-          break;
+-        }
+-      }
+-      LOG(ERROR) << "[DisplayXR] ProcScheduledFrame #" << g_psf
+-                 << " type=" << static_cast<int>(frame_type)
+-                 << " focused=" << xr_->IsFrameFocused()
+-                 << " immersive=" << (immersive_session_ ? 1 : 0)
+-                 << " reqs=" << requesting_sessions_.size() << " inl=" << inl;
+-    }
+-  }
+-
+   LocalDOMWindow* window = xr_->DomWindow();
+   if (!window)
+     return;
+@@ -659,13 +641,6 @@ void XRFrameProvider::OnPreDispatchInlineFrame(XRSession* session,
+ 
+   // If we still have the session and don't have an immersive session, then we
+   // should serve the frame.
+-  {
+-    static int g_pdi = 0;
+-    if (++g_pdi <= 10) {
+-      LOG(ERROR) << "[DisplayXR] OnPreDispatchInlineFrame -> OnFrame inl="
+-                 << session->is_inline_3d();
+-    }
+-  }
+   session->OnFrame(timestamp, Vector<XRSharedImageData>());
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 7ec4782aa8190..0c8310c272f06 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -1836,16 +1836,6 @@ void XRSession::MaybeRequestFrame() {
+   // and wants one.
+   bool request_frame =
+       !pending_frame_ && page_allowed_frames && page_can_process_frames;
+-  {
+-    static int g_mrf = 0;
+-    if (++g_mrf % 60 == 1) {
+-      LOG(ERROR) << "[DisplayXR] MaybeRequestFrame inline3d=" << is_inline_3d_
+-                 << " layers=" << display_layers_.size()
+-                 << " render_ok=" << will_have_valid_render_state
+-                 << " wants=" << page_wants_frame
+-                 << " pending=" << pending_frame_ << " req=" << request_frame;
+-    }
+-  }
+   if (request_frame) {
+     xr_->frameProvider()->RequestFrame(this);
+     pending_frame_ = true;
+@@ -2614,15 +2604,6 @@ void XRSession::ReportInline3DRects() {
+     }
+   }
+   widget->SetInline3DRects(rects);
+-  {
+-    static int g_rir = 0;
+-    if (++g_rir % 60 == 1) {
+-      LOG(ERROR) << "[DisplayXR] ReportInline3DRects layers="
+-                 << display_layers_.size() << " rects=" << rects.size()
+-                 << " dsf=" << dsf
+-                 << (rects.empty() ? "" : " r0=" + rects[0].ToString());
+-    }
+-  }
+ }
+ 
+ // DisplayXR inline-3D (#625, Step B3d): build two eye views with window-relative

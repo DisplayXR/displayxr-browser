@@ -1,0 +1,171 @@
+From d28d0dd29f9732d29cd8b551591c8aa7d31335d3 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 9 Jul 2026 14:22:12 -0700
+Subject: [PATCH 14/15] =?UTF-8?q?inline-3d(#625):=20quiet=20bring-up=20dia?=
+ =?UTF-8?q?gnostics=20=E2=80=94=20success=20one-shots=20LOG(ERROR)=20->=20?=
+ =?UTF-8?q?VLOG(1)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The per-frame hot-path traces were already stripped in B4b/B4c; this quiets the
+remaining success-path one-shot bring-up confirmations so a default (non-verbose)
+chrome is silent, while keeping them available under --v=1 for the ongoing B4d
+(zero-copy) + look-around validation. Error-path LOG(ERROR) are unchanged (real
+failure logging). Also drops the B2a/B2c.2/PASSED scaffolding phase markers from
+the messages.
+
+Converted (9 sites): weave provider registered (chrome + shell gpu clients),
+weave client init/display-info/PFNs/bindWindow-success (displayxr_weave_client.cc),
+weave-input-ready + canvas-tex (displayxr_weave_gpu.cc), and the DComp root-pass
+weave marker (skia_output_surface_impl_on_gpu.cc). bindWindow failure kept as
+LOG(ERROR). Re-verified: weave still fires under default flags (no 0x80070057),
+default log now quiet.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ chrome/gpu/chrome_content_gpu_client.cc       |  2 +-
+ .../browser/displayxr_weave_client.cc         | 33 ++++++++++---------
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 12 +++----
+ .../skia_output_surface_impl_on_gpu.cc        |  6 ++--
+ content/shell/gpu/shell_content_gpu_client.cc |  2 +-
+ 5 files changed, 28 insertions(+), 27 deletions(-)
+
+diff --git a/chrome/gpu/chrome_content_gpu_client.cc b/chrome/gpu/chrome_content_gpu_client.cc
+index fcb8556287010..8937f73875844 100644
+--- a/chrome/gpu/chrome_content_gpu_client.cc
++++ b/chrome/gpu/chrome_content_gpu_client.cc
+@@ -157,7 +157,7 @@ void ChromeContentGpuClient::PostCompositorThreadCreated(
+     weave_gpu_ = std::make_unique<displayxr::DisplayXRWeaveGpu>();
+     weave_gpu_->Bind();
+     viz::SetDisplayXRWeaveProvider(weave_gpu_.get());
+-    LOG(ERROR) << "[DisplayXR] B2c GPU weave provider registered";
++    VLOG(1) << "[DisplayXR] inline-3D GPU weave provider registered";
+   }
+ #endif
+ }
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index fb7a14bf414af..9b86ed7dcb877 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -185,10 +185,9 @@ void InitializeWin() {
+       HasExtension(exts, XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+   s.has_weave = HasExtension(exts, XR_EXT_WEAVE_EXTENSION_NAME);
+ 
+-  LOG(ERROR) << "[DisplayXR] inline-3D weave client (B2a): "
+-             << "D3D11=" << has_d3d11 << " win32_window_binding=" << has_window
+-             << " display_info=" << has_display_info
+-             << " weave=" << s.has_weave;
++  VLOG(1) << "[DisplayXR] inline-3D weave client: "
++          << "D3D11=" << has_d3d11 << " win32_window_binding=" << has_window
++          << " display_info=" << has_display_info << " weave=" << s.has_weave;
+ 
+   if (!has_d3d11 || !has_window || !s.has_weave) {
+     LOG(ERROR) << "[DisplayXR] required extensions missing — weave unavailable "
+@@ -241,9 +240,9 @@ void InitializeWin() {
+       s.display_h_m = di.displaySizeMeters.height;
+       s.display_px_w = di.displayPixelWidth;
+       s.display_px_h = di.displayPixelHeight;
+-      LOG(ERROR) << "[DisplayXR] display info: " << s.display_w_m << "x"
+-                 << s.display_h_m << " m, " << s.display_px_w << "x"
+-                 << s.display_px_h << " px";
++      VLOG(1) << "[DisplayXR] display info: " << s.display_w_m << "x"
++              << s.display_h_m << " m, " << s.display_px_w << "x"
++              << s.display_px_h << " px";
+     }
+   }
+ 
+@@ -254,10 +253,10 @@ void InitializeWin() {
+   xrGetInstanceProcAddr(s.instance, "xrWeaveSnapWindowRectEXT",
+                         reinterpret_cast<PFN_xrVoidFunction*>(&s.snap));
+ 
+-  LOG(ERROR) << "[DisplayXR] instance + system OK; weave PFNs: bindWindow="
+-             << (s.bind_window ? "ok" : "NULL")
+-             << " submit=" << (s.submit ? "ok" : "NULL")
+-             << " snap=" << (s.snap ? "ok" : "NULL");
++  VLOG(1) << "[DisplayXR] instance + system OK; weave PFNs: bindWindow="
++          << (s.bind_window ? "ok" : "NULL")
++          << " submit=" << (s.submit ? "ok" : "NULL")
++          << " snap=" << (s.snap ? "ok" : "NULL");
+   if (!s.bind_window || !s.submit) {
+     LOG(ERROR) << "[DisplayXR] failed to resolve weave entry points";
+     return;
+@@ -312,11 +311,13 @@ void InitializeWin() {
+   }
+ 
+   XrResult br = s.bind_window(s.session, reinterpret_cast<void*>(s.hwnd));
+-  LOG(ERROR) << "[DisplayXR] present-owner session + xrWeaveBindWindowEXT(hwnd="
+-             << reinterpret_cast<void*>(s.hwnd) << ") -> " << br
+-             << (XR_SUCCEEDED(br)
+-                     ? "  — B2a PASSED (window-bound weave session live)"
+-                     : "  — bindWindow FAILED");
++  if (XR_SUCCEEDED(br)) {
++    VLOG(1) << "[DisplayXR] present-owner session bound; xrWeaveBindWindowEXT(hwnd="
++            << reinterpret_cast<void*>(s.hwnd) << ") -> " << br;
++  } else {
++    LOG(ERROR) << "[DisplayXR] xrWeaveBindWindowEXT(hwnd="
++               << reinterpret_cast<void*>(s.hwnd) << ") failed -> " << br;
++  }
+ }
+ 
+ // Drive one weave on the live present-owner session. Returns ok=false unless the
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index ba6dc285e1ed6..214919d4b3c0b 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -102,8 +102,8 @@ bool DisplayXRWeaveGpu::EnsureInput(ID3D11Device* device,
+   input_w_ = w;
+   input_h_ = h;
+   input_format_ = format;
+-  LOG(ERROR) << "[DisplayXR] B2c.2 canvas weave input ready " << w << "x" << h
+-             << " fmt=" << format << " (NT handle=" << input_handle_ << ")";
++  VLOG(1) << "[DisplayXR] weave input ready " << w << "x" << h
++          << " fmt=" << format << " (NT handle=" << input_handle_ << ")";
+   return true;
+ }
+ 
+@@ -122,10 +122,10 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
+   canvas_tex->GetDesc(&cd);
+   if (!logged_canvas_desc_) {
+     logged_canvas_desc_ = true;
+-    LOG(ERROR) << "[DisplayXR] B2c.2 canvas tex " << cd.Width << "x" << cd.Height
+-               << " fmt=" << cd.Format << " slice=" << array_slice
+-               << " src=" << src_rect.ToString()
+-               << " win=" << window_rect.ToString();
++    VLOG(1) << "[DisplayXR] canvas tex " << cd.Width << "x" << cd.Height
++            << " fmt=" << cd.Format << " slice=" << array_slice
++            << " src=" << src_rect.ToString()
++            << " win=" << window_rect.ToString();
+   }
+ 
+   const uint32_t w = static_cast<uint32_t>(window_rect.width());
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 30239ccafe5e8..93e3a629589f1 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2727,9 +2727,9 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+   static bool logged = false;
+   if (!logged) {
+     logged = true;
+-    LOG(ERROR) << "[DisplayXR] MaybeWeaveRootRenderPass: DComp root pass "
+-               << surface->width() << "x" << surface->height()
+-               << " rects=" << inline_3d_rects_.size();
++    VLOG(1) << "[DisplayXR] weaving inline-3D on DComp root render-pass "
++            << surface->width() << "x" << surface->height()
++            << " rects=" << inline_3d_rects_.size();
+   }
+   WeaveCompositedSurface(surface, surface->getCanvas());
+ }
+diff --git a/content/shell/gpu/shell_content_gpu_client.cc b/content/shell/gpu/shell_content_gpu_client.cc
+index 9a7f8fff86b46..796d890d4b3ad 100644
+--- a/content/shell/gpu/shell_content_gpu_client.cc
++++ b/content/shell/gpu/shell_content_gpu_client.cc
+@@ -55,7 +55,7 @@ void ShellContentGpuClient::PostCompositorThreadCreated(
+   weave_gpu_ = std::make_unique<displayxr::DisplayXRWeaveGpu>();
+   weave_gpu_->Bind();
+   viz::SetDisplayXRWeaveProvider(weave_gpu_.get());
+-  LOG(ERROR) << "[DisplayXR] B2c GPU weave provider registered";
++  VLOG(1) << "[DisplayXR] inline-3D GPU weave provider registered";
+ }
+ #endif
+ 
