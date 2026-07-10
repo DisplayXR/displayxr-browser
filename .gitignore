@@ -1,0 +1,17 @@
+# Chromium checkout / build artifacts (never vendored here — see scripts/fetch)
+src/
+chromium/
+out/
+depot_tools/
+*.exe
+*.pdb
+*.dll
+
+# packaging output
+dist/
+_package/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
