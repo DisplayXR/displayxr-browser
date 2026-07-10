@@ -1,0 +1,8 @@
+# Patch files carry binary (base64) hunks + exact diff context — never touch line endings,
+# or `git am` breaks on another machine.
+*.patch  -text
+
+# Build/orchestration scripts must stay LF (they run in git-bash / on the Linux-ish depot_tools env).
+*.sh        text eol=lf
+config.env  text eol=lf
+*.gn        text eol=lf

@@ -1,0 +1,312 @@
+From 6578f2719c16fe359f40e191f99796038ecfe1e0 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 9 Jul 2026 01:28:53 -0700
+Subject: [PATCH 11/15] =?UTF-8?q?inline-3d(#625):=20plumb=20inline=5F3d=5F?=
+ =?UTF-8?q?rects=20through=20LayerContext=20=E2=80=94=20retire=20--disable?=
+ =?UTF-8?q?-features=3DTreesInViz?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Chrome's default TreesInVizInClientProcess() forwards each frame to Viz as a
+LayerContext display-tree update (LayerTreeUpdate) that carried latency_info +
+tracked_element_rects but NOT the DisplayXR inline_3d_rects. On the Viz side
+MakeCompositorFrameMetadata then rebuilt metadata with an empty inline_3d_rects
+(active_tree()->inline_3d_rects() is never populated on the Viz tree), so
+MaybeWeaveOutput saw no rects and never wove. The B4b launch worked around this
+with --disable-features=TreesInViz.
+
+Fix: carry inline_3d_rects through the display-tree update, mirroring
+tracked_element_rects exactly:
+ - mojom LayerTreeUpdate gains array<gfx.mojom.Rect> inline_3d_rects.
+ - LayerContext::UpdateDisplayTreeFrom (+ base virtual, viz/fake/test impls)
+   and LayerTreeHostImpl::UpdateDisplayTree gain the param; the client threads
+   compositor_frame.metadata.inline_3d_rects into it.
+ - LayerContextImpl applies it via a new
+   LayerTreeHostImpl::set_inline_3d_rects_from_client / _from_client_ member.
+ - MakeCompositorFrameMetadata sets metadata.inline_3d_rects from the client
+   copy in the trees_in_viz_in_viz_process branch (and from active_tree() in the
+   renderer-side branch), matching tracked_element_rects.
+
+Validated in real chrome with --disable-features=TreesInViz REMOVED: the weave
+fires end-to-end (service leia_dp_d3d11_process_atlas weave: target=2593x1974
+vp=(374,920 1810x1054), zero OpenSharedResource 0x80070057) and the inline canvas
+is glasses-free 3D (user eyeball).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ cc/mojo_embedder/viz_layer_context.cc          |  4 +++-
+ cc/mojo_embedder/viz_layer_context.h           |  3 ++-
+ cc/test/fake_layer_context.cc                  |  3 ++-
+ cc/test/fake_layer_context.h                   |  3 ++-
+ cc/test/test_layer_context.cc                  |  3 ++-
+ cc/test/test_layer_context.h                   |  3 ++-
+ cc/trees/layer_context.h                       |  3 ++-
+ cc/trees/layer_tree_host_impl.cc               | 18 +++++++++++++-----
+ cc/trees/layer_tree_host_impl.h                | 10 ++++++++++
+ .../viz/service/layers/layer_context_impl.cc   |  3 +++
+ .../layers/viz_layer_context_unittest.cc       |  4 ++--
+ .../mojom/compositing/layer_context.mojom      |  4 ++++
+ 12 files changed, 47 insertions(+), 14 deletions(-)
+
+diff --git a/cc/mojo_embedder/viz_layer_context.cc b/cc/mojo_embedder/viz_layer_context.cc
+index 4588ca238230a..3a7bcf768eed7 100644
+--- a/cc/mojo_embedder/viz_layer_context.cc
++++ b/cc/mojo_embedder/viz_layer_context.cc
+@@ -1463,7 +1463,8 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+     bool frame_has_damage,
+     bool is_flush,
+     std::vector<ui::LatencyInfo> latency_info,
+-    viz::TrackedElementRects tracked_element_rects) {
++    viz::TrackedElementRects tracked_element_rects,
++    std::vector<gfx::Rect> inline_3d_rects) {
+   TRACE_EVENT0("viz", "VizLayerContext::UpdateDisplayTreeFrom");
+ 
+   auto& property_trees = *tree.property_trees();
+@@ -1497,6 +1498,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+ 
+   update->latency_info = std::move(latency_info);
+   update->tracked_element_rects = std::move(tracked_element_rects);
++  update->inline_3d_rects = std::move(inline_3d_rects);
+   update->device_viewport = tree.GetDeviceViewport();
+   update->device_scale_factor = tree.device_scale_factor();
+   DUMP_WILL_BE_CHECK_GT(update->device_scale_factor, 0.f);
+diff --git a/cc/mojo_embedder/viz_layer_context.h b/cc/mojo_embedder/viz_layer_context.h
+index ef0e67334590b..8cf4e1e509898 100644
+--- a/cc/mojo_embedder/viz_layer_context.h
++++ b/cc/mojo_embedder/viz_layer_context.h
+@@ -53,7 +53,8 @@ class CC_MOJO_EMBEDDER_EXPORT VizLayerContext
+       bool frame_has_damage,
+       bool is_flush,
+       std::vector<ui::LatencyInfo> latency_info,
+-      viz::TrackedElementRects tracked_element_rects) override;
++      viz::TrackedElementRects tracked_element_rects,
++      std::vector<gfx::Rect> inline_3d_rects) override;
+   void UpdateDisplayTile(PictureLayerImpl& layer,
+                          const Tile& tile,
+                          viz::ClientResourceProvider& resource_provider,
+diff --git a/cc/test/fake_layer_context.cc b/cc/test/fake_layer_context.cc
+index 78268c2e95d83..d16c8b2516beb 100644
+--- a/cc/test/fake_layer_context.cc
++++ b/cc/test/fake_layer_context.cc
+@@ -24,7 +24,8 @@ base::TimeTicks FakeLayerContext::UpdateDisplayTreeFrom(
+     bool frame_has_damage,
+     bool is_flush,
+     std::vector<ui::LatencyInfo> latency_info,
+-    viz::TrackedElementRects tracked_element_rects) {
++    viz::TrackedElementRects tracked_element_rects,
++    std::vector<gfx::Rect> inline_3d_rects) {
+   return base::TimeTicks::Now();
+ }
+ 
+diff --git a/cc/test/fake_layer_context.h b/cc/test/fake_layer_context.h
+index e5f7218761d23..cbab66e7edf8f 100644
+--- a/cc/test/fake_layer_context.h
++++ b/cc/test/fake_layer_context.h
+@@ -30,7 +30,8 @@ class FakeLayerContext : public LayerContext {
+       bool frame_has_damage,
+       bool is_flush,
+       std::vector<ui::LatencyInfo> latency_info,
+-      viz::TrackedElementRects tracked_element_rects) override;
++      viz::TrackedElementRects tracked_element_rects,
++      std::vector<gfx::Rect> inline_3d_rects) override;
+ 
+   void UpdateDisplayTile(PictureLayerImpl& layer,
+                          const Tile& tile,
+diff --git a/cc/test/test_layer_context.cc b/cc/test/test_layer_context.cc
+index 13c99808c62dc..fa1b5ad0c1666 100644
+--- a/cc/test/test_layer_context.cc
++++ b/cc/test/test_layer_context.cc
+@@ -23,7 +23,8 @@ base::TimeTicks TestLayerContext::UpdateDisplayTreeFrom(
+     bool frame_has_damage,
+     bool is_flush,
+     std::vector<ui::LatencyInfo> latency_info,
+-    viz::TrackedElementRects tracked_element_rects) {
++    viz::TrackedElementRects tracked_element_rects,
++    std::vector<gfx::Rect> inline_3d_rects) {
+   return base::TimeTicks::Now();
+ }
+ 
+diff --git a/cc/test/test_layer_context.h b/cc/test/test_layer_context.h
+index 3bcb6e5fb346e..0829a8ccdc1fd 100644
+--- a/cc/test/test_layer_context.h
++++ b/cc/test/test_layer_context.h
+@@ -30,7 +30,8 @@ class TestLayerContext : public LayerContext {
+       bool frame_has_damage,
+       bool is_flush,
+       std::vector<ui::LatencyInfo> latency_info,
+-      viz::TrackedElementRects tracked_element_rects) override;
++      viz::TrackedElementRects tracked_element_rects,
++      std::vector<gfx::Rect> inline_3d_rects) override;
+ 
+   void UpdateDisplayTile(PictureLayerImpl& layer,
+                          const Tile& tile,
+diff --git a/cc/trees/layer_context.h b/cc/trees/layer_context.h
+index c2f40737c3291..d09799a720422 100644
+--- a/cc/trees/layer_context.h
++++ b/cc/trees/layer_context.h
+@@ -54,7 +54,8 @@ class CC_EXPORT LayerContext {
+       bool frame_has_damage,
+       bool is_flush,
+       std::vector<ui::LatencyInfo> latency_info,
+-      viz::TrackedElementRects tracked_element_rects) = 0;
++      viz::TrackedElementRects tracked_element_rects,
++      std::vector<gfx::Rect> inline_3d_rects) = 0;
+ 
+   // Pushes an update to a single tile in the context's display tree.
+   virtual void UpdateDisplayTile(
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index 123052d1f4398..7f28122e1fc1a 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -2447,12 +2447,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+   metadata.capture_bounds = CollectRegionCaptureBounds();
+   // DisplayXR inline-3D (#625, Step B / B4b): carry the page's inline-3d canvas
+   // rects (window-relative device px) so Viz can weave those output sub-rects.
+-  metadata.inline_3d_rects = active_tree()->inline_3d_rects();
++  // In TreesInViz-in-viz mode the Viz-side active tree never receives the rects,
++  // so take them from the client-supplied copy (mirrors tracked_element_rects).
+   if (settings().trees_in_viz_in_viz_process) {
+     metadata.tracked_element_rects = tracked_element_rects_from_client_;
++    metadata.inline_3d_rects = inline_3d_rects_from_client_;
+   } else {
+     metadata.tracked_element_rects = CollectTrackedElementRects(
+         /*is_for_compositor_frame_metadata=*/true);
++    metadata.inline_3d_rects = active_tree()->inline_3d_rects();
+   }
+ 
+   if (!screenshot_destination_.is_empty()) {
+@@ -2628,7 +2631,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+ 
+     // Send updates to Viz even for no damage case when TreesInViz is enabled.
+     if (settings_.TreesInVizInClientProcess()) {
+-      UpdateDisplayTree(*frame, {}, viz::TrackedElementRects());
++      UpdateDisplayTree(*frame, {}, viz::TrackedElementRects(),
++                        std::vector<gfx::Rect>());
+     }
+ 
+     active_tree()->ResetAllChangeTracking();
+@@ -2720,7 +2724,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+         compositor_frame.metadata.send_frame_token_to_embedder;
+     trees_in_viz_submit_time = UpdateDisplayTree(
+         *frame, std::move(compositor_frame.metadata.latency_info),
+-        std::move(compositor_frame.metadata.tracked_element_rects));
++        std::move(compositor_frame.metadata.tracked_element_rects),
++        std::move(compositor_frame.metadata.inline_3d_rects));
+ 
+     layer_tree_frame_sink_->ExportFrameTiming();
+   } else {
+@@ -3248,6 +3253,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+     FrameData& frame,
+     std::vector<ui::LatencyInfo> latency_info,
+     viz::TrackedElementRects tracked_element_rects,
++    std::vector<gfx::Rect> inline_3d_rects,
+     bool is_flush) {
+   DCHECK(settings_.TreesInVizInClientProcess());
+   DCHECK(layer_context_);
+@@ -3258,7 +3264,8 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+       *active_tree(), *resource_provider(),
+       layer_tree_frame_sink_->shared_image_interface().get(),
+       viewport_damage_rect_, !frame.has_no_damage, is_flush,
+-      std::move(latency_info), std::move(tracked_element_rects));
++      std::move(latency_info), std::move(tracked_element_rects),
++      std::move(inline_3d_rects));
+ }
+ 
+ void LayerTreeHostImpl::FlushDisplayTree() {
+@@ -3287,7 +3294,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
+   // activation of this specific update and ensures that subsequent metadata
+   // (like frame tokens in ACKs) remains consistent.
+   ++next_frame_token_;
+-  UpdateDisplayTree(frame, {}, viz::TrackedElementRects(), /*is_flush=*/true);
++  UpdateDisplayTree(frame, {}, viz::TrackedElementRects(),
++                    std::vector<gfx::Rect>(), /*is_flush=*/true);
+ 
+   // A flush update synchronizes state (e.g. tile evictions) to Viz but does not
+   // result in a frame draw. We reset internal damage tracking and tree change
+diff --git a/cc/trees/layer_tree_host_impl.h b/cc/trees/layer_tree_host_impl.h
+index 716c6cbd8ca88..aac12746cdb29 100644
+--- a/cc/trees/layer_tree_host_impl.h
++++ b/cc/trees/layer_tree_host_impl.h
+@@ -424,6 +424,7 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+       FrameData& frame,
+       std::vector<ui::LatencyInfo> latency_info,
+       viz::TrackedElementRects tracked_element_rects,
++      std::vector<gfx::Rect> inline_3d_rects,
+       bool is_flush = false);
+ 
+   // Synchronizes the current tree state to Viz without triggering a draw.
+@@ -579,6 +580,10 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+     return tracked_element_rects_from_client_;
+   }
+ 
++  void set_inline_3d_rects_from_client(std::vector<gfx::Rect> inline_3d_rects) {
++    inline_3d_rects_from_client_ = std::move(inline_3d_rects);
++  }
++
+   // Buffers `callback` until a relevant presentation feedback arrives, at which
+   // point the callback will be posted to run on the main thread. A presentation
+   // feedback is considered relevant if the frame's token is greater than or
+@@ -1367,6 +1372,11 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+   // client so that they can be added to generated frame metadata in Viz.
+   viz::TrackedElementRects tracked_element_rects_from_client_;
+ 
++  // DisplayXR inline-3D (#625, Step B). Only used in TreesInViz mode. Stores the
++  // inline-3d canvas rects passed from the client so they can be added to
++  // generated frame metadata in Viz (mirrors tracked_element_rects_from_client_).
++  std::vector<gfx::Rect> inline_3d_rects_from_client_;
++
+   // Settings whether we dump generated compositor frame during DrawLayers.
+   // They are for debug purposes for TreesInViz and TreeAnimationsInViz.
+   bool dump_compositor_frame_ = false;
+diff --git a/components/viz/service/layers/layer_context_impl.cc b/components/viz/service/layers/layer_context_impl.cc
+index 5347f77a90f80..9820a5a255d43 100644
+--- a/components/viz/service/layers/layer_context_impl.cc
++++ b/components/viz/service/layers/layer_context_impl.cc
+@@ -2029,6 +2029,9 @@ base::expected<void, std::string> LayerContextImpl::DoUpdateDisplayTree(
+   host_impl_->set_tracked_element_rects_from_client(
+       std::move(update->tracked_element_rects));
+ 
++  host_impl_->set_inline_3d_rects_from_client(
++      std::move(update->inline_3d_rects));
++
+   for (const auto& latency : update->latency_info) {
+     if (latency.terminated()) {
+       return base::unexpected("Received already-terminated LatencyInfo");
+diff --git a/components/viz/service/layers/viz_layer_context_unittest.cc b/components/viz/service/layers/viz_layer_context_unittest.cc
+index 8568f520092d1..02e2069f2a324 100644
+--- a/components/viz/service/layers/viz_layer_context_unittest.cc
++++ b/components/viz/service/layers/viz_layer_context_unittest.cc
+@@ -138,7 +138,7 @@ void VizLayerContextTest::UpdateDisplayTreeAndWait() {
+       *host_impl_->active_tree(), *host_impl_->resource_provider(),
+       /*shared_image_interface=*/nullptr, viewport_damage_rect,
+       frame_has_damage, /*is_flush=*/false, std::move(latency_info),
+-      TrackedElementRects());
++      TrackedElementRects(), std::vector<gfx::Rect>());
+ 
+   base::RunLoop run_loop;
+   fake_layer_context_.on_update_display_tree_ = run_loop.QuitClosure();
+@@ -292,7 +292,7 @@ TEST_F(VizLayerContextTest, FlushOnlyUpdate) {
+       *host_impl_->active_tree(), *host_impl_->resource_provider(),
+       /*shared_image_interface=*/nullptr, viewport_damage_rect,
+       frame_has_damage, /*is_flush=*/true, std::move(latency_info),
+-      TrackedElementRects());
++      TrackedElementRects(), std::vector<gfx::Rect>());
+ 
+   base::RunLoop run_loop;
+   fake_layer_context_.on_update_display_tree_ = run_loop.QuitClosure();
+diff --git a/services/viz/public/mojom/compositing/layer_context.mojom b/services/viz/public/mojom/compositing/layer_context.mojom
+index 8da3a9726b52a..ca94d2b6c67da 100644
+--- a/services/viz/public/mojom/compositing/layer_context.mojom
++++ b/services/viz/public/mojom/compositing/layer_context.mojom
+@@ -261,6 +261,10 @@ struct LayerTreeUpdate {
+ 
+   // Tracked element rects to be added to the frame metadata.
+   TrackedElementRects tracked_element_rects;
++
++  // DisplayXR inline-3D (#625, Step B): canvas rects (window-relative device px)
++  // to be added to the frame metadata so Viz can weave those output sub-rects.
++  array<gfx.mojom.Rect> inline_3d_rects;
+ };
+ 
+ // Drives updates to a GPU-side LayerTreeHostImpl from its corresponding

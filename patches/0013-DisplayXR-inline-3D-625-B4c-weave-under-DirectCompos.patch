@@ -1,0 +1,179 @@
+From 485518796a94c439a77b7e98105e9eddb47c388d Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 9 Jul 2026 09:13:45 -0700
+Subject: [PATCH 13/15] =?UTF-8?q?DisplayXR=20inline-3D=20(#625=20B4c):=20w?=
+ =?UTF-8?q?eave=20under=20DirectComposition=20=E2=80=94=20retire=20--disab?=
+ =?UTF-8?q?le-direct-composition?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The inline-3d weave was gated on --disable-direct-composition. Root cause was not
+CPU-vs-GPU copy but the weave hook's location: MaybeWeaveOutput ran only from
+FinishPaintCurrentFrame (the GL output-device path). Under chrome's default
+DirectComposition, renderer_allocates_images=true draws the composited page into
+the ROOT render-pass backing via FinishPaintRenderPass (a writable, window-sized
+Skia surface) — the output-device surface is never painted (SkiaOutputDeviceDComp::
+BeginPaint is NOTIMPLEMENTED), so the weave never fired.
+
+Fix: run the same composited-sub-rect weave on the root render-pass surface.
+- Extract the weave loop into WeaveCompositedSurface(output, out_canvas).
+- MaybeWeaveOutput (GL path) delegates to it, unchanged behavior.
+- New MaybeWeaveRootRenderPass hook in FinishPaintRenderPass (both Ganesh + Graphite
+  branches) weaves the window-sized (== size_), is_overlay root pass. Non-root
+  overlay passes are element-sized and skipped; the two paths are mutually exclusive
+  (root uses BeginPaintCurrentFrame under GL, so the render-pass hook never fires
+  there — no double-weave).
+
+Validated on Leia: with --disable-direct-composition removed the weave fires
+end-to-end (MaybeWeaveRootRenderPass: DComp root pass 2593x1974, canvas weave input
+ready 1810x1054, service leia_dp_d3d11_process_atlas weave vp=(374,920 1810x1054),
+zero 0x80070057) and the inline canvas is glasses-free 3D (user eyeball). GL path
+(flag present) unchanged and does not fire the new hook.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 77 +++++++++++++++----
+ .../skia_output_surface_impl_on_gpu.h         | 14 ++++
+ 2 files changed, 75 insertions(+), 16 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 6580ff09cf02b..30239ccafe5e8 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -745,6 +745,13 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintRenderPass(
+     }
+     if (insert_success) {
+       skia_representation->SetCleared();
++#if BUILDFLAG(IS_WIN)
++      // DisplayXR inline-3D (#625, Step B / B4c): under DComp the composited page
++      // lands in the ROOT render-pass backing (this Graphite recording), not the
++      // output-device surface — weave it here so --disable-direct-composition is
++      // no longer required.
++      MaybeWeaveRootRenderPass(surface, is_overlay);
++#endif
+     } else {
+       DLOG(ERROR) << "Failed to insert recording";
+       draw_render_pass_failed_ = true;
+@@ -766,6 +773,15 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintRenderPass(
+     DrawOverdraw(std::move(overdraw_ddl), *surface->getCanvas());
+   }
+ 
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B / B4c): under DComp (Ganesh backend) the
++  // composited page lands in the ROOT render-pass backing (this DDL), not the
++  // output-device surface — weave it here so --disable-direct-composition is no
++  // longer required. WeaveCompositedSurface flushes the woven draw-back itself;
++  // the flush below is harmless.
++  MaybeWeaveRootRenderPass(surface, is_overlay);
++#endif
++
+ #if BUILDFLAG(ENABLE_VULKAN)
+   // Semaphores for release fences for vulkan should be created before flush.
+   if (!return_release_fence_cb.is_null() && is_using_vulkan()) {
+@@ -2683,6 +2699,43 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+   if (inline_3d_rects_.empty()) {
+     return;
+   }
++  // GL output device (--disable-direct-composition): the composited page is in
++  // the output-device SkSurface.
++  if (!scoped_output_device_paint_) {
++    return;
++  }
++  SkSurface* output = scoped_output_device_paint_->sk_surface();
++  SkCanvas* out_canvas = scoped_output_device_paint_->GetCanvas();
++  if (!output || !out_canvas) {
++    return;
++  }
++  WeaveCompositedSurface(output, out_canvas);
++}
++
++void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
++                                                          bool is_overlay) {
++  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++  if (inline_3d_rects_.empty() || !surface || !is_overlay) {
++    return;
++  }
++  // inline_3d_rects_ are window-relative device-px, so only the window-sized root
++  // render pass (== the whole composited page, the CEF pageTex equivalent under
++  // DComp) carries them. Non-root overlay passes are element-sized — skip them.
++  if (gfx::Size(surface->width(), surface->height()) != size_) {
++    return;
++  }
++  static bool logged = false;
++  if (!logged) {
++    logged = true;
++    LOG(ERROR) << "[DisplayXR] MaybeWeaveRootRenderPass: DComp root pass "
++               << surface->width() << "x" << surface->height()
++               << " rects=" << inline_3d_rects_.size();
++  }
++  WeaveCompositedSurface(surface, surface->getCanvas());
++}
++
++void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
++                                                        SkCanvas* out_canvas) {
+   auto* provider = GetDisplayXRWeaveProvider();
+   if (!provider) {
+     return;
+@@ -2692,28 +2745,20 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+   if (!device_x) {
+     return;
+   }
+-  if (!scoped_output_device_paint_) {
+-    return;
+-  }
+-  SkSurface* output = scoped_output_device_paint_->sk_surface();
+-  SkCanvas* out_canvas = scoped_output_device_paint_->GetCanvas();
+-  if (!output || !out_canvas) {
+-    return;
+-  }
+   const gfx::Rect window_bounds(size_);
+   if (window_bounds.IsEmpty()) {
+     return;
+   }
+ 
+   // CEF sub-rect model (design §13.3): the composited page (2D chrome + each
+-  // inline-3d canvas's flat SBS pixels, already squashed together) is now in the
+-  // output surface — this is exactly the Step-A CEF host's `pageTex`. Per rect we
+-  // read the composited sub-rect's pixels back to CPU and upload them into the
+-  // weave input, weave, then draw the woven result back over the output. Under
+-  // this config the output device is SkiaOutputDeviceGL (Ganesh/ANGLE, forced by
+-  // --disable-direct-composition), so a synchronous SkSurface::readPixels is
+-  // valid; the zero-copy D3D-texture route + Graphite async readback are
+-  // follow-ups. We read before drawing the woven back, so no read/write hazard.
++  // inline-3d canvas's flat SBS pixels, already squashed together) is now in
++  // |output| — this is exactly the Step-A CEF host's `pageTex`. |output| is
++  // either the GL output-device SkSurface (--disable-direct-composition) or the
++  // DComp root render-pass backing surface (default DComp); both are readable
++  // Skia surfaces, so the same loop serves both. Per rect we read the composited
++  // sub-rect's pixels back (Ganesh sync readPixels; Graphite blocking-async) and
++  // upload them into the weave input, weave, then draw the woven result back over
++  // |out_canvas|. We read before drawing the woven back, so no read/write hazard.
+ 
+   // Prune woven state beyond the current rect count (canvas removed / count
+   // shrank) before (re)sizing, so the woven SharedImages are not leaked.
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index ade0dd23235ee..78670455d090e 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -498,6 +498,20 @@ class SkiaOutputSurfaceImplOnGpu
+   // fence, and draw the woven texture back over the output at that rect. GPU main
+   // thread; mirrors the Step-A CEF host's external-compositor loop.
+   void MaybeWeaveOutput();
++
++  // DComp path (retires --disable-direct-composition). Chrome's default
++  // DirectComposition output device paints the composited page into the ROOT
++  // render-pass backing (renderer_allocates_images) via FinishPaintRenderPass,
++  // not the output-device SkSurface — so MaybeWeaveOutput (driven from
++  // FinishPaintCurrentFrame) never runs under DComp. This runs the SAME
++  // composited-sub-rect weave on the root render-pass surface (window-sized,
++  // is_overlay) so the weave fires regardless of the GL-vs-DComp output device.
++  void MaybeWeaveRootRenderPass(SkSurface* surface, bool is_overlay);
++
++  // Shared weave loop for both output paths: for each inline_3d_rects_ entry,
++  // read the composited sub-rect out of |output|, weave it, and draw the woven
++  // result back over |out_canvas| at that rect.
++  void WeaveCompositedSurface(SkSurface* output, SkCanvas* out_canvas);
+ #endif
+ 
+   class ReleaseCurrent {

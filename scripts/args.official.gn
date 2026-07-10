@@ -1,0 +1,13 @@
+# DisplayXR Browser — official static distributable build args.
+# Written into $CHROMIUM_SRC/out/$OUT_DIR/args.gn by scripts/build.sh.
+is_official_build = true
+is_component_build = false        # static — the inline-3D weave links into chrome.exe, not a viz DLL
+is_debug = false
+target_cpu = "x64"
+chrome_pgo_phase = 0              # no local PGO profile on a self-hosted box → must disable or gen fails
+use_remoteexec = false           # no Google RBE on a self-hosted box
+symbol_level = 1
+blink_symbol_level = 0
+dcheck_always_on = false
+# proprietary_codecs = true / ffmpeg_branding = "Chrome": enable for the shipped preview if it needs
+#   H.264/AAC media. Omitted by default (lighter build, avoids the licensing weight) — a preview scope call.

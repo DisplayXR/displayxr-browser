@@ -1,0 +1,309 @@
+From df37631fec067596f2e7033c83703fb67962c79b Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 26 Jun 2026 01:22:26 -0500
+Subject: [PATCH 03/15] [displayxr inline-3d #625 B2b] GPU<->browser weave Mojo
+ bridge
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The canvas SharedImage + present live in the GPU process, but the weave RPC
+client lives in the browser process (B2a; the GPU sandbox blocks the per-frame
+RPC). B2b builds the bridge between them via the standard
+ChildThread::BindHostReceiver -> GpuProcessHost::BindHostReceiver ->
+ContentBrowserClient::BindGpuHostReceiver path (mirrors Chromecast's
+VideoGeometrySetter). No new IPC plumbing — two embedder overrides + a mojom.
+
+- content/shell/common/displayxr_weave.mojom: DisplayXRWeaver.WeaveSubmit(Rect)
+  => (bool). B2c extends it with the pre-weave DXGIHandle in + woven handle +
+  fence + eyes out.
+- Browser: DisplayXRWeaverImpl (B2b: log + ok) + ShellContentBrowserClient::
+  BindGpuHostReceiver (flag-gated, binds on the UI thread).
+- GPU: ShellContentGpuClient::PostCompositorThreadCreated fires a one-shot
+  WeaveSubmit probe via ChildThread::BindHostReceiver.
+
+Validated on Leia: GPU process (pid A) WeaveSubmit -> browser process (pid B)
+DisplayXRWeaverImpl -> reply ok=1. Distinct PIDs confirm the cross-process round
+trip end to end.
+---
+ content/shell/BUILD.gn                        | 10 ++++++
+ .../shell/browser/displayxr_weaver_impl.cc    | 34 +++++++++++++++++++
+ content/shell/browser/displayxr_weaver_impl.h | 34 +++++++++++++++++++
+ .../browser/shell_content_browser_client.cc   | 17 ++++++++++
+ .../browser/shell_content_browser_client.h    |  2 ++
+ content/shell/common/displayxr_weave.mojom    | 20 +++++++++++
+ content/shell/gpu/shell_content_gpu_client.cc | 24 +++++++++++++
+ content/shell/gpu/shell_content_gpu_client.h  | 15 ++++++++
+ 8 files changed, 156 insertions(+)
+ create mode 100644 content/shell/browser/displayxr_weaver_impl.cc
+ create mode 100644 content/shell/browser/displayxr_weaver_impl.h
+ create mode 100644 content/shell/common/displayxr_weave.mojom
+
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index f2423637d1d5e..0d86b8bb1ed44 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -200,6 +200,8 @@ static_library("content_shell_lib") {
+     "browser/protocol/browser_handler.cc",
+     "browser/protocol/browser_handler.h",
+     "browser/protocol/domain_handler.h",
++    "browser/displayxr_weaver_impl.cc",
++    "browser/displayxr_weaver_impl.h",
+     "browser/protocol/shell_devtools_session.cc",
+     "browser/protocol/shell_devtools_session.h",
+     "browser/shell.cc",
+@@ -344,6 +346,7 @@ static_library("content_shell_lib") {
+   deps = [
+     ":content_browsertests_mojom",
+     ":displayxr_weave",
++    ":displayxr_weave_mojom",
+     ":protocol_sources",
+     ":resources",
+     ":rust_test_mojom",
+@@ -1183,6 +1186,13 @@ mojom("shell_controller_mojom") {
+   public_deps = [ "//mojo/public/mojom/base" ]
+ }
+ 
++# DisplayXR inline-3D weave bridge (#625, Step B): GPU/Viz -> browser per-frame
++# weave RPC. See docs/roadmap/webxr-step-b-design.md.
++mojom("displayxr_weave_mojom") {
++  sources = [ "common/displayxr_weave.mojom" ]
++  public_deps = [ "//ui/gfx/geometry/mojom" ]
++}
++
+ mojom("rust_test_mojom") {
+   testonly = true
+   sources = [ "common/rust_test.test-mojom" ]
+diff --git a/content/shell/browser/displayxr_weaver_impl.cc b/content/shell/browser/displayxr_weaver_impl.cc
+new file mode 100644
+index 0000000000000..b81f71ce3147a
+--- /dev/null
++++ b/content/shell/browser/displayxr_weaver_impl.cc
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/shell/browser/displayxr_weaver_impl.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/logging.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace content {
++
++// static
++void DisplayXRWeaverImpl::Bind(
++    mojo::PendingReceiver<shell::mojom::DisplayXRWeaver> receiver) {
++  mojo::MakeSelfOwnedReceiver(std::make_unique<DisplayXRWeaverImpl>(),
++                              std::move(receiver));
++}
++
++DisplayXRWeaverImpl::DisplayXRWeaverImpl() = default;
++DisplayXRWeaverImpl::~DisplayXRWeaverImpl() = default;
++
++void DisplayXRWeaverImpl::WeaveSubmit(const gfx::Rect& rect,
++                                      WeaveSubmitCallback callback) {
++  // B2b: prove the GPU->browser bridge. B2c forwards to xrWeaveSubmitEXT.
++  LOG(ERROR) << "[DisplayXR] B2b WeaveSubmit received in BROWSER from GPU: rect="
++             << rect.ToString() << " — GPU<->browser bridge OK";
++  std::move(callback).Run(/*ok=*/true);
++}
++
++}  // namespace content
+diff --git a/content/shell/browser/displayxr_weaver_impl.h b/content/shell/browser/displayxr_weaver_impl.h
+new file mode 100644
+index 0000000000000..00099b5fcb557
+--- /dev/null
++++ b/content/shell/browser/displayxr_weaver_impl.h
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
++#define CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
++
++#include "content/shell/common/displayxr_weave.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++
++namespace content {
++
++// Browser-process implementation of the GPU->browser weave bridge (#625, Step B).
++// B2b: logs the cross-process call + returns ok, proving the channel. B2c will
++// forward WeaveSubmit to the OpenXR weave session (DisplayXRWeaveClient).
++class DisplayXRWeaverImpl : public shell::mojom::DisplayXRWeaver {
++ public:
++  // Bind a receiver to a fresh self-owned impl. Call on the UI thread
++  // (ShellContentBrowserClient::BindGpuHostReceiver hops here from the IO thread).
++  static void Bind(
++      mojo::PendingReceiver<shell::mojom::DisplayXRWeaver> receiver);
++
++  DisplayXRWeaverImpl();
++  DisplayXRWeaverImpl(const DisplayXRWeaverImpl&) = delete;
++  DisplayXRWeaverImpl& operator=(const DisplayXRWeaverImpl&) = delete;
++  ~DisplayXRWeaverImpl() override;
++
++  // shell::mojom::DisplayXRWeaver:
++  void WeaveSubmit(const gfx::Rect& rect, WeaveSubmitCallback callback) override;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 948a8755c033d..a24a648d50863 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -15,6 +15,10 @@
+ 
+ #include "base/base_switches.h"
+ #include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/shell/browser/displayxr_weaver_impl.h"
+ #include "base/containers/fixed_flat_set.h"
+ #include "base/containers/flat_set.h"
+ #include "base/feature_list.h"
+@@ -341,6 +345,19 @@ ShellContentBrowserClient::~ShellContentBrowserClient() {
+   std::erase(GetShellContentBrowserClientInstancesImpl(), this);
+ }
+ 
++void ShellContentBrowserClient::BindGpuHostReceiver(
++    mojo::GenericPendingReceiver receiver) {
++  // DisplayXR inline-3D (#625, Step B / B2b): GPU process -> browser weave
++  // bridge. Dormant unless opted in. Called on the IO thread.
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    return;
++  }
++  if (auto r = receiver.As<shell::mojom::DisplayXRWeaver>()) {
++    GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(&DisplayXRWeaverImpl::Bind, std::move(r)));
++  }
++}
++
+ std::unique_ptr<BrowserMainParts>
+ ShellContentBrowserClient::CreateBrowserMainParts(
+     bool /* is_integration_test */) {
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index b9d397b810743..fefc763d13ac8 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -94,6 +94,8 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+                               blink::web_pref::WebPreferences* prefs) override;
+   std::unique_ptr<content::DevToolsManagerDelegate>
+   CreateDevToolsManagerDelegate() override;
++  // DisplayXR inline-3D (#625, Step B): bind the GPU->browser weave bridge.
++  void BindGpuHostReceiver(mojo::GenericPendingReceiver receiver) override;
+   void ExposeInterfacesToRenderer(
+       service_manager::BinderRegistry* registry,
+       blink::AssociatedInterfaceRegistry* associated_registry,
+diff --git a/content/shell/common/displayxr_weave.mojom b/content/shell/common/displayxr_weave.mojom
+new file mode 100644
+index 0000000000000..9e44edb40d9f7
+--- /dev/null
++++ b/content/shell/common/displayxr_weave.mojom
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module content.shell.mojom;
++
++import "ui/gfx/geometry/mojom/geometry.mojom";
++
++// DisplayXR inline-3D weave bridge (#625, Step B). The GPU/Viz process (where the
++// canvas SharedImage + present live) calls this per frame; the BROWSER process
++// hosts it (it owns the unsandboxed OpenXR weave session — the GPU sandbox blocks
++// the per-frame RPC to displayxr-service; see docs/roadmap/webxr-step-b-design.md).
++//
++// B2b proves the channel with just the window-relative rect. B2c extends
++// WeaveSubmit to carry the pre-weave gfx.mojom.DXGIHandle in, and return the
++// woven DXGIHandle + fence + tracked eyes.
++interface DisplayXRWeaver {
++  // Returns true once the browser-side weave client has handled the submission.
++  WeaveSubmit(gfx.mojom.Rect rect) => (bool ok);
++};
+diff --git a/content/shell/gpu/shell_content_gpu_client.cc b/content/shell/gpu/shell_content_gpu_client.cc
+index f6934a36f30f7..f021e101c0666 100644
+--- a/content/shell/gpu/shell_content_gpu_client.cc
++++ b/content/shell/gpu/shell_content_gpu_client.cc
+@@ -6,10 +6,17 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "build/build_config.h"
+ #include "content/shell/common/power_monitor_test_impl.h"
+ #include "mojo/public/cpp/bindings/binder_map.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
++#if BUILDFLAG(IS_WIN)
++#include "base/logging.h"
++#include "content/public/child/child_thread.h"
++#include "ui/gfx/geometry/rect.h"
++#endif
++
+ namespace content {
+ 
+ ShellContentGpuClient::ShellContentGpuClient() = default;
+@@ -26,4 +33,21 @@ void ShellContentGpuClient::ExposeInterfacesToBrowser(
+       base::SingleThreadTaskRunner::GetCurrentDefault());
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++void ShellContentGpuClient::PostCompositorThreadCreated(
++    base::SingleThreadTaskRunner* task_runner) {
++  // #625 Step B (B2b): one-shot probe proving the GPU->browser weave bridge.
++  // Runs on the GPU main thread (where ChildThread lives). The browser only
++  // binds the receiver when --enable-inline-3d is set, so this is dormant
++  // otherwise (the reply never arrives). B2c replaces this with the per-frame
++  // weave driven from Viz.
++  ChildThread::Get()->BindHostReceiver(weaver_.BindNewPipeAndPassReceiver());
++  weaver_->WeaveSubmit(
++      gfx::Rect(0, 0, 1, 1), base::BindOnce([](bool ok) {
++        LOG(ERROR) << "[DisplayXR] B2b GPU->browser WeaveSubmit reply ok=" << ok
++                   << " — GPU<->browser bridge PASSED";
++      }));
++}
++#endif
++
+ }  // namespace content
+diff --git a/content/shell/gpu/shell_content_gpu_client.h b/content/shell/gpu/shell_content_gpu_client.h
+index a1e4d758dff78..fc5d8418ddd86 100644
+--- a/content/shell/gpu/shell_content_gpu_client.h
++++ b/content/shell/gpu/shell_content_gpu_client.h
+@@ -5,8 +5,14 @@
+ #ifndef CONTENT_SHELL_GPU_SHELL_CONTENT_GPU_CLIENT_H_
+ #define CONTENT_SHELL_GPU_SHELL_CONTENT_GPU_CLIENT_H_
+ 
++#include "build/build_config.h"
+ #include "content/public/gpu/content_gpu_client.h"
+ 
++#if BUILDFLAG(IS_WIN)
++#include "content/shell/common/displayxr_weave.mojom.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#endif
++
+ namespace content {
+ 
+ class ShellContentGpuClient : public ContentGpuClient {
+@@ -24,6 +30,15 @@ class ShellContentGpuClient : public ContentGpuClient {
+       const gpu::GpuPreferences& gpu_preferences,
+       const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
+       mojo::BinderMap* binders) override;
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, Step B): fire a one-shot probe to the browser's
++  // weave bridge once the compositor thread exists (B2b channel proof).
++  void PostCompositorThreadCreated(
++      base::SingleThreadTaskRunner* task_runner) override;
++
++ private:
++  mojo::Remote<shell::mojom::DisplayXRWeaver> weaver_;
++#endif
+ };
+ 
+ }  // namespace content

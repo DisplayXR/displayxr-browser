@@ -1,0 +1,128 @@
+From 7db14cade79869c23b41bcbac7a8a2d506a845ca Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 9 Jul 2026 01:54:59 -0700
+Subject: [PATCH 12/15] =?UTF-8?q?inline-3d(#625):=20Graphite-compatible=20?=
+ =?UTF-8?q?weave=20readback=20=E2=80=94=20retire=20--disable-features=3DSk?=
+ =?UTF-8?q?iaGraphite?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+MaybeWeaveOutput read the composited output sub-rect via SkSurface::readPixels,
+which is synchronous only on Ganesh; Graphite has no sync readPixels, so B4b
+forced Ganesh with --disable-features=SkiaGraphite.
+
+Make the readback dual-backend: on Graphite, FlushGraphiteRecorder() then the
+blocking-async GraphiteSharedContext::asyncRescaleAndReadPixelsAndSubmit (submit
++ wait) of the sub-rect into a local WeaveReadPixelsContext, feeding its
+async_result data(0)/rowBytes(0) to WeavePixels (which already handles an
+arbitrary stride via its DEFAULT upload texture). Ganesh keeps the existing
+synchronous readPixels. Mirrors SkiaOutputDeviceOffscreen::ReadbackForTesting.
+The draw-back / FlushSurface / submit were already backend-agnostic.
+
+Validated in real chrome with --disable-features=SkiaGraphite REMOVED:
+SystemInfo.getInfo reports skia_graphite: enabled_on (Graphite is the active
+backend, so the new path runs), the weave fires end-to-end (service
+leia_dp_d3d11_process_atlas weave: target=2593x1974 vp=(374,920 1810x1054), zero
+0x80070057, chrome WeavePixels "canvas weave input ready 1810x1054"), and the
+inline canvas is glasses-free 3D (user eyeball).
+
+--disable-direct-composition is a SEPARATE output-device concern and still
+required: it forces the readable GL backbuffer SkSurface; under the DComp output
+device MaybeWeaveOutput has no single composited surface to read and its guards
+bail (verified: with DComp on the weave client binds the window but no weave
+fires, while the page still animates). Retiring it needs the zero-copy D3D path.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 62 ++++++++++++++++---
+ 1 file changed, 55 insertions(+), 7 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 1c8286eb2a5f0..6580ff09cf02b 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2731,6 +2731,24 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+   // (D) Per rect: weave the composited sub-rect and draw the woven result back
+   // over the output. Serialized (the provider reuses one keyed-mutex input +
+   // one woven output), mirroring the CEF host's per-element loop.
++  //
++  // Graphite has no synchronous SkSurface::readPixels, so the Graphite readback
++  // uses the blocking-async path (asyncRescaleAndReadPixelsAndSubmit, which
++  // submits + waits) into this context; mirrors
++  // SkiaOutputDeviceOffscreen::ReadbackForTesting. Named distinctly from the
++  // file's CopyOutput-flow ReadPixelsContext.
++  struct WeaveReadPixelsContext {
++    std::unique_ptr<const SkImage::AsyncReadResult> async_result;
++    bool finished = false;
++    static void OnReadPixelsDone(
++        void* raw_ctx,
++        std::unique_ptr<const SkImage::AsyncReadResult> async_result) {
++      auto* ctx = reinterpret_cast<WeaveReadPixelsContext*>(raw_ctx);
++      ctx->async_result = std::move(async_result);
++      ctx->finished = true;
++    }
++  };
++
+   bool drew_any = false;
+   // The woven SkImages must stay backed until the output is flushed + submitted
+   // (Ganesh records the draw and reads the texture at flush time). Hold the
+@@ -2746,21 +2764,51 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+     }
+ 
+     // Read the composited sub-rect back to CPU (BGRA8), then upload it into the
+-    // weave input. Read from the output SkSurface (it knows its own recording
+-    // context and flushes as needed).
++    // weave input. Ganesh has a synchronous SkSurface::readPixels; Graphite has
++    // no sync readback, so it uses the blocking-async path. Read from the output
++    // SkSurface (it knows its own recording context and flushes as needed). We
++    // read before drawing the woven back, so there is no read/write hazard.
+     const int rw = rect.width();
+     const int rh = rect.height();
+-    const size_t stride = static_cast<size_t>(rw) * 4;
+-    std::vector<uint8_t> pixels(stride * rh);
+     const SkImageInfo info = SkImageInfo::Make(
+         rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+         SkColorSpace::MakeSRGB());
+-    if (!output->readPixels(info, pixels.data(), stride, rect.x(), rect.y())) {
+-      continue;
++
++    const uint8_t* src_pixels = nullptr;
++    size_t src_stride = 0;
++    std::vector<uint8_t> ganesh_pixels;    // owns the Ganesh sync-read pixels
++    WeaveReadPixelsContext read_ctx;       // owns the Graphite async-read result
++    if (auto* graphite = context_state_->graphite_shared_context()) {
++      // Graphite: blocking-async rescale+read of the sub-rect (identity scale —
++      // dst dims == src rect dims), submitting + waiting so the pixels are ready
++      // synchronously. FlushGraphiteRecorder() first so the just-drawn output is
++      // committed before the read.
++      context_state_->FlushGraphiteRecorder();
++      graphite->asyncRescaleAndReadPixelsAndSubmit(
++          output, info, SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh),
++          SkImage::RescaleGamma::kSrc, SkImage::RescaleMode::kRepeatedLinear,
++          base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone), &read_ctx);
++      if (!read_ctx.finished || !read_ctx.async_result ||
++          read_ctx.async_result->count() != 1) {
++        continue;
++      }
++      src_pixels =
++          reinterpret_cast<const uint8_t*>(read_ctx.async_result->data(0));
++      src_stride = read_ctx.async_result->rowBytes(0);
++    } else {
++      // Ganesh: synchronous readback into a local buffer.
++      const size_t stride = static_cast<size_t>(rw) * 4;
++      ganesh_pixels.resize(stride * rh);
++      if (!output->readPixels(info, ganesh_pixels.data(), stride, rect.x(),
++                              rect.y())) {
++        continue;
++      }
++      src_pixels = ganesh_pixels.data();
++      src_stride = stride;
+     }
+ 
+     const DisplayXRWeaveProvider::Result r = provider->WeavePixels(
+-        device_x.Get(), pixels.data(), static_cast<uint32_t>(stride), rect);
++        device_x.Get(), src_pixels, static_cast<uint32_t>(src_stride), rect);
+     if (!r.ok) {
+       continue;
+     }

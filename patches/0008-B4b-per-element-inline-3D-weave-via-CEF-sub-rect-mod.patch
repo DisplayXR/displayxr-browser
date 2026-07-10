@@ -1,0 +1,1390 @@
+From 33a7971ff5fa85e71a29af922e70bf3b9bef6258 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 7 Jul 2026 14:06:04 -0700
+Subject: [PATCH 08/15] =?UTF-8?q?B4b:=20per-element=20inline-3D=20weave=20?=
+ =?UTF-8?q?via=20CEF=20sub-rect=20model=20(#625)=20=E2=80=94=20WORKS=20in?=
+ =?UTF-8?q?=20chrome?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Transplants the Step-A CEF external-compositor flow into Viz (design §13.3), so
+the per-element weave fires end-to-end in real chrome — the per-element boundary
+content_shell (page-flatten) architecturally could not cross. Eyeball: canvas
+rect glasses-free 3D (when the Leia DP is tracking / in 3D mode), 2D chrome flat.
+
+Pipeline: XRDisplayLayer reports the canvas window-relative device-px rect each
+XR frame (XRSession::ReportInline3DRects) -> FrameWidget::SetInline3DRects ->
+LayerTreeHost commit-state -> CompositorFrameMetadata.inline_3d_rects (new field
++ mojom array<gfx.mojom.Rect> + traits) -> SurfaceAggregator -> AggregatedFrame
+-> Display::DrawAndSwap -> SkiaOutputSurface::SetInline3DRects -> (GPU thread)
+SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput (replaces MaybeWeaveSubstitute),
+post-Draw pre-Flush: readPixels the composited output sub-rect -> WeavePixels
+(new provider method: CPU pixels -> intermediate texture -> CopyResource into the
+keyed-mutex input) -> xrWeaveSubmitEXT (unchanged bridge) -> Leia DP weaves ->
+import woven + fence-wait -> drawImageRect the woven back over the output.
+
+Blink: inline-3d sessions now animate — treat a registered XRDisplayLayer as a
+valid render state (MaybeRequestFrame), bypass the focus gate for inline-3d
+(XRFrameProvider::ProcessScheduledFrame — a glasses-free display must weave
+unfocused), and add a minimal inline-3d OnFrame path (no XR base layer/transport).
+
+Validation-only launch flags (documented follow-ups, NOT the design):
+--force_high_performance_gpu (match the NVIDIA adapter the Leia runtime uses;
+dual-GPU cross-adapter NT-handle share was the final blocker),
+--disable-features=TreesInViz (chrome default drops non-tracked_element_rects
+metadata; follow-up: plumb inline_3d_rects through LayerContext) and SkiaGraphite
+(CPU readback needs Ganesh synchronous readPixels; follow-up: Graphite async /
+zero-copy D3D texture).
+
+WIP checkpoint — still contains bring-up LOG diagnostics + a one-shot PNG/BGRA
+dump; Item-4 (drop the now-dead B3a weave_target tag plumbing) not yet done.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ cc/trees/commit_state.cc                      |   1 +
+ cc/trees/commit_state.h                       |   5 +
+ cc/trees/layer_tree_host.cc                   |   7 +
+ cc/trees/layer_tree_host.h                    |   5 +
+ cc/trees/layer_tree_host_impl.cc              |  10 +
+ cc/trees/layer_tree_impl.cc                   |   2 +
+ cc/trees/layer_tree_impl.h                    |  13 +
+ .../displayxr/gpu/displayxr_weave_gpu.cc      |  86 +++++
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  13 +
+ .../common/quads/compositor_frame_metadata.cc |   5 +-
+ .../common/quads/compositor_frame_metadata.h  |   6 +
+ .../viz/service/display/aggregated_frame.h    |   5 +
+ components/viz/service/display/display.cc     |  12 +
+ .../viz/service/display/skia_output_surface.h |   6 +
+ .../viz/service/display/surface_aggregator.cc |  17 +
+ .../viz/service/display/surface_aggregator.h  |   4 +
+ .../displayxr_weave_provider.h                |  11 +
+ .../skia_output_surface_impl.cc               |  13 +
+ .../skia_output_surface_impl.h                |   2 +
+ .../skia_output_surface_impl_on_gpu.cc        | 297 ++++++++++++------
+ .../skia_output_surface_impl_on_gpu.h         |  43 ++-
+ .../compositor_frame_metadata_mojom_traits.cc |  11 +-
+ .../compositor_frame_metadata_mojom_traits.h  |   5 +
+ .../compositor_frame_metadata.mojom           |   4 +
+ .../core/frame/web_frame_widget_impl.cc       |   7 +
+ .../core/frame/web_frame_widget_impl.h        |   2 +
+ .../renderer/modules/xr/xr_frame_provider.cc  |  40 ++-
+ .../blink/renderer/modules/xr/xr_session.cc   | 112 +++++++
+ .../blink/renderer/modules/xr/xr_session.h    |   8 +
+ .../renderer/platform/widget/frame_widget.h   |   5 +
+ 30 files changed, 646 insertions(+), 111 deletions(-)
+
+diff --git a/cc/trees/commit_state.cc b/cc/trees/commit_state.cc
+index 74dc25078564a..ed86e99f43fd2 100644
+--- a/cc/trees/commit_state.cc
++++ b/cc/trees/commit_state.cc
+@@ -19,6 +19,7 @@ CommitState::CommitState(const CommitState& prev)
+       may_throttle_if_undrawn_frames(prev.may_throttle_if_undrawn_frames),
+       prefers_reduced_motion(prev.prefers_reduced_motion),
+       browser_controls_params(prev.browser_controls_params),
++      inline_3d_rects(prev.inline_3d_rects),
+       event_listener_properties(prev.event_listener_properties),
+       bottom_controls_shown_ratio(prev.bottom_controls_shown_ratio),
+       device_scale_factor(prev.device_scale_factor),
+diff --git a/cc/trees/commit_state.h b/cc/trees/commit_state.h
+index 9d885219f15f2..a1960bcc2e55c 100644
+--- a/cc/trees/commit_state.h
++++ b/cc/trees/commit_state.h
+@@ -87,6 +87,11 @@ struct CC_EXPORT CommitState {
+   bool may_throttle_if_undrawn_frames = true;
+   bool prefers_reduced_motion = false;
+   BrowserControlsParams browser_controls_params;
++  // DisplayXR inline-3D (#625, Step B / B4b): window-relative device-px rects of
++  // the page's inline-3d canvases, reported by Blink each frame and carried into
++  // CompositorFrameMetadata so Viz can weave those output sub-rects atomically
++  // with the frame they describe.
++  std::vector<gfx::Rect> inline_3d_rects;
+   std::array<EventListenerProperties, kEventListenerClassCount>
+       event_listener_properties = {EventListenerProperties::kNone};
+   float bottom_controls_shown_ratio = 0.f;
+diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
+index 4a740ff0ecbfe..cc753c14f1799 100644
+--- a/cc/trees/layer_tree_host.cc
++++ b/cc/trees/layer_tree_host.cc
+@@ -1564,6 +1564,13 @@ void LayerTreeHost::SetBrowserControlsParams(
+   SetNeedsCommit();
+ }
+ 
++void LayerTreeHost::SetInline3DRects(std::vector<gfx::Rect> rects) {
++  if (pending_commit_state()->inline_3d_rects == rects)
++    return;
++  pending_commit_state()->inline_3d_rects = std::move(rects);
++  SetNeedsCommit();
++}
++
+ void LayerTreeHost::SetBrowserControlsShownRatio(float top_ratio,
+                                                  float bottom_ratio) {
+   if (pending_commit_state()->top_controls_shown_ratio == top_ratio &&
+diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
+index bb1b8edfe423e..42e40d58ebc42 100644
+--- a/cc/trees/layer_tree_host.h
++++ b/cc/trees/layer_tree_host.h
+@@ -583,6 +583,11 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
+   void SetBrowserControlsParams(const BrowserControlsParams& params);
+   void SetBrowserControlsShownRatio(float top_ratio, float bottom_ratio);
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): set the window-relative device-px
++  // rects of the page's inline-3d canvases for the next commit. Carried to Viz
++  // via CompositorFrameMetadata::inline_3d_rects.
++  void SetInline3DRects(std::vector<gfx::Rect> rects);
++
+   void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
+   const OverscrollBehavior& overscroll_behavior() const {
+     return pending_commit_state()->overscroll_behavior;
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index a1371f56d4520..93419b319fca0 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -2445,6 +2445,16 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+   }
+ 
+   metadata.capture_bounds = CollectRegionCaptureBounds();
++  // DisplayXR inline-3D (#625, Step B / B4b): carry the page's inline-3d canvas
++  // rects (window-relative device px) so Viz can weave those output sub-rects.
++  metadata.inline_3d_rects = active_tree()->inline_3d_rects();
++  {
++    static int g_mcfm = 0;
++    if (!metadata.inline_3d_rects.empty() || (++g_mcfm % 120 == 1)) {
++      LOG(ERROR) << "[DisplayXR] MakeCompositorFrameMetadata inline_3d_rects="
++                 << metadata.inline_3d_rects.size();
++    }
++  }
+   if (settings().trees_in_viz_in_viz_process) {
+     metadata.tracked_element_rects = tracked_element_rects_from_client_;
+   } else {
+diff --git a/cc/trees/layer_tree_impl.cc b/cc/trees/layer_tree_impl.cc
+index a5503832debc1..915b041222b28 100644
+--- a/cc/trees/layer_tree_impl.cc
++++ b/cc/trees/layer_tree_impl.cc
+@@ -885,6 +885,7 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
+                               commit_state.page_scale_factor_limits_set);
+ 
+   SetBrowserControlsParams(commit_state.browser_controls_params);
++  SetInline3DRects(commit_state.inline_3d_rects);
+   set_overscroll_behavior(commit_state.overscroll_behavior);
+   PushBrowserControlsFromMainThread(commit_state.top_controls_shown_ratio,
+                                     commit_state.bottom_controls_shown_ratio);
+@@ -1011,6 +1012,7 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
+   target_tree->SetExternalPageScaleFactor(external_page_scale_factor_);
+ 
+   target_tree->SetBrowserControlsParams(browser_controls_params_);
++  target_tree->SetInline3DRects(inline_3d_rects_);
+   target_tree->PushBrowserControls(nullptr, nullptr);
+ 
+   target_tree->set_overscroll_behavior(overscroll_behavior_);
+diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
+index 63c1d15df8cb1..438ba4dd67ee5 100644
+--- a/cc/trees/layer_tree_impl.h
++++ b/cc/trees/layer_tree_impl.h
+@@ -669,6 +669,16 @@ class CC_EXPORT LayerTreeImpl {
+     return browser_controls_params_;
+   }
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): the inline-3d canvas rects for this
++  // tree, pushed from the main-thread commit state and read in
++  // LayerTreeHostImpl::MakeCompositorFrameMetadata.
++  void SetInline3DRects(std::vector<gfx::Rect> rects) {
++    inline_3d_rects_ = std::move(rects);
++  }
++  const std::vector<gfx::Rect>& inline_3d_rects() const {
++    return inline_3d_rects_;
++  }
++
+   bool browser_controls_shrink_blink_size() const {
+     return browser_controls_params_.browser_controls_shrink_blink_size;
+   }
+@@ -1023,6 +1033,9 @@ class CC_EXPORT LayerTreeImpl {
+ 
+   BrowserControlsParams browser_controls_params_;
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b).
++  std::vector<gfx::Rect> inline_3d_rects_;
++
+   OverscrollBehavior overscroll_behavior_;
+ 
+   // The amount that the browser controls are shown from 0 (hidden) to 1 (fully
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index 38787273cf8fd..ba6dc285e1ed6 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -200,6 +200,92 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
+   return out;
+ }
+ 
++viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeavePixels(
++    ID3D11Device* device,
++    const uint8_t* bgra_pixels,
++    uint32_t stride,
++    const gfx::Rect& window_rect) {
++  Result out;
++  if (!weaver_.is_bound() || window_rect.IsEmpty() || !device || !bgra_pixels) {
++    return out;
++  }
++
++  const uint32_t w = static_cast<uint32_t>(window_rect.width());
++  const uint32_t h = static_cast<uint32_t>(window_rect.height());
++  if (!EnsureInput(device, DXGI_FORMAT_B8G8R8A8_UNORM, w, h)) {
++    return out;
++  }
++
++  // (Re)create the non-shared DEFAULT upload texture on device X. We UpdateSub-
++  // resource the CPU pixels here, then CopyResource into the shared input — CPU
++  // upload directly into a keyed-mutex/NT-shared texture invalidates its handle
++  // (service OpenSharedResource -> E_INVALIDARG).
++  if (!upload_tex_ || upload_w_ != w || upload_h_ != h) {
++    upload_tex_.Reset();
++    D3D11_TEXTURE2D_DESC ud = {};
++    ud.Width = w;
++    ud.Height = h;
++    ud.MipLevels = 1;
++    ud.ArraySize = 1;
++    ud.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    ud.SampleDesc.Count = 1;
++    ud.Usage = D3D11_USAGE_DEFAULT;
++    ud.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++    if (FAILED(device_->CreateTexture2D(&ud, nullptr, &upload_tex_))) {
++      LOG(ERROR) << "[DisplayXR] B4b WeavePixels: CreateTexture2D(upload) failed";
++      upload_tex_.Reset();
++      return out;
++    }
++    upload_w_ = w;
++    upload_h_ = h;
++  }
++
++  // CPU pixels -> upload texture -> (keyed-mutex) shared input via GPU copy.
++  context_->UpdateSubresource(upload_tex_.Get(), /*DstSubresource=*/0,
++                              /*pDstBox=*/nullptr, bgra_pixels, stride,
++                              /*SrcDepthPitch=*/0);
++  if (input_mutex_->AcquireSync(0, 1000) != S_OK) {
++    LOG(ERROR) << "[DisplayXR] B4b WeavePixels: AcquireSync(0) failed";
++    return out;
++  }
++  context_->CopyResource(input_tex_.Get(), upload_tex_.Get());
++  context_->Flush();
++  input_mutex_->ReleaseSync(0);
++
++  HANDLE dup = nullptr;
++  if (!::DuplicateHandle(::GetCurrentProcess(), input_handle_,
++                         ::GetCurrentProcess(), &dup, 0, FALSE,
++                         DUPLICATE_SAME_ACCESS) ||
++      !dup) {
++    LOG(ERROR) << "[DisplayXR] B4b WeavePixels: DuplicateHandle(input) failed";
++    return out;
++  }
++  gfx::DXGIHandle input{base::win::ScopedHandle(dup)};
++
++  mojom::DisplayXRWeaveResultPtr result;
++  if (!weaver_->WeaveSubmit(std::move(input), window_rect, &result)) {
++    LOG(ERROR) << "[DisplayXR] B4b WeavePixels: Sync WeaveSubmit call failed";
++    return out;
++  }
++  if (!result) {
++    return out;
++  }
++
++  out.ok = true;
++  out.fence_value = result->fence_value;
++  out.width = result->width;
++  out.height = result->height;
++  if (result->woven) {
++    out.woven_handle = reinterpret_cast<uintptr_t>(
++        result->woven->TakeBufferHandle().release());
++  }
++  if (result->fence) {
++    out.fence_handle = reinterpret_cast<uintptr_t>(
++        result->fence->TakeBufferHandle().release());
++  }
++  return out;
++}
++
+ }  // namespace displayxr
+ 
+ #endif  // BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index f984f91ff473d..cdbc77adc88a0 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -52,6 +52,11 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+                      const gfx::Rect& src_rect,
+                      const gfx::Rect& window_rect) override;
+ 
++  Result WeavePixels(ID3D11Device* device,
++                     const uint8_t* bgra_pixels,
++                     uint32_t stride,
++                     const gfx::Rect& window_rect) override;
++
+  private:
+   // Lazily (re)create the keyed-mutex SBS input + its shared NT handle on
+   // |device| at |w|x|h| with |format|. Recreated on any device/size/format
+@@ -76,6 +81,14 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   uint32_t input_w_ = 0;
+   uint32_t input_h_ = 0;
+   DXGI_FORMAT input_format_ = DXGI_FORMAT_UNKNOWN;
++  // B4b (WeavePixels): a non-shared DEFAULT upload texture. CPU readback pixels
++  // are UpdateSubresource'd here, then CopyResource'd into the keyed-mutex
++  // |input_tex_| (UpdateSubresource directly on the shared keyed-mutex texture
++  // corrupts its NT handle -> the service's OpenSharedResource fails). Matches the
++  // B2c.2 pattern of filling the shared input via a GPU copy.
++  Microsoft::WRL::ComPtr<ID3D11Texture2D> upload_tex_;
++  uint32_t upload_w_ = 0;
++  uint32_t upload_h_ = 0;
+   bool logged_canvas_desc_ = false;
+ };
+ 
+diff --git a/components/viz/common/quads/compositor_frame_metadata.cc b/components/viz/common/quads/compositor_frame_metadata.cc
+index 8a7b74a648b89..ecbea7cadfcc8 100644
+--- a/components/viz/common/quads/compositor_frame_metadata.cc
++++ b/components/viz/common/quads/compositor_frame_metadata.cc
+@@ -120,6 +120,8 @@ void CompositorFrameMetadata::AsValueInto(
+ 
+   value->SetString("tracked_element_rects",
+                    TrackedElementRectsToString(tracked_element_rects));
++  value->SetInteger("inline_3d_rects",
++                    static_cast<int>(inline_3d_rects.size()));
+   value->EndDictionary();
+ 
+   // Ignore trees_in_viz_timing_details because it's for metrics only.
+@@ -155,7 +157,8 @@ CompositorFrameMetadata::CompositorFrameMetadata(
+       offset_tag_definitions(other.offset_tag_definitions),
+       offset_tag_values(other.offset_tag_values),
+       frame_interval_inputs(other.frame_interval_inputs),
+-      tracked_element_rects(other.tracked_element_rects) {
++      tracked_element_rects(other.tracked_element_rects),
++      inline_3d_rects(other.inline_3d_rects) {
+   if (other.delegated_ink_metadata) {
+     delegated_ink_metadata = std::make_unique<gfx::DelegatedInkMetadata>(
+         *other.delegated_ink_metadata.get());
+diff --git a/components/viz/common/quads/compositor_frame_metadata.h b/components/viz/common/quads/compositor_frame_metadata.h
+index b5a64e05c6ffd..2d8cee41803af 100644
+--- a/components/viz/common/quads/compositor_frame_metadata.h
++++ b/components/viz/common/quads/compositor_frame_metadata.h
+@@ -227,6 +227,12 @@ class VIZ_COMMON_EXPORT CompositorFrameMetadata {
+   // coordinate space of the root render pass.
+   TrackedElementRects tracked_element_rects;
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): window-relative device-px rects of
++  // the page's inline-3d canvases. Consumed in Viz's post-paint output weave
++  // loop (SkiaOutputSurfaceImplOnGpu). Arrives atomically with the frame it
++  // describes, so the woven sub-rect always matches the composited pixels.
++  std::vector<gfx::Rect> inline_3d_rects;
++
+  private:
+   CompositorFrameMetadata(const CompositorFrameMetadata& other);
+   CompositorFrameMetadata operator=(const CompositorFrameMetadata&) = delete;
+diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
+index 8abfbf9f518cb..94b53d23601bc 100644
+--- a/components/viz/service/display/aggregated_frame.h
++++ b/components/viz/service/display/aggregated_frame.h
+@@ -68,6 +68,11 @@ class VIZ_SERVICE_EXPORT AggregatedFrame {
+   // compositor frames and transformed to the coordinate space of the root
+   // render pass.
+   TrackedElementRects tracked_element_rects;
++
++  // DisplayXR inline-3D (#625, Step B / B4b): the page's inline-3d canvas rects,
++  // aggregated and transformed to the root render pass space, for the post-paint
++  // output weave loop.
++  std::vector<gfx::Rect> inline_3d_rects;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index ecd530cd32994..56e7fbab76e43 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -983,6 +983,18 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+     draw_timer.emplace();
+     overlay_processor_->SetFrameSequenceNumber(frame_sequence_number_);
+     overlay_processor_->SetIsPageFullscreen(frame.page_fullscreen_mode);
++    // DisplayXR inline-3D (#625, Step B / B4b): hand the frame's inline-3d canvas
++    // rects to the GPU thread before DrawFrame (which enqueues
++    // FinishPaintCurrentFrame), so the post-paint output weave loop reads the
++    // rects that match this frame's composited pixels.
++    if (skia_output_surface_) {
++      static int g_das = 0;
++      if (++g_das % 60 == 1) {
++        LOG(ERROR) << "[DisplayXR] Display::DrawAndSwap inline_3d_rects="
++                   << frame.inline_3d_rects.size();
++      }
++      skia_output_surface_->SetInline3DRects(frame.inline_3d_rects);
++    }
+     renderer_->DrawFrame(&frame.render_pass_list, device_scale_factor_,
+                          current_surface_size, display_color_spaces_,
+                          std::move(frame.surface_damage_rect_list_),
+diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
+index 93ce03eeff30d..0a662c4c41fdf 100644
+--- a/components/viz/service/display/skia_output_surface.h
++++ b/components/viz/service/display/skia_output_surface.h
+@@ -207,6 +207,12 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
+ 
+   virtual bool SupportsBGRA() const = 0;
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): set the page's inline-3d canvas
++  // rects (root-render-pass / window-relative device px) for the current frame.
++  // Consumed by the GPU-thread post-paint output weave loop. Default no-op for
++  // non-Skia / non-Windows paths.
++  virtual void SetInline3DRects(std::vector<gfx::Rect> rects) {}
++
+ #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
+     BUILDFLAG(USE_V4L2_CODEC)
+   virtual void DetileOverlay(gpu::Mailbox input,
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 437fad4542a4b..a88fac079e73e 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2157,6 +2157,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+ 
+   root_surface_id_ = surface_id;
+   tracked_element_rects_ = {};
++  inline_3d_rects_ = {};
+ 
+   ResolvedFrameData* resolved_frame = GetResolvedFrame(surface_id);
+ 
+@@ -2339,6 +2340,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     frame_annotator_->AnnotateAggregatedFrame(&frame);
+ 
+   frame.tracked_element_rects = std::move(tracked_element_rects_);
++  frame.inline_3d_rects = std::move(inline_3d_rects_);
+ 
+   return frame;
+ }
+@@ -2497,6 +2499,21 @@ void SurfaceAggregator::CollectTrackedElementRects(
+       tracked_element_rects_[feature].push_back(transformed_rect_data);
+     }
+   }
++  // DisplayXR inline-3D (#625, Step B / B4b): collect the inline-3d canvas rects
++  // alongside tracked elements, transformed into the root render pass space.
++  {
++    static int g_cter = 0;
++    if (++g_cter % 90 == 1) {
++      LOG(ERROR) << "[DisplayXR] SurfaceAggregator::CollectTrackedElementRects"
++                 << " inline=" << frame_metadata.inline_3d_rects.size()
++                 << " tracked=" << frame_metadata.tracked_element_rects.size();
++    }
++  }
++  for (const gfx::Rect& rect : frame_metadata.inline_3d_rects) {
++    inline_3d_rects_.push_back(TransformRectToDestRootTargetSpace(
++        rect, target_transform, transform_to_root_target,
++        root_target_clip_rect));
++  }
+ }
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index aef13e755fffa..cf8adee5f9d47 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -470,6 +470,10 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+   // The list of tracked elements from all surfaces in the aggregated frame.
+   // The bounds are transformed to the coordinate space of the root render pass.
+   TrackedElementRects tracked_element_rects_;
++
++  // DisplayXR inline-3D (#625, Step B / B4b): inline-3d canvas rects from all
++  // surfaces, transformed to the root render pass space.
++  std::vector<gfx::Rect> inline_3d_rects_;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index c06e73f853b22..8484123537ce8 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -56,6 +56,17 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+                              UINT array_slice,
+                              const gfx::Rect& src_rect,
+                              const gfx::Rect& window_rect) = 0;
++
++  // B4b (CEF sub-rect model): drive a weave from CPU pixels. |bgra_pixels| is a
++  // tightly/|stride|-packed BGRA8 buffer of size window_rect.width() x
++  // window_rect.height() (the composited page sub-rect read back from the output
++  // surface). Uploaded into the owned keyed-mutex SBS input on |device| and
++  // woven at |window_rect| (window-relative device px). Backend-agnostic (avoids
++  // the D3D-backing / overlay path); the zero-copy texture route is a follow-up.
++  virtual Result WeavePixels(ID3D11Device* device,
++                             const uint8_t* bgra_pixels,
++                             uint32_t stride,
++                             const gfx::Rect& window_rect) = 0;
+ };
+ 
+ // Register / fetch the process-global provider (GPU process, GPU main thread).
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+index e0a3d2779dda4..03ec65aba481b 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+@@ -1070,6 +1070,19 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
+ }
+ #endif
+ 
++void SkiaOutputSurfaceImpl::SetInline3DRects(std::vector<gfx::Rect> rects) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK(impl_on_gpu_);
++  // Enqueue before the frame's FinishPaintCurrentFrame task (Display calls this
++  // right before renderer_->DrawFrame), so the GPU-thread weave loop reads the
++  // rects that match this frame.
++  auto task = base::BindOnce(&SkiaOutputSurfaceImplOnGpu::SetInline3DRects,
++                             base::Unretained(impl_on_gpu_.get()),
++                             std::move(rects));
++  EnqueueGpuTask(std::move(task), {}, /*make_current=*/false,
++                 /*need_framebuffer=*/false);
++}
++
+ void SkiaOutputSurfaceImpl::SetCapabilitiesForTesting(
+     gfx::SurfaceOrigin output_surface_origin) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
+index 0a80deff8dedd..af245cd95356f 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
+@@ -176,6 +176,8 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
+   void SetSharedImagePurgeable(const gpu::Mailbox& mailbox,
+                                bool purgeable) override;
+   bool SupportsBGRA() const override;
++  // DisplayXR inline-3D (#625, Step B / B4b).
++  void SetInline3DRects(std::vector<gfx::Rect> rects) override;
+ 
+   // ExternalUseClient implementation:
+   gpu::SyncToken ReleaseImageContexts(
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 845f7f26ecffc..c2533668bbc4b 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -70,6 +70,7 @@
+ #include "skia/ext/rgba_to_yuva.h"
+ #include "third_party/libyuv/include/libyuv/planar_functions.h"
+ #include "third_party/skia/include/core/SkAlphaType.h"
++#include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkBlendMode.h"
+ #include "third_party/skia/include/core/SkCanvas.h"
+ #include "third_party/skia/include/core/SkColor.h"
+@@ -78,8 +79,10 @@
+ #include "third_party/skia/include/core/SkColorType.h"
+ #include "third_party/skia/include/core/SkImageInfo.h"
+ #include "third_party/skia/include/core/SkSamplingOptions.h"
++#include "third_party/skia/include/core/SkStream.h"
+ #include "third_party/skia/include/core/SkSwizzle.h"
+ #include "third_party/skia/include/core/SkYUVAInfo.h"
++#include "third_party/skia/include/encode/SkPngEncoder.h"
+ #include "third_party/skia/include/gpu/GpuTypes.h"
+ #include "third_party/skia/include/gpu/ganesh/GrTypes.h"
+ #include "third_party/skia/include/gpu/ganesh/SkSurfaceGanesh.h"
+@@ -498,11 +501,6 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+ 
+   if (graphite_recording) {
+     CHECK(return_release_fence_cb.is_null());
+-#if BUILDFLAG(IS_WIN)
+-    // DisplayXR inline-3D (#625, Step B / B2c.1): same weave substitution on the
+-    // Graphite path (content_shell may default to Graphite-Dawn).
+-    MaybeWeaveSubstitute(image_contexts);
+-#endif
+     promise_image_access_helper_.BeginAccess(std::move(image_contexts),
+                                              /*begin_semaphores=*/nullptr,
+                                              /*end_semaphores=*/nullptr);
+@@ -513,6 +511,14 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+     if (!draw_success) {
+       draw_render_pass_failed_ = true;
+     }
++#if BUILDFLAG(IS_WIN)
++    // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model): weave the
++    // composited output's inline-3d sub-rects AFTER the page is painted, before
++    // Flush/Submit. (Graphite-Dawn is chrome's default.)
++    if (draw_success) {
++      MaybeWeaveOutput();
++    }
++#endif
+     return;
+   }
+ 
+@@ -527,12 +533,6 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+ 
+     std::vector<GrBackendSemaphore> begin_semaphores;
+     std::vector<GrBackendSemaphore> end_semaphores;
+-#if BUILDFLAG(IS_WIN)
+-    // DisplayXR inline-3D (#625, Step B / B2c.1): if a canvas quad is tagged as
+-    // a weave target, drive the weave + import the woven texture and redirect
+-    // the tagged image context to it, before promise images are fulfilled below.
+-    MaybeWeaveSubstitute(image_contexts);
+-#endif
+     promise_image_access_helper_.BeginAccess(
+         std::move(image_contexts), &begin_semaphores, &end_semaphores);
+     if (!begin_semaphores.empty()) {
+@@ -553,6 +553,15 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+                    *scoped_output_device_paint_->GetCanvas());
+     }
+ 
++#if BUILDFLAG(IS_WIN)
++    // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model): weave the
++    // composited output's inline-3d sub-rects AFTER the page is painted, before
++    // Flush/Submit.
++    if (draw_success) {
++      MaybeWeaveOutput();
++    }
++#endif
++
+     auto end_paint_semaphores =
+         scoped_output_device_paint_->TakeEndPaintSemaphores();
+     end_semaphores.insert(end_semaphores.end(), end_paint_semaphores.begin(),
+@@ -2666,11 +2675,31 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+   return {};
+ }
+ 
++void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
++    std::vector<gfx::Rect> rects) {
++  static int g_sir = 0;
++  if (!rects.empty() || (++g_sir % 120 == 1)) {
++    LOG(ERROR) << "[DisplayXR] GPU SetInline3DRects n=" << rects.size();
++  }
++  inline_3d_rects_ = std::move(rects);
++}
++
+ #if BUILDFLAG(IS_WIN)
+-void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+-    const std::vector<raw_ptr<ImageContextImpl, VectorExperimental>>&
+-        image_contexts) {
++void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++  // B4b bring-up diagnostics (first frames unthrottled to catch the import +
++  // fence, then throttled ~1/120).
++  static int g_wo_frame = 0;
++  ++g_wo_frame;
++  const bool dbg = (g_wo_frame <= 20) || (g_wo_frame % 120 == 1);
++  if (dbg) {
++    LOG(ERROR) << "[DisplayXR] MaybeWeaveOutput #" << g_wo_frame
++               << " rects=" << inline_3d_rects_.size()
++               << " provider=" << (GetDisplayXRWeaveProvider() ? 1 : 0);
++  }
++  if (inline_3d_rects_.empty()) {
++    return;
++  }
+   auto* provider = GetDisplayXRWeaveProvider();
+   if (!provider) {
+     return;
+@@ -2680,72 +2709,104 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+   if (!device_x) {
+     return;
+   }
++  if (!scoped_output_device_paint_) {
++    return;
++  }
++  SkSurface* output = scoped_output_device_paint_->sk_surface();
++  SkCanvas* out_canvas = scoped_output_device_paint_->GetCanvas();
++  if (!output || !out_canvas) {
++    return;
++  }
+   const gfx::Rect window_bounds(size_);
++  if (window_bounds.IsEmpty()) {
++    return;
++  }
+ 
+-  // B3c multi-element: drive an independent weave for EVERY canvas quad
+-  // SkiaRenderer tagged as a weave target (was B2c single-first-tag). Per-target
+-  // woven/fence state is keyed by the source canvas mailbox in
+-  // |displayxr_weave_state_|. NOTE (validated at B4 against the real service in
+-  // chrome; content_shell flattens the page so this can't be exercised here):
+-  // whether N submits accumulate into one window output or must serialize, and
+-  // the sub-rect UV sampling / CSS-scale mapping for a woven output that is not
+-  // element-sized, are finalized then. The full-window single-canvas path
+-  // (weave_rect == window) is unchanged from B2c.2.
+-  // B3e: source mailboxes tagged this frame, to prune stale woven state below.
+-  base::flat_set<gpu::Mailbox> seen_this_frame;
+-  for (ImageContextImpl* target : image_contexts) {
+-    if (!target || !target->is_weave_target()) {
+-      continue;
+-    }
+-    seen_this_frame.insert(target->mailbox());
+-
+-    // Seam D: the element's committed window-relative device-pixel rect (full
+-    // window as a fallback for the flattened single-canvas bring-up), clamped to
+-    // the window.
+-    gfx::Rect rect = target->weave_rect();
+-    if (rect.IsEmpty()) {
+-      rect = window_bounds;
++  // CEF sub-rect model (design §13.3): the composited page (2D chrome + each
++  // inline-3d canvas's flat SBS pixels, already squashed together) is now in the
++  // output surface — this is exactly the Step-A CEF host's `pageTex`. Snapshot it
++  // (copy-on-write), stage it into an owned full-window scratch SharedImage whose
++  // D3D texture we can hand to the weave, then per rect: weave the sub-rect and
++  // draw the woven result back over the output at that rect.
++  // (A) Per rect, read the composited sub-rect's pixels back to CPU and upload
++  // them into the weave input. Under this config the output device is
++  // SkiaOutputDeviceGL (Ganesh/ANGLE, forced by --disable-direct-composition),
++  // so a synchronous SkSurface::readPixels is valid; the zero-copy D3D-texture
++  // route is a follow-up. We read before drawing the woven result back, so no
++  // snapshot is needed to avoid a read/write hazard.
++  if (dbg) {
++    LOG(ERROR) << "[DisplayXR] MaybeWeaveOutput page snapshot "
++               << window_bounds.size().ToString()
++               << " rects=" << inline_3d_rects_.size()
++               << " gr_context=" << (gr_context() ? 1 : 0)
++               << " graphite=" << (graphite_recorder() ? 1 : 0);
++  }
++
++  // Prune woven state beyond the current rect count (canvas removed / count
++  // shrank) before (re)sizing, so the woven SharedImages are not leaked.
++  if (displayxr_woven_state_.size() > inline_3d_rects_.size()) {
++    for (size_t i = inline_3d_rects_.size(); i < displayxr_woven_state_.size();
++         ++i) {
++      if (!displayxr_woven_state_[i].woven_mailbox.IsZero()) {
++        shared_image_factory_->DestroySharedImage(
++            displayxr_woven_state_[i].woven_mailbox);
++      }
+     }
++  }
++  displayxr_woven_state_.resize(inline_3d_rects_.size());
++
++  // (D) Per rect: weave the composited sub-rect and draw the woven result back
++  // over the output. Serialized (the provider reuses one keyed-mutex input +
++  // one woven output), mirroring the CEF host's per-element loop.
++  bool drew_any = false;
++  // The woven SkImages must stay backed until the output is flushed + submitted
++  // (Ganesh records the draw and reads the texture at flush time). Hold the
++  // representations + scoped read accesses alive here across the flush below.
++  std::vector<std::unique_ptr<gpu::SkiaImageRepresentation>> held_reps;
++  std::vector<std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>>
++      held_accesses;
++  for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
++    gfx::Rect rect = inline_3d_rects_[i];
+     rect.Intersect(window_bounds);
+     if (rect.IsEmpty()) {
+       continue;
+     }
+ 
+-    // Resolve the tagged canvas's ID3D11Texture2D on the GPU thread via a
+-    // SCANOUT-free overlay representation (a normal 2D canvas SI is DISPLAY_READ-
+-    // only, so ProduceOverlay's SCANOUT gate would reject it). Hold the scoped
+-    // read access alive across WeaveCanvas: it inserts the canvas-render acquire
+-    // sync on device X, and WeaveCanvas copies on that same device synchronously.
+-    auto overlay = shared_image_representation_factory_->ProduceOverlayForWeave(
+-        target->mailbox());
+-    if (!overlay) {
+-      continue;
+-    }
+-    auto access = overlay->BeginScopedReadAccess();
+-    if (!access) {
+-      continue;
+-    }
+-    std::optional<gl::DCLayerOverlayImage> overlay_image =
+-        access->GetDCLayerOverlayImage();
+-    if (!overlay_image ||
+-        overlay_image->type() != gl::DCLayerOverlayType::kD3D11Texture ||
+-        !overlay_image->d3d11_video_texture()) {
++    // Read the composited sub-rect back to CPU (BGRA8), then upload it into the
++    // weave input. |page| is the full composited output; read from (rect.x,y).
++    const int rw = rect.width();
++    const int rh = rect.height();
++    const size_t stride = static_cast<size_t>(rw) * 4;
++    std::vector<uint8_t> pixels(stride * rh);
++    const SkImageInfo info = SkImageInfo::Make(
++        rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
++        SkColorSpace::MakeSRGB());
++    // Read from the output SkSurface (it knows its own recording context and
++    // flushes as needed); more reliable than SkImage::readPixels for a GPU
++    // snapshot.
++    if (!output->readPixels(info, pixels.data(), stride, rect.x(), rect.y())) {
++      if (dbg) {
++        LOG(ERROR) << "[DisplayXR] readPixels failed rect=" << rect.ToString();
++      }
+       continue;
+     }
+ 
+-    const DisplayXRWeaveProvider::Result r = provider->WeaveCanvas(
+-        device_x.Get(), overlay_image->d3d11_video_texture(),
+-        static_cast<UINT>(overlay_image->texture_array_slice()), rect, rect);
++    const DisplayXRWeaveProvider::Result r = provider->WeavePixels(
++        device_x.Get(), pixels.data(), static_cast<uint32_t>(stride), rect);
++    if (dbg) {
++      LOG(ERROR) << "[DisplayXR] weave rect=" << rect.ToString()
++                 << " ok=" << r.ok << " woven=" << r.woven_handle
++                 << " fence=" << r.fence_handle << " " << r.width << "x"
++                 << r.height;
++    }
+     if (!r.ok) {
+       continue;
+     }
+ 
+-    DisplayXRWeaveTargetState& st = displayxr_weave_state_[target->mailbox()];
++    DisplayXRWovenState& st = displayxr_woven_state_[i];
+ 
+-    // (Re)import the woven texture whenever a fresh handle arrives — the first
+-    // weave and again on re-allocation (resize). Steady-state frames return
+-    // handle 0 and we reuse the imported SharedImage (the runtime re-weaves into
+-    // the same texture in place).
++    // (Re)import the woven texture whenever a fresh handle arrives (first weave +
++    // resize); steady-state frames return handle 0 and reuse the import.
+     if (r.woven_handle) {
+       if (!st.woven_mailbox.IsZero()) {
+         shared_image_factory_->DestroySharedImage(st.woven_mailbox);
+@@ -2764,22 +2825,25 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+               mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
+         st.woven_mailbox = mailbox;
+       } else {
+-        LOG(ERROR) << "[DisplayXR] failed to import woven SharedImage " << r.width
+-                   << "x" << r.height;
++        LOG(ERROR) << "[DisplayXR] failed to import woven SharedImage "
++                   << r.width << "x" << r.height;
+         continue;
+       }
+     }
+     if (st.woven_mailbox.IsZero()) {
+       continue;
+     }
++    if (dbg) {
++      LOG(ERROR) << "[DisplayXR] woven ready mailbox_set=1 fence_state="
++                 << (st.fence ? 1 : 0) << " r.fence_h=" << r.fence_handle
++                 << " r.fence_v=" << r.fence_value;
++    }
+ 
+     // (Re)open + GPU-wait the service->caller fence so the woven content is ready
+-    // before this element's quad samples it. The woven texture has no keyed mutex
+-    // (fence-synced), so this wait is the sole synchronization.
++    // before we sample it (fence-synced, no keyed mutex).
+     if (r.fence_handle) {
+       st.fence = gfx::D3DSharedFence::CreateFromUnownedHandle(
+           reinterpret_cast<HANDLE>(r.fence_handle));
+-      // CreateFromUnownedHandle duplicates; we still own the passed handle.
+       ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
+     }
+     if (st.fence) {
+@@ -2791,33 +2855,82 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+       }
+     }
+ 
+-    // Redirect this element's context to its woven backing; the existing
+-    // promise-image fulfillment (below) then reads the woven texture instead of
+-    // the canvas.
+-    target->SetWeaveOverrideMailbox(st.woven_mailbox);
+-  }
+-
+-  // B3e: prune woven state for source canvases no longer tagged this frame
+-  // (canvas resize -> new mailbox, or the element untagged on layer close /
+-  // session end). Otherwise the map grows unbounded and leaks the woven
+-  // SharedImages (a fresh one is imported per source mailbox).
+-  if (displayxr_weave_state_.size() > seen_this_frame.size()) {
+-    std::vector<gpu::Mailbox> stale;
+-    for (const auto& entry : displayxr_weave_state_) {
+-      if (!seen_this_frame.contains(entry.first)) {
+-        stale.push_back(entry.first);
+-      }
++    // Draw the woven texture back over the output at |rect|. The woven output is
++    // window-sized and offset-preserving, so sample the SAME rect from it (the
++    // CEF host's UV mapping). Opaque overwrite, nearest sampling (device-pixel-
++    // exact — critical for the interlace lattice).
++    auto woven_rep = shared_image_representation_factory_->ProduceSkia(
++        st.woven_mailbox, context_state_.get());
++    if (!woven_rep) {
++      continue;
+     }
+-    for (const gpu::Mailbox& src : stale) {
+-      auto it = displayxr_weave_state_.find(src);
+-      if (it == displayxr_weave_state_.end()) {
+-        continue;
++    std::vector<GrBackendSemaphore> wbegin_sem, wend_sem;
++    auto woven_access =
++        woven_rep->BeginScopedReadAccess(&wbegin_sem, &wend_sem);
++    if (!woven_access) {
++      continue;
++    }
++    sk_sp<SkImage> woven_img = woven_access->CreateSkImage(context_state_.get());
++    if (!woven_img) {
++      continue;
++    }
++    // B4b one-shot dump (frame 200): raw BGRA of the input we send + the woven we
++    // get back, to confirm the service actually interlaced (vs SBS passthrough /
++    // stale). Raw bytes (no PNG encoder linked); converted offline.
++    if (g_wo_frame == 200) {
++      {
++        SkFILEWStream f(
++            "C:\\Users\\SPARKS~1\\AppData\\Local\\Temp\\b4_input.bgra");
++        f.write(pixels.data(), pixels.size());
+       }
+-      if (!it->second.woven_mailbox.IsZero()) {
+-        shared_image_factory_->DestroySharedImage(it->second.woven_mailbox);
++      SkBitmap wb;
++      if (wb.tryAllocPixels(SkImageInfo::Make(
++              static_cast<int>(r.width), static_cast<int>(r.height),
++              kBGRA_8888_SkColorType, kPremul_SkAlphaType,
++              SkColorSpace::MakeSRGB())) &&
++          woven_img->readPixels(gr_context(), wb.pixmap(), 0, 0)) {
++        SkFILEWStream f(
++            "C:\\Users\\SPARKS~1\\AppData\\Local\\Temp\\b4_woven.bgra");
++        f.write(wb.getPixels(), wb.computeByteSize());
++        LOG(ERROR) << "[DisplayXR] dumped b4_input.bgra (" << rw << "x" << rh
++                   << ") + b4_woven.bgra (" << r.width << "x" << r.height << ")";
++      } else {
++        LOG(ERROR) << "[DisplayXR] woven readPixels for dump failed";
+       }
+-      displayxr_weave_state_.erase(it);
+     }
++    if (!wbegin_sem.empty()) {
++      output->wait(wbegin_sem.size(), wbegin_sem.data(),
++                   /*deleteSemaphoresAfterWait=*/false);
++    }
++    const SkRect src_dst =
++        SkRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height());
++    SkPaint paint;
++    paint.setBlendMode(SkBlendMode::kSrc);
++    out_canvas->drawImageRect(woven_img.get(), src_dst, src_dst,
++                              SkSamplingOptions(SkFilterMode::kNearest), &paint,
++                              SkCanvas::kStrict_SrcRectConstraint);
++    drew_any = true;
++    // Keep the woven backing alive until after the flush + submit below.
++    held_accesses.push_back(std::move(woven_access));
++    held_reps.push_back(std::move(woven_rep));
++  }
++
++  // Ensure the woven draws land in (and are submitted to) the output surface
++  // before the scoped read accesses are released — otherwise Ganesh reads the
++  // released woven texture at flush time and the draw shows nothing.
++  if (drew_any) {
++    std::vector<GrBackendSemaphore> empty_sem;
++    FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
++    if (gr_context()) {
++      gr_context()->submit();
++    }
++    if (graphite_shared_context()) {
++      graphite_shared_context()->submit();
++    }
++  }
++  // held_reps / held_accesses release here, after the submit.
++  if (dbg) {
++    LOG(ERROR) << "[DisplayXR] MaybeWeaveOutput drew_any=" << drew_any;
+   }
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 43115c4388c32..ade0dd23235ee 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -43,6 +43,7 @@
+ #include "third_party/skia/include/gpu/ganesh/GrBackendSemaphore.h"
+ #include "third_party/skia/include/gpu/ganesh/GrTypes.h"
+ #include "third_party/skia/include/private/chromium/GrDeferredDisplayList.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/gpu_fence_handle.h"
+ 
+ #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
+@@ -226,6 +227,12 @@ class SkiaOutputSurfaceImplOnGpu
+ 
+   bool was_context_lost() { return context_state_->context_lost(); }
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): the page's inline-3d canvas rects
++  // (root-render-pass / window-relative device px) for the frame currently being
++  // finished. Set from the compositor thread (Display, via SkiaOutputSurfaceImpl)
++  // before FinishPaintCurrentFrame; read by MaybeWeaveOutput on the GPU thread.
++  void SetInline3DRects(std::vector<gfx::Rect> rects);
++
+   void SetCapabilitiesForTesting(
+       const OutputSurface::Capabilities& capabilities);
+ 
+@@ -483,14 +490,14 @@ class SkiaOutputSurfaceImplOnGpu
+   gpu::SkiaImageRepresentation* GetSkiaRepresentation(gpu::Mailbox mailbox);
+ 
+ #if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B / B2c.1). If any image context is tagged
+-  // as a weave target, drive the weave via the registered DisplayXRWeaveProvider,
+-  // import the woven texture as a SharedImage, GPU-wait its fence, and point the
+-  // tagged context at the woven backing. GPU main thread; called before promise
+-  // images are fulfilled in FinishPaintCurrentFrame.
+-  void MaybeWeaveSubstitute(
+-      const std::vector<raw_ptr<ImageContextImpl, VectorExperimental>>&
+-          image_contexts);
++  // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model). After the
++  // frame's quads are painted into the output surface and before Flush/Submit,
++  // for each inline_3d_rects_ entry: copy the composited output sub-rect into an
++  // owned keyed-mutex SBS input (via a full-window scratch SharedImage), drive
++  // the weave (DisplayXRWeaveProvider), import the woven texture + GPU-wait its
++  // fence, and draw the woven texture back over the output at that rect. GPU main
++  // thread; mirrors the Step-A CEF host's external-compositor loop.
++  void MaybeWeaveOutput();
+ #endif
+ 
+   class ReleaseCurrent {
+@@ -628,19 +635,23 @@ class SkiaOutputSurfaceImplOnGpu
+   // destructor.
+   base::flat_set<gpu::Mailbox> solid_color_images_;
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): inline-3d canvas rects for the
++  // frame currently being finished (set via SetInline3DRects; consumed by
++  // MaybeWeaveOutput). Empty when inline-3d is inactive.
++  std::vector<gfx::Rect> inline_3d_rects_;
++
+ #if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B) cross-frame weave state, PER weave target
+-  // element (B3c multi-element: keyed by the source canvas SharedImage mailbox,
+-  // stable per canvas and re-keyed on resize). Each entry holds the imported
+-  // woven SharedImage (re-imported when a fresh handle arrives) and the
+-  // service->caller shared fence GPU-waited before the element's quad samples it.
+-  // The woven SharedImages are owned by shared_image_factory_ and destroyed with
++  // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model) GPU-thread
++  // weave state. Per inline-3d rect (index-keyed), |woven_mailbox| is the
++  // imported woven SharedImage (re-imported on a fresh handle) and |fence| is the
++  // service->caller shared fence GPU-waited before the woven texture is drawn
++  // back. Owned by shared_image_factory_ and destroyed with
+   // DestroyAllSharedImages().
+-  struct DisplayXRWeaveTargetState {
++  struct DisplayXRWovenState {
+     gpu::Mailbox woven_mailbox;
+     scoped_refptr<gfx::D3DSharedFence> fence;
+   };
+-  base::flat_map<gpu::Mailbox, DisplayXRWeaveTargetState> displayxr_weave_state_;
++  std::vector<DisplayXRWovenState> displayxr_woven_state_;
+ #endif
+ 
+   THREAD_CHECKER(thread_checker_);
+diff --git a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
+index d0655cf592c61..f661e0c95675a 100644
+--- a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ 
++#include "base/logging.h"
+ #include "build/build_config.h"
+ #include "services/viz/public/cpp/compositing/begin_frame_args_mojom_traits.h"
+ #include "services/viz/public/cpp/compositing/compositor_frame_transition_directive_mojom_traits.h"
+@@ -82,9 +83,17 @@ bool StructTraits<viz::mojom::CompositorFrameMetadataDataView,
+         data.ReadOffsetTagValues(&out->offset_tag_values) &&
+         data.ReadFrameIntervalInputs(&out->frame_interval_inputs) &&
+         data.ReadTreesInVizTiming(&out->trees_in_viz_timing_details) &&
+-        data.ReadTrackedElementRects(&out->tracked_element_rects))) {
++        data.ReadTrackedElementRects(&out->tracked_element_rects) &&
++        data.ReadInline3dRects(&out->inline_3d_rects))) {
+     return false;
+   }
++  {
++    static int g_rd = 0;
++    if (!out->inline_3d_rects.empty() || (++g_rd % 120 == 1)) {
++      LOG(ERROR) << "[DisplayXR] CFM traits Read inline_3d_rects="
++                 << out->inline_3d_rects.size();
++    }
++  }
+ 
+   // Verify that OffsetTagDefinition providers are referenced surfaces.
+   for (auto& tag_def : out->offset_tag_definitions) {
+diff --git a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
+index bb0dbb10dab48..adec8dedf2486 100644
+--- a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
++++ b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
+@@ -196,6 +196,11 @@ struct StructTraits<viz::mojom::CompositorFrameMetadataDataView,
+     return metadata.tracked_element_rects;
+   }
+ 
++  static const std::vector<gfx::Rect>& inline_3d_rects(
++      const viz::CompositorFrameMetadata& metadata) {
++    return metadata.inline_3d_rects;
++  }
++
+   static bool Read(viz::mojom::CompositorFrameMetadataDataView data,
+                    viz::CompositorFrameMetadata* out);
+ };
+diff --git a/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom b/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
+index ba76572f8b5e8..fcab519a0375f 100644
+--- a/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
++++ b/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
+@@ -97,4 +97,8 @@ struct CompositorFrameMetadata {
+ 
+   // Tracked element rects for the frame.
+   TrackedElementRects tracked_element_rects;
++
++  // DisplayXR inline-3D (#625, Step B / B4b): window-relative device-px rects of
++  // the page's inline-3d canvases, for the Viz post-paint output weave loop.
++  array<gfx.mojom.Rect> inline_3d_rects;
+ };
+diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
+index a536e2dbd65ac..5f6196c81b19d 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
++++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
+@@ -1633,6 +1633,13 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
+   widget_base_->LayerTreeHost()->SetOverscrollBehavior(overscroll_behavior);
+ }
+ 
++void WebFrameWidgetImpl::SetInline3DRects(
++    const std::vector<gfx::Rect>& rects) {
++  if (!View()->does_composite())
++    return;
++  widget_base_->LayerTreeHost()->SetInline3DRects(rects);
++}
++
+ void WebFrameWidgetImpl::SetPrefersReducedMotion(bool prefers_reduced_motion) {
+   if (!View()->does_composite())
+     return;
+diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
+index 1da01a03fc20b..c0c962548e953 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
++++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
+@@ -232,6 +232,8 @@ class CORE_EXPORT WebFrameWidgetImpl
+   cc::AnimationTimeline* ScrollAnimationTimeline() const final;
+   void SetOverscrollBehavior(
+       const cc::OverscrollBehavior& overscroll_behavior) final;
++  // DisplayXR inline-3D (#625, Step B / B4b).
++  void SetInline3DRects(const std::vector<gfx::Rect>& rects) final;
+   void SendEarlyFinalBeginMainFrame() override;
+   void RequestAnimationAfterDelay(const base::TimeDelta&, bool urgent) final;
+   void RequestAnimationAfterDelay(cc::BeginMainFrameReason,
+diff --git a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
+index 8ff9258d5ff42..0466fd423ee5a 100644
+--- a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
++++ b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
+@@ -508,11 +508,42 @@ void XRFrameProvider::ProcessScheduledFrame(
+   TRACE_EVENT2("gpu", "XRFrameProvider::ProcessScheduledFrame", "frame",
+                frame_id_, "timestamp", high_res_now_ms);
+ 
++  {
++    static int g_psf = 0;
++    if (++g_psf <= 10) {
++      bool inl = false;
++      for (auto& r : requesting_sessions_) {
++        if (r.key && r.key->is_inline_3d()) {
++          inl = true;
++          break;
++        }
++      }
++      LOG(ERROR) << "[DisplayXR] ProcScheduledFrame #" << g_psf
++                 << " type=" << static_cast<int>(frame_type)
++                 << " focused=" << xr_->IsFrameFocused()
++                 << " immersive=" << (immersive_session_ ? 1 : 0)
++                 << " reqs=" << requesting_sessions_.size() << " inl=" << inl;
++    }
++  }
++
+   LocalDOMWindow* window = xr_->DomWindow();
+   if (!window)
+     return;
+ 
+-  if (!xr_->IsFrameFocused() && !immersive_session_) {
++  // DisplayXR inline-3D (#625, Step B / B4b): an inline-3d session drives a
++  // glasses-free 3D *display* surface, not input — it must keep weaving whether
++  // or not the window holds keyboard focus (and gating it on focus stalls the
++  // frame loop permanently in headless/agent launches). So do not drop frames
++  // for inline-3d sessions on the focus check. (Pose/eye exposure to unfocused
++  // pages is acceptable for this display feature; revisit for production.)
++  bool has_inline_3d_request = false;
++  for (auto& r : requesting_sessions_) {
++    if (r.key && r.key->is_inline_3d()) {
++      has_inline_3d_request = true;
++      break;
++    }
++  }
++  if (!xr_->IsFrameFocused() && !immersive_session_ && !has_inline_3d_request) {
+     return;  // Not currently focused, so we won't expose poses (except to
+              // immersive sessions).
+   }
+@@ -628,6 +659,13 @@ void XRFrameProvider::OnPreDispatchInlineFrame(XRSession* session,
+ 
+   // If we still have the session and don't have an immersive session, then we
+   // should serve the frame.
++  {
++    static int g_pdi = 0;
++    if (++g_pdi <= 10) {
++      LOG(ERROR) << "[DisplayXR] OnPreDispatchInlineFrame -> OnFrame inl="
++                 << session->is_inline_3d();
++    }
++  }
+   session->OnFrame(timestamp, Vector<XRSharedImageData>());
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index cc97fbac8a5d4..7ec4782aa8190 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -31,7 +31,11 @@
+ #include "third_party/blink/renderer/core/frame/frame.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/geometry/dom_rect.h"
+ #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
++#include "third_party/blink/renderer/platform/widget/frame_widget.h"
++#include "ui/gfx/geometry/rect_conversions.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "third_party/blink/renderer/core/inspector/console_message.h"
+ #include "third_party/blink/renderer/core/probe/async_task_context.h"
+ #include "third_party/blink/renderer/core/resize_observer/resize_observer.h"
+@@ -1789,6 +1793,16 @@ void XRSession::MaybeRequestFrame() {
+     }
+   }
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): an inline-3d session's active
++  // render target is its XRDisplayLayer (a canvas weave target), NOT an
++  // XRWebGLLayer base layer. Treat a registered display layer as a valid render
++  // state so the session actually animates -> XRSession::OnFrame runs each frame,
++  // reporting the canvas rect to the compositor (ReportInline3DRects) and driving
++  // the 2-view head-tracked pose path (B3d).
++  if (is_inline_3d_ && !display_layers_.empty()) {
++    will_have_valid_render_state = true;
++  }
++
+   // A page will not be allowed to get frames if its visibility state is hidden.
+   bool page_allowed_frames = visibility_state_ != XRVisibilityState::HIDDEN;
+ 
+@@ -1822,6 +1836,16 @@ void XRSession::MaybeRequestFrame() {
+   // and wants one.
+   bool request_frame =
+       !pending_frame_ && page_allowed_frames && page_can_process_frames;
++  {
++    static int g_mrf = 0;
++    if (++g_mrf % 60 == 1) {
++      LOG(ERROR) << "[DisplayXR] MaybeRequestFrame inline3d=" << is_inline_3d_
++                 << " layers=" << display_layers_.size()
++                 << " render_ok=" << will_have_valid_render_state
++                 << " wants=" << page_wants_frame
++                 << " pending=" << pending_frame_ << " req=" << request_frame;
++    }
++  }
+   if (request_frame) {
+     xr_->frameProvider()->RequestFrame(this);
+     pending_frame_ = true;
+@@ -2221,6 +2245,33 @@ void XRSession::OnFrame(double timestamp,
+   if (pending_frame_) {
+     pending_frame_ = false;
+ 
++    // DisplayXR inline-3D (#625, Step B / B4b): an inline-3d session renders
++    // through its own canvas (driven by the page's window rAF) and is woven in
++    // Viz — it has NO XR base layer / output canvas / frame transport, so it
++    // must skip the layer-submission machinery below (which would drop the frame
++    // at the HasActiveLayer / output_canvas gates and stall the loop). Run a
++    // minimal animation frame: build the XRFrame, dispatch the page's rAF
++    // callbacks (so getViewerPose + the app loop run and the page re-requests),
++    // and report the canvas rect to the compositor for the weave.
++    if (is_inline_3d_) {
++      if (visibility_state_ == XRVisibilityState::HIDDEN) {
++        return;
++      }
++      CHECK(animation_frame_ == nullptr);
++      animation_frame_ = CreatePresentationFrame(true);
++      {
++        base::AutoReset<bool> resolving(&resolving_frame_, true);
++        page_animation_frame_timer_.StartTimer();
++        ExecuteVideoFrameCallbacks(timestamp);
++        callback_collection_->ExecuteCallbacks(this, timestamp, animation_frame_);
++        page_animation_frame_timer_.StopTimer();
++      }
++      ReportInline3DRects();
++      animation_frame_->Deactivate();
++      animation_frame_ = nullptr;
++      return;
++    }
++
+     // Don't allow frames to be processed if there's no layers attached to the
+     // session. That would allow tracking with no associated visuals.
+     if (!render_state_->HasActiveLayer()) {
+@@ -2339,6 +2390,11 @@ void XRSession::OnFrame(double timestamp,
+     callback_collection_->ExecuteCallbacks(this, timestamp, animation_frame_);
+     page_animation_frame_timer_.StopTimer();
+ 
++    // DisplayXR inline-3D (#625, Step B / B4b): the rAF callbacks have painted the
++    // inline-3d canvases; report their current rects so this frame's composited
++    // output carries them to the Viz weave loop.
++    ReportInline3DRects();
++
+     // Calling OnFrameEnd() on the render state will trigger each layer to
+     // submit its drawing data to be cached by the frame provider.
+     render_state_->OnFrameEnd();
+@@ -2513,6 +2569,62 @@ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
+   display_layers_.erase(layer);
+ }
+ 
++void XRSession::ReportInline3DRects() {
++  // Collect each registered inline-3d canvas's window-relative device-px rect
++  // (getBoundingClientRect x device-scale-factor) and hand it to the compositor.
++  // The rects ride to Viz on CompositorFrameMetadata::inline_3d_rects, arriving
++  // atomically with the frame whose pixels they describe (design §13.3) — so the
++  // woven output sub-rect always matches the composited page. Even when
++  // display_layers_ is empty we push an empty list to clear a prior frame's rects.
++  LocalDOMWindow* window = DynamicTo<LocalDOMWindow>(GetExecutionContext());
++  if (!window) {
++    return;
++  }
++  LocalFrame* frame = window->GetFrame();
++  if (!frame) {
++    return;
++  }
++  FrameWidget* widget = frame->GetWidgetForLocalRoot();
++  if (!widget) {
++    return;
++  }
++  const double dsf = frame->DevicePixelRatio();
++  std::vector<gfx::Rect> rects;
++  rects.reserve(display_layers_.size());
++  for (const auto& layer : display_layers_) {
++    Element* target = layer->target();
++    if (!target) {
++      continue;
++    }
++    // getBoundingClientRect() is viewport-relative CSS px; the composited output
++    // is window-relative device px. For the main frame the visual-viewport origin
++    // maps to the widget origin, so device px = CSS px x DSF (pinch-zoom /
++    // multi-monitor origin refinements are deferred).
++    DOMRect* r = target->GetBoundingClientRect();
++    if (!r) {
++      continue;
++    }
++    gfx::RectF css_rect(static_cast<float>(r->x()), static_cast<float>(r->y()),
++                        static_cast<float>(r->width()),
++                        static_cast<float>(r->height()));
++    css_rect.Scale(static_cast<float>(dsf));
++    gfx::Rect device_rect = gfx::ToRoundedRect(css_rect);
++    if (!device_rect.IsEmpty()) {
++      rects.push_back(device_rect);
++    }
++  }
++  widget->SetInline3DRects(rects);
++  {
++    static int g_rir = 0;
++    if (++g_rir % 60 == 1) {
++      LOG(ERROR) << "[DisplayXR] ReportInline3DRects layers="
++                 << display_layers_.size() << " rects=" << rects.size()
++                 << " dsf=" << dsf
++                 << (rects.empty() ? "" : " r0=" + rects[0].ToString());
++    }
++  }
++}
++
+ // DisplayXR inline-3D (#625, Step B3d): build two eye views with window-relative
+ // off-axis (Kooima) projections + per-eye poses from the tracked eyes. The
+ // element is treated as a physical window into the scene: the frustum edges are
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
+index 10392883b4d2f..20ed4c009c1f9 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.h
++++ b/third_party/blink/renderer/modules/xr/xr_session.h
+@@ -151,6 +151,8 @@ class XRSession final : public EventTarget,
+   ~XRSession() override = default;
+ 
+   XRSystem* xr() const { return xr_.Get(); }
++  // DisplayXR inline-3D (#625, Step B).
++  bool is_inline_3d() const { return is_inline_3d_; }
+   V8XREnvironmentBlendMode environmentBlendMode() const {
+     return V8XREnvironmentBlendMode(blend_mode_);
+   }
+@@ -337,6 +339,12 @@ class XRSession final : public EventTarget,
+   void RegisterDisplayLayer(XRDisplayLayer* layer);
+   void UnregisterDisplayLayer(XRDisplayLayer* layer);
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): collect each registered inline-3d
++  // canvas's window-relative device-px rect and forward it to the compositor
++  // (FrameWidget::SetInline3DRects) so Viz can weave those output sub-rects. Called
++  // once per animation frame after the rAF callbacks have painted the canvases.
++  void ReportInline3DRects();
++
+   void AddTransientInputSource(XRInputSource* input_source);
+   void RemoveTransientInputSource(XRInputSource* input_source);
+ 
+diff --git a/third_party/blink/renderer/platform/widget/frame_widget.h b/third_party/blink/renderer/platform/widget/frame_widget.h
+index 33956395177f1..d44654c317aee 100644
+--- a/third_party/blink/renderer/platform/widget/frame_widget.h
++++ b/third_party/blink/renderer/platform/widget/frame_widget.h
+@@ -302,6 +302,11 @@ class PLATFORM_EXPORT FrameWidget {
+   // this widget, taking into account its transform to main frame space.
+   virtual float GetCompositingScaleFactor() = 0;
+ 
++  // DisplayXR inline-3D (#625, Step B / B4b): forward the page's inline-3d canvas
++  // rects (window-relative device px) to the compositor for the next commit, so
++  // they reach Viz via CompositorFrameMetadata::inline_3d_rects. Default no-op.
++  virtual void SetInline3DRects(const std::vector<gfx::Rect>& rects) {}
++
+   // Get and set the configuration for the debugging overlay managed by the
+   // underlying LayerTreeHost. This may return null if the widget does not
+   // composite.
