@@ -8,6 +8,8 @@
 - **[integration-points.md](integration-points.md)** — the enumerated file set the patch touches
   (grouped by subsystem), so a rebase conflict can only land in a known, documented hook. The reason a
   rebase is mechanical.
+- **[release-and-distribution.md](release-and-distribution.md)** — the release flow (build → sign →
+  GitHub Release), the website download, and the lightweight version-check-not-auto-update mechanism.
 
 Design/rationale for every hook lives in the runtime repo:
 [`docs/roadmap/webxr-step-b-design.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-step-b-design.md)
