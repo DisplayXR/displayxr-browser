@@ -10,6 +10,8 @@
   rebase is mechanical.
 - **[release-and-distribution.md](release-and-distribution.md)** — the release flow (build → sign →
   GitHub Release), the website download, and the lightweight version-check-not-auto-update mechanism.
+- **[remote-build.md](remote-build.md)** — build on the remote signing/build box (`$DXR_SIGN_REPO`) to
+  free the local machine from the multi-hour compile; the one-time box provisioning + caveats.
 
 Design/rationale for every hook lives in the runtime repo:
 [`docs/roadmap/webxr-step-b-design.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-step-b-design.md)
