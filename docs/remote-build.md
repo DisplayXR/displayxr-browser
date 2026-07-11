@@ -47,7 +47,10 @@ and expensive. Self-hosted only.
 
 ## One-time box provisioning (heavy — the real prerequisite)
 The build box needs, once:
-- **~200 GB free disk** on the `CHROMIUM_ROOT` drive (`C:\cr` by default in the workflow).
+- **~250 GB free disk** on the `CHROMIUM_ROOT` drive — defaults to **`D:\chromium`** (on the Leia
+  runner `C:` is nearly full; `D:` has the room). The workflow also redirects `TMP`/`TEMP` to `D:\tmp`
+  (job-scoped) so Chromium's temp spill doesn't fill `C:`. Override `CHROMIUM_ROOT` / `BUILD_TMP` /
+  `VS2022_INSTALL` via repo **vars** for a different box.
 - **depot_tools** (the workflow bootstraps it to `$DEPOT_TOOLS` if missing) + `DEPOT_TOOLS_WIN_TOOLCHAIN=0`.
 - VS 2022 (C++ workload) + Windows SDK (the box already has these for component builds).
 - The first run's `fetch chromium` is tens of GB + hours; later runs only `gclient sync` to the pin.
