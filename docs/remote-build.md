@@ -28,6 +28,23 @@ Or dispatch directly:
 gh workflow run build-browser.yml -R "$DXR_SIGN_REPO" -f chromium_tag=150.0.7871.24 -f sign=true
 ```
 
+## Choosing the runner (the `chromium-build` label)
+The workflow is `runs-on: [self-hosted, chromium-build]` — decoupled from any specific box. Assign the
+**`chromium-build`** label to whichever runner should carry the ~150 GB Chromium tree:
+- **The Leia signing box** — add `chromium-build` to its runner's labels. In-place signing works
+  (the box-local `SIGN_CMD` is present). ⚠️ But this puts Chromium's disk + a multi-hour full-CPU build
+  on the box that does release signing — only do this if it has **~250 GB genuinely free** and you're OK
+  with signing jobs contending. See the risk note below.
+- **A dedicated / cloud build VM** (recommended) — a 32–64 vCPU Windows VM with a **persistent ~512 GB
+  disk**, registered with the `chromium-build` label. Keeps Chromium off the signing box, keeps the
+  checkout warm between runs (no re-fetch), and spins down between monthly rebases. The in-place sign
+  step no-ops there (no box signer) — sign afterward via the folder-sign path (`scripts/sign.sh`) or a
+  `sign-artifact` pass on the signing box.
+
+**Why not GitHub-hosted:** standard runners can't hold the checkout; larger (paid) runners are
+ephemeral so they'd re-`fetch` ~100 GB every run (no usable cache) and still have no RBE — impractical
+and expensive. Self-hosted only.
+
 ## One-time box provisioning (heavy — the real prerequisite)
 The build box needs, once:
 - **~200 GB free disk** on the `CHROMIUM_ROOT` drive (`C:\cr` by default in the workflow).
