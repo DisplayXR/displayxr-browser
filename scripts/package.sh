@@ -19,8 +19,10 @@ rm -rf "$STAGE"; mkdir -p "$STAGE"
 
 # Core run-set of an official static Chromium build. (A static build has far fewer DLLs than the
 # component build; the vendored openxr_loader.dll ships alongside for the weave client.)
+# chrome.exe is only a launcher stub even in a static build — the code is chrome.dll (~300-400MB).
 for item in \
-  chrome.exe chrome_proxy.exe chrome_pwa_launcher.exe \
+  chrome.exe chrome.dll chrome_wer.dll chrome_elf.dll \
+  chrome_proxy.exe chrome_pwa_launcher.exe \
   chrome_100_percent.pak chrome_200_percent.pak resources.pak \
   icudtl.dat v8_context_snapshot.bin snapshot_blob.bin \
   vk_swiftshader.dll vk_swiftshader_icd.json vulkan-1.dll libEGL.dll libGLESv2.dll \
