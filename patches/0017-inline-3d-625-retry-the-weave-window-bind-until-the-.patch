@@ -1,0 +1,93 @@
+From 4516573a5ce13946ff1e73854ed6aa662ce61082 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 12 Jul 2026 12:46:11 -0700
+Subject: [PATCH 17/18] inline-3d(#625): retry the weave window bind until the
+ browser window is visible
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+chrome shows its first window via a posted task, so the one-shot delayed
+init could fire before any Chrome_WidgetWin_* window was visible — with
+the class filter that meant a permanent 'no top-level browser window'
+and a dormant weave for the whole session. Look the window up first and
+self-repost (500ms, bounded 20 attempts) before creating any OpenXR
+state.
+---
+ .../browser/displayxr_weave_client.cc         | 33 +++++++++++++++----
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 17444f3758b41..3691cae22650e 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -6,8 +6,12 @@
+ 
+ #include "base/command_line.h"
+ #include "base/compiler_specific.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr_exclusion.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
+ #include "build/build_config.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -157,11 +161,30 @@ bool HasExtension(const std::vector<XrExtensionProperties>& exts,
+   return false;
+ }
+ 
+-void InitializeWin() {
++void InitializeWin(int attempts_left) {
+   WeaveClientState& s = State();
+   if (s.initialized) {
+     return;
+   }
++
++  // Find the browser frame window FIRST — chrome shows its first window via a
++  // posted task, so it may not be visible yet when the delayed init task
++  // fires. A miss must retry, not give up: this init is one-shot and an
++  // unbound client leaves inline-3D dormant for the whole browser session.
++  HWND hwnd = FindMainWindowForCurrentProcess();
++  if (!hwnd) {
++    if (attempts_left > 1) {
++      VLOG(1) << "[DisplayXR] browser window not visible yet — retrying bind ("
++              << attempts_left - 1 << " attempts left)";
++      base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++          FROM_HERE, base::BindOnce(&InitializeWin, attempts_left - 1),
++          base::Milliseconds(500));
++    } else {
++      LOG(ERROR) << "[DisplayXR] no top-level browser window for bindWindow";
++    }
++    return;
++  }
++
+   s.initialized = true;
+ 
+   // The weave service is IPC-only; force the runtime onto the out-of-process
+@@ -297,11 +320,7 @@ void InitializeWin() {
+     return;
+   }
+ 
+-  s.hwnd = FindMainWindowForCurrentProcess();
+-  if (!s.hwnd) {
+-    LOG(ERROR) << "[DisplayXR] no top-level browser window for bindWindow";
+-    return;
+-  }
++  s.hwnd = hwnd;  // resolved (with retry) at the top of this function
+ 
+   XrGraphicsBindingD3D11KHR gb = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
+   gb.device = s.device;
+@@ -489,7 +508,7 @@ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+     return;
+   }
+ #if BUILDFLAG(IS_WIN)
+-  InitializeWin();
++  InitializeWin(/*attempts_left=*/20);
+ #else
+   LOG(ERROR) << "[DisplayXR] inline-3D is Windows-only in Step B";
+ #endif
+-- 
+2.42.0.windows.2
+

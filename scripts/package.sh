@@ -31,9 +31,11 @@ for item in \
   [ -e "$OUT/$item" ] && cp "$OUT/$item" "$STAGE/" || echo "[package]  (skip missing $item)"
 done
 
-# Locales + version-coded resource dir.
+# Locales + version-coded resource dir + external SxS manifest (chrome.exe fails
+# "side-by-side configuration is incorrect" without <VER>.manifest next to it).
 [ -d "$OUT/locales" ] && cp -r "$OUT/locales" "$STAGE/"
 VER="$(cat "$CHROMIUM_SRC/chrome/VERSION" | awk -F= '/MAJOR/{a=$2}/MINOR/{b=$2}/BUILD/{c=$2}/PATCH/{d=$2}END{print a"."b"."c"."d}')"
+[ -f "$OUT/$VER.manifest" ] && cp "$OUT/$VER.manifest" "$STAGE/"
 [ -d "$OUT/$VER" ] && cp -r "$OUT/$VER" "$STAGE/" || true
 
 echo "[package] version $VER staged. Contents:"
