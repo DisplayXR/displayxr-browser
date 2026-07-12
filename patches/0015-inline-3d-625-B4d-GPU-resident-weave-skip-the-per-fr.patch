@@ -1,7 +1,7 @@
 From 44d39f2d939bad69e151b0bf34effe6d7ee7c2b4 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 9 Jul 2026 16:50:07 -0700
-Subject: [PATCH 15/15] =?UTF-8?q?inline-3d(#625)=20B4d:=20GPU-resident=20w?=
+Subject: [PATCH 15/18] =?UTF-8?q?inline-3d(#625)=20B4d:=20GPU-resident=20w?=
  =?UTF-8?q?eave=20=E2=80=94=20skip=20the=20per-frame=20CPU=20readback=20(D?=
  =?UTF-8?q?Comp)?=
 MIME-Version: 1.0
@@ -507,3 +507,6 @@ index f871108f5afeb..62ecba1d8f867 100644
    std::unique_ptr<MemoryImageRepresentation> ProduceMemory(
        const Mailbox& mailbox,
        MemoryTypeTracker* ref);
+-- 
+2.42.0.windows.2
+

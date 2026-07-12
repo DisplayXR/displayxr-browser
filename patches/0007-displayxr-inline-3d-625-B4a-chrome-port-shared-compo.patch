@@ -1,7 +1,7 @@
 From c1753d518a77be2f32eca4a52c01c5e1ab71f371 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 6 Jul 2026 09:36:12 -0700
-Subject: [PATCH 07/15] [displayxr inline-3d #625 B4a] chrome port: shared
+Subject: [PATCH 07/18] [displayxr inline-3d #625 B4a] chrome port: shared
  component + hooks; per-element weave premise disproven
 
 Extract the six content/shell-only weave files into a shared components/displayxr/
@@ -1075,3 +1075,6 @@ index 8505e1b3ca07d..4a2f47ccebee8 100644
  #endif
  };
  
+-- 
+2.42.0.windows.2
+

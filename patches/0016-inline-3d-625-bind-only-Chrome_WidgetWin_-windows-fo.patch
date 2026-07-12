@@ -1,0 +1,53 @@
+From 7e61d0c72f9b9928a18a9c94a4406eb5d8e16a98 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 12 Jul 2026 02:04:49 -0700
+Subject: [PATCH 16/18] inline-3d(#625): bind only Chrome_WidgetWin_* windows
+ for the weave session
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+FindMainWindowProc took the first visible unowned top-level in Z-order;
+with --enable-logging the process also owns a visible ConsoleWindowClass
+conhost that can win the race. Binding it sizes the weave target to the
+console's client rect (never resizes) and anchors the eye-frusta screen
+mapping to the console's position — partial/no weave and broken look-around.
+Require the Chrome frame window class so the bind is deterministic.
+---
+ .../displayxr/browser/displayxr_weave_client.cc     | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 9b86ed7dcb877..17444f3758b41 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -72,7 +72,11 @@ struct WeaveClientState {
+ // Find this process's main top-level window (the browser's main window) so
+ // the weave session can bind it for DP phase-snap. The browser process owns the
+ // HWND directly (design doc Seam D), so a Win32 enumeration avoids pulling in
+-// ui/views/aura. Picks the first visible, unowned, reasonably sized top-level.
++// ui/views/aura. Must be a Chrome frame window: the process can own other
++// visible unowned top-levels (e.g. the ConsoleWindowClass conhost under
++// --enable-logging) that would otherwise win the Z-order race — binding one of
++// those sizes the weave target to the wrong window and anchors the eye-frusta
++// mapping to the wrong screen rect.
+ BOOL CALLBACK FindMainWindowProc(HWND hwnd, LPARAM lparam) {
+   DWORD wpid = 0;
+   ::GetWindowThreadProcessId(hwnd, &wpid);
+@@ -80,6 +84,13 @@ BOOL CALLBACK FindMainWindowProc(HWND hwnd, LPARAM lparam) {
+       ::GetWindow(hwnd, GW_OWNER) != nullptr) {
+     return TRUE;
+   }
++  wchar_t cls[64] = {};
++  int cls_len = ::GetClassNameW(hwnd, cls, 64);
++  if (cls_len <= 0 ||
++      !std::wstring_view(cls, static_cast<size_t>(cls_len))
++           .starts_with(L"Chrome_WidgetWin_")) {
++    return TRUE;
++  }
+   RECT r = {};
+   if (!::GetWindowRect(hwnd, &r) || (r.right - r.left) < 64 ||
+       (r.bottom - r.top) < 64) {
+-- 
+2.42.0.windows.2
+

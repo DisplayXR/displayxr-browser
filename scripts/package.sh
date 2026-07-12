@@ -19,8 +19,10 @@ rm -rf "$STAGE"; mkdir -p "$STAGE"
 
 # Core run-set of an official static Chromium build. (A static build has far fewer DLLs than the
 # component build; the vendored openxr_loader.dll ships alongside for the weave client.)
+# chrome.exe is only a launcher stub even in a static build — the code is chrome.dll (~300-400MB).
 for item in \
-  chrome.exe chrome_proxy.exe chrome_pwa_launcher.exe \
+  chrome.exe chrome.dll chrome_wer.dll chrome_elf.dll \
+  chrome_proxy.exe chrome_pwa_launcher.exe \
   chrome_100_percent.pak chrome_200_percent.pak resources.pak \
   icudtl.dat v8_context_snapshot.bin snapshot_blob.bin \
   vk_swiftshader.dll vk_swiftshader_icd.json vulkan-1.dll libEGL.dll libGLESv2.dll \
@@ -29,9 +31,11 @@ for item in \
   [ -e "$OUT/$item" ] && cp "$OUT/$item" "$STAGE/" || echo "[package]  (skip missing $item)"
 done
 
-# Locales + version-coded resource dir.
+# Locales + version-coded resource dir + external SxS manifest (chrome.exe fails
+# "side-by-side configuration is incorrect" without <VER>.manifest next to it).
 [ -d "$OUT/locales" ] && cp -r "$OUT/locales" "$STAGE/"
 VER="$(cat "$CHROMIUM_SRC/chrome/VERSION" | awk -F= '/MAJOR/{a=$2}/MINOR/{b=$2}/BUILD/{c=$2}/PATCH/{d=$2}END{print a"."b"."c"."d}')"
+[ -f "$OUT/$VER.manifest" ] && cp "$OUT/$VER.manifest" "$STAGE/"
 [ -d "$OUT/$VER" ] && cp -r "$OUT/$VER" "$STAGE/" || true
 
 echo "[package] version $VER staged. Contents:"
