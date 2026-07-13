@@ -1,0 +1,916 @@
+From ed2be3cc1d00f4e44e47cc71d2de103aba4f0bc3 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 12 Jul 2026 20:53:41 -0700
+Subject: [PATCH 20/21] =?UTF-8?q?inline-3d(#625):=20async=20weave=20submit?=
+ =?UTF-8?q?=20=E2=80=94=20drop=20banned=20GPU-process=20[Sync]=20mojo=20ca?=
+ =?UTF-8?q?ll?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+One-frame-lag async redesign (displayxr-browser#11): the GPU/viz process fired a
+[Sync] DisplayXRWeaver.WeaveSubmit up to the browser, which Chromium bans in the
+GPU process (sync_call_restrictions) → the historical static/official crash.
+
+WeaveSubmit is now async. The GPU submits one target's SBS per frame without
+blocking (single keyed-mutex input → SubmitInFlight() gates; round-robin across
+targets), stores the woven reply per-target on the GPU-main sequence, and draws
+back each target's latest completed woven output at the current rect (one-frame
+lag). Submit runs before draw-back so it reads the clean pre-weave page. Both the
+DComp GPU-resident (WeaveCanvas) and GL (WeavePixels) paths go async.
+
+Validated on Leia hardware (component build): DComp + GL paths both weave,
+user-eyeballed, zero xrWeaveSubmitDXR failures on a fresh service.
+---
+ .../displayxr/common/displayxr_weave.mojom    |  15 +-
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 201 ++++++++----
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  51 ++-
+ .../displayxr_weave_provider.h                |  66 ++--
+ .../skia_output_surface_impl_on_gpu.cc        | 303 ++++++++++--------
+ .../skia_output_surface_impl_on_gpu.h         |   6 +
+ 6 files changed, 404 insertions(+), 238 deletions(-)
+
+diff --git a/components/displayxr/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
+index a3af50bd4721d..d63e97c3ad391 100644
+--- a/components/displayxr/common/displayxr_weave.mojom
++++ b/components/displayxr/common/displayxr_weave.mojom
+@@ -42,11 +42,16 @@ struct DisplayXRWeaveResult {
+ 
+ interface DisplayXRWeaver {
+   // Weave one window sub-rect. |texture| is the pre-weave SBS keyed-mutex shared
+-  // texture; |rect| is its window-relative device-pixel placement. Returns the
+-  // woven output, or null if the weave failed / the session isn't live.
+-  // Synchronous: the GPU thread blocks on the per-frame weave (the CEF-host
+-  // model), so the woven texture is ready to sample when the call returns.
+-  [Sync, EnableIf=is_win]
++  // texture; |rect| is its window-relative device-pixel placement. Replies with
++  // the woven output, or null if the weave failed / the session isn't live.
++  //
++  // ASYNC (was [Sync] through B4d): a synchronous mojo call from the GPU process
++  // is banned (sync_call_restrictions — the browser may sync-wait on the GPU
++  // concurrently → deadlock; the historical static/official-build crash). The
++  // GPU caller fires this without blocking and draws back the LATEST completed
++  // woven output a frame later (one-frame-lag; see the GPU-side provider). The
++  // reply is marshalled to the GPU-main sequence that owns the D3D device.
++  [EnableIf=is_win]
+   WeaveSubmit(gfx.mojom.DXGIHandle texture, gfx.mojom.Rect rect)
+       => (DisplayXRWeaveResult? result);
+ };
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index 214919d4b3c0b..85584cd762b7d 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -10,6 +10,7 @@
+ 
+ #include <utility>
+ 
++#include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/win/scoped_handle.h"
+ #include "content/public/child/child_thread.h"
+@@ -26,11 +27,22 @@ DisplayXRWeaveGpu::~DisplayXRWeaveGpu() {
+     ::CloseHandle(input_handle_);
+     input_handle_ = nullptr;
+   }
++  // Close any woven/fence handles Viz never took (e.g. process teardown).
++  for (auto& [id, pending] : results_) {
++    if (pending.have) {
++      CloseResultHandles(pending.result);
++    }
++  }
+ }
+ 
+ void DisplayXRWeaveGpu::Bind() {
+   content::ChildThread::Get()->BindHostReceiver(
+       weaver_.BindNewPipeAndPassReceiver());
++  // If the browser bridge drops (its reply callback would be discarded), clear
++  // the in-flight guard so a rebound remote can submit again instead of wedging.
++  weaver_.set_disconnect_handler(base::BindOnce(
++      [](DisplayXRWeaveGpu* self) { self->submit_in_flight_ = false; },
++      base::Unretained(this)));
+ }
+ 
+ bool DisplayXRWeaveGpu::EnsureInput(ID3D11Device* device,
+@@ -107,15 +119,21 @@ bool DisplayXRWeaveGpu::EnsureInput(ID3D11Device* device,
+   return true;
+ }
+ 
+-viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
+-    ID3D11Device* device,
+-    ID3D11Texture2D* canvas_tex,
+-    UINT array_slice,
+-    const gfx::Rect& src_rect,
+-    const gfx::Rect& window_rect) {
+-  Result out;
+-  if (!weaver_.is_bound() || window_rect.IsEmpty() || !device || !canvas_tex) {
+-    return out;
++bool DisplayXRWeaveGpu::SubmitInFlight() const {
++  return submit_in_flight_;
++}
++
++bool DisplayXRWeaveGpu::WeaveCanvas(ID3D11Device* device,
++                                    ID3D11Texture2D* canvas_tex,
++                                    UINT array_slice,
++                                    const gfx::Rect& src_rect,
++                                    const gfx::Rect& window_rect,
++                                    uint32_t target_id) {
++  // At most one submit in flight (single shared keyed-mutex input): skip while
++  // one is outstanding — the weave runs at reply cadence (one-frame-lag).
++  if (submit_in_flight_ || !weaver_.is_bound() || window_rect.IsEmpty() ||
++      !device || !canvas_tex) {
++    return false;
+   }
+ 
+   D3D11_TEXTURE2D_DESC cd = {};
+@@ -133,7 +151,7 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
+   // Match the input format to the canvas so CopySubresourceRegion is always
+   // legal (a cross-format copy would silently fail -> black).
+   if (!EnsureInput(device, cd.Format, w, h)) {
+-    return out;
++    return false;
+   }
+ 
+   // Copy the canvas sub-rect into the owned keyed-mutex input on device X.
+@@ -156,7 +174,7 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
+ 
+   if (input_mutex_->AcquireSync(0, 1000) != S_OK) {
+     LOG(ERROR) << "[DisplayXR] B2c.2 weave: AcquireSync(0) failed";
+-    return out;
++    return false;
+   }
+   context_->CopySubresourceRegion(input_tex_.Get(), /*DstSubresource=*/0,
+                                   /*DstX=*/0, /*DstY=*/0, /*DstZ=*/0, canvas_tex,
+@@ -164,56 +182,23 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeaveCanvas(
+   context_->Flush();
+   input_mutex_->ReleaseSync(0);
+ 
+-  // Duplicate the input handle for the Mojo message (it consumes/duplicates the
+-  // handle into the browser process); keep our own for reuse.
+-  HANDLE dup = nullptr;
+-  if (!::DuplicateHandle(::GetCurrentProcess(), input_handle_,
+-                         ::GetCurrentProcess(), &dup, 0, FALSE,
+-                         DUPLICATE_SAME_ACCESS) ||
+-      !dup) {
+-    LOG(ERROR) << "[DisplayXR] B2c.2 weave: DuplicateHandle(input) failed";
+-    return out;
+-  }
+-  gfx::DXGIHandle input{base::win::ScopedHandle(dup)};
+-
+-  mojom::DisplayXRWeaveResultPtr result;
+-  if (!weaver_->WeaveSubmit(std::move(input), window_rect, &result)) {
+-    LOG(ERROR) << "[DisplayXR] B2c.2 weave: Sync WeaveSubmit call failed";
+-    return out;
+-  }
+-  if (!result) {
+-    return out;  // browser-side weave failed / session not live
+-  }
+-
+-  out.ok = true;
+-  out.fence_value = result->fence_value;
+-  out.width = result->width;
+-  out.height = result->height;
+-  if (result->woven) {
+-    out.woven_handle = reinterpret_cast<uintptr_t>(
+-        result->woven->TakeBufferHandle().release());
+-  }
+-  if (result->fence) {
+-    out.fence_handle = reinterpret_cast<uintptr_t>(
+-        result->fence->TakeBufferHandle().release());
+-  }
+-  return out;
++  return SubmitInput(window_rect, target_id);
+ }
+ 
+-viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeavePixels(
+-    ID3D11Device* device,
+-    const uint8_t* bgra_pixels,
+-    uint32_t stride,
+-    const gfx::Rect& window_rect) {
+-  Result out;
+-  if (!weaver_.is_bound() || window_rect.IsEmpty() || !device || !bgra_pixels) {
+-    return out;
++bool DisplayXRWeaveGpu::WeavePixels(ID3D11Device* device,
++                                    const uint8_t* bgra_pixels,
++                                    uint32_t stride,
++                                    const gfx::Rect& window_rect,
++                                    uint32_t target_id) {
++  if (submit_in_flight_ || !weaver_.is_bound() || window_rect.IsEmpty() ||
++      !device || !bgra_pixels) {
++    return false;
+   }
+ 
+   const uint32_t w = static_cast<uint32_t>(window_rect.width());
+   const uint32_t h = static_cast<uint32_t>(window_rect.height());
+   if (!EnsureInput(device, DXGI_FORMAT_B8G8R8A8_UNORM, w, h)) {
+-    return out;
++    return false;
+   }
+ 
+   // (Re)create the non-shared DEFAULT upload texture on device X. We UpdateSub-
+@@ -234,7 +219,7 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeavePixels(
+     if (FAILED(device_->CreateTexture2D(&ud, nullptr, &upload_tex_))) {
+       LOG(ERROR) << "[DisplayXR] B4b WeavePixels: CreateTexture2D(upload) failed";
+       upload_tex_.Reset();
+-      return out;
++      return false;
+     }
+     upload_w_ = w;
+     upload_h_ = h;
+@@ -246,44 +231,118 @@ viz::DisplayXRWeaveProvider::Result DisplayXRWeaveGpu::WeavePixels(
+                               /*SrcDepthPitch=*/0);
+   if (input_mutex_->AcquireSync(0, 1000) != S_OK) {
+     LOG(ERROR) << "[DisplayXR] B4b WeavePixels: AcquireSync(0) failed";
+-    return out;
++    return false;
+   }
+   context_->CopyResource(input_tex_.Get(), upload_tex_.Get());
+   context_->Flush();
+   input_mutex_->ReleaseSync(0);
+ 
++  return SubmitInput(window_rect, target_id);
++}
++
++bool DisplayXRWeaveGpu::SubmitInput(const gfx::Rect& window_rect,
++                                    uint32_t target_id) {
++  // Duplicate the input handle for the Mojo message (it consumes/duplicates the
++  // handle into the browser process); keep our own for reuse. The single-in-
++  // flight guard keeps the input stable until the reply, so the browser reads
++  // the pixels we just wrote even though the call no longer blocks.
+   HANDLE dup = nullptr;
+   if (!::DuplicateHandle(::GetCurrentProcess(), input_handle_,
+                          ::GetCurrentProcess(), &dup, 0, FALSE,
+                          DUPLICATE_SAME_ACCESS) ||
+       !dup) {
+-    LOG(ERROR) << "[DisplayXR] B4b WeavePixels: DuplicateHandle(input) failed";
+-    return out;
++    LOG(ERROR) << "[DisplayXR] weave: DuplicateHandle(input) failed";
++    return false;
+   }
+   gfx::DXGIHandle input{base::win::ScopedHandle(dup)};
+ 
+-  mojom::DisplayXRWeaveResultPtr result;
+-  if (!weaver_->WeaveSubmit(std::move(input), window_rect, &result)) {
+-    LOG(ERROR) << "[DisplayXR] B4b WeavePixels: Sync WeaveSubmit call failed";
+-    return out;
+-  }
++  submit_in_flight_ = true;
++  // ASYNC: fire WeaveSubmit without blocking (a [Sync] call from the GPU process
++  // is banned). The reply lands back on this GPU-main sequence (the Remote lives
++  // here); OnWeaveReply stores the woven handles for |target_id|.
++  weaver_->WeaveSubmit(std::move(input), window_rect,
++                       base::BindOnce(&DisplayXRWeaveGpu::OnWeaveReply,
++                                      weak_factory_.GetWeakPtr(), target_id));
++  return true;
++}
++
++void DisplayXRWeaveGpu::OnWeaveReply(uint32_t target_id,
++                                     mojom::DisplayXRWeaveResultPtr result) {
++  submit_in_flight_ = false;
+   if (!result) {
+-    return out;
++    // Browser-side weave failed / session not live; keep the target's last good
++    // woven result so it stops updating rather than flickering to raw.
++    return;
+   }
+ 
+-  out.ok = true;
+-  out.fence_value = result->fence_value;
+-  out.width = result->width;
+-  out.height = result->height;
++  PendingResult& pending = results_[target_id];
++  Result r;
++  r.ok = true;
++  r.fence_value = result->fence_value;
++  r.width = result->width;
++  r.height = result->height;
++  // The woven/fence handles are fresh only on (re)allocation; a steady-state
++  // reply reuses the same texture. If a fresh handle from a prior un-taken reply
++  // is still pending, carry it forward (same underlying texture) so Viz doesn't
++  // miss the import.
+   if (result->woven) {
+-    out.woven_handle = reinterpret_cast<uintptr_t>(
++    r.woven_handle = reinterpret_cast<uintptr_t>(
+         result->woven->TakeBufferHandle().release());
++  } else if (pending.have) {
++    r.woven_handle = pending.result.woven_handle;
++    pending.result.woven_handle = 0;
+   }
+   if (result->fence) {
+-    out.fence_handle = reinterpret_cast<uintptr_t>(
++    r.fence_handle = reinterpret_cast<uintptr_t>(
+         result->fence->TakeBufferHandle().release());
++  } else if (pending.have) {
++    r.fence_handle = pending.result.fence_handle;
++    pending.result.fence_handle = 0;
++  }
++  // Close whatever the prior un-taken result still owns (not carried forward).
++  if (pending.have) {
++    CloseResultHandles(pending.result);
++  }
++  pending.result = r;
++  pending.have = true;
++}
++
++bool DisplayXRWeaveGpu::TryTakeWovenResult(uint32_t target_id, Result* out) {
++  auto it = results_.find(target_id);
++  if (it == results_.end() || !it->second.have) {
++    return false;
++  }
++  *out = it->second.result;
++  // Ownership of the handles transfers to the caller; drop our copy so the
++  // dtor / a later reply does not double-close them.
++  it->second.result = Result();
++  it->second.have = false;
++  return true;
++}
++
++void DisplayXRWeaveGpu::PruneTargets(size_t count) {
++  for (auto it = results_.begin(); it != results_.end();) {
++    if (it->first >= count) {
++      if (it->second.have) {
++        CloseResultHandles(it->second.result);
++      }
++      it = results_.erase(it);
++    } else {
++      ++it;
++    }
++  }
++}
++
++// static
++void DisplayXRWeaveGpu::CloseResultHandles(Result& r) {
++  if (r.woven_handle) {
++    ::CloseHandle(reinterpret_cast<HANDLE>(r.woven_handle));
++    r.woven_handle = 0;
++  }
++  if (r.fence_handle) {
++    ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
++    r.fence_handle = 0;
+   }
+-  return out;
+ }
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index 2e174ec642347..aacc8d95bde7e 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -16,6 +16,8 @@
+ 
+ #include <cstdint>
+ 
++#include "base/containers/flat_map.h"
++#include "base/memory/weak_ptr.h"
+ #include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -46,16 +48,20 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   void Bind();
+ 
+   // viz::DisplayXRWeaveProvider:
+-  Result WeaveCanvas(ID3D11Device* device,
+-                     ID3D11Texture2D* canvas_tex,
+-                     UINT array_slice,
+-                     const gfx::Rect& src_rect,
+-                     const gfx::Rect& window_rect) override;
+-
+-  Result WeavePixels(ID3D11Device* device,
+-                     const uint8_t* bgra_pixels,
+-                     uint32_t stride,
+-                     const gfx::Rect& window_rect) override;
++  bool SubmitInFlight() const override;
++  bool WeaveCanvas(ID3D11Device* device,
++                   ID3D11Texture2D* canvas_tex,
++                   UINT array_slice,
++                   const gfx::Rect& src_rect,
++                   const gfx::Rect& window_rect,
++                   uint32_t target_id) override;
++  bool WeavePixels(ID3D11Device* device,
++                   const uint8_t* bgra_pixels,
++                   uint32_t stride,
++                   const gfx::Rect& window_rect,
++                   uint32_t target_id) override;
++  bool TryTakeWovenResult(uint32_t target_id, Result* out) override;
++  void PruneTargets(size_t count) override;
+ 
+  private:
+   // Lazily (re)create the keyed-mutex SBS input + its shared NT handle on
+@@ -66,8 +72,31 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+                    uint32_t w,
+                    uint32_t h);
+ 
++  // Fire the async WeaveSubmit for |target_id| using the current input handle.
++  // Marks the submit in flight. Returns true if the RPC was dispatched.
++  bool SubmitInput(const gfx::Rect& window_rect, uint32_t target_id);
++
++  // Async reply from the browser weave bridge (GPU-main sequence). Clears the
++  // in-flight flag and stores the woven handles for |target_id|.
++  void OnWeaveReply(uint32_t target_id, mojom::DisplayXRWeaveResultPtr result);
++
++  // Close any owned Win32 handles carried in |r| (un-taken woven result).
++  static void CloseResultHandles(Result& r);
++
+   mojo::Remote<mojom::DisplayXRWeaver> weaver_;
+ 
++  // Async weave state (single shared input -> at most one submit in flight).
++  // |submit_in_flight_| is set on dispatch and cleared on OnWeaveReply. Latest
++  // completed woven result per target id (index of the inline-3d rect), owning
++  // its handles until Viz takes it via TryTakeWovenResult. All touched only on
++  // the GPU main thread.
++  bool submit_in_flight_ = false;
++  struct PendingResult {
++    bool have = false;
++    Result result;
++  };
++  base::flat_map<uint32_t, PendingResult> results_;
++
+   // The Viz GPU-main D3D11 device (device X, == the canvas SharedImage's device)
+   // the input lives on, plus its immediate context (used for the canvas->input
+   // copy + keyed-mutex acquire/release). Held to detect a device change. The
+@@ -90,6 +119,8 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   uint32_t upload_w_ = 0;
+   uint32_t upload_h_ = 0;
+   bool logged_canvas_desc_ = false;
++
++  base::WeakPtrFactory<DisplayXRWeaveGpu> weak_factory_{this};
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index 8484123537ce8..3f60859165eb9 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -44,29 +44,55 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+ 
+   virtual ~DisplayXRWeaveProvider() = default;
+ 
+-  // B2c.2: drive a weave from the REAL canvas texture. |device| is the Viz GPU-
+-  // main D3D11 device (== the canvas SharedImage's device, so the copy below is
++  // ASYNC weave model (drops the banned GPU-process [Sync] mojo call). The submit
++  // methods FIRE the weave RPC without blocking and return immediately; the woven
++  // result is delivered a frame (or more) later and retrieved with
++  // TryTakeWovenResult. The GPU caller draws back the latest completed woven
++  // output at the current rect (one-frame-lag). A single SBS input is shared, so
++  // at most one submit is in flight at a time: SubmitInFlight() gates the caller,
++  // and the submit methods no-op (return false) while one is outstanding. All
++  // methods run on the GPU main thread (where the Mojo remote + reply live).
++
++  // Returns true if the caller may issue a submit this frame (no weave RPC is
++  // outstanding). When true, the input SBS buffer is free to (re)fill.
++  virtual bool SubmitInFlight() const = 0;
++
++  // B2c.2: fire an async weave from the REAL canvas texture. |device| is the Viz
++  // GPU-main D3D11 device (== the canvas SharedImage's device, so the copy is
+   // same-device); |canvas_tex| / |array_slice| are the canvas overlay texture
+   // resolved on the GPU thread; |src_rect| is the canvas region to weave;
+-  // |window_rect| is its window-relative device-pixel placement. The provider
+-  // copies |src_rect| into an owned keyed-mutex SBS input on |device| and drives
+-  // the synchronous weave RPC. Runs on the GPU main thread.
+-  virtual Result WeaveCanvas(ID3D11Device* device,
+-                             ID3D11Texture2D* canvas_tex,
+-                             UINT array_slice,
+-                             const gfx::Rect& src_rect,
+-                             const gfx::Rect& window_rect) = 0;
+-
+-  // B4b (CEF sub-rect model): drive a weave from CPU pixels. |bgra_pixels| is a
+-  // tightly/|stride|-packed BGRA8 buffer of size window_rect.width() x
++  // |window_rect| is its window-relative device-pixel placement; |target_id|
++  // keys the per-target woven result. Copies |src_rect| into the owned keyed-
++  // mutex SBS input on |device| and fires WeaveSubmit. Returns true if a submit
++  // was issued (false if one is already in flight or the inputs were invalid).
++  virtual bool WeaveCanvas(ID3D11Device* device,
++                           ID3D11Texture2D* canvas_tex,
++                           UINT array_slice,
++                           const gfx::Rect& src_rect,
++                           const gfx::Rect& window_rect,
++                           uint32_t target_id) = 0;
++
++  // B4b (CEF sub-rect model): fire an async weave from CPU pixels. |bgra_pixels|
++  // is a tightly/|stride|-packed BGRA8 buffer of size window_rect.width() x
+   // window_rect.height() (the composited page sub-rect read back from the output
+-  // surface). Uploaded into the owned keyed-mutex SBS input on |device| and
+-  // woven at |window_rect| (window-relative device px). Backend-agnostic (avoids
+-  // the D3D-backing / overlay path); the zero-copy texture route is a follow-up.
+-  virtual Result WeavePixels(ID3D11Device* device,
+-                             const uint8_t* bgra_pixels,
+-                             uint32_t stride,
+-                             const gfx::Rect& window_rect) = 0;
++  // surface). Uploaded into the owned keyed-mutex SBS input on |device| and woven
++  // at |window_rect|. Returns true if a submit was issued. Same async contract as
++  // WeaveCanvas.
++  virtual bool WeavePixels(ID3D11Device* device,
++                           const uint8_t* bgra_pixels,
++                           uint32_t stride,
++                           const gfx::Rect& window_rect,
++                           uint32_t target_id) = 0;
++
++  // If a completed weave result for |target_id| is available and not yet taken,
++  // move it into |*out| (transferring the woven/fence HANDLE ownership to the
++  // caller) and return true; else return false. |woven_handle| / |fence_handle|
++  // are non-zero only on a fresh (re)allocation, matching the prior contract.
++  virtual bool TryTakeWovenResult(uint32_t target_id, Result* out) = 0;
++
++  // Close + drop any stored woven results for target ids >= |count| (canvas
++  // removed / rect count shrank), so their handles are not leaked.
++  virtual void PruneTargets(size_t count) = 0;
+ };
+ 
+ // Register / fetch the process-global provider (GPU process, GPU main thread).
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 8ed4872ea2a9b..520e6cd2f5f5a 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2759,18 +2759,24 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     return;
+   }
+ 
+-  // CEF sub-rect model (design §13.3): the composited page (2D chrome + each
+-  // inline-3d canvas's flat SBS pixels, already squashed together) is now in
+-  // |output| — this is exactly the Step-A CEF host's `pageTex`. |output| is
+-  // either the GL output-device SkSurface (--disable-direct-composition) or the
+-  // DComp root render-pass backing surface (default DComp); both are readable
+-  // Skia surfaces, so the same loop serves both. Per rect we read the composited
+-  // sub-rect's pixels back (Ganesh sync readPixels; Graphite blocking-async) and
+-  // upload them into the weave input, weave, then draw the woven result back over
+-  // |out_canvas|. We read before drawing the woven back, so no read/write hazard.
+-
+-  // Prune woven state beyond the current rect count (canvas removed / count
+-  // shrank) before (re)sizing, so the woven SharedImages are not leaked.
++  // CEF sub-rect model (design §13.3), now ASYNC (design §13.6): the composited
++  // page (2D chrome + each inline-3d canvas's flat SBS pixels, already squashed
++  // together) is in |output| — exactly the Step-A CEF host's `pageTex`. |output|
++  // is either the GL output-device SkSurface (--disable-direct-composition) or
++  // the DComp root render-pass backing; both are readable Skia surfaces, so one
++  // pass serves both.
++  //
++  // A [Sync] weave RPC from the GPU process is banned (sync_call_restrictions —
++  // the browser may sync-wait on the GPU concurrently → deadlock; the historical
++  // static/official crash). So the weave is one-frame-lag async, in two phases:
++  //   (A) submit ONE target's freshly composited SBS sub-rect WITHOUT blocking;
++  //   (B) draw back each target's LATEST completed woven output at its current
++  //       rect (last frame's pixels; a moved canvas smears for one frame).
++  // (A) runs BEFORE (B) so the submit reads the clean pre-weave page, not the
++  // woven pixels (B) is about to composite over |output|.
++
++  // Prune woven / scratch / provider-result state beyond the current rect count
++  // (canvas removed / count shrank) so nothing leaks.
+   if (displayxr_woven_state_.size() > inline_3d_rects_.size()) {
+     for (size_t i = inline_3d_rects_.size(); i < displayxr_woven_state_.size();
+          ++i) {
+@@ -2794,11 +2800,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+   }
+   displayxr_scratch_state_.resize(inline_3d_rects_.size());
++  provider->PruneTargets(inline_3d_rects_.size());
++
++  if (inline_3d_rects_.empty()) {
++    return;
++  }
+ 
+-  // (D) Per rect: weave the composited sub-rect and draw the woven result back
+-  // over the output. Serialized (the provider reuses one keyed-mutex input +
+-  // one woven output), mirroring the CEF host's per-element loop.
+-  //
+   // Graphite has no synchronous SkSurface::readPixels, so the Graphite readback
+   // uses the blocking-async path (asyncRescaleAndReadPixelsAndSubmit, which
+   // submits + waits) into this context; mirrors
+@@ -2816,35 +2823,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+   };
+ 
+-  bool drew_any = false;
+-  // The woven SkImages must stay backed until the output is flushed + submitted
+-  // (Ganesh records the draw and reads the texture at flush time). Hold the
+-  // representations + scoped read accesses alive here across the flush below.
+-  std::vector<std::unique_ptr<gpu::SkiaImageRepresentation>> held_reps;
+-  std::vector<std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>>
+-      held_accesses;
+-  for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
+-    gfx::Rect rect = inline_3d_rects_[i];
++  // ---- (A) Submit one target's SBS this frame (async, at reply cadence) ----
++  // Read the composited sub-rect and fire the weave without blocking. Returns
++  // true if a submit was dispatched. The single keyed-mutex input means only one
++  // submit may be in flight, so this runs for at most one target per frame.
++  auto attempt_submit = [&](size_t t) -> bool {
++    gfx::Rect rect = inline_3d_rects_[t];
+     rect.Intersect(window_bounds);
+     if (rect.IsEmpty()) {
+-      continue;
++      return false;
+     }
+-
+     const int rw = rect.width();
+     const int rh = rect.height();
+ 
+-    DisplayXRWeaveProvider::Result r;
+-    bool wove = false;
+-
+     // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the composited
+     // sub-rect on the GPU instead of the readPixels roundtrip: Skia-copy it into
+-    // an owned SCANOUT scratch D3DImageBacking, ProduceOverlay its raw
+-    // ID3D11Texture2D, and WeaveCanvas it straight into the keyed-mutex weave
+-    // input. No hazard with the root backing's open write access — we snapshot
+-    // |output| (as readPixels already does) and only ProduceOverlay a *separate*
+-    // scratch mailbox. Any step failing falls through to the CPU readback below.
++    // an owned scratch D3DImageBacking, ProduceOverlay its raw ID3D11Texture2D,
++    // and WeaveCanvas it into the keyed-mutex weave input. We snapshot |output|
++    // (as readPixels does) and only ProduceOverlay a *separate* scratch mailbox,
++    // so there is no hazard with the root backing's write access. Any step
++    // failing falls through to the CPU readback below.
+     if (prefer_zero_copy) {
+-      wove = [&]() -> bool {
++      bool zc = [&]() -> bool {
+         // If any step fails we fall back to the WeavePixels CPU readback (still
+         // correct), logging the first reason once at VLOG(1) so a future
+         // regression is diagnosable without spamming default chrome.
+@@ -2857,7 +2857,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           }
+           return false;
+         };
+-        DisplayXRScratchState& sc = displayxr_scratch_state_[i];
++        DisplayXRScratchState& sc = displayxr_scratch_state_[t];
+         // (1) Ensure an owned DISPLAY_READ/WRITE (NON-SCANOUT) D3DImageBacking
+         // scratch sized to |rect|. Non-scanout is deliberate: a SCANOUT backing
+         // on Windows becomes a DComp visual (want_dcomp_texture in
+@@ -2967,127 +2967,166 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         }
+ 
+         // (4) GPU-resident weave: CopySubresourceRegion scratch -> keyed-mutex
+-        // input, then submit to the service. WeaveCanvas is synchronous, so the
+-        // overlay read access stays valid across it.
+-        r = provider->WeaveCanvas(
++        // input, then fire the async WeaveSubmit. The overlay read access stays
++        // valid across the dispatch (the copy into the input is synchronous; the
++        // RPC completes later).
++        bool submitted = provider->WeaveCanvas(
+             device_x.Get(), ov->d3d11_video_texture(),
+             static_cast<UINT>(ov->texture_array_slice()),
+-            gfx::Rect(0, 0, rw, rh), rect);
++            gfx::Rect(0, 0, rw, rh), rect, static_cast<uint32_t>(t));
+         static bool logged_zc = false;
+-        if (r.ok && !logged_zc) {
++        if (submitted && !logged_zc) {
+           logged_zc = true;
+           VLOG(1) << "[DisplayXR] weave: GPU-resident scratch path (no CPU "
+                      "readback) "
+                   << rw << "x" << rh;
+         }
+-        return r.ok;
++        return submitted;
+       }();
++      if (zc) {
++        return true;
++      }
+     }
+ 
+-    if (!wove) {
+-      // CPU-readback fallback (GL output device, or a failed zero-copy step):
+-      // read the composited sub-rect back to CPU (BGRA8) and upload it into the
+-      // weave input. Ganesh has a synchronous SkSurface::readPixels; Graphite
+-      // has no sync readback, so it uses the blocking-async path. Read from the
+-      // output SkSurface (it knows its own recording context and flushes as
+-      // needed) before drawing the woven back, so there is no read/write hazard.
+-      const SkImageInfo info = SkImageInfo::Make(
+-          rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+-          SkColorSpace::MakeSRGB());
+-
+-      const uint8_t* src_pixels = nullptr;
+-      size_t src_stride = 0;
+-      std::vector<uint8_t> ganesh_pixels;  // owns the Ganesh sync-read pixels
+-      WeaveReadPixelsContext read_ctx;     // owns the Graphite async-read result
+-      if (auto* graphite = context_state_->graphite_shared_context()) {
+-        // Graphite: blocking-async rescale+read of the sub-rect (identity scale
+-        // — dst dims == src rect dims), submitting + waiting so the pixels are
+-        // ready synchronously. FlushGraphiteRecorder() first so the just-drawn
+-        // output is committed before the read.
+-        context_state_->FlushGraphiteRecorder();
+-        graphite->asyncRescaleAndReadPixelsAndSubmit(
+-            output, info, SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh),
+-            SkImage::RescaleGamma::kSrc, SkImage::RescaleMode::kRepeatedLinear,
+-            base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone),
+-            &read_ctx);
+-        if (!read_ctx.finished || !read_ctx.async_result ||
+-            read_ctx.async_result->count() != 1) {
+-          continue;
+-        }
+-        src_pixels =
+-            reinterpret_cast<const uint8_t*>(read_ctx.async_result->data(0));
+-        src_stride = read_ctx.async_result->rowBytes(0);
+-      } else {
+-        // Ganesh: synchronous readback into a local buffer.
+-        const size_t stride = static_cast<size_t>(rw) * 4;
+-        ganesh_pixels.resize(stride * rh);
+-        if (!output->readPixels(info, ganesh_pixels.data(), stride, rect.x(),
+-                                rect.y())) {
+-          continue;
+-        }
+-        src_pixels = ganesh_pixels.data();
+-        src_stride = stride;
++    // CPU-readback fallback (GL output device, or a failed zero-copy step): read
++    // the composited sub-rect back to CPU (BGRA8) and upload it into the weave
++    // input. Ganesh has a synchronous SkSurface::readPixels; Graphite has no sync
++    // readback, so it uses the blocking-async path. This reads the clean pre-
++    // weave page (phase (A) runs before the woven draw-back in (B)).
++    const SkImageInfo info = SkImageInfo::Make(
++        rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
++        SkColorSpace::MakeSRGB());
++
++    const uint8_t* src_pixels = nullptr;
++    size_t src_stride = 0;
++    std::vector<uint8_t> ganesh_pixels;  // owns the Ganesh sync-read pixels
++    WeaveReadPixelsContext read_ctx;     // owns the Graphite async-read result
++    if (auto* graphite = context_state_->graphite_shared_context()) {
++      // Graphite: blocking-async rescale+read of the sub-rect (identity scale —
++      // dst dims == src rect dims), submitting + waiting so the pixels are ready
++      // synchronously. FlushGraphiteRecorder() first so the just-drawn output is
++      // committed before the read.
++      context_state_->FlushGraphiteRecorder();
++      graphite->asyncRescaleAndReadPixelsAndSubmit(
++          output, info, SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh),
++          SkImage::RescaleGamma::kSrc, SkImage::RescaleMode::kRepeatedLinear,
++          base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone), &read_ctx);
++      if (!read_ctx.finished || !read_ctx.async_result ||
++          read_ctx.async_result->count() != 1) {
++        return false;
+       }
++      src_pixels =
++          reinterpret_cast<const uint8_t*>(read_ctx.async_result->data(0));
++      src_stride = read_ctx.async_result->rowBytes(0);
++    } else {
++      // Ganesh: synchronous readback into a local buffer.
++      const size_t stride = static_cast<size_t>(rw) * 4;
++      ganesh_pixels.resize(stride * rh);
++      if (!output->readPixels(info, ganesh_pixels.data(), stride, rect.x(),
++                              rect.y())) {
++        return false;
++      }
++      src_pixels = ganesh_pixels.data();
++      src_stride = stride;
++    }
++
++    return provider->WeavePixels(device_x.Get(), src_pixels,
++                                 static_cast<uint32_t>(src_stride), rect,
++                                 static_cast<uint32_t>(t));
++  };
+ 
+-      r = provider->WeavePixels(device_x.Get(), src_pixels,
+-                                static_cast<uint32_t>(src_stride), rect);
++  // Drive one submit per frame while no weave is in flight (single keyed-mutex
++  // input). Round-robin from the cursor so every target refreshes over
++  // successive frames; skip empty rects. Advance the cursor regardless of the
++  // dispatch result so a persistently-failing target never starves the others.
++  if (!provider->SubmitInFlight()) {
++    const size_t n = inline_3d_rects_.size();
++    for (size_t k = 0; k < n; ++k) {
++      const size_t t = (displayxr_next_submit_ + k) % n;
++      gfx::Rect probe = inline_3d_rects_[t];
++      probe.Intersect(window_bounds);
++      if (probe.IsEmpty()) {
++        continue;
++      }
++      attempt_submit(t);
++      displayxr_next_submit_ = (t + 1) % n;
++      break;
+     }
++  }
+ 
+-    if (!r.ok) {
++  // ---- (B) Draw back the latest completed woven output per target ----
++  // Pull any freshly completed weave result (async reply from a prior frame),
++  // (re)import it, then draw the target's current woven texture over |output| at
++  // this frame's rect. Runs after (A) so the submit read the clean page.
++  bool drew_any = false;
++  // The woven SkImages must stay backed until the output is flushed + submitted
++  // (Ganesh records the draw and reads the texture at flush time). Hold the
++  // representations + scoped read accesses alive across the flush below.
++  std::vector<std::unique_ptr<gpu::SkiaImageRepresentation>> held_reps;
++  std::vector<std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>>
++      held_accesses;
++  for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
++    gfx::Rect rect = inline_3d_rects_[i];
++    rect.Intersect(window_bounds);
++    if (rect.IsEmpty()) {
+       continue;
+     }
+ 
+     DisplayXRWovenState& st = displayxr_woven_state_[i];
+ 
+-    // (Re)import the woven texture whenever a fresh handle arrives (first weave +
+-    // resize); steady-state frames return handle 0 and reuse the import.
+-    if (r.woven_handle) {
+-      if (!st.woven_mailbox.IsZero()) {
+-        shared_image_factory_->DestroySharedImage(st.woven_mailbox);
+-        st.woven_mailbox = gpu::Mailbox();
++    // Take a freshly completed weave result for this target, if one arrived.
++    DisplayXRWeaveProvider::Result r;
++    if (provider->TryTakeWovenResult(static_cast<uint32_t>(i), &r) && r.ok) {
++      // (Re)import the woven texture whenever a fresh handle arrives (first weave
++      // + resize); steady-state replies carry handle 0 and reuse the import.
++      if (r.woven_handle) {
++        if (!st.woven_mailbox.IsZero()) {
++          shared_image_factory_->DestroySharedImage(st.woven_mailbox);
++          st.woven_mailbox = gpu::Mailbox();
++        }
++        gfx::DXGIHandle dxgi(
++            base::win::ScopedHandle(reinterpret_cast<HANDLE>(r.woven_handle)));
++        gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++        gpu::SharedImageInfo si_info(
++            SinglePlaneFormat::kRGBA_8888,
++            gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height)),
++            gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++            kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++            "DisplayXRWoven");
++        if (shared_image_factory_->CreateSharedImage(
++                mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
++          st.woven_mailbox = mailbox;
++        } else {
++          LOG(ERROR) << "[DisplayXR] failed to import woven SharedImage "
++                     << r.width << "x" << r.height;
++        }
+       }
+-      gfx::DXGIHandle dxgi(
+-          base::win::ScopedHandle(reinterpret_cast<HANDLE>(r.woven_handle)));
+-      gpu::Mailbox mailbox = gpu::Mailbox::Generate();
+-      gpu::SharedImageInfo si_info(
+-          SinglePlaneFormat::kRGBA_8888,
+-          gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height)),
+-          gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
+-          kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
+-          "DisplayXRWoven");
+-      if (shared_image_factory_->CreateSharedImage(
+-              mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
+-        st.woven_mailbox = mailbox;
+-      } else {
+-        LOG(ERROR) << "[DisplayXR] failed to import woven SharedImage "
+-                   << r.width << "x" << r.height;
+-        continue;
++      // (Re)open + GPU-wait the service->caller fence so the fresh woven content
++      // is ready before we sample it (fence-synced, no keyed mutex). Only needed
++      // when new content arrives; between replies the woven texture is stable.
++      if (r.fence_handle) {
++        st.fence = gfx::D3DSharedFence::CreateFromUnownedHandle(
++            reinterpret_cast<HANDLE>(r.fence_handle));
++        ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
++      }
++      if (st.fence) {
++        st.fence->Update(r.fence_value);
++        Microsoft::WRL::ComPtr<ID3D11Device> wait_device =
++            gl::GetDirectCompositionD3D11Device();
++        if (wait_device) {
++          st.fence->WaitD3D11(wait_device);
++        }
+       }
+-    }
+-    if (st.woven_mailbox.IsZero()) {
+-      continue;
+     }
+ 
+-    // (Re)open + GPU-wait the service->caller fence so the woven content is ready
+-    // before we sample it (fence-synced, no keyed mutex).
+-    if (r.fence_handle) {
+-      st.fence = gfx::D3DSharedFence::CreateFromUnownedHandle(
+-          reinterpret_cast<HANDLE>(r.fence_handle));
+-      ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
+-    }
+-    if (st.fence) {
+-      st.fence->Update(r.fence_value);
+-      Microsoft::WRL::ComPtr<ID3D11Device> wait_device =
+-          gl::GetDirectCompositionD3D11Device();
+-      if (wait_device) {
+-        st.fence->WaitD3D11(wait_device);
+-      }
++    if (st.woven_mailbox.IsZero()) {
++      continue;  // no woven result yet — leave raw content for this target
+     }
+ 
+-    // Draw the woven texture back over the output at |rect|. The woven output is
+-    // window-sized and offset-preserving, so sample the SAME rect from it (the
+-    // CEF host's UV mapping). Opaque overwrite, nearest sampling (device-pixel-
+-    // exact — critical for the interlace lattice).
++    // Draw the latest woven texture back over the output at the CURRENT |rect|.
++    // The woven output is window-sized and offset-preserving, so sample the SAME
++    // rect from it (the CEF host's UV mapping). Opaque overwrite, nearest
++    // sampling (device-pixel-exact — critical for the interlace lattice).
+     auto woven_rep = shared_image_representation_factory_->ProduceSkia(
+         st.woven_mailbox, context_state_.get());
+     if (!woven_rep) {
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 50dce6fd8e90f..098b78cf95b02 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -686,6 +686,12 @@ class SkiaOutputSurfaceImplOnGpu
+     gfx::Size size;
+   };
+   std::vector<DisplayXRScratchState> displayxr_scratch_state_;
++
++  // DisplayXR inline-3D (#625, Step B — async weave). Round-robin cursor over
++  // inline_3d_rects_: a single keyed-mutex weave input backs the provider, so at
++  // most one target is submitted per frame; this rotates which one so all
++  // targets refresh over successive frames (weave at reply cadence).
++  size_t displayxr_next_submit_ = 0;
+ #endif
+ 
+   THREAD_CHECKER(thread_checker_);
+-- 
+2.42.0.windows.2
+

@@ -1,0 +1,266 @@
+From d6c174fc6f342148836c1248c3ce043560c19e29 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 12 Jul 2026 22:26:13 -0700
+Subject: [PATCH 21/21] inline-3d(#625): draw all elements from the shared
+ window-sized woven output
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Multi-element weave fix. The runtime weaves every submitted sub-rect into ONE
+window-sized handback texture (process_atlas writes only the sub-rect, never
+clearing → the output accumulates all elements at their window positions). The
+async draw-back imported the woven PER-TARGET, but the output is window-sized and
+never re-allocates, so only the FIRST submitting element got a fresh importable
+handle — every later element got handle 0 and never drew back (only one element
+wove).
+
+Import the shared window-sized woven once, adopt the latest submit's fence, and
+draw EACH inline-3d rect's region from it. All visible elements now weave.
+
+Validated on Leia: the 5-logo displayxr-web gallery — all five woven glasses-free
+3D, user-eyeballed. (Known follow-up: per-element round-robin submit cadence adds
+scroll lag; tracked separately.)
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 174 +++++++++---------
+ .../skia_output_surface_impl_on_gpu.h         |  11 ++
+ 2 files changed, 98 insertions(+), 87 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 520e6cd2f5f5a..d8135ec351725 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3054,98 +3054,101 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+   }
+ 
+-  // ---- (B) Draw back the latest completed woven output per target ----
+-  // Pull any freshly completed weave result (async reply from a prior frame),
+-  // (re)import it, then draw the target's current woven texture over |output| at
+-  // this frame's rect. Runs after (A) so the submit read the clean page.
+-  bool drew_any = false;
+-  // The woven SkImages must stay backed until the output is flushed + submitted
+-  // (Ganesh records the draw and reads the texture at flush time). Hold the
+-  // representations + scoped read accesses alive across the flush below.
+-  std::vector<std::unique_ptr<gpu::SkiaImageRepresentation>> held_reps;
+-  std::vector<std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>>
+-      held_accesses;
++  // ---- (B) Draw back the accumulated window-sized woven output ----
++  // The runtime weaves EVERY submitted sub-rect into ONE window-sized handback
++  // texture (process_atlas writes only the sub-rect, never clearing), so all
++  // inline-3d elements accumulate into a single shared output at their window
++  // positions. Import that shared texture once (a fresh handle arrives only on
++  // the first submit / a window-size change; every later reply carries handle 0),
++  // adopt the latest submit's fence, then draw EACH rect's region from it. Runs
++  // after (A) so the submit read the clean pre-weave page.
++  uint64_t latest_fence_value = 0;
++  bool got_result = false;
+   for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
+-    gfx::Rect rect = inline_3d_rects_[i];
+-    rect.Intersect(window_bounds);
+-    if (rect.IsEmpty()) {
++    DisplayXRWeaveProvider::Result r;
++    if (!provider->TryTakeWovenResult(static_cast<uint32_t>(i), &r) || !r.ok) {
+       continue;
+     }
+-
+-    DisplayXRWovenState& st = displayxr_woven_state_[i];
+-
+-    // Take a freshly completed weave result for this target, if one arrived.
+-    DisplayXRWeaveProvider::Result r;
+-    if (provider->TryTakeWovenResult(static_cast<uint32_t>(i), &r) && r.ok) {
+-      // (Re)import the woven texture whenever a fresh handle arrives (first weave
+-      // + resize); steady-state replies carry handle 0 and reuse the import.
+-      if (r.woven_handle) {
+-        if (!st.woven_mailbox.IsZero()) {
+-          shared_image_factory_->DestroySharedImage(st.woven_mailbox);
+-          st.woven_mailbox = gpu::Mailbox();
+-        }
+-        gfx::DXGIHandle dxgi(
+-            base::win::ScopedHandle(reinterpret_cast<HANDLE>(r.woven_handle)));
+-        gpu::Mailbox mailbox = gpu::Mailbox::Generate();
+-        gpu::SharedImageInfo si_info(
+-            SinglePlaneFormat::kRGBA_8888,
+-            gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height)),
+-            gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
+-            kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
+-            "DisplayXRWoven");
+-        if (shared_image_factory_->CreateSharedImage(
+-                mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
+-          st.woven_mailbox = mailbox;
+-        } else {
+-          LOG(ERROR) << "[DisplayXR] failed to import woven SharedImage "
+-                     << r.width << "x" << r.height;
+-        }
+-      }
+-      // (Re)open + GPU-wait the service->caller fence so the fresh woven content
+-      // is ready before we sample it (fence-synced, no keyed mutex). Only needed
+-      // when new content arrives; between replies the woven texture is stable.
+-      if (r.fence_handle) {
+-        st.fence = gfx::D3DSharedFence::CreateFromUnownedHandle(
+-            reinterpret_cast<HANDLE>(r.fence_handle));
+-        ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
++    got_result = true;
++    if (r.woven_handle) {
++      if (!displayxr_shared_woven_mailbox_.IsZero()) {
++        shared_image_factory_->DestroySharedImage(displayxr_shared_woven_mailbox_);
++        displayxr_shared_woven_mailbox_ = gpu::Mailbox();
+       }
+-      if (st.fence) {
+-        st.fence->Update(r.fence_value);
+-        Microsoft::WRL::ComPtr<ID3D11Device> wait_device =
+-            gl::GetDirectCompositionD3D11Device();
+-        if (wait_device) {
+-          st.fence->WaitD3D11(wait_device);
+-        }
++      gfx::DXGIHandle dxgi(
++          base::win::ScopedHandle(reinterpret_cast<HANDLE>(r.woven_handle)));
++      gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++      gpu::SharedImageInfo si_info(
++          SinglePlaneFormat::kRGBA_8888,
++          gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height)),
++          gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++          kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++          "DisplayXRWoven");
++      if (shared_image_factory_->CreateSharedImage(
++              mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
++        displayxr_shared_woven_mailbox_ = mailbox;
++        displayxr_shared_woven_size_ =
++            gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height));
++      } else {
++        LOG(ERROR) << "[DisplayXR] failed to import shared woven SharedImage "
++                   << r.width << "x" << r.height;
+       }
+     }
+-
+-    if (st.woven_mailbox.IsZero()) {
+-      continue;  // no woven result yet — leave raw content for this target
++    if (r.fence_handle) {
++      displayxr_shared_woven_fence_ = gfx::D3DSharedFence::CreateFromUnownedHandle(
++          reinterpret_cast<HANDLE>(r.fence_handle));
++      ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
+     }
+-
+-    // Draw the latest woven texture back over the output at the CURRENT |rect|.
+-    // The woven output is window-sized and offset-preserving, so sample the SAME
+-    // rect from it (the CEF host's UV mapping). Opaque overwrite, nearest
+-    // sampling (device-pixel-exact — critical for the interlace lattice).
+-    auto woven_rep = shared_image_representation_factory_->ProduceSkia(
+-        st.woven_mailbox, context_state_.get());
+-    if (!woven_rep) {
+-      continue;
++    if (r.fence_value > latest_fence_value) {
++      latest_fence_value = r.fence_value;
+     }
+-    std::vector<GrBackendSemaphore> wbegin_sem, wend_sem;
+-    auto woven_access =
+-        woven_rep->BeginScopedReadAccess(&wbegin_sem, &wend_sem);
+-    if (!woven_access) {
+-      continue;
++  }
++
++  if (displayxr_shared_woven_mailbox_.IsZero()) {
++    return;  // nothing woven yet — leave raw content
++  }
++
++  // GPU-wait the latest submit's fence so every accumulated sub-rect is complete
++  // before we sample the shared woven texture (fence-synced, no keyed mutex).
++  if (displayxr_shared_woven_fence_ && got_result && latest_fence_value > 0) {
++    displayxr_shared_woven_fence_->Update(latest_fence_value);
++    Microsoft::WRL::ComPtr<ID3D11Device> wait_device =
++        gl::GetDirectCompositionD3D11Device();
++    if (wait_device) {
++      displayxr_shared_woven_fence_->WaitD3D11(wait_device);
+     }
+-    sk_sp<SkImage> woven_img = woven_access->CreateSkImage(context_state_.get());
+-    if (!woven_img) {
++  }
++
++  // One read access on the shared woven; draw each inline-3d rect's region from
++  // it. The woven output is window-sized and offset-preserving, so sample the
++  // SAME rect it occupies (device-pixel-exact nearest — critical for the
++  // interlace lattice). Access + representation stay alive until after the flush.
++  auto woven_rep = shared_image_representation_factory_->ProduceSkia(
++      displayxr_shared_woven_mailbox_, context_state_.get());
++  if (!woven_rep) {
++    return;
++  }
++  std::vector<GrBackendSemaphore> wbegin_sem, wend_sem;
++  auto woven_access = woven_rep->BeginScopedReadAccess(&wbegin_sem, &wend_sem);
++  if (!woven_access) {
++    return;
++  }
++  sk_sp<SkImage> woven_img = woven_access->CreateSkImage(context_state_.get());
++  if (!woven_img) {
++    return;
++  }
++  if (!wbegin_sem.empty()) {
++    output->wait(wbegin_sem.size(), wbegin_sem.data(),
++                 /*deleteSemaphoresAfterWait=*/false);
++  }
++
++  bool drew_any = false;
++  for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
++    gfx::Rect rect = inline_3d_rects_[i];
++    rect.Intersect(window_bounds);
++    if (rect.IsEmpty()) {
+       continue;
+     }
+-    if (!wbegin_sem.empty()) {
+-      output->wait(wbegin_sem.size(), wbegin_sem.data(),
+-                   /*deleteSemaphoresAfterWait=*/false);
+-    }
+     const SkRect src_dst =
+         SkRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height());
+     SkPaint paint;
+@@ -3154,14 +3157,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                               SkSamplingOptions(SkFilterMode::kNearest), &paint,
+                               SkCanvas::kStrict_SrcRectConstraint);
+     drew_any = true;
+-    // Keep the woven backing alive until after the flush + submit below.
+-    held_accesses.push_back(std::move(woven_access));
+-    held_reps.push_back(std::move(woven_rep));
+   }
+ 
+   // Ensure the woven draws land in (and are submitted to) the output surface
+-  // before the scoped read accesses are released — otherwise Ganesh reads the
+-  // released woven texture at flush time and the draw shows nothing.
++  // before |woven_access| releases — otherwise Ganesh reads the released woven
++  // texture at flush time and the draws show nothing.
+   if (drew_any) {
+     std::vector<GrBackendSemaphore> empty_sem;
+     FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
+@@ -3172,7 +3172,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       graphite_shared_context()->submit();
+     }
+   }
+-  // held_reps / held_accesses release here, after the submit.
++  // woven_access / woven_rep release here, after the submit.
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 098b78cf95b02..3efb289c0eba4 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -692,6 +692,17 @@ class SkiaOutputSurfaceImplOnGpu
+   // most one target is submitted per frame; this rotates which one so all
+   // targets refresh over successive frames (weave at reply cadence).
+   size_t displayxr_next_submit_ = 0;
++
++  // The runtime weaves EVERY submitted sub-rect into ONE window-sized handback
++  // texture (process_atlas writes only the sub-rect, never clearing → the output
++  // accumulates all elements at their window positions). So the woven output is a
++  // single shared texture, not per-element: import it once (fresh handle arrives
++  // only on the first submit / a window-size change) and draw each inline-3d
++  // rect's region from it. |displayxr_shared_woven_fence_| is GPU-waited to the
++  // latest submit's fence value before sampling.
++  gpu::Mailbox displayxr_shared_woven_mailbox_;
++  scoped_refptr<gfx::D3DSharedFence> displayxr_shared_woven_fence_;
++  gfx::Size displayxr_shared_woven_size_;
+ #endif
+ 
+   THREAD_CHECKER(thread_checker_);
+-- 
+2.42.0.windows.2
+
