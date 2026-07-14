@@ -1,7 +1,7 @@
 From 3cbb1a1b8f079f2e323b9c765ad537c92b570de1 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 01:10:04 -0700
-Subject: [PATCH 27/27] =?UTF-8?q?displayxr:=20batched=20weave=20submit=20?=
+Subject: [PATCH 27/28] =?UTF-8?q?displayxr:=20batched=20weave=20submit=20?=
  =?UTF-8?q?=E2=80=94=20one=20xrWeaveSubmitDXR=20per=20frame=20(spec=20v3)?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From 3622143ef39e0a71977f8df68f72bca661b113e4 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 7 Jul 2026 18:43:26 -0700
-Subject: [PATCH 10/27] =?UTF-8?q?inline-3d(#625):=20auto-force=20high-perf?=
+Subject: [PATCH 10/28] =?UTF-8?q?inline-3d(#625):=20auto-force=20high-perf?=
  =?UTF-8?q?=20GPU=20adapter=20=E2=80=94=20retire=20--force=5Fhigh=5Fperfor?=
  =?UTF-8?q?mance=5Fgpu?=
 MIME-Version: 1.0

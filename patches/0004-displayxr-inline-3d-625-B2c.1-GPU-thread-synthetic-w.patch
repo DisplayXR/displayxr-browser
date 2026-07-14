@@ -1,7 +1,7 @@
 From 1f110e06893af3b5255986668ae37de23c1d809d Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 26 Jun 2026 03:29:28 -0500
-Subject: [PATCH 04/27] [displayxr inline-3d #625 B2c.1] GPU-thread synthetic
+Subject: [PATCH 04/28] [displayxr inline-3d #625 B2c.1] GPU-thread synthetic
  weave pipe + Viz substitution
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
