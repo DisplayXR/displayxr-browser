@@ -1,7 +1,7 @@
 From d28d0dd29f9732d29cd8b551591c8aa7d31335d3 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 9 Jul 2026 14:22:12 -0700
-Subject: [PATCH 14/21] =?UTF-8?q?inline-3d(#625):=20quiet=20bring-up=20dia?=
+Subject: [PATCH 14/26] =?UTF-8?q?inline-3d(#625):=20quiet=20bring-up=20dia?=
  =?UTF-8?q?gnostics=20=E2=80=94=20success=20one-shots=20LOG(ERROR)=20->=20?=
  =?UTF-8?q?VLOG(1)?=
 MIME-Version: 1.0

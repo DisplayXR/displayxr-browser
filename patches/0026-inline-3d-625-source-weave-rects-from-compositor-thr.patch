@@ -1,0 +1,231 @@
+From 228f3ec8494f66b83df5f9da7311cf6ad62cd549 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Mon, 13 Jul 2026 21:31:31 -0700
+Subject: [PATCH 26/26] inline-3d(#625): source weave rects from
+ compositor-thread tracked-element rects
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The weave rects were a Blink main-thread getBoundingClientRect snapshot
+patched by an approximate impl-scroll delta (Phase 2), finalized at
+metadata time but trailing the pixels presented during a fling. Register
+the inline-3d canvas as a tracked element (new
+viz::TrackedElementFeature::kInline3dWeave) so cc projects its exact
+screen rect through the layer ScreenSpaceTransform at draw time (live
+property trees, current impl scroll), and prefer those rects in
+SurfaceAggregator::CollectTrackedElementRects; the legacy
+metadata.inline_3d_rects path stays as a live fallback (empty tracked
+rects are filtered and never suppress it). Undecorated canvases record
+paint-chunk tracked-element data via the same replaced_painter carve-out
+region capture uses; for the weave feature cc skips the
+visible_layer_rect intersection — the tracked chunk lands on a layer
+with no drawable content (empty visible rect would zero the weave rect)
+and the weave path clips to the window itself. inline_3d_rects are
+sorted (y,x,w,h) at handoff since the weave consumer keys per-target
+state by vector index.
+
+Hardware-validated: zero-lag scroll tracking on a fast fling (Leia,
+5-element gallery), user-eyeballed.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ cc/trees/layer_tree_host_impl.cc              | 12 +++-
+ .../common/surfaces/tracked_element_rects.h   |  4 ++
+ .../viz/service/display/surface_aggregator.cc | 55 +++++++++++++++++--
+ .../renderer/core/paint/replaced_painter.cc   |  6 +-
+ .../renderer/modules/xr/xr_display_layer.cc   | 20 +++++++
+ 5 files changed, 89 insertions(+), 8 deletions(-)
+
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index 80d8cc6dcd2bc..b066a935b15e0 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -2258,7 +2258,17 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
+         viz::TrackedElementRect transformed_rect = rect_data;
+         gfx::Rect visible_layer_rect =
+             layer->draw_properties().visible_layer_rect;
+-        visible_layer_rect.Intersect(rect_data.visible_bounds);
++        // DisplayXR inline-3D (#625): the inline-3d tracked chunk lands on a
++        // layer with no drawable content (an undecorated canvas's background
++        // chunk), whose visible_layer_rect is empty — intersecting would zero
++        // the weave rect. The weave path clips to the window itself, so
++        // project the raw element rect (matches the legacy unclipped
++        // getBoundingClientRect semantics).
++        if (feature == viz::TrackedElementFeature::kInline3dWeave) {
++          visible_layer_rect = rect_data.visible_bounds;
++        } else {
++          visible_layer_rect.Intersect(rect_data.visible_bounds);
++        }
+         gfx::Rect visible_element_bounds_in_screen_space =
+             MathUtil::ProjectEnclosingClippedRect(layer->ScreenSpaceTransform(),
+                                                   visible_layer_rect);
+diff --git a/components/viz/common/surfaces/tracked_element_rects.h b/components/viz/common/surfaces/tracked_element_rects.h
+index a0bad1b359b34..592831f450e5b 100644
+--- a/components/viz/common/surfaces/tracked_element_rects.h
++++ b/components/viz/common/surfaces/tracked_element_rects.h
+@@ -29,6 +29,10 @@ using TrackedElementId = base::Token;
+ enum class TrackedElementFeature : int32_t {
+   kIframeTracking = 0,
+   kPasswordTracking = 1,
++  // DisplayXR inline-3D (#625): compositor-thread screen rect of an inline-3d
++  // canvas, consumed by the Viz weave path (scroll-current, replaces the
++  // main-thread getBoundingClientRect report).
++  kInline3dWeave = 2,
+   kTrackedElementFeatureEnd,
+   kTrackedElementFeatureMax = kTrackedElementFeatureEnd + 2,
+ };
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index e68dc4659288d..1f1bd1dee1cc0 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <map>
++#include <tuple>
+ #include <utility>
+ #include <vector>
+ 
+@@ -2340,6 +2341,14 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     frame_annotator_->AnnotateAggregatedFrame(&frame);
+ 
+   frame.tracked_element_rects = std::move(tracked_element_rects_);
++  // DisplayXR inline-3D (#625): deterministic order — the weave consumer keys
++  // per-target state by vector index, and the tracked-element and legacy paths
++  // enumerate in different orders.
++  std::ranges::sort(
++      inline_3d_rects_, [](const gfx::Rect& a, const gfx::Rect& b) {
++        return std::make_tuple(a.y(), a.x(), a.width(), a.height()) <
++               std::make_tuple(b.y(), b.x(), b.width(), b.height());
++      });
+   frame.inline_3d_rects = std::move(inline_3d_rects_);
+ 
+   return frame;
+@@ -2489,8 +2498,39 @@ void SurfaceAggregator::CollectTrackedElementRects(
+     const gfx::Transform& target_transform,
+     const gfx::Transform& transform_to_root_target,
+     const std::optional<gfx::Rect> root_target_clip_rect) {
++  // DisplayXR inline-3D (#625, scroll-sync P3): prefer the compositor-thread
++  // tracked-element rects for the weave. cc projects them through the layer's
++  // ScreenSpaceTransform at DRAW time (live property trees, current impl
++  // scroll), so they match the pixels presented this frame exactly — unlike
++  // metadata.inline_3d_rects, which are a Blink main-thread
++  // getBoundingClientRect snapshot patched by an approximate impl-scroll delta
++  // and trail during a fling.
++  bool has_tracked_inline3d = false;
+   for (const auto& [feature, tracked_elements] :
+        frame_metadata.tracked_element_rects) {
++    if (feature == TrackedElementFeature::kInline3dWeave) {
++      // Route into the weave rects; keep these out of the generic map so they
++      // don't leak into CopyOutput geometry or the pixel-moving-filter union.
++      // Skip empty rects (fully-clipped/offscreen canvases) — an empty rect
++      // must never suppress the legacy fallback below or reach the weave.
++      for (const auto& rect_data : tracked_elements) {
++        if (rect_data.visible_bounds.IsEmpty()) {
++          continue;
++        }
++        inline_3d_rects_.push_back(TransformRectToDestRootTargetSpace(
++            rect_data.visible_bounds, target_transform,
++            transform_to_root_target, root_target_clip_rect));
++        has_tracked_inline3d = true;
++      }
++      if (has_tracked_inline3d) {
++        static int inline3d_tracked_log_throttle = 0;
++        if ((inline3d_tracked_log_throttle++ % 300) == 0) {
++          VLOG(1) << "[DisplayXR] weave rects from tracked elements: n="
++                  << tracked_elements.size();
++        }
++      }
++      continue;
++    }
+     for (const auto& rect_data : tracked_elements) {
+       TrackedElementRect transformed_rect_data = rect_data;
+       transformed_rect_data.visible_bounds = TransformRectToDestRootTargetSpace(
+@@ -2499,12 +2539,15 @@ void SurfaceAggregator::CollectTrackedElementRects(
+       tracked_element_rects_[feature].push_back(transformed_rect_data);
+     }
+   }
+-  // DisplayXR inline-3D (#625, Step B / B4b): collect the inline-3d canvas rects
+-  // alongside tracked elements, transformed into the root render pass space.
+-  for (const gfx::Rect& rect : frame_metadata.inline_3d_rects) {
+-    inline_3d_rects_.push_back(TransformRectToDestRootTargetSpace(
+-        rect, target_transform, transform_to_root_target,
+-        root_target_clip_rect));
++  // DisplayXR inline-3D (#625, Step B / B4b): legacy main-thread-measured rects
++  // — used only when this frame carries no tracked-element weave rects, so the
++  // old path stays a live fallback and nothing regresses.
++  if (!has_tracked_inline3d) {
++    for (const gfx::Rect& rect : frame_metadata.inline_3d_rects) {
++      inline_3d_rects_.push_back(TransformRectToDestRootTargetSpace(
++          rect, target_transform, transform_to_root_target,
++          root_target_clip_rect));
++    }
+   }
+ }
+ 
+diff --git a/third_party/blink/renderer/core/paint/replaced_painter.cc b/third_party/blink/renderer/core/paint/replaced_painter.cc
+index d52393e433975..a3f6af3d4bb57 100644
+--- a/third_party/blink/renderer/core/paint/replaced_painter.cc
++++ b/third_party/blink/renderer/core/paint/replaced_painter.cc
+@@ -139,7 +139,11 @@ void ReplacedPainter::Paint(const PaintInfo& paint_info) {
+       should_paint_background = true;
+     } else {
+       Element* element = DynamicTo<Element>(layout_replaced_.GetNode());
+-      if (element && element->GetRegionCaptureCropId()) {
++      // Tracked elements need the background display item recorded even on an
++      // undecorated canvas, same as region capture: the paint chunk is what
++      // carries the tracked-element rect (DisplayXR inline-3D, #625).
++      if (element && (element->GetRegionCaptureCropId() ||
++                      element->GetTrackedElementSubRects())) {
+         should_paint_background = true;
+       }
+     }
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+index 71de41af4198b..a0c7e2a325e84 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.cc
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "third_party/blink/renderer/modules/xr/xr_display_layer.h"
+ 
++#include "base/token.h"
++#include "components/viz/common/surfaces/tracked_element_rects.h"
+ #include "third_party/blink/renderer/core/dom/element.h"
+ #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
+ #include "third_party/blink/renderer/modules/xr/xr_session.h"
+@@ -38,6 +40,19 @@ XRDisplayLayer::XRDisplayLayer(XRSession* session, Element* target)
+     if (session_) {
+       session_->RegisterDisplayLayer(this);
+     }
++    // Also register the canvas as a tracked element so cc reports its exact
++    // screen-space rect on the compositor thread each drawn frame (live scroll
++    // transform baked in). The Viz weave path prefers this rect over the
++    // main-thread getBoundingClientRect report above, which trails impl-thread
++    // scrolls by ~1 frame (#625 scroll-lag).
++    if (!target_->GetTrackedElementSubRect(
++            viz::TrackedElementFeature::kInline3dWeave)) {
++      target_->SetTrackedElementSubRect(
++          viz::TrackedElementFeature::kInline3dWeave,
++          TrackedElementSubRect(
++              TrackedElementId(base::Token::CreateRandom()),
++              /*should_add_to_compositor_frame_metadata=*/true));
++    }
+   }
+ }
+ 
+@@ -68,6 +83,11 @@ void XRDisplayLayer::close() {
+   if (session_) {
+     session_->UnregisterDisplayLayer(this);
+   }
++  if (target_ && target_->GetTrackedElementSubRect(
++                     viz::TrackedElementFeature::kInline3dWeave)) {
++    target_->ClearTrackedElementSubRect(
++        viz::TrackedElementFeature::kInline3dWeave);
++  }
+ }
+ 
+ void XRDisplayLayer::Trace(Visitor* visitor) const {
+-- 
+2.42.0.windows.2
+

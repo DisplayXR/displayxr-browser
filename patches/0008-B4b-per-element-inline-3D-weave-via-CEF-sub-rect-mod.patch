@@ -1,7 +1,7 @@
 From 33a7971ff5fa85e71a29af922e70bf3b9bef6258 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 7 Jul 2026 14:06:04 -0700
-Subject: [PATCH 08/21] =?UTF-8?q?B4b:=20per-element=20inline-3D=20weave=20?=
+Subject: [PATCH 08/26] =?UTF-8?q?B4b:=20per-element=20inline-3D=20weave=20?=
  =?UTF-8?q?via=20CEF=20sub-rect=20model=20(#625)=20=E2=80=94=20WORKS=20in?=
  =?UTF-8?q?=20chrome?=
 MIME-Version: 1.0

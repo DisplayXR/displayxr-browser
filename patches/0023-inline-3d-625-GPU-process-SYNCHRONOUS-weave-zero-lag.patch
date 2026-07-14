@@ -1,0 +1,901 @@
+From 2ff0cda6f9405fe88fe80e0078beb2b094c673e1 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Mon, 13 Jul 2026 09:53:31 -0700
+Subject: [PATCH 23/26] =?UTF-8?q?inline-3d(#625):=20GPU-process=20SYNCHRON?=
+ =?UTF-8?q?OUS=20weave=20=E2=80=94=20zero-lag,=20browser-owned?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Runs the OpenXR present-owner weave session INSIDE the GPU process (created in
+gpu_main.cc PreSandboxStartup, before LowerToken()), so per-frame
+xrWeaveSubmitDXR is a synchronous in-process call on Viz's present thread — no
+mojo, no browser hop, no sync_call_restrictions deadlock. Viz composite → weave
+→ draw-back happens in ONE frame, eliminating the ~1-frame async round-trip
+floor. User-eyeballed: woven inline-3D on the demo gallery, scroll lag greatly
+reduced.
+
+Opt-in behind --inline-3d-sync-weave (the default --enable-inline-3d async mojo
+path is untouched as a fallback):
+- gpu_main.cc: PreSandboxStartup hook (gated) connects the runtime IPC pipe +
+  creates the window-bound present-owner session pre-sandbox (the sandbox blocks
+  OPENING the pipe, not I/O on the open handle). IsInline3DGpuProcess() excludes
+  the info-collection GPU process.
+- DisplayXRWeaveClient: PreSandboxInitializeForGpuProcess() (session create,
+  bindWindow, process-DACL widen so the Medium service can dup the woven handle
+  back into the Low GPU process). Submit() gains input_is_dxgi. Browser-process
+  session suppressed under the sync flag so the two don't race on the pipe.
+- DisplayXRWeaveGpu: SyncMode() routes to a direct synchronous Submit and stores
+  the woven result immediately, so Viz's existing same-frame TryTakeWovenResult
+  draws it back with zero lag (WeaveCompositedSurface is UNCHANGED). The input is
+  a LEGACY DXGI keyed-mutex handle (tagged over the runtime IPC — a Low-integrity
+  GPU process can't OpenProcess the Medium service to send an NT handle).
+- weave_client is now a component() (COMPONENT_EXPORT) so its process-global
+  session State() is a SINGLE instance across DLLs (content.dll pre-sandbox init
+  + components_viz_service.dll per-frame submit); a source_set duplicated it.
+
+Requires the runtime IPC fixes (displayxr-runtime#743): Low-integrity pipe
+label, mainloop mid-connect-abort hardening, tagged-handle transport.
+---
+ .../browser/chrome_content_browser_client.cc  |   7 +
+ components/displayxr/browser/BUILD.gn         |   6 +-
+ .../browser/displayxr_weave_client.cc         | 227 +++++++++++++++---
+ .../browser/displayxr_weave_client.h          |  37 ++-
+ components/displayxr/gpu/BUILD.gn             |   4 +
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 173 ++++++++++---
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  22 +-
+ content/gpu/BUILD.gn                          |   7 +
+ content/gpu/gpu_main.cc                       |  43 ++++
+ 9 files changed, 451 insertions(+), 75 deletions(-)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 59563cbd9dcdd..1d8a18772f641 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2840,6 +2840,13 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+     if (!command_line->HasSwitch("enable-inline-3d")) {
+       command_line->AppendSwitch("enable-inline-3d");
+     }
++    // #625 zero-lag: forward the sync-weave opt-in so the GPU process creates
++    // the present-owner weave session pre-sandbox (gpu_main.cc).
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++            "inline-3d-sync-weave") &&
++        !command_line->HasSwitch("inline-3d-sync-weave")) {
++      command_line->AppendSwitch("inline-3d-sync-weave");
++    }
+ #if BUILDFLAG(IS_WIN)
+     // The weave input is an NT-shared keyed-mutex D3D11 texture the DisplayXR
+     // service creates on the runtime's adapter — the high-performance discrete
+diff --git a/components/displayxr/browser/BUILD.gn b/components/displayxr/browser/BUILD.gn
+index b979631cca412..569cc0822d8f5 100644
+--- a/components/displayxr/browser/BUILD.gn
++++ b/components/displayxr/browser/BUILD.gn
+@@ -7,17 +7,21 @@
+ # header it exposes is OpenXR-free so consumers stay chromium_code. Lives in the
+ # unsandboxed browser process because the per-frame weave RPC to displayxr-service
+ # is IPC the GPU sandbox blocks.
+-source_set("weave_client") {
++component("weave_client") {
+   sources = [
+     "displayxr_weave_client.cc",
+     "displayxr_weave_client.h",
+   ]
+   configs -= [ "//build/config/compiler:chromium_code" ]
+   configs += [ "//build/config/compiler:no_chromium_code" ]
++  # #625: single shared instance of the session State() across DLLs (component
++  # build). COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) keys off this define.
++  defines = [ "IS_DISPLAYXR_WEAVE_CLIENT_IMPL" ]
+   deps = [ "//base" ]
+   if (is_win) {
+     deps += [ "//third_party/displayxr:openxr_loader" ]
+     libs = [
++      "advapi32.lib",  # GetSecurityInfo/SetEntriesInAcl (GPU-process DACL widen)
+       "d3d11.lib",
+       "dxgi.lib",
+     ]
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 79d3882d8a5ce..1efbb5e69fe47 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -17,6 +17,7 @@
+ #if BUILDFLAG(IS_WIN)
+ #include <windows.h>
+ 
++#include <aclapi.h>
+ #include <d3d11.h>
+ #include <dxgi1_2.h>
+ 
+@@ -24,6 +25,8 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/process/process_handle.h"
++
+ #define XR_USE_GRAPHICS_API_D3D11
+ #define XR_USE_PLATFORM_WIN32
+ #include <openxr/openxr.h>
+@@ -41,6 +44,12 @@ namespace {
+ // The opt-in switch. Off by default — the patch is dormant unless requested.
+ constexpr char kEnableInline3DSwitch[] = "enable-inline-3d";
+ 
++// #625 zero-lag: when present, the OpenXR present-owner weave session is owned
++// by the GPU process (created pre-sandbox, submitted synchronously on Viz's
++// present thread) instead of the browser process. The browser-process session
++// is then suppressed so the two don't race on the single-instance service pipe.
++constexpr char kInline3DSyncWeaveSwitch[] = "inline-3d-sync-weave";
++
+ #if BUILDFLAG(IS_WIN)
+ 
+ // File-static client state. B2a only proves instance + extension availability;
+@@ -81,10 +90,16 @@ struct WeaveClientState {
+ // --enable-logging) that would otherwise win the Z-order race — binding one of
+ // those sizes the weave target to the wrong window and anchors the eye-frusta
+ // mapping to the wrong screen rect.
++struct FindMainWindowCtx {
++  DWORD pid = 0;
++  HWND found = nullptr;
++};
++
+ BOOL CALLBACK FindMainWindowProc(HWND hwnd, LPARAM lparam) {
++  FindMainWindowCtx* ctx = reinterpret_cast<FindMainWindowCtx*>(lparam);
+   DWORD wpid = 0;
+   ::GetWindowThreadProcessId(hwnd, &wpid);
+-  if (wpid != ::GetCurrentProcessId() || !::IsWindowVisible(hwnd) ||
++  if (wpid != ctx->pid || !::IsWindowVisible(hwnd) ||
+       ::GetWindow(hwnd, GW_OWNER) != nullptr) {
+     return TRUE;
+   }
+@@ -100,14 +115,22 @@ BOOL CALLBACK FindMainWindowProc(HWND hwnd, LPARAM lparam) {
+       (r.bottom - r.top) < 64) {
+     return TRUE;
+   }
+-  *reinterpret_cast<HWND*>(lparam) = hwnd;
++  ctx->found = hwnd;
+   return FALSE;  // take the first qualifying window
+ }
+ 
++// Find |pid|'s main browser frame window. In the browser process |pid| is the
++// current process; in the GPU process (sync weave, #625) it is the PARENT
++// (browser) process — the GPU process owns no windows.
++HWND FindMainWindowForProcess(DWORD pid) {
++  FindMainWindowCtx ctx;
++  ctx.pid = pid;
++  ::EnumWindows(&FindMainWindowProc, reinterpret_cast<LPARAM>(&ctx));
++  return ctx.found;
++}
++
+ HWND FindMainWindowForCurrentProcess() {
+-  HWND found = nullptr;
+-  ::EnumWindows(&FindMainWindowProc, reinterpret_cast<LPARAM>(&found));
+-  return found;
++  return FindMainWindowForProcess(::GetCurrentProcessId());
+ }
+ 
+ // Create a D3D11 device on the adapter the runtime requires (shared handles only
+@@ -161,30 +184,15 @@ bool HasExtension(const std::vector<XrExtensionProperties>& exts,
+   return false;
+ }
+ 
+-void InitializeWin(int attempts_left) {
++// Everything after the window lookup: forced-IPC env, instance, system,
++// display info, PFNs, D3D11 device, present-owner session, bindWindow. Shared
++// between the browser-process async-retry init (InitializeWin) and the
++// GPU-process pre-sandbox init (PreSandboxInitializeForGpuProcess).
++void InitializeCore(HWND hwnd) {
+   WeaveClientState& s = State();
+   if (s.initialized) {
+     return;
+   }
+-
+-  // Find the browser frame window FIRST — chrome shows its first window via a
+-  // posted task, so it may not be visible yet when the delayed init task
+-  // fires. A miss must retry, not give up: this init is one-shot and an
+-  // unbound client leaves inline-3D dormant for the whole browser session.
+-  HWND hwnd = FindMainWindowForCurrentProcess();
+-  if (!hwnd) {
+-    if (attempts_left > 1) {
+-      VLOG(1) << "[DisplayXR] browser window not visible yet — retrying bind ("
+-              << attempts_left - 1 << " attempts left)";
+-      base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+-          FROM_HERE, base::BindOnce(&InitializeWin, attempts_left - 1),
+-          base::Milliseconds(500));
+-    } else {
+-      LOG(ERROR) << "[DisplayXR] no top-level browser window for bindWindow";
+-    }
+-    return;
+-  }
+-
+   s.initialized = true;
+ 
+   // The weave service is IPC-only; force the runtime onto the out-of-process
+@@ -350,6 +358,34 @@ void InitializeWin(int attempts_left) {
+   }
+ }
+ 
++// Browser-process init: async window-lookup retry, then the shared core.
++void InitializeWin(int attempts_left) {
++  WeaveClientState& s = State();
++  if (s.initialized) {
++    return;
++  }
++
++  // Find the browser frame window FIRST — chrome shows its first window via a
++  // posted task, so it may not be visible yet when the delayed init task
++  // fires. A miss must retry, not give up: this init is one-shot and an
++  // unbound client leaves inline-3D dormant for the whole browser session.
++  HWND hwnd = FindMainWindowForCurrentProcess();
++  if (!hwnd) {
++    if (attempts_left > 1) {
++      VLOG(1) << "[DisplayXR] browser window not visible yet — retrying bind ("
++              << attempts_left - 1 << " attempts left)";
++      base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++          FROM_HERE, base::BindOnce(&InitializeWin, attempts_left - 1),
++          base::Milliseconds(500));
++    } else {
++      LOG(ERROR) << "[DisplayXR] no top-level browser window for bindWindow";
++    }
++    return;
++  }
++
++  InitializeCore(hwnd);
++}
++
+ // Drive one weave on the live present-owner session. Returns ok=false unless the
+ // session + submit PFN came up in InitializeWin(). The runtime opens the input
+ // handle synchronously inside xrWeaveSubmitDXR, so borrowing it for the call is
+@@ -358,7 +394,8 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+                                                   int32_t x,
+                                                   int32_t y,
+                                                   int32_t w,
+-                                                  int32_t h) {
++                                                  int32_t h,
++                                                  bool input_is_dxgi = false) {
+   DisplayXRWeaveClient::WeaveSubmitResult result;
+   WeaveClientState& s = State();
+   if (s.session == XR_NULL_HANDLE || !s.submit) {
+@@ -367,7 +404,10 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+ 
+   XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+   in.inputTexture = reinterpret_cast<void*>(input_handle);
+-  in.inputIsDxgi = XR_FALSE;  // NT handle (keyed-mutex), not a legacy DXGI handle
++  // Legacy DXGI shared handles (process-independent values) cross the runtime
++  // IPC raw — the sandboxed GPU process uses them since it cannot
++  // OpenProcess(PROCESS_DUP_HANDLE) the service to send an NT handle.
++  in.inputIsDxgi = input_is_dxgi ? XR_TRUE : XR_FALSE;
+   in.rect.offset.x = x;
+   in.rect.offset.y = y;
+   in.rect.extent.width = w;
+@@ -417,6 +457,118 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+   return result;
+ }
+ 
++// ---------------------------------------------------------------------------
++// GPU-process synchronous weave (#625, zero-lag spike).
++// ---------------------------------------------------------------------------
++
++// The service duplicates the woven output + fence handles INTO this GPU process
++// on the first weave submit (service->GPU DuplicateHandle). Its Medium-integrity
++// OpenProcess(PROCESS_DUP_HANDLE, gpu_pid) must pass this process object's DACL,
++// which the sandbox's lockdown default can strip the interactive user from.
++// Grant the current user PROCESS_DUP_HANDLE explicitly — pre-sandbox, while the
++// thread's impersonation token still holds WRITE_DAC. Other SANDBOXED processes
++// still fail their restricted-SID access check, so this does not reopen the
++// sandbox-to-sandbox handle-steal hole.
++void WidenProcessDaclForServiceDup() {
++  HANDLE token = nullptr;
++  if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) {
++    LOG(ERROR) << "[DisplayXR] OpenProcessToken failed: " << ::GetLastError();
++    return;
++  }
++  BYTE user_buf[256] = {};
++  DWORD len = 0;
++  const BOOL got_user = ::GetTokenInformation(token, TokenUser, user_buf,
++                                              sizeof(user_buf), &len);
++  ::CloseHandle(token);
++  if (!got_user) {
++    LOG(ERROR) << "[DisplayXR] GetTokenInformation(TokenUser) failed: "
++               << ::GetLastError();
++    return;
++  }
++  PSID user_sid = reinterpret_cast<TOKEN_USER*>(user_buf)->User.Sid;
++
++  PACL old_dacl = nullptr;
++  PSECURITY_DESCRIPTOR sd = nullptr;
++  DWORD rc = ::GetSecurityInfo(::GetCurrentProcess(), SE_KERNEL_OBJECT,
++                               DACL_SECURITY_INFORMATION, nullptr, nullptr,
++                               &old_dacl, nullptr, &sd);
++  if (rc != ERROR_SUCCESS) {
++    LOG(ERROR) << "[DisplayXR] GetSecurityInfo(process) failed: " << rc;
++    return;
++  }
++
++  EXPLICIT_ACCESSW ea = {};
++  ea.grfAccessPermissions = PROCESS_DUP_HANDLE;
++  ea.grfAccessMode = GRANT_ACCESS;
++  ea.grfInheritance = NO_INHERITANCE;
++  ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
++  ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
++  ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(user_sid);
++
++  PACL new_dacl = nullptr;
++  rc = ::SetEntriesInAclW(1, &ea, old_dacl, &new_dacl);
++  if (rc == ERROR_SUCCESS) {
++    rc = ::SetSecurityInfo(::GetCurrentProcess(), SE_KERNEL_OBJECT,
++                           DACL_SECURITY_INFORMATION, nullptr, nullptr,
++                           new_dacl, nullptr);
++    VLOG(1) << "[DisplayXR] process DACL widened for service woven-handle dup "
++               "(user PROCESS_DUP_HANDLE) -> rc="
++            << rc;
++  } else {
++    LOG(ERROR) << "[DisplayXR] SetEntriesInAcl failed: " << rc;
++  }
++  if (new_dacl) {
++    ::LocalFree(new_dacl);
++  }
++  if (sd) {
++    ::LocalFree(sd);
++  }
++}
++
++void PreSandboxInitializeForGpuProcessWin() {
++  WeaveClientState& s = State();
++  if (s.initialized) {
++    return;
++  }
++  const base::TimeTicks t0 = base::TimeTicks::Now();
++
++  WidenProcessDaclForServiceDup();
++
++  // Bounded wait for the BROWSER's main frame window — the GPU process
++  // launches before the browser shows it. 32 x 250ms = 8s cap (the GPU
++  // watchdog's init budget is finite); typical appearance is 1-3s.
++  const DWORD browser_pid =
++      static_cast<DWORD>(base::GetParentProcessId(::GetCurrentProcess()));
++  HWND hwnd = nullptr;
++  for (int i = 0; i < 32 && !hwnd; ++i) {
++    hwnd = FindMainWindowForProcess(browser_pid);
++    if (!hwnd) {
++      ::Sleep(250);
++    }
++  }
++  VLOG(1) << "[DisplayXR] pre-sandbox browser-window wait: hwnd=" << hwnd
++          << " (browser pid " << browser_pid << ") after "
++          << (base::TimeTicks::Now() - t0).InMilliseconds() << " ms";
++  if (!hwnd) {
++    return;  // weave stays dormant this GPU-process lifetime
++  }
++
++  InitializeCore(hwnd);
++  if (s.session == XR_NULL_HANDLE) {
++    LOG(ERROR) << "[DisplayXR] pre-sandbox weave session create FAILED "
++                  "(see messages above / runtime client log)";
++    return;
++  }
++  // Session is live and window-bound. Do NOT submit here: the FIRST
++  // xrWeaveSubmitDXR must be the real per-frame submit on Viz's present thread,
++  // so it (a) does the one-time woven-output export on that thread and (b) leaves
++  // the IPC connection untouched by any other thread. A pre-sandbox test submit
++  // pre-sets the runtime's per-session `exported` flag, which would suppress the
++  // export on the first real submit (Viz would never receive the woven handle).
++  VLOG(1) << "[DisplayXR] GPU-process weave session ready pre-sandbox (hwnd="
++          << hwnd << ")";
++}
++
+ bool IsSupportedWin() {
+   WeaveClientState& s = State();
+   return s.session != XR_NULL_HANDLE && s.submit != nullptr;
+@@ -465,9 +617,10 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::Submit(
+     int32_t x,
+     int32_t y,
+     int32_t w,
+-    int32_t h) {
++    int32_t h,
++    bool input_is_dxgi) {
+ #if BUILDFLAG(IS_WIN)
+-  return SubmitWin(input_handle, x, y, w, h);
++  return SubmitWin(input_handle, x, y, w, h, input_is_dxgi);
+ #else
+   return {};
+ #endif
+@@ -501,10 +654,22 @@ void DisplayXRWeaveClient::GetLatest(std::vector<float>* eyes,
+ #endif
+ }
+ 
++// static
++void DisplayXRWeaveClient::PreSandboxInitializeForGpuProcess() {
++#if BUILDFLAG(IS_WIN)
++  PreSandboxInitializeForGpuProcessWin();
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+-  if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
+-          kEnableInline3DSwitch)) {
++  const base::CommandLine& cl = *base::CommandLine::ForCurrentProcess();
++  if (!cl.HasSwitch(kEnableInline3DSwitch)) {
++    return;
++  }
++  // #625 zero-lag: the GPU process owns the weave session in sync mode; skip the
++  // browser-process session so the two don't race on the service pipe.
++  if (cl.HasSwitch(kInline3DSyncWeaveSwitch)) {
+     return;
+   }
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index d1648340a97f4..8a80dbbf47682 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -18,14 +18,34 @@
+ #include <cstdint>
+ #include <vector>
+ 
++#include "base/component_export.h"
++
+ namespace displayxr {
+ 
+-class DisplayXRWeaveClient {
++// #625: a proper component (single shared library in component builds) so its
++// process-global session State() is ONE instance across every DLL that touches
++// it (content.dll via gpu_main's pre-sandbox init, components_viz_service.dll
++// via DisplayXRWeaveGpu's per-frame sync submit, the browser lib). As a plain
++// source_set the statics duplicate per-DLL and the GPU-owned session created in
++// one DLL is invisible to the weave reading another.
++class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+  public:
+   // If --enable-inline-3d is on the command line, initialize the weave client
+   // (idempotent, browser process only). Safe no-op otherwise or on non-Windows.
+   static void MaybeInitializeFromCommandLine();
+ 
++  // GPU-process synchronous weave (#625, zero-lag). Called from gpu_main.cc's
++  // PreSandboxStartup, BEFORE the sandbox LowerToken(): connects the runtime
++  // IPC pipe (xrCreateInstance under XRT_FORCE_MODE=ipc), creates the
++  // present-owner session bound to the BROWSER process's main window (found by
++  // a bounded wait — the GPU process starts before the window exists), calls
++  // xrWeaveBindWindowDXR, and allocates a legacy-DXGI keyed-mutex probe input.
++  // Everything privileged (pipe open, registry, OpenProcess-based handle
++  // transfer, USER32 window lookup) happens here; per-frame submits after the
++  // sandbox engages are plain WriteFile/ReadFile on the already-open pipe.
++  // Blocking (bounded); caller gates on --enable-inline-3d + real GPU process.
++  static void PreSandboxInitializeForGpuProcess();
++
+   // OpenXR-free result of one weave submission (mirrors XrWeaveOutputDXR). All
+   // handles are Win32 HANDLEs carried as uintptr_t so this header stays
+   // platform/OpenXR-free; the caller (DisplayXRWeaverImpl) owns them and is
+@@ -42,16 +62,19 @@ class DisplayXRWeaveClient {
+     bool eyes_valid = false;
+   };
+ 
+-  // Drive one xrWeaveSubmitDXR on the B2a present-owner session. |input_handle|
+-  // is a pre-weave SBS keyed-mutex shared-texture HANDLE (borrowed for the
+-  // duration of the call; the runtime opens it synchronously). |x,y,w,h| is the
+-  // element's window-relative device-pixel rect. Returns ok=false if the weave
+-  // session isn't live. Windows-only; a stub elsewhere.
++  // Drive one xrWeaveSubmitDXR on the present-owner session. |input_handle| is a
++  // pre-weave SBS keyed-mutex shared-texture HANDLE (borrowed for the duration of
++  // the call; the runtime opens it synchronously). |x,y,w,h| is the element's
++  // window-relative device-pixel rect. |input_is_dxgi| tags a legacy DXGI shared
++  // handle (true for the GPU-owned sync path, whose Low-integrity process can't
++  // send an NT handle) vs an NT handle (false, the async mojo path). Returns
++  // ok=false if the weave session isn't live. Windows-only; a stub elsewhere.
+   static WeaveSubmitResult Submit(uintptr_t input_handle,
+                                   int32_t x,
+                                   int32_t y,
+                                   int32_t w,
+-                                  int32_t h);
++                                  int32_t h,
++                                  bool input_is_dxgi = false);
+ 
+   // DisplayXR inline-3D (#625, Step B3d): the display + committed-element
+   // geometry the renderer's off-axis (Kooima) projection needs, delivered via
+diff --git a/components/displayxr/gpu/BUILD.gn b/components/displayxr/gpu/BUILD.gn
+index a890fbf91f730..ae66f1d96ef71 100644
+--- a/components/displayxr/gpu/BUILD.gn
++++ b/components/displayxr/gpu/BUILD.gn
+@@ -13,6 +13,10 @@ source_set("gpu") {
+   ]
+   deps = [
+     "//base",
++    # #625 zero-lag: the sync path calls DisplayXRWeaveClient::Submit in-process
++    # (the weave session lives in this GPU process, created pre-sandbox). The
++    # header is OpenXR-free; the OpenXR loader is pulled transitively.
++    "//components/displayxr/browser:weave_client",
+     "//components/displayxr/common:displayxr_weave_mojom",
+     "//components/viz/service",
+     "//content/public/child",
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index 5c4d01943facc..5fd950c302002 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -13,6 +13,7 @@
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/win/scoped_handle.h"
++#include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "content/public/child/child_thread.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+ 
+@@ -50,14 +51,27 @@ void DisplayXRWeaveGpu::Bind() {
+       base::Unretained(this)));
+ }
+ 
++// static
++bool DisplayXRWeaveGpu::SyncMode() {
++  // The GPU-owned present session is live iff it was created pre-sandbox
++  // (--inline-3d-sync-weave). IsSupported() is the same session/submit guard the
++  // client uses; it is a process-global in this GPU process.
++  return DisplayXRWeaveClient::IsSupported();
++}
++
+ // static
+ void DisplayXRWeaveGpu::ResetInput(WeaveInput& in) {
+   in.input_tex.Reset();
+   in.input_mutex.Reset();
+   if (in.input_handle) {
+-    ::CloseHandle(in.input_handle);
++    // Legacy DXGI shared handles (GetSharedHandle) are owned by the resource and
++    // must not be closed; only NT handles (CreateSharedHandle) are owned here.
++    if (!in.legacy_handle) {
++      ::CloseHandle(in.input_handle);
++    }
+     in.input_handle = nullptr;
+   }
++  in.legacy_handle = false;
+   in.input_w = 0;
+   in.input_h = 0;
+   in.input_format = DXGI_FORMAT_UNKNOWN;
+@@ -91,6 +105,16 @@ bool DisplayXRWeaveGpu::EnsureInput(WeaveInput& in,
+   }
+   ResetInput(in);
+ 
++  // #625 zero-lag sync mode: the GPU process sends the input handle DIRECTLY to
++  // displayxr-service over the runtime IPC. A Low-integrity GPU process can't
++  // OpenProcess the Medium service to duplicate an NT handle, so use a LEGACY
++  // DXGI shared handle (IDXGIResource::GetSharedHandle) — process-independent,
++  // opened by the service via OpenSharedResource, and crosses the runtime IPC
++  // low-bit-tagged (skipping OpenProcess). The async path keeps its NT handle
++  // (it travels GPU->browser over mojo, then browser->service, where the Medium
++  // browser CAN OpenProcess the service).
++  const bool sync = SyncMode();
++
+   D3D11_TEXTURE2D_DESC td = {};
+   td.Width = w;
+   td.Height = h;
+@@ -100,49 +124,71 @@ bool DisplayXRWeaveGpu::EnsureInput(WeaveInput& in,
+   td.SampleDesc.Count = 1;
+   td.Usage = D3D11_USAGE_DEFAULT;
+   td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+-  td.MiscFlags =
+-      D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
++  td.MiscFlags = sync ? D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
++                      : (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
++                         D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+   HRESULT hr = device_->CreateTexture2D(&td, nullptr, &in.input_tex);
+   if (FAILED(hr) || !in.input_tex) {
+-    LOG(ERROR) << "[DisplayXR] B2c.2 input: CreateTexture2D failed: 0x"
++    LOG(ERROR) << "[DisplayXR] weave input: CreateTexture2D failed: 0x"
+                << std::hex << hr;
+     return false;
+   }
+   if (FAILED(in.input_tex.As(&in.input_mutex))) {
+-    LOG(ERROR) << "[DisplayXR] B2c.2 input: no keyed mutex";
++    LOG(ERROR) << "[DisplayXR] weave input: no keyed mutex";
+     return false;
+   }
+-  // The shared handle is opened by the EXTERNAL displayxr-service (not a Chromium
+-  // process), and this texture is created in the sandboxed GPU process — its
+-  // restricted token would otherwise give the object a DACL the service can't
+-  // open. Grant an explicit null DACL (any process may open) so the service can
+-  // OpenSharedResource1 it.
+-  SECURITY_DESCRIPTOR sd = {};
+-  ::InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+-  ::SetSecurityDescriptorDacl(&sd, TRUE, /*pDacl=*/nullptr,
+-                              /*bDaclDefaulted=*/FALSE);
+-  SECURITY_ATTRIBUTES sa = {};
+-  sa.nLength = sizeof(sa);
+-  sa.lpSecurityDescriptor = &sd;
+-  sa.bInheritHandle = FALSE;
+-  ComPtr<IDXGIResource1> res1;
+-  if (FAILED(in.input_tex.As(&res1)) ||
+-      FAILED(res1->CreateSharedHandle(
+-          &sa, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+-          &in.input_handle))) {
+-    LOG(ERROR) << "[DisplayXR] B2c.2 input: CreateSharedHandle failed";
+-    return false;
++
++  if (sync) {
++    // Legacy DXGI shared handle: resource-owned, same-adapter openable, tagged
++    // over the runtime IPC. No per-object DACL (not needed — the service opens
++    // it on the same adapter via OpenSharedResource).
++    ComPtr<IDXGIResource> res;
++    if (FAILED(in.input_tex.As(&res)) ||
++        FAILED(res->GetSharedHandle(&in.input_handle)) || !in.input_handle) {
++      LOG(ERROR) << "[DisplayXR] weave input: GetSharedHandle (legacy) failed";
++      return false;
++    }
++    in.legacy_handle = true;
++  } else {
++    // NT shared handle for the async mojo path. The handle is opened by the
++    // EXTERNAL displayxr-service, and this texture is created in the sandboxed
++    // GPU process — its restricted token would otherwise give the object a DACL
++    // the service can't open. Grant an explicit null DACL (any process may open)
++    // so the service can OpenSharedResource1 it.
++    SECURITY_DESCRIPTOR sd = {};
++    ::InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
++    ::SetSecurityDescriptorDacl(&sd, TRUE, /*pDacl=*/nullptr,
++                                /*bDaclDefaulted=*/FALSE);
++    SECURITY_ATTRIBUTES sa = {};
++    sa.nLength = sizeof(sa);
++    sa.lpSecurityDescriptor = &sd;
++    sa.bInheritHandle = FALSE;
++    ComPtr<IDXGIResource1> res1;
++    if (FAILED(in.input_tex.As(&res1)) ||
++        FAILED(res1->CreateSharedHandle(
++            &sa, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
++            &in.input_handle))) {
++      LOG(ERROR) << "[DisplayXR] weave input: CreateSharedHandle (NT) failed";
++      return false;
++    }
++    in.legacy_handle = false;
+   }
+ 
+   in.input_w = w;
+   in.input_h = h;
+   in.input_format = format;
+   VLOG(1) << "[DisplayXR] weave input ready " << w << "x" << h
+-          << " fmt=" << format << " (NT handle=" << in.input_handle << ")";
++          << " fmt=" << format << (sync ? " (legacy DXGI handle=" : " (NT handle=")
++          << in.input_handle << ")";
+   return true;
+ }
+ 
+ bool DisplayXRWeaveGpu::SubmitInFlight(uint32_t target_id) const {
++  // Sync mode completes each submit in the same call — never in flight, so Viz
++  // (re)submits every visible target every frame.
++  if (SyncMode()) {
++    return false;
++  }
+   auto it = inputs_.find(target_id);
+   return it != inputs_.end() && it->second.in_flight;
+ }
+@@ -153,12 +199,13 @@ bool DisplayXRWeaveGpu::WeaveCanvas(ID3D11Device* device,
+                                     const gfx::Rect& src_rect,
+                                     const gfx::Rect& window_rect,
+                                     uint32_t target_id) {
+-  // Per-target keyed-mutex input: skip only while THIS target's submit is in
+-  // flight (its pixels must stay stable until its reply). Other targets are
+-  // independent — all visible targets can be submitted the same frame.
++  // Per-target keyed-mutex input: in async mode skip while THIS target's submit
++  // is in flight (its pixels must stay stable until the reply); in sync mode
++  // every target submits every frame (no in-flight, no mojo remote needed).
+   WeaveInput& in = inputs_[target_id];
+-  if (in.in_flight || !weaver_.is_bound() || window_rect.IsEmpty() || !device ||
+-      !canvas_tex) {
++  const bool sync = SyncMode();
++  if ((!sync && (in.in_flight || !weaver_.is_bound())) || window_rect.IsEmpty() ||
++      !device || !canvas_tex) {
+     return false;
+   }
+ 
+@@ -208,7 +255,8 @@ bool DisplayXRWeaveGpu::WeaveCanvas(ID3D11Device* device,
+   context_->Flush();
+   in.input_mutex->ReleaseSync(0);
+ 
+-  return SubmitInput(in, window_rect, target_id);
++  return sync ? SubmitSync(in, window_rect, target_id)
++              : SubmitInput(in, window_rect, target_id);
+ }
+ 
+ bool DisplayXRWeaveGpu::WeavePixels(ID3D11Device* device,
+@@ -217,8 +265,9 @@ bool DisplayXRWeaveGpu::WeavePixels(ID3D11Device* device,
+                                     const gfx::Rect& window_rect,
+                                     uint32_t target_id) {
+   WeaveInput& in = inputs_[target_id];
+-  if (in.in_flight || !weaver_.is_bound() || window_rect.IsEmpty() || !device ||
+-      !bgra_pixels) {
++  const bool sync = SyncMode();
++  if ((!sync && (in.in_flight || !weaver_.is_bound())) || window_rect.IsEmpty() ||
++      !device || !bgra_pixels) {
+     return false;
+   }
+ 
+@@ -264,7 +313,8 @@ bool DisplayXRWeaveGpu::WeavePixels(ID3D11Device* device,
+   context_->Flush();
+   in.input_mutex->ReleaseSync(0);
+ 
+-  return SubmitInput(in, window_rect, target_id);
++  return sync ? SubmitSync(in, window_rect, target_id)
++              : SubmitInput(in, window_rect, target_id);
+ }
+ 
+ bool DisplayXRWeaveGpu::SubmitInput(WeaveInput& in,
+@@ -294,6 +344,59 @@ bool DisplayXRWeaveGpu::SubmitInput(WeaveInput& in,
+   return true;
+ }
+ 
++bool DisplayXRWeaveGpu::SubmitSync(WeaveInput& in,
++                                   const gfx::Rect& window_rect,
++                                   uint32_t target_id) {
++  // #625 zero-lag: xrWeaveSubmitDXR directly on the GPU-process session — no
++  // mojo, no browser hop, no deadlock. The woven output comes back in this call,
++  // stored into results_ immediately so Viz's same-frame TryTakeWovenResult
++  // draws it at the current rect (zero lag). The input rides tagged as a legacy
++  // DXGI handle (see EnsureInput), so the runtime IPC needs no OpenProcess.
++  DisplayXRWeaveClient::WeaveSubmitResult sr = DisplayXRWeaveClient::Submit(
++      reinterpret_cast<uintptr_t>(in.input_handle), window_rect.x(),
++      window_rect.y(), window_rect.width(), window_rect.height(),
++      /*input_is_dxgi=*/true);
++  if (!sr.ok) {
++    return false;
++  }
++  static bool logged_sync = false;
++  if (!logged_sync) {
++    logged_sync = true;
++    VLOG(1) << "[DisplayXR] GPU-process SYNC weave live: target=" << target_id
++            << " woven=0x" << std::hex << sr.woven_handle << std::dec << " "
++            << sr.width << "x" << sr.height << " eyes_valid=" << sr.eyes_valid;
++  }
++
++  // Store the synchronous result exactly as OnWeaveReply would, so the existing
++  // Viz Phase-B import/draw path is unchanged. Fresh woven/fence handles arrive
++  // only on the first submit / a window-size change (steady frames carry 0);
++  // carry a still-pending fresh handle forward so Viz never misses the import.
++  PendingResult& pending = results_[target_id];
++  Result r;
++  r.ok = true;
++  r.fence_value = sr.fence_value;
++  r.width = sr.width;
++  r.height = sr.height;
++  if (sr.woven_handle) {
++    r.woven_handle = sr.woven_handle;
++  } else if (pending.have) {
++    r.woven_handle = pending.result.woven_handle;
++    pending.result.woven_handle = 0;
++  }
++  if (sr.fence_handle) {
++    r.fence_handle = sr.fence_handle;
++  } else if (pending.have) {
++    r.fence_handle = pending.result.fence_handle;
++    pending.result.fence_handle = 0;
++  }
++  if (pending.have) {
++    CloseResultHandles(pending.result);
++  }
++  pending.result = r;
++  pending.have = true;
++  return true;
++}
++
+ void DisplayXRWeaveGpu::OnWeaveReply(uint32_t target_id,
+                                      mojom::DisplayXRWeaveResultPtr result) {
+   // Clear THIS target's in-flight guard (its input is free to refill next frame).
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index 6aaa56ecadcb5..eea2c4667724b 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -72,7 +72,13 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   struct WeaveInput {
+     Microsoft::WRL::ComPtr<ID3D11Texture2D> input_tex;
+     Microsoft::WRL::ComPtr<IDXGIKeyedMutex> input_mutex;
+-    HANDLE input_handle = nullptr;  // NT shared handle (owned)
++    HANDLE input_handle = nullptr;  // shared handle (owned iff !legacy_handle)
++    // #625 zero-lag: in GPU-owned sync mode the input is a LEGACY DXGI shared
++    // handle (from IDXGIResource::GetSharedHandle) so it crosses the runtime IPC
++    // low-bit-tagged (no OpenProcess — a Low GPU process can't open the Medium
++    // service). Legacy handles are resource-owned, so ResetInput must NOT close
++    // them (unlike the async path's NT handle from CreateSharedHandle).
++    bool legacy_handle = false;
+     uint32_t input_w = 0;
+     uint32_t input_h = 0;
+     DXGI_FORMAT input_format = DXGI_FORMAT_UNKNOWN;
+@@ -102,6 +108,20 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+                    const gfx::Rect& window_rect,
+                    uint32_t target_id);
+ 
++  // #625 zero-lag: true iff the OpenXR weave session lives IN this GPU process
++  // (created pre-sandbox, --inline-3d-sync-weave). When true the submit is a
++  // direct synchronous xrWeaveSubmitDXR on this thread (no mojo, no browser hop);
++  // when false the legacy async mojo path to the browser bridge is used.
++  static bool SyncMode();
++
++  // Synchronous in-process weave for |target_id|: xrWeaveSubmitDXR returns the
++  // woven output in the SAME call, stored immediately in results_ so Viz's
++  // same-frame TryTakeWovenResult draws it back with zero lag. Returns true if a
++  // result was stored.
++  bool SubmitSync(WeaveInput& in,
++                  const gfx::Rect& window_rect,
++                  uint32_t target_id);
++
+   // Async reply from the browser weave bridge (GPU-main sequence). Clears the
+   // target's in-flight flag and stores the woven handles for |target_id|.
+   void OnWeaveReply(uint32_t target_id, mojom::DisplayXRWeaveResultPtr result);
+diff --git a/content/gpu/BUILD.gn b/content/gpu/BUILD.gn
+index 3a31d22435aff..2c7c4c85c3347 100644
+--- a/content/gpu/BUILD.gn
++++ b/content/gpu/BUILD.gn
+@@ -110,6 +110,13 @@ target(link_target_type, "gpu_sources") {
+     deps += [ "//sandbox" ]
+   }
+ 
++  if (is_win) {
++    # DisplayXR inline-3D (#625): gpu_main.cc creates the OpenXR present-owner
++    # weave session pre-sandbox (see PreSandboxStartup). The header it uses is
++    # OpenXR-free; the OpenXR loader is pulled transitively by :weave_client.
++    deps += [ "//components/displayxr/browser:weave_client" ]
++  }
++
+   if (is_mac) {
+     deps += [ "//components/metal_util" ]
+   }
+diff --git a/content/gpu/gpu_main.cc b/content/gpu/gpu_main.cc
+index e7b1bd73f21a3..d74a9581383bf 100644
+--- a/content/gpu/gpu_main.cc
++++ b/content/gpu/gpu_main.cc
+@@ -104,7 +104,9 @@
+ #include "base/win/scoped_com_initializer.h"
+ #include "base/win/win_util.h"
+ #include "base/win/windows_version.h"
++#include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "media/base/win/mf_initializer.h"
++#include "sandbox/policy/switches.h"
+ #include "sandbox/policy/win/sandbox_warmup.h"
+ #include "sandbox/win/src/sandbox.h"
+ #endif
+@@ -130,6 +132,35 @@ namespace content {
+ 
+ namespace {
+ 
++#if BUILDFLAG(IS_WIN)
++// DisplayXR inline-3D (#625): true iff this is the real, to-be-sandboxed GPU
++// process AND inline-3D was requested. Excludes the info-collection GPU process
++// (--disable-gpu-sandbox + --use-gl=disabled) so the synchronous weave session
++// is created exactly once, in the process that presents. The weave client
++// connects the runtime IPC pipe + creates the OpenXR present-owner session
++// PRE-sandbox (the sandbox blocks opening the pipe, not I/O on an open handle);
++// per-frame submits post-LowerToken are plain WriteFile/ReadFile.
++bool IsInline3DGpuProcess() {
++  const base::CommandLine& cl = *base::CommandLine::ForCurrentProcess();
++  if (!cl.HasSwitch("enable-inline-3d")) {
++    return false;
++  }
++  // The GPU-process sync-weave session is opt-in behind a second switch so the
++  // default (browser-owned async) inline-3D path is untouched.
++  if (!cl.HasSwitch("inline-3d-sync-weave")) {
++    return false;
++  }
++  if (cl.HasSwitch(sandbox::policy::switches::kDisableGpuSandbox)) {
++    return false;  // info-collection GPU process (or sandbox disabled for diag)
++  }
++  if (cl.GetSwitchValueASCII(switches::kUseGL) ==
++      gl::kGLImplementationDisabledName) {
++    return false;  // info-collection GPU process
++  }
++  return true;
++}
++#endif  // BUILDFLAG(IS_WIN)
++
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+ bool StartSandboxLinux(gpu::GpuWatchdogThread*,
+                        const gpu::GPUInfo*,
+@@ -191,6 +222,18 @@ class ContentSandboxHelper : public gpu::GpuSandboxHelper {
+     // On Linux, reading system memory doesn't work through the GPU sandbox.
+     // This value is cached, so access it here to populate the cache.
+     base::SysInfo::AmountOfPhysicalMemory();
++
++#if BUILDFLAG(IS_WIN)
++    // DisplayXR inline-3D (#625, zero-lag sync weave): connect the runtime IPC
++    // pipe + create the OpenXR present-owner weave session HERE, before
++    // LowerToken() lands. Opening the named pipe / registry / windows is
++    // exactly what the sandbox blocks; doing it pre-sandbox is the same pattern
++    // MediaFoundation warms up above. Per-frame xrWeaveSubmitDXR after the
++    // sandbox engages is plain I/O on the now-open handle.
++    if (IsInline3DGpuProcess()) {
++      displayxr::DisplayXRWeaveClient::PreSandboxInitializeForGpuProcess();
++    }
++#endif
+   }
+ 
+   bool EnsureSandboxInitialized(gpu::GpuWatchdogThread* watchdog_thread,
+-- 
+2.42.0.windows.2
+

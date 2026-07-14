@@ -1,7 +1,7 @@
 From ff9dbd5301e52d11f45541fc764706b7da22e74f Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 26 Jun 2026 01:07:32 -0500
-Subject: [PATCH 02/21] [displayxr inline-3d #625 B2a] add present-owner
+Subject: [PATCH 02/26] [displayxr inline-3d #625 B2a] add present-owner
  session + bindWindow (Level 4)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
