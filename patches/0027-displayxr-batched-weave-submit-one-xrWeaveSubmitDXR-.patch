@@ -1,0 +1,906 @@
+From 3cbb1a1b8f079f2e323b9c765ad537c92b570de1 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 01:10:04 -0700
+Subject: [PATCH 27/27] =?UTF-8?q?displayxr:=20batched=20weave=20submit=20?=
+ =?UTF-8?q?=E2=80=94=20one=20xrWeaveSubmitDXR=20per=20frame=20(spec=20v3)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The GPU-process sync weave did one synchronous xrWeaveSubmitDXR per visible
+inline-3d element per frame (~1 ms fixed cost each on Viz's present thread),
+capping a page at ~8-12 visible elements. This batches to ONE submit per
+frame carrying N rects (runtime XR_DXR_weave SPEC_VERSION 3, chained
+XrWeaveSubmitRectsDXR).
+
+- third_party/displayxr XR_DXR_weave.h byte-synced from the runtime
+  canonical v3 copy.
+- DisplayXRWeaveClient: captures the runtime's reported extensionVersion
+  (previously unread); new SubmitBatch packs the chained rect array and
+  chunks past the 32-rect per-call cap. Spec-v2 runtimes report ok=false and
+  callers keep the per-element Submit loop.
+- DisplayXRWeaveGpu: BatchMode (sync + spec>=3) collapses the per-target
+  keyed-mutex input pool into ONE window-sized legacy-DXGI shared input;
+  WeaveCanvas/WeavePixels become copy-only (CopySubresourceRegion dest = the
+  element's own window position, same copy count as before), and
+  SubmitBatchSync does one snap + one submit + per-target result fan-out
+  (fresh woven/fence handles ride the first entry; the rest carry 0 = reuse,
+  which Phase B's shared-woven import already expects). The v2 per-target
+  path is kept intact as the fallback.
+- Viz WeaveCompositedSurface Phase A brackets the existing attempt_submit
+  loop with BeginBatchSync/SubmitBatchSync in batch mode; Phase B unchanged
+  (it was already shared-output-shaped).
+
+Throttled VLOG(1) reports the one-submit batch cost (n, µs) for the
+scaling measurement.
+---
+ .../browser/displayxr_weave_client.cc         | 157 +++++++++-
+ .../browser/displayxr_weave_client.h          |  28 ++
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 276 ++++++++++++++++++
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  46 ++-
+ .../displayxr_weave_provider.cc               |  12 +
+ .../displayxr_weave_provider.h                |  18 ++
+ .../skia_output_surface_impl_on_gpu.cc        |  15 +-
+ .../displayxr/include/openxr/XR_DXR_weave.h   |  64 +++-
+ 8 files changed, 607 insertions(+), 9 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 710396b6e7b88..118c9ad9370e9 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -22,6 +22,7 @@
+ #include <d3d11.h>
+ #include <dxgi1_2.h>
+ 
++#include <algorithm>
+ #include <cstring>
+ #include <string>
+ #include <string_view>
+@@ -60,6 +61,10 @@ struct WeaveClientState {
+   XrInstance instance = XR_NULL_HANDLE;
+   XrSystemId system_id = XR_NULL_SYSTEM_ID;
+   bool has_weave = false;
++  // The XR_DXR_weave spec version the RUNTIME reported at enumeration. >= 3
++  // enables the batched submit (chained XrWeaveSubmitRectsDXR); older runtimes
++  // take the per-element Submit loop.
++  uint32_t weave_spec_version = 0;
+   PFN_xrWeaveBindWindowDXR bind_window = nullptr;
+   PFN_xrWeaveSubmitDXR submit = nullptr;
+   PFN_xrWeaveSnapWindowRectDXR snap = nullptr;
+@@ -194,6 +199,17 @@ bool HasExtension(const std::vector<XrExtensionProperties>& exts,
+   return false;
+ }
+ 
++// The runtime's reported spec version for |name|, or 0 when absent.
++uint32_t GetExtensionVersion(const std::vector<XrExtensionProperties>& exts,
++                             const char* name) {
++  for (const auto& e : exts) {
++    if (std::string_view(e.extensionName) == name) {
++      return e.extensionVersion;
++    }
++  }
++  return 0;
++}
++
+ // Defined below; installs the drag phase-snap window subclass (browser process
+ // only). Forward-declared so InitializeCore can call it.
+ void InstallDragSnapSubclassIfOwned(HWND hwnd);
+@@ -239,11 +255,14 @@ void InitializeCore(HWND hwnd) {
+       HasExtension(exts, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
+   const bool has_display_info =
+       HasExtension(exts, XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+-  s.has_weave = HasExtension(exts, XR_DXR_WEAVE_EXTENSION_NAME);
++  s.weave_spec_version =
++      GetExtensionVersion(exts, XR_DXR_WEAVE_EXTENSION_NAME);
++  s.has_weave = s.weave_spec_version > 0;
+ 
+   VLOG(1) << "[DisplayXR] inline-3D weave client: "
+           << "D3D11=" << has_d3d11 << " win32_window_binding=" << has_window
+-          << " display_info=" << has_display_info << " weave=" << s.has_weave;
++          << " display_info=" << has_display_info << " weave=" << s.has_weave
++          << " weave_spec=" << s.weave_spec_version;
+ 
+   if (!has_d3d11 || !has_window || !s.has_weave) {
+     LOG(ERROR) << "[DisplayXR] required extensions missing — weave unavailable "
+@@ -560,6 +579,119 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+   return result;
+ }
+ 
++// Batched weave (spec v3, #625): ONE xrWeaveSubmitDXR carrying up to
++// XR_WEAVE_SUBMIT_MAX_RECTS_DXR rects via the chained XrWeaveSubmitRectsDXR.
++// The input is WINDOW-sized with each rect's SBS content at its own window
++// position (the v3 batch layout; base rect ignored). More rects than the cap
++// chunk into multiple batched calls — the runtime's weave fence is one
++// monotonic timeline, so waiting the LAST chunk's fence value covers all.
++DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchWin(
++    uintptr_t input_handle,
++    const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
++    bool input_is_dxgi) {
++  const size_t rect_count = rects.size();
++  DisplayXRWeaveClient::WeaveSubmitResult result;
++  WeaveClientState& s = State();
++  if (s.session == XR_NULL_HANDLE || !s.submit || rect_count == 0) {
++    return result;  // ok=false: dormant / failed init / nothing to weave
++  }
++  if (s.weave_spec_version < 3) {
++    static bool logged_v2 = false;
++    if (!logged_v2) {
++      logged_v2 = true;
++      VLOG(1) << "[DisplayXR] SubmitBatch on a spec-v" << s.weave_spec_version
++              << " runtime — caller must use the per-element Submit loop";
++    }
++    return result;
++  }
++
++  static bool logged_chunk = false;
++  if (rect_count > XR_WEAVE_SUBMIT_MAX_RECTS_DXR && !logged_chunk) {
++    logged_chunk = true;
++    VLOG(1) << "[DisplayXR] SubmitBatch: " << rect_count
++            << " rects exceed the per-call cap " << XR_WEAVE_SUBMIT_MAX_RECTS_DXR
++            << " — chunking into multiple batched submits";
++  }
++
++  XrRect2Di xr_rects[XR_WEAVE_SUBMIT_MAX_RECTS_DXR];
++  size_t done = 0;
++  while (done < rect_count) {
++    const size_t n =
++        std::min<size_t>(rect_count - done, XR_WEAVE_SUBMIT_MAX_RECTS_DXR);
++    for (size_t i = 0; i < n; ++i) {
++      const DisplayXRWeaveClient::WeaveRect& r = rects[done + i];
++      XrRect2Di& xr = UNSAFE_TODO(xr_rects[i]);
++      xr.offset.x = r.x;
++      xr.offset.y = r.y;
++      xr.extent.width = r.w;
++      xr.extent.height = r.h;
++    }
++
++    XrWeaveSubmitRectsDXR batch = {XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
++    batch.rectCount = static_cast<uint32_t>(n);
++    batch.rects = xr_rects;
++
++    XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
++    in.next = &batch;
++    in.inputTexture = reinterpret_cast<void*>(input_handle);
++    in.inputIsDxgi = input_is_dxgi ? XR_TRUE : XR_FALSE;
++    // Base rect is ignored under the batch chain; keep it zero.
++
++    XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
++    const XrResult sr = s.submit(s.session, &in, &out);
++    if (XR_FAILED(sr)) {
++      static int s_fail = 0;
++      if (s_fail < 3) {
++        ++s_fail;
++        LOG(ERROR) << "[DisplayXR] xrWeaveSubmitDXR(batch n=" << n
++                   << ") failed: " << sr;
++      }
++      result.ok = false;
++      return result;
++    }
++
++    // Handles show up on the first submit / resize; keep whichever chunk
++    // returned them. Scalars (fence value, dims, eyes) track the LAST chunk.
++    result.ok = true;
++    if (out.weavedTexture) {
++      result.woven_handle = reinterpret_cast<uintptr_t>(out.weavedTexture);
++    }
++    if (out.fence) {
++      result.fence_handle = reinterpret_cast<uintptr_t>(out.fence);
++    }
++    result.fence_value = out.fenceValue;
++    result.width = out.width;
++    result.height = out.height;
++    result.eyes_valid = (out.eyesValid == XR_TRUE);
++    result.eyes.clear();
++    if (result.eyes_valid && out.eyeCount > 0) {
++      const uint32_t en = out.eyeCount > XR_WEAVE_MAX_EYES_DXR
++                              ? XR_WEAVE_MAX_EYES_DXR
++                              : out.eyeCount;
++      result.eyes.reserve(en * 3u);
++      for (uint32_t i = 0; i < en; ++i) {
++        const XrVector3f& eye = UNSAFE_TODO(out.eyes[i]);
++        result.eyes.push_back(eye.x);
++        result.eyes.push_back(eye.y);
++        result.eyes.push_back(eye.z);
++      }
++    }
++    done += n;
++  }
++
++  // B3d: cache eyes + the first rect (a representative element) for the
++  // DisplayXRService pull, mirroring the per-element Submit path.
++  s.latest_eyes = result.eyes;
++  s.latest_eyes_valid = result.eyes_valid;
++  const DisplayXRWeaveClient::WeaveRect& r0 = rects[0];
++  s.rect_x = r0.x;
++  s.rect_y = r0.y;
++  s.rect_w = r0.w > 0 ? static_cast<uint32_t>(r0.w) : 0u;
++  s.rect_h = r0.h > 0 ? static_cast<uint32_t>(r0.h) : 0u;
++  s.rect_valid = (r0.w > 0 && r0.h > 0);
++  return result;
++}
++
+ // ---------------------------------------------------------------------------
+ // GPU-process synchronous weave (#625, zero-lag spike).
+ // ---------------------------------------------------------------------------
+@@ -771,6 +903,27 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::Submit(
+ #endif
+ }
+ 
++// static
++DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::SubmitBatch(
++    uintptr_t input_handle,
++    const std::vector<WeaveRect>& rects,
++    bool input_is_dxgi) {
++#if BUILDFLAG(IS_WIN)
++  return SubmitBatchWin(input_handle, rects, input_is_dxgi);
++#else
++  return {};
++#endif
++}
++
++// static
++uint32_t DisplayXRWeaveClient::WeaveSpecVersion() {
++#if BUILDFLAG(IS_WIN)
++  return State().weave_spec_version;
++#else
++  return 0;
++#endif
++}
++
+ // static
+ bool DisplayXRWeaveClient::IsSupported() {
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index e4eada6d612cf..a8e7eb229958f 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -76,6 +76,34 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+                                   int32_t h,
+                                   bool input_is_dxgi = false);
+ 
++  // One window-relative device-pixel rect for SubmitBatch. Kept OpenXR- and
++  // gfx-free so this header stays includable from chromium_code TUs.
++  struct WeaveRect {
++    int32_t x = 0;
++    int32_t y = 0;
++    int32_t w = 0;
++    int32_t h = 0;
++  };
++
++  // Batched weave (XR_DXR_weave spec v3, #625): ONE xrWeaveSubmitDXR carrying
++  // |rects| via a chained XrWeaveSubmitRectsDXR. |input_handle| must be a
++  // WINDOW-sized keyed-mutex texture with each rect's SBS content at that
++  // rect's own window position (the v3 batch input-layout contract — NOT the
++  // per-element atlas Submit() takes). Chunks internally when |rects| exceeds
++  // the extension's per-call cap (each chunk gets its own fence value; the
++  // returned result carries the LAST chunk's fence value, which covers all
++  // earlier chunks on the runtime's single monotonic weave fence). Requires
++  // WeaveSpecVersion() >= 3; returns ok=false otherwise (callers fall back to
++  // per-element Submit() loops). Windows-only; a stub elsewhere.
++  static WeaveSubmitResult SubmitBatch(uintptr_t input_handle,
++                                       const std::vector<WeaveRect>& rects,
++                                       bool input_is_dxgi = false);
++
++  // The XR_DXR_weave spec version the RUNTIME reported at extension
++  // enumeration (0 until initialized / extension absent). >= 3 means the
++  // batched SubmitBatch path is available.
++  static uint32_t WeaveSpecVersion();
++
+   // DisplayXR inline-3D (#625, Step B3d): the display + committed-element
+   // geometry the renderer's off-axis (Kooima) projection needs, delivered via
+   // the renderer<-browser DisplayXRService mojom. OpenXR-free so this header
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index b760f626c5636..ebc5803afa063 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -8,10 +8,13 @@
+ 
+ #include <dxgi1_2.h>
+ 
++#include <algorithm>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
++#include "base/time/time.h"
+ #include "base/win/scoped_handle.h"
+ #include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "content/public/child/child_thread.h"
+@@ -28,6 +31,7 @@ DisplayXRWeaveGpu::~DisplayXRWeaveGpu() {
+   for (auto& [id, in] : inputs_) {
+     ResetInput(in);
+   }
++  ResetInput(shared_input_);
+   // Close any woven/fence handles Viz never took (e.g. process teardown).
+   for (auto& [id, pending] : results_) {
+     if (pending.have) {
+@@ -94,6 +98,8 @@ bool DisplayXRWeaveGpu::EnsureInput(WeaveInput& in,
+     for (auto& [id, other] : inputs_) {
+       ResetInput(other);
+     }
++    ResetInput(shared_input_);
++    batch_mutex_held_ = false;
+     device_ = device;
+     context_.Reset();
+     device_->GetImmediateContext(&context_);
+@@ -199,6 +205,12 @@ bool DisplayXRWeaveGpu::WeaveCanvas(ID3D11Device* device,
+                                     const gfx::Rect& src_rect,
+                                     const gfx::Rect& window_rect,
+                                     uint32_t target_id) {
++  // Batched sync weave (spec v3): copy-only into the shared window-sized
++  // input; the single submit happens in SubmitBatchSync.
++  if (batch_open_) {
++    return BatchCopyCanvas(device, canvas_tex, array_slice, src_rect,
++                           window_rect, target_id);
++  }
+   // Per-target keyed-mutex input: in async mode skip while THIS target's submit
+   // is in flight (its pixels must stay stable until the reply); in sync mode
+   // every target submits every frame (no in-flight, no mojo remote needed).
+@@ -264,6 +276,11 @@ bool DisplayXRWeaveGpu::WeavePixels(ID3D11Device* device,
+                                     uint32_t stride,
+                                     const gfx::Rect& window_rect,
+                                     uint32_t target_id) {
++  // Batched sync weave (spec v3): copy-only into the shared window-sized
++  // input; the single submit happens in SubmitBatchSync.
++  if (batch_open_) {
++    return BatchCopyPixels(device, bgra_pixels, stride, window_rect, target_id);
++  }
+   WeaveInput& in = inputs_[target_id];
+   const bool sync = SyncMode();
+   if ((!sync && (in.in_flight || !weaver_.is_bound())) || window_rect.IsEmpty() ||
+@@ -402,6 +419,265 @@ bool DisplayXRWeaveGpu::SubmitSync(WeaveInput& in,
+   return true;
+ }
+ 
++bool DisplayXRWeaveGpu::BatchMode() const {
++  // Spec v3 is required for the chained rect-array submit; a spec-v2 runtime
++  // keeps the per-target SubmitSync loop (still correct, just N submits).
++  return SyncMode() && DisplayXRWeaveClient::WeaveSpecVersion() >= 3;
++}
++
++void DisplayXRWeaveGpu::BeginBatchSync(const gfx::Size& window_size) {
++  // Defensive: a prior frame that never reached SubmitBatchSync must not leave
++  // the shared input's keyed mutex held.
++  if (batch_mutex_held_ && shared_input_.input_mutex) {
++    shared_input_.input_mutex->ReleaseSync(0);
++  }
++  batch_mutex_held_ = false;
++  batch_open_ = true;
++  batch_size_ = window_size;
++  batch_entries_.clear();
++}
++
++bool DisplayXRWeaveGpu::EnsureBatchInputAndAcquire(ID3D11Device* device,
++                                                   DXGI_FORMAT format) {
++  if (!batch_open_ || batch_size_.IsEmpty() || !device) {
++    return false;
++  }
++  // All of a frame's copies share ONE input; a mid-frame format mismatch would
++  // recreate it under the held mutex and lose the earlier copies. In practice
++  // every canvas copy comes from the same composited output format.
++  if (!batch_entries_.empty() && shared_input_.input_tex &&
++      shared_input_.input_format != format) {
++    static bool logged_fmt = false;
++    if (!logged_fmt) {
++      logged_fmt = true;
++      LOG(ERROR) << "[DisplayXR] batch weave: mixed input formats in one frame ("
++                 << shared_input_.input_format << " vs " << format
++                 << ") — skipping this target";
++    }
++    return false;
++  }
++  if (!EnsureInput(shared_input_, device,
++                   format, static_cast<uint32_t>(batch_size_.width()),
++                   static_cast<uint32_t>(batch_size_.height()))) {
++    return false;
++  }
++  if (!batch_mutex_held_) {
++    if (shared_input_.input_mutex->AcquireSync(0, 1000) != S_OK) {
++      LOG(ERROR) << "[DisplayXR] batch weave: AcquireSync(0) failed";
++      return false;
++    }
++    batch_mutex_held_ = true;
++  }
++  return true;
++}
++
++bool DisplayXRWeaveGpu::BatchCopyCanvas(ID3D11Device* device,
++                                        ID3D11Texture2D* canvas_tex,
++                                        UINT array_slice,
++                                        const gfx::Rect& src_rect,
++                                        const gfx::Rect& window_rect,
++                                        uint32_t target_id) {
++  if (window_rect.IsEmpty() || !device || !canvas_tex) {
++    return false;
++  }
++  D3D11_TEXTURE2D_DESC cd = {};
++  canvas_tex->GetDesc(&cd);
++  if (!EnsureBatchInputAndAcquire(device, cd.Format)) {
++    return false;
++  }
++
++  // Copy the canvas sub-rect into the shared window-sized input AT THE
++  // ELEMENT'S OWN WINDOW POSITION (the v3 batch layout: sample position ==
++  // weave position). Same clamping as the per-target path.
++  D3D11_BOX box = {};
++  box.left = static_cast<UINT>(src_rect.x());
++  box.top = static_cast<UINT>(src_rect.y());
++  box.front = 0;
++  box.right = static_cast<UINT>(src_rect.right());
++  box.bottom = static_cast<UINT>(src_rect.bottom());
++  box.back = 1;
++  if (box.right > cd.Width) {
++    box.right = cd.Width;
++  }
++  if (box.bottom > cd.Height) {
++    box.bottom = cd.Height;
++  }
++  // Keep the copy inside the shared input (window_rect is window-clipped by
++  // the caller; this guards a race with a same-frame window shrink).
++  const uint32_t dst_x = static_cast<uint32_t>(std::max(window_rect.x(), 0));
++  const uint32_t dst_y = static_cast<uint32_t>(std::max(window_rect.y(), 0));
++  if (dst_x >= shared_input_.input_w || dst_y >= shared_input_.input_h) {
++    return false;
++  }
++  const uint32_t max_w = shared_input_.input_w - dst_x;
++  const uint32_t max_h = shared_input_.input_h - dst_y;
++  if (box.right - box.left > max_w) {
++    box.right = box.left + max_w;
++  }
++  if (box.bottom - box.top > max_h) {
++    box.bottom = box.top + max_h;
++  }
++  if (box.right <= box.left || box.bottom <= box.top) {
++    return false;
++  }
++
++  context_->CopySubresourceRegion(shared_input_.input_tex.Get(),
++                                  /*DstSubresource=*/0, dst_x, dst_y,
++                                  /*DstZ=*/0, canvas_tex, array_slice, &box);
++  batch_entries_.push_back({target_id, window_rect});
++  return true;
++}
++
++bool DisplayXRWeaveGpu::BatchCopyPixels(ID3D11Device* device,
++                                        const uint8_t* bgra_pixels,
++                                        uint32_t stride,
++                                        const gfx::Rect& window_rect,
++                                        uint32_t target_id) {
++  if (window_rect.IsEmpty() || !device || !bgra_pixels) {
++    return false;
++  }
++  if (!EnsureBatchInputAndAcquire(device, DXGI_FORMAT_B8G8R8A8_UNORM)) {
++    return false;
++  }
++
++  // Reuse the per-target upload texture (CPU staging) from the inputs_ pool;
++  // in batch mode only the upload fields of that entry are used.
++  WeaveInput& in = inputs_[target_id];
++  const uint32_t w = static_cast<uint32_t>(window_rect.width());
++  const uint32_t h = static_cast<uint32_t>(window_rect.height());
++  if (!in.upload_tex || in.upload_w != w || in.upload_h != h) {
++    in.upload_tex.Reset();
++    D3D11_TEXTURE2D_DESC ud = {};
++    ud.Width = w;
++    ud.Height = h;
++    ud.MipLevels = 1;
++    ud.ArraySize = 1;
++    ud.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    ud.SampleDesc.Count = 1;
++    ud.Usage = D3D11_USAGE_DEFAULT;
++    ud.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++    if (FAILED(device_->CreateTexture2D(&ud, nullptr, &in.upload_tex))) {
++      LOG(ERROR) << "[DisplayXR] batch weave: CreateTexture2D(upload) failed";
++      in.upload_tex.Reset();
++      return false;
++    }
++    in.upload_w = w;
++    in.upload_h = h;
++  }
++  context_->UpdateSubresource(in.upload_tex.Get(), /*DstSubresource=*/0,
++                              /*pDstBox=*/nullptr, bgra_pixels, stride,
++                              /*SrcDepthPitch=*/0);
++  const uint32_t dst_x = static_cast<uint32_t>(std::max(window_rect.x(), 0));
++  const uint32_t dst_y = static_cast<uint32_t>(std::max(window_rect.y(), 0));
++  if (dst_x >= shared_input_.input_w || dst_y >= shared_input_.input_h) {
++    return false;
++  }
++  D3D11_BOX box = {};
++  box.right = std::min(w, shared_input_.input_w - dst_x);
++  box.bottom = std::min(h, shared_input_.input_h - dst_y);
++  box.back = 1;
++  if (box.right == 0 || box.bottom == 0) {
++    return false;
++  }
++  context_->CopySubresourceRegion(shared_input_.input_tex.Get(),
++                                  /*DstSubresource=*/0, dst_x, dst_y,
++                                  /*DstZ=*/0, in.upload_tex.Get(), 0, &box);
++  batch_entries_.push_back({target_id, window_rect});
++  return true;
++}
++
++bool DisplayXRWeaveGpu::SubmitBatchSync() {
++  if (!batch_open_) {
++    return false;
++  }
++  batch_open_ = false;
++  const bool had_copies = batch_mutex_held_ && !batch_entries_.empty();
++  if (batch_mutex_held_) {
++    // Hand the input to the service in the "caller done writing" state.
++    context_->Flush();
++    shared_input_.input_mutex->ReleaseSync(0);
++    batch_mutex_held_ = false;
++  }
++  if (!had_copies) {
++    return false;
++  }
++
++  // #625 phase-snap (CEF parity): once per batch frame, like the per-target
++  // path did once per submit.
++  DisplayXRWeaveClient::SnapWindowIfMoved();
++
++  std::vector<DisplayXRWeaveClient::WeaveRect> rects;
++  rects.reserve(batch_entries_.size());
++  for (const BatchEntry& e : batch_entries_) {
++    rects.push_back({e.rect.x(), e.rect.y(), e.rect.width(), e.rect.height()});
++  }
++
++  const base::TimeTicks t0 = base::TimeTicks::Now();
++  DisplayXRWeaveClient::WeaveSubmitResult sr = DisplayXRWeaveClient::SubmitBatch(
++      reinterpret_cast<uintptr_t>(shared_input_.input_handle), rects,
++      /*input_is_dxgi=*/true);
++  const base::TimeDelta dt = base::TimeTicks::Now() - t0;
++  if (!sr.ok) {
++    static int s_fail = 0;
++    if (s_fail < 3) {
++      ++s_fail;
++      LOG(ERROR) << "[DisplayXR] batch weave submit failed (n=" << rects.size()
++                 << ")";
++    }
++    return false;
++  }
++  // Throttled batch-cost telemetry: this ONE call replaced n serialized ~1 ms
++  // submits — the number that lifts the visible-element ceiling.
++  static base::TimeTicks s_last_log;
++  if (base::TimeTicks::Now() - s_last_log > base::Seconds(5)) {
++    s_last_log = base::TimeTicks::Now();
++    VLOG(1) << "[DisplayXR] batch weave: n=" << rects.size() << " in "
++            << dt.InMicroseconds() << "us (one submit) " << sr.width << "x"
++            << sr.height << " eyes_valid=" << sr.eyes_valid;
++  }
++
++  // Store one result per target, exactly as SubmitSync stores per submit, so
++  // Viz's Phase-B import/draw path is unchanged. The fresh woven/fence handles
++  // (first submit / resize) ride on the FIRST entry; every other entry carries
++  // handle 0 = reuse the imported shared texture — Phase B already imports the
++  // window-sized woven output once and draws each rect's region from it.
++  bool first = true;
++  for (const BatchEntry& e : batch_entries_) {
++    PendingResult& pending = results_[e.target_id];
++    Result r;
++    r.ok = true;
++    r.fence_value = sr.fence_value;
++    r.width = sr.width;
++    r.height = sr.height;
++    if (first) {
++      first = false;
++      if (sr.woven_handle) {
++        r.woven_handle = sr.woven_handle;
++      }
++      if (sr.fence_handle) {
++        r.fence_handle = sr.fence_handle;
++      }
++    }
++    // Carry a still-pending fresh handle forward (same texture) so Viz never
++    // misses an import — mirrors SubmitSync/OnWeaveReply.
++    if (!r.woven_handle && pending.have) {
++      r.woven_handle = pending.result.woven_handle;
++      pending.result.woven_handle = 0;
++    }
++    if (!r.fence_handle && pending.have) {
++      r.fence_handle = pending.result.fence_handle;
++      pending.result.fence_handle = 0;
++    }
++    if (pending.have) {
++      CloseResultHandles(pending.result);
++    }
++    pending.result = r;
++    pending.have = true;
++  }
++  batch_entries_.clear();
++  return true;
++}
++
+ void DisplayXRWeaveGpu::OnWeaveReply(uint32_t target_id,
+                                      mojom::DisplayXRWeaveResultPtr result) {
+   // Clear THIS target's in-flight guard (its input is free to refill next frame).
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index eea2c4667724b..6ee4c94d15dea 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -15,6 +15,7 @@
+ #include <wrl/client.h>
+ 
+ #include <cstdint>
++#include <vector>
+ 
+ #include "base/containers/flat_map.h"
+ #include "base/memory/weak_ptr.h"
+@@ -22,6 +23,7 @@
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
+ 
+ namespace displayxr {
+ 
+@@ -62,6 +64,14 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+                    uint32_t target_id) override;
+   bool TryTakeWovenResult(uint32_t target_id, Result* out) override;
+   void PruneTargets(size_t count) override;
++  // Batched sync weave (spec v3, #625): one shared window-sized input, ONE
++  // xrWeaveSubmitDXR per frame carrying every visible rect. BatchMode() is
++  // true iff the GPU-owned sync session is live AND the runtime reported
++  // XR_DXR_weave spec >= 3; a spec-v2 runtime falls back to the per-target
++  // SubmitSync loop untouched.
++  bool BatchMode() const override;
++  void BeginBatchSync(const gfx::Size& window_size) override;
++  bool SubmitBatchSync() override;
+ 
+  private:
+   // Per-target weave SBS input (one entry per inline-3d element, keyed by
+@@ -129,6 +139,25 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   // Close + reset |in|'s owned keyed-mutex input + NT handle.
+   static void ResetInput(WeaveInput& in);
+ 
++  // Batched sync weave internals. WeaveCanvas/WeavePixels route here while a
++  // batch frame is open (batch_open_): copy the target's SBS sub-rect into the
++  // ONE window-sized shared input AT ITS OWN window position and record the
++  // (target_id, rect) entry — no submit until SubmitBatchSync. The shared
++  // input's keyed mutex is acquired on the frame's first copy and released in
++  // SubmitBatchSync just before the (single) submit.
++  bool EnsureBatchInputAndAcquire(ID3D11Device* device, DXGI_FORMAT format);
++  bool BatchCopyCanvas(ID3D11Device* device,
++                       ID3D11Texture2D* canvas_tex,
++                       UINT array_slice,
++                       const gfx::Rect& src_rect,
++                       const gfx::Rect& window_rect,
++                       uint32_t target_id);
++  bool BatchCopyPixels(ID3D11Device* device,
++                       const uint8_t* bgra_pixels,
++                       uint32_t stride,
++                       const gfx::Rect& window_rect,
++                       uint32_t target_id);
++
+   // Close any owned Win32 handles carried in |r| (un-taken woven result).
+   static void CloseResultHandles(Result& r);
+ 
+@@ -144,9 +173,24 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   base::flat_map<uint32_t, PendingResult> results_;
+ 
+   // Per-target keyed-mutex SBS input pool, keyed by target_id. Pruned by
+-  // PruneTargets when the inline-3d rect count shrinks.
++  // PruneTargets when the inline-3d rect count shrinks. In batch mode only
++  // each entry's |upload_tex| is used (the WeavePixels CPU staging path); the
++  // shared window-sized input below replaces the per-target shared textures.
+   base::flat_map<uint32_t, WeaveInput> inputs_;
+ 
++  // Batched sync weave (spec v3): the ONE window-sized legacy-DXGI keyed-mutex
++  // input every visible target's sub-rect is copied into (at its own window
++  // position) each frame, plus the per-frame batch bookkeeping.
++  struct BatchEntry {
++    uint32_t target_id = 0;
++    gfx::Rect rect;  // window-relative device px
++  };
++  WeaveInput shared_input_;
++  bool batch_open_ = false;        // BeginBatchSync..SubmitBatchSync bracket
++  bool batch_mutex_held_ = false;  // shared input's keyed mutex held (key 0)
++  gfx::Size batch_size_;           // window client size this batch frame
++  std::vector<BatchEntry> batch_entries_;
++
+   // The Viz GPU-main D3D11 device (device X, == the canvas SharedImage's device)
+   // the inputs live on, plus its immediate context (used for the canvas->input
+   // copy + keyed-mutex acquire/release). Held to detect a device change. Each
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+index c49902cf79a9e..f0f19ae18958a 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.cc
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -14,6 +14,18 @@ namespace {
+ DisplayXRWeaveProvider* g_provider = nullptr;
+ }  // namespace
+ 
++// Batched sync weave defaults: off unless the provider implements the spec-v3
++// shared-input batch (DisplayXRWeaveGpu); the per-target flow applies then.
++bool DisplayXRWeaveProvider::BatchMode() const {
++  return false;
++}
++
++void DisplayXRWeaveProvider::BeginBatchSync(const gfx::Size& window_size) {}
++
++bool DisplayXRWeaveProvider::SubmitBatchSync() {
++  return false;
++}
++
+ void SetDisplayXRWeaveProvider(DisplayXRWeaveProvider* p) {
+   g_provider = p;
+ }
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index f9e706e7c44d0..ab0f0b6f224bf 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -15,6 +15,7 @@
+ 
+ #include "components/viz/service/viz_service_export.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
+ 
+ namespace viz {
+ 
+@@ -96,6 +97,23 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   // Close + drop any stored woven results for target ids >= |count| (canvas
+   // removed / rect count shrank), so their handles are not leaked.
+   virtual void PruneTargets(size_t count) = 0;
++
++  // Batched sync weave (XR_DXR_weave spec v3, #625): ONE runtime submit per
++  // frame carrying every visible rect, replacing N serialized ~1 ms sync
++  // submits. When BatchMode() is true the caller brackets Phase A with:
++  //   BeginBatchSync(window_size);           // opens the frame's batch
++  //   WeaveCanvas/WeavePixels per target;    // copy-only: each target's SBS
++  //                                          // sub-rect lands in ONE shared
++  //                                          // window-sized input AT ITS OWN
++  //                                          // window position; no submit
++  //   SubmitBatchSync();                     // one synchronous submit for all
++  // Results land per target exactly as before — TryTakeWovenResult/Phase B are
++  // unchanged (the shared woven output was already the model). BatchMode() is
++  // false on spec-v2 runtimes or in async mode; the per-target flow above then
++  // applies untouched.
++  virtual bool BatchMode() const;
++  virtual void BeginBatchSync(const gfx::Size& window_size);
++  virtual bool SubmitBatchSync();
+ };
+ 
+ // Register / fetch the process-global provider (GPU process, GPU main thread).
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index d147be01db680..3b750a23e820c 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3051,17 +3051,30 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // per-target SubmitInFlight(t) gate skips only a target whose prior submit has
+   // not yet replied (its input must stay stable until then). This kills the old
+   // ~N-frame round-robin lag — each element re-weaves every frame.
++  //
++  // Batched sync weave (spec v3, #625): in batch mode WeaveCanvas/WeavePixels
++  // (inside attempt_submit) only COPY each target's sub-rect into the
++  // provider's ONE shared window-sized input at its own window position, and
++  // the single SubmitBatchSync below replaces the N serialized ~1 ms sync
++  // submits — the change that lifts the ~8-12 visible-element ceiling.
++  const bool batch = provider->BatchMode();
++  if (batch) {
++    provider->BeginBatchSync(window_bounds.size());
++  }
+   for (size_t t = 0; t < inline_3d_rects_.size(); ++t) {
+     gfx::Rect probe = inline_3d_rects_[t];
+     probe.Intersect(window_bounds);
+     if (probe.IsEmpty()) {
+       continue;
+     }
+-    if (provider->SubmitInFlight(static_cast<uint32_t>(t))) {
++    if (!batch && provider->SubmitInFlight(static_cast<uint32_t>(t))) {
+       continue;
+     }
+     attempt_submit(t);
+   }
++  if (batch) {
++    provider->SubmitBatchSync();
++  }
+ 
+   // ---- (B) Draw back the accumulated window-sized woven output ----
+   // The runtime weaves EVERY submitted sub-rect into ONE window-sized handback
+diff --git a/third_party/displayxr/include/openxr/XR_DXR_weave.h b/third_party/displayxr/include/openxr/XR_DXR_weave.h
+index eb387362fa321..8786abb535f28 100644
+--- a/third_party/displayxr/include/openxr/XR_DXR_weave.h
++++ b/third_party/displayxr/include/openxr/XR_DXR_weave.h
+@@ -6,7 +6,8 @@
+ // Khronos OpenXR registry: extension numbers and XrStructureType values sit
+ // in a provisional experimental block (1004999xxx) pending official
+ // assignment. Extension names are expected to be stable; numeric values are
+-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
++// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
++// interface history did not restart with the name).
+ // See GOVERNANCE.md.
+ //
+ /*!
+@@ -75,6 +76,31 @@
+  *
+  * Only the rect's offset (top-left) is snapped; the extent passes through
+  * unchanged. This is a synchronous, GPU-free query — no texture, no fence.
++ *
++ * Batched submit (SPEC_VERSION 3, issue #625). Per-element submits serialize
++ * the per-call fixed cost (IPC round-trip + shared-texture open + keyed-mutex
++ * + fence) N times per frame, which caps a page at ~8-12 visible weaved
++ * elements. Version 3 amortizes that to ONE submit per frame: chain an
++ * XrWeaveSubmitRectsDXR onto XrWeaveSubmitInfoDXR::next carrying up to
++ * XR_WEAVE_SUBMIT_MAX_RECTS_DXR rects. The chained struct SWITCHES the input
++ * layout contract:
++ *
++ *  - Chain absent (v2 behavior, unchanged): @c inputTexture is an
++ *    element-sized 2x1 SBS atlas for the single @c rect; the whole texture is
++ *    the atlas (left view = left half).
++ *  - Chain present (batch): @c inputTexture is sized to the bound window's
++ *    client area, and each rect's pre-weave SBS content sits in it AT THAT
++ *    RECT'S OWN WINDOW POSITION (identity mapping: sample position == weave
++ *    position; each rect region itself holds squeezed SBS, left view in the
++ *    left half of the rect). The base @c rect field is ignored.
++ *
++ * All rects weave into the same window-sized output with ONE fence signal at
++ * the end; eyes are returned once per call. A batch is NOT equivalent to N
++ * single-rect submits of the same texture — the layouts differ (see above).
++ *
++ * Version history: 1 = initial (pre-rename numbering carried over); 2 =
++ * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
++ * submit.
+  */
+ #ifndef XR_DXR_WEAVE_H
+ #define XR_DXR_WEAVE_H 1
+@@ -87,18 +113,24 @@ extern "C" {
+ #endif
+ 
+ #define XR_DXR_weave 1
+-#define XR_DXR_weave_SPEC_VERSION 1
++#define XR_DXR_weave_SPEC_VERSION 3
+ #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
+ 
+-// Reserved 1004999190..191. Final values reconcile with the Khronos registry
++// Reserved 1004999190..192. Final values reconcile with the Khronos registry
+ // before spec freeze. Allocation registry: README.md in this directory.
+-#define XR_TYPE_WEAVE_SUBMIT_INFO_DXR ((XrStructureType)1004999190)
+-#define XR_TYPE_WEAVE_OUTPUT_DXR      ((XrStructureType)1004999191)
++#define XR_TYPE_WEAVE_SUBMIT_INFO_DXR  ((XrStructureType)1004999190)
++#define XR_TYPE_WEAVE_OUTPUT_DXR       ((XrStructureType)1004999191)
++#define XR_TYPE_WEAVE_SUBMIT_RECTS_DXR ((XrStructureType)1004999192)
+ 
+ //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
+ //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
+ #define XR_WEAVE_MAX_EYES_DXR 8
+ 
++//! Upper bound on rects carried by one XrWeaveSubmitRectsDXR (sized so the
++//! runtime's IPC message stays within its fixed buffer). Callers with more
++//! visible elements split into multiple batched submits.
++#define XR_WEAVE_SUBMIT_MAX_RECTS_DXR 32
++
+ /*!
+  * @brief Per-frame weave submission for one window sub-rect.
+  *
+@@ -121,6 +153,28 @@ typedef struct XrWeaveSubmitInfoDXR {
+     XrRect2Di                rect;         //!< window-relative sub-rect, device px (y-down)
+ } XrWeaveSubmitInfoDXR;
+ 
++/*!
++ * @brief Batched weave submission — N window sub-rects in ONE call (spec v3).
++ *
++ * Chain onto XrWeaveSubmitInfoDXR::next. When present it switches the input
++ * layout contract (see the file header): @c inputTexture must be sized to the
++ * bound window's client area with each rect's pre-weave SBS content placed at
++ * that rect's own window position; the base struct's @c rect is ignored. Each
++ * rect region holds squeezed SBS (left view in the rect's left half). The
++ * runtime weaves every rect into the shared window-sized output and signals
++ * the fence ONCE after the last rect.
++ *
++ * @c rectCount must be 1..XR_WEAVE_SUBMIT_MAX_RECTS_DXR; callers with more
++ * visible elements split into multiple batched submits (each with its own
++ * fence value; waiting the last covers all).
++ */
++typedef struct XrWeaveSubmitRectsDXR {
++    XrStructureType          type;      //!< XR_TYPE_WEAVE_SUBMIT_RECTS_DXR
++    const void* XR_MAY_ALIAS next;
++    uint32_t                 rectCount; //!< 1..XR_WEAVE_SUBMIT_MAX_RECTS_DXR
++    const XrRect2Di*         rects;     //!< window-relative sub-rects, device px (y-down)
++} XrWeaveSubmitRectsDXR;
++
+ /*!
+  * @brief Weaved output handed back to the present-owner.
+  *
+-- 
+2.42.0.windows.2
+

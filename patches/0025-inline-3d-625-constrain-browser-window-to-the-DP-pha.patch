@@ -1,7 +1,7 @@
 From be01cb3f7e93c300ed2b88a5d379bcfe0df53db0 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 13 Jul 2026 10:51:12 -0700
-Subject: [PATCH 25/26] inline-3d(#625): constrain browser window to the DP
+Subject: [PATCH 25/27] inline-3d(#625): constrain browser window to the DP
  phase grid during a drag
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
