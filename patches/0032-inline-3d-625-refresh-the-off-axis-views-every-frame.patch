@@ -1,0 +1,64 @@
+From 93569f42ebb00ebea634cdf33d666810ea9b458d Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 17:16:31 -0700
+Subject: [PATCH 32/39] inline-3d(#625): refresh the off-axis views every frame
+ (the real mono-fallback cause)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The inline-3d session was permanently stuck on its mono fallback — one view,
+eye "none", at the origin — so a rendered scene showed no cube (z=0 content
+sits exactly at the camera and is clipped) and no look-around.
+
+UpdateInlineView() holds BOTH the async eye pull and the 2-view gate, but it
+is only reached from UpdateViews() (device-driven, never fires for a
+sensorless inline session) or a canvas/render-state change. So the eye pull
+ran once at setup, the gate was evaluated once (necessarily before any eyes
+existed: eyes_valid=0 info=0) and NEVER revisited. Tracked eyes arriving
+milliseconds later were delivered correctly and then ignored forever.
+
+Drive it from XRSession::OnFrame's inline-3d branch — that early-returning
+shortcut IS this session type's per-frame path (it runs the page's rAF and
+ReportInline3DRects; there is no base layer / frame transport, so the normal
+machinery below is skipped). Refresh before the callbacks so this frame's
+getViewerPose() sees fresh views. This is exactly what UpdateInlineView's own
+contract assumes ("kick off the async eye pull for the next frame and build
+this frame from the latest cached eyes").
+
+Instrumented evidence (tag+31 diag): the eye feed was healthy end to end —
+GPU "GPU->browser eyes: bound=1 n=6 valid=1", browser "browser cached GPU
+eyes: n=6 valid=1" — while the renderer's gate logged exactly ONCE with
+eyes_valid=0 info=0. That one-shot log is what exposed the missing per-frame
+drive; UpdatePresentationFrameState (tried first) is not on the inline-3d
+path at all.
+---
+ third_party/blink/renderer/modules/xr/xr_session.cc | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 08eeaf98d6c0e..db718f01ace91 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -2247,6 +2247,18 @@ void XRSession::OnFrame(double timestamp,
+       if (visibility_state_ == XRVisibilityState::HIDDEN) {
+         return;
+       }
++      // Refresh the off-axis views BEFORE the page's rAF runs, so this frame's
++      // getViewerPose() sees views built from the latest tracked eyes (and the
++      // pull for the next frame is kicked off). This shortcut IS the inline-3d
++      // frame path — UpdateInlineView is otherwise only reached from
++      // UpdateViews (device-driven, never for a sensorless inline session) or a
++      // canvas/render-state change, so the eye pull fired exactly once, at
++      // setup, before any eyes existed; the 2-view gate was evaluated once with
++      // eyes_valid=0 and never revisited, leaving the session pinned to its
++      // mono fallback (one view at the origin => z=0 scene content sits at the
++      // camera and is clipped, and no look-around) no matter that tracked eyes
++      // arrived milliseconds later.
++      UpdateInlineView();
+       CHECK(animation_frame_ == nullptr);
+       animation_frame_ = CreatePresentationFrame(true);
+       {
+-- 
+2.42.0.windows.2
+

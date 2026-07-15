@@ -1,0 +1,68 @@
+From ab2d5e2d1f7448a46498adcd275e03cd0480311b Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 22:02:43 -0700
+Subject: [PATCH 37/39] inline-3d(#625): start the frame loop when the first
+ display layer registers
+
+Every page load showed ~10-13s of horizontally smeared tiles -- photos and the
+three.js scene alike, content unrecognisable -- that cleared "once you clicked
+the page". The XR session's frame loop was simply never starting: an instrumented
+Inline3D._frame counter sat at 0 for 30 seconds on a fresh load while
+document.requestAnimationFrame ticked normally throughout.
+
+MaybeRequestFrame() treats an inline-3d session's display layers as its valid
+render state:
+
+    if (is_inline_3d_ && !display_layers_.empty()) will_have_valid_render_state = true;
+
+But apps request their first animation frame at session setup, BEFORE adding any
+window -- our SDK does it in the Inline3D constructor -- so display_layers_ is
+empty and MaybeRequestFrame correctly declines. The layers then arrive via
+addImage()/addScene(), and nothing re-ran MaybeRequestFrame. The loop stayed dead
+until something unrelated happened to call it: a focus blip through
+UpdateVisibilityState is the usual one, which is exactly why interacting with the
+page "fixed" it, and why the stall length was arbitrary.
+
+Registering the first display layer is what makes an inline-3d session
+renderable, so it must kick the loop -- the same rationale, and the same one-line
+remedy, as the MaybeRequestFrame() call at the end of UpdateVisibilityState.
+
+Why a dead loop SMEARS rather than freezing: the app repaints its canvases from
+its rAF callback (the SDK does this deliberately -- see inline3d.js _frame: "a
+canvas that isn't redrawn can have its layer dropped from the aggregated frame,
+so the weave reads a stale sub-rect and the window flickers to a horizontal
+smear"). No frames means no repaints, the canvas layers drop out of the
+aggregated frame, Viz's per-target copy fails, and the batch collapses to n=1 of
+6 rects -- confirmed in the service log, which showed `weave split: n=1` for 13s
+before jumping to n=6 once the loop finally started.
+---
+ third_party/blink/renderer/modules/xr/xr_session.cc | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 2f3d77e502979..760c700a37891 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -2615,6 +2615,19 @@ void XRSession::OnInline3DViews(
+ 
+ void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
+   display_layers_.insert(layer);
++  // An inline-3d session's valid render state IS its display layers (see
++  // MaybeRequestFrame), so registering the FIRST one is what makes the session
++  // renderable — exactly like a base layer arriving. Kick the frame loop, or it
++  // never starts: apps request their first animation frame at session setup,
++  // before adding any window, and MaybeRequestFrame correctly declines then
++  // (no layers => no valid render state). Nothing re-ran it afterwards, so the
++  // loop stayed dead until something unrelated happened to call it — a focus
++  // blip via UpdateVisibilityState, say. That is the "blurred until you click
++  // the page" startup smear: with no frames the app never repaints its
++  // canvases, their layers drop out of the aggregated frame, and the weave
++  // reads stale sub-rects. Same rationale as the MaybeRequestFrame() call in
++  // UpdateVisibilityState.
++  MaybeRequestFrame();
+ }
+ 
+ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
+-- 
+2.42.0.windows.2
+

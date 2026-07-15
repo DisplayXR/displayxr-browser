@@ -1,0 +1,65 @@
+From 55caa1c8e16f4a6036d164c6c4c82ad3a155dccc Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 22:55:59 -0700
+Subject: [PATCH 39/39] inline-3d(#625): keep rendering while the page is
+ visible but unfocused
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Clicking away from the browser made the 3D windows smear in place — the same
+stale-sub-rect corruption as the startup case, with a different trigger.
+
+UpdateVisibilityState forces an inline session to HIDDEN whenever the frame
+loses focus, and MaybeRequestFrame refuses frames while HIDDEN. For an ordinary
+inline session that is exactly right: no focus, no poses to script. But an
+inline-3d session's output is not a pose handed to script, it is PIXELS ON THE
+PANEL. Its frames drive the app's canvas repaints, and the compositor weaves
+whatever those canvases last held — so stopping them drops the canvas layers out
+of the aggregated frame and the weave starts reading stale sub-rects. The user
+sees content they are still looking at visibly corrupt, because they clicked
+another window. Visible-but-unfocused is the normal state of a 3D display
+sitting alongside other apps.
+
+So exempt inline-3d from the focus gate; document visibility still governs.
+
+The exposure this opens is narrower than it looks: an unfocused inline-3d page
+keeps receiving eye-derived views, but it is on-screen and already having its
+content woven from those same eyes, and a genuinely hidden page stops regardless
+— inline frames ride the document's rAF, which Blink throttles for background
+tabs.
+---
+ .../blink/renderer/modules/xr/xr_session.cc     | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 069d36dfe271d..35c0b29efce4c 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -1754,7 +1754,22 @@ void XRSession::UpdateVisibilityState() {
+   // because while the runtime reports us as focused the content owned by the
+   // session should be focued, which is owned by the document. For inline, we
+   // can and must rely on frame focus.
+-  if (!immersive() && !xr_->IsFrameFocused()) {
++  //
++  // ...except for inline-3d (#625), where the session's output is not a pose
++  // handed to script but PIXELS ON THE GLASSES-FREE-3D PANEL. Its frames drive
++  // the app's canvas repaints, and the compositor weaves whatever those
++  // canvases last held: stop the frames and the canvas layers fall out of the
++  // aggregated frame, so the weave reads stale sub-rects and the page's 3D
++  // windows visibly smear. Merely clicking another window would corrupt content
++  // the user is still looking at. Visible-but-unfocused is the normal state of
++  // a 3D display alongside other apps, so keep rendering.
++  //
++  // This does mean an unfocused inline-3d page keeps receiving eye-derived
++  // views. That is a narrower exposure than it looks: the page is on-screen and
++  // already having its content woven from those same eyes, and a genuinely
++  // hidden page stops anyway — inline frames ride the document's rAF, which
++  // Blink throttles for background tabs.
++  if (!immersive() && !is_inline_3d_ && !xr_->IsFrameFocused()) {
+     state = XRVisibilityState::HIDDEN;
+   }
+ 
+-- 
+2.42.0.windows.2
+

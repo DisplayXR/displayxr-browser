@@ -1,0 +1,44 @@
+From 05cac5611eb0e8aefaa0b9b0f4a33a2cf5d3acc1 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 17:42:36 -0700
+Subject: [PATCH 34/39] TEMP DIAG (#625): log inline-3d element geometry units
+
+Which units element_display_rect actually arrives in (device vs logical px),
+the dsf, the normalised rect, the display px, and the derived element height
++ m2v. Measured eye z is exactly 2.5x (the DPI scale) off expected, so the
+two rect sources (submitted weave rect vs the scene-layer rect) disagree on
+units. Drop with the other diag.
+---
+ .../blink/renderer/modules/xr/xr_session.cc      | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 4c0f82473417d..5dec6ad41cd76 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -2729,6 +2729,22 @@ void XRSession::UpdateInline3DViews() {
+   if (dsf > 0.0) {
+     er_f.Scale(static_cast<float>(1.0 / dsf));
+   }
++  // TEMP DIAG (#625): which units actually arrive, and what geometry we derive.
++  {
++    static int s_geo_log = 0;
++    if (s_geo_log < 8) {
++      ++s_geo_log;
++      const gfx::Rect& raw = di.element_display_rect;
++      VLOG(1) << "[DisplayXR] inline3d geom: raw_er=" << raw.x() << "," << raw.y()
++              << " " << raw.width() << "x" << raw.height() << " dsf=" << dsf
++              << " er_f=" << er_f.width() << "x" << er_f.height()
++              << " disp_px=" << di.display_width_px << "x" << di.display_height_px
++              << " pixel_m=" << pixel_m
++              << " elem_h_m=" << (er_f.height() * pixel_m)
++              << " vdh=" << inline_3d_virtual_display_height_
++              << " scene_layer=" << (inline_3d_scene_layer_ ? 1 : 0);
++    }
++  }
+ 
+   // Element rect centre offset from the display centre + half-size, in
+   // display-space metres (+x right, +y up; screen y is top-down).
+-- 
+2.42.0.windows.2
+
