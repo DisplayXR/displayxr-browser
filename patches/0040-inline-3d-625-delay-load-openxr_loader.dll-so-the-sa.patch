@@ -1,4 +1,4 @@
-From cccbe8b9cd2d05be9b41e77fa074d751627f847e Mon Sep 17 00:00:00 2001
+From 70b64ba67c35527f916ea279e7c91253263ac115 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 15 Jul 2026 14:56:17 -0700
 Subject: [PATCH 40/40] inline-3d(#625): delay-load openxr_loader.dll so the
@@ -7,71 +7,80 @@ MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-A patched non-component build never showed a browser window (displayxr-browser#15).
-The cause is one line of link config, and nothing of ours had to run: with zero
-flags set, chrome.dll's import table alone did it.
+A patched non-component build never showed a browser window (displayxr-browser#15),
+and nothing of ours had to run: with zero flags set, chrome.dll's import table
+alone did it.
 
-third_party/displayxr's openxr_loader_link config linked the loader's import lib
-plainly. In a component build that import lands in the weave_client DLL, which
-only the browser and GPU processes ever load. In a non-component build every
+In a component build the OpenXR loader import lands in the weave_client DLL,
+which only the browser and GPU processes load. In a non-component build every
 component collapses into chrome.dll, so chrome.dll itself imports
-openxr_loader.dll — and every process must then resolve it at load time. The
-renderer is sandboxed (low integrity, restricted token) and cannot load a DLL
-outside its policy, so it died before running any Blink code.
+openxr_loader.dll — and every process must resolve it at load time. The renderer
+is sandboxed (low integrity, restricted token) and cannot load a DLL outside its
+policy, so it died before running any Blink code. Measured against vanilla on the
+same box: identical browser/gpu/utility/crashpad counts, 3 renderers vs our 0;
+--no-sandbox brought 4 renderers back, isolating the sandbox from a crash. Zero
+renderers is what produced the symptom — the toolbar WebUI JS never ran, so
+BrowserView::Show()'s deferred-show gate never released.
 
-Measured against vanilla upstream on the same machine, same staging, same ACLs:
-identical browser/gpu/utility/crashpad counts, and 3 renderers vs our 0.
---no-sandbox brought 4 renderers back, which isolates the sandbox from a crash.
+The fix delay-loads the loader so it resolves on the first xr* call. Renderers
+never make one; the browser (unsandboxed) and GPU (weave inits pre-sandbox in
+gpu_main.cc) processes that do are safe.
 
-Zero renderers is what produced the reported symptom. The toolbar WebUI's JS
-never ran, so it never reached app.ts:335 onPageInitialized(), so
-InitialWebUIManager::OnWebUIToolbarLoaded() never fired, so the RequestDeferShow
-gate at the top of BrowserView::Show() never released and the window stayed
-hidden forever. The frame pumping messages and Viz never drawing were both
-downstream of the same emptiness.
-
-Delay-loading resolves on the first xr* call instead. Renderers never make one.
-The two processes that do are both safe: the browser is unsandboxed, and the GPU
-process creates its weave session pre-sandbox in gpu_main.cc, which is exactly
-when the delay-load fires.
+Placement matters: a /DELAYLOAD ldflag in third_party/displayxr's link config does
+NOT reach chrome.dll — `libs` propagate transitively to the final link
+automatically, but a config's `ldflags` only propagate through an unbroken
+public_configs chain, which breaks before chrome.dll. So the entry lives in
+//build/config/win:delayloads_except_dbghelp, alongside d3d11/dxgi/dcomp, which
+chrome_dll pulls in directly.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- third_party/displayxr/BUILD.gn | 18 ++++++++++++++++++
- 1 file changed, 18 insertions(+)
+ build/config/win/BUILD.gn      | 10 ++++++++++
+ third_party/displayxr/BUILD.gn | 10 ++++++++++
+ 2 files changed, 20 insertions(+)
 
+diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
+index 101c2339697ca..f00fed5c7e01a 100644
+--- a/build/config/win/BUILD.gn
++++ b/build/config/win/BUILD.gn
+@@ -433,6 +433,16 @@ config("delayloads_except_dbghelp") {
+     "/DELAYLOAD:netapi32.dll",
+     "/DELAYLOAD:ncrypt.dll",
+     "/DELAYLOAD:ole32.dll",
++
++    # DisplayXR inline-3D (#625, displayxr-browser#15): the vendored OpenXR
++    # loader. Only the browser and GPU processes ever call an xr* function; in a
++    # non-component build chrome.dll's static import of it would otherwise force
++    # the sandboxed renderer to resolve the DLL at load time, which it cannot do
++    # (low integrity, restricted token) — the renderer dies before running any
++    # Blink code and the browser window never shows. Delay-loading resolves it on
++    # first use instead, exactly like the d3d11/dxgi/dcomp entries above.
++    "/DELAYLOAD:openxr_loader.dll",
++
+     "/DELAYLOAD:oleacc.dll",
+     "/DELAYLOAD:oleaut32.dll",
+     "/DELAYLOAD:pdh.dll",
 diff --git a/third_party/displayxr/BUILD.gn b/third_party/displayxr/BUILD.gn
-index 3ecafc90fb7c5..b647c9ab8ab94 100644
+index 3ecafc90fb7c5..0b91c0057a95e 100644
 --- a/third_party/displayxr/BUILD.gn
 +++ b/third_party/displayxr/BUILD.gn
-@@ -16,9 +16,27 @@ config("openxr_headers") {
+@@ -16,6 +16,16 @@ config("openxr_headers") {
  
  # Link the prebuilt OpenXR loader import lib (CRT-neutral). lib_dirs is resolved
  # relative to this BUILD.gn directory.
 +#
-+# DELAYLOAD is load-bearing, not an optimization (displayxr-browser#15). A plain
-+# import puts openxr_loader.dll in the import table of whatever links this. In a
-+# component build that is only the weave_client DLL, which just the browser and
-+# GPU processes ever load. In a NON-component build every component collapses
-+# into chrome.dll, so chrome.dll itself imports the loader — and then EVERY
-+# process resolves it at load time, including the renderer, which is sandboxed
-+# (low integrity, restricted token) and cannot load a DLL outside its policy. It
-+# dies before running any Blink code, leaving zero renderers and, downstream, a
-+# browser window that never shows.
-+#
-+# Delay-loading resolves on the first xr* call instead. Renderers never make one.
-+# The two processes that do are both safe: the browser is unsandboxed, and the
-+# GPU process creates its weave session pre-sandbox in gpu_main.cc (#625), which
-+# is exactly when the delay-load fires.
++# NOTE (displayxr-browser#15): openxr_loader.dll MUST be delay-loaded in a
++# non-component build, or chrome.dll's static import of it kills the sandboxed
++# renderer at load time (it can't load a DLL outside its policy) — zero
++# renderers, and the browser window never shows. A /DELAYLOAD ldflag here does
++# NOT work: `libs` propagate transitively to chrome.dll's link automatically, but
++# a config's `ldflags` only propagate through an unbroken public_configs chain,
++# which breaks before chrome.dll. So the delay-load lives where it is guaranteed
++# to reach the final link — //build/config/win:delayloads_except_dbghelp,
++# alongside d3d11/dxgi/dcomp — which chrome_dll pulls in directly.
  config("openxr_loader_link") {
    libs = [ "openxr_loader.lib" ]
    lib_dirs = [ "lib" ]
-+  if (is_win) {
-+    ldflags = [ "/DELAYLOAD:openxr_loader.dll" ]
-+  }
- }
- 
- # Depend on this to compile against + link the OpenXR loader.
 -- 
 2.42.0.windows.2
 
