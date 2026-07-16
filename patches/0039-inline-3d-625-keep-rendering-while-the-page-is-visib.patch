@@ -1,7 +1,7 @@
 From 55caa1c8e16f4a6036d164c6c4c82ad3a155dccc Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 22:55:59 -0700
-Subject: [PATCH 39/40] inline-3d(#625): keep rendering while the page is
+Subject: [PATCH 39/41] inline-3d(#625): keep rendering while the page is
  visible but unfocused
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

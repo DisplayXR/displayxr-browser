@@ -1,7 +1,7 @@
 From 18157e460572217174c8f4f1c173779dd50772d8 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 19:17:30 -0700
-Subject: [PATCH 36/40] inline-3d(#625): let the runtime's XR_DXR_view_rig
+Subject: [PATCH 36/41] inline-3d(#625): let the runtime's XR_DXR_view_rig
  build the off-axis views
 
 The three.js scene rig has never been right: the cube renders far too large,

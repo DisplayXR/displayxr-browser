@@ -1,7 +1,7 @@
 From df37631fec067596f2e7033c83703fb67962c79b Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 26 Jun 2026 01:22:26 -0500
-Subject: [PATCH 03/40] [displayxr inline-3d #625 B2b] GPU<->browser weave Mojo
+Subject: [PATCH 03/41] [displayxr inline-3d #625 B2b] GPU<->browser weave Mojo
  bridge
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

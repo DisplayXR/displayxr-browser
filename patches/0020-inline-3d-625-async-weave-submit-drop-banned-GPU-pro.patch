@@ -1,7 +1,7 @@
 From ed2be3cc1d00f4e44e47cc71d2de103aba4f0bc3 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 20:53:41 -0700
-Subject: [PATCH 20/40] =?UTF-8?q?inline-3d(#625):=20async=20weave=20submit?=
+Subject: [PATCH 20/41] =?UTF-8?q?inline-3d(#625):=20async=20weave=20submit?=
  =?UTF-8?q?=20=E2=80=94=20drop=20banned=20GPU-process=20[Sync]=20mojo=20ca?=
  =?UTF-8?q?ll?=
 MIME-Version: 1.0

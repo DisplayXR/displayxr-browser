@@ -1,0 +1,61 @@
+From 8ac3244e9c8669e75196d76a81a04ca0133abe84 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 16 Jul 2026 11:07:34 -0700
+Subject: [PATCH 41/41] inline-3d(#625,#16): auto-disable delegated compositing
+ when --enable-inline-3d
+
+The inline-3D weave needs a flattened composited surface. Under DirectComposition,
+delegated compositing decomposes the page into DComp visuals and destroys the root
+render-pass buffers, so there is nothing to weave (displayxr-browser#16). The
+installer works around this with a --disable-features=DelegatedCompositing launch
+flag; this makes the browser do it itself whenever inline-3D is requested, so the
+weave works regardless of how it is launched.
+
+Appended in ChromeMainDelegate::BasicStartupComplete (the earliest callback, before
+the FeatureList is created) so the disabled state lands in the browser FeatureList
+and is serialized to the GPU process, where delegated compositing is evaluated.
+DirectComposition itself stays on, so the weave remains GPU-resident zero-copy.
+---
+ chrome/app/chrome_main_delegate.cc | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+index df8f9455d224f..8970caad45f2c 100644
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -1085,6 +1085,32 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
+     }
+   }
+ 
++#if BUILDFLAG(IS_WIN)
++  // DisplayXR inline-3D (#625, displayxr-browser#16): inline-3D weaving needs a
++  // flattened composited surface. Delegated compositing decomposes the page into
++  // DirectComposition visuals and destroys the root render-pass buffers
++  // (skia_renderer.cc "delegating to the system compositor"), leaving nothing for
++  // the display processor to weave. Auto-disable delegated compositing whenever
++  // inline-3D is requested — keeping DirectComposition ON, so the weave stays
++  // GPU-resident zero-copy — so the browser weaves without a manual
++  // --disable-features launch flag. Done here (the earliest callback, before the
++  // FeatureList is created) so the disabled state is in the browser FeatureList
++  // and serialized to the GPU process, where delegated compositing is evaluated.
++  if (!command_line.HasSwitch(switches::kProcessType) &&
++      command_line.HasSwitch("enable-inline-3d")) {
++    auto* mutable_command_line = base::CommandLine::ForCurrentProcess();
++    std::string disabled =
++        mutable_command_line->GetSwitchValueASCII("disable-features");
++    if (disabled.find("DelegatedCompositing") == std::string::npos) {
++      if (!disabled.empty()) {
++        disabled += ",";
++      }
++      disabled += "DelegatedCompositing";
++      mutable_command_line->AppendSwitchASCII("disable-features", disabled);
++    }
++  }
++#endif  // BUILDFLAG(IS_WIN)
++
+   // The DevTools remote debugging pipe file descriptors need to be checked
+   // before any other files are opened, see https://crbug.com/40259890.
+   const bool is_browser = !command_line.HasSwitch(switches::kProcessType);
+-- 
+2.42.0.windows.2
+

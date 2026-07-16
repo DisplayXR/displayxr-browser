@@ -1,7 +1,7 @@
 From 7e61d0c72f9b9928a18a9c94a4406eb5d8e16a98 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 02:04:49 -0700
-Subject: [PATCH 16/40] inline-3d(#625): bind only Chrome_WidgetWin_* windows
+Subject: [PATCH 16/41] inline-3d(#625): bind only Chrome_WidgetWin_* windows
  for the weave session
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

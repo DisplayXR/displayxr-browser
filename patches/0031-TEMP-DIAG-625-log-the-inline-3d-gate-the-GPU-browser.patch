@@ -1,7 +1,7 @@
 From 38f88771248efb84c7af3ae4be052264cd2d2410 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 17:06:40 -0700
-Subject: [PATCH 31/40] TEMP DIAG (#625): log the inline-3d gate + the
+Subject: [PATCH 31/41] TEMP DIAG (#625): log the inline-3d gate + the
  GPU->browser eye feed
 
 Throwaway instrumentation to find why the inline-3d 2-view path stays off

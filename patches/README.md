@@ -1,7 +1,7 @@
 # Patch series — inline-3D over Chromium `150.0.7871.24`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`150.0.7871.24` (M150). **40 commits, 117 files** (~30 are the vendored OpenXR SDK; the real
+`150.0.7871.24` (M150). **41 commits, 117 files** (~30 are the vendored OpenXR SDK; the real
 integration surface is ~87 files — see [../docs/integration-points.md](../docs/integration-points.md)).
 
 Apply with `git am --3way patches/*.patch` onto a fresh checkout of the tag (or just run

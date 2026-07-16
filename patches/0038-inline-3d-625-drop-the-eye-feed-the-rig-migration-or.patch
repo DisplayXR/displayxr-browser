@@ -1,7 +1,7 @@
 From 9b5813c3dd3a27e7963eb455f095a400449d4396 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 22:46:41 -0700
-Subject: [PATCH 38/40] inline-3d(#625): drop the eye feed the rig migration
+Subject: [PATCH 38/41] inline-3d(#625): drop the eye feed the rig migration
  orphaned, and the diags
 
 Once the renderer stopped rebuilding Kooima and started consuming the runtime's

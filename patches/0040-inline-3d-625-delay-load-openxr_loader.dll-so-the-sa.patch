@@ -1,7 +1,7 @@
 From 70b64ba67c35527f916ea279e7c91253263ac115 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 15 Jul 2026 14:56:17 -0700
-Subject: [PATCH 40/40] inline-3d(#625): delay-load openxr_loader.dll so the
+Subject: [PATCH 40/41] inline-3d(#625): delay-load openxr_loader.dll so the
  sandboxed renderer survives
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
