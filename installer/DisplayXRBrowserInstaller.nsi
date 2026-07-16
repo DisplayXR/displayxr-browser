@@ -57,10 +57,18 @@
 ;                                             feature, no switch->feature map; without it the JS
 ;                                             gate inline3DAvailable() is false -> page drops to 2D)
 ;   --inline-3d-sync-weave                    GPU-resident zero-lag weave submit
-;   --disable-direct-composition              routes to the GL weave path (MaybeWeaveOutput); the
-;                                             default DComp path (MaybeWeaveRootRenderPass) currently
-;                                             gives no overlay backing -> no weave (regression, TODO)
-!define BROWSER_FLAGS "--enable-inline-3d --enable-blink-features=DisplayXRInline3D --inline-3d-sync-weave --disable-direct-composition"
+;   --disable-features=DelegatedCompositing   the real #16 fix (confirmed by instrumented build):
+;                                             delegated compositing decomposes the page into DComp
+;                                             visuals and destroys the root render-pass buffers
+;                                             (skia_renderer.cc "delegating to the system compositor"),
+;                                             so there is NO flattened composited surface for the
+;                                             weave to read. Disabling ONLY delegation keeps
+;                                             DirectComposition on and routes the root pass to a
+;                                             renderer-allocated backing that MaybeWeaveRootRenderPass
+;                                             weaves GPU-resident (zero-copy) — strictly better than
+;                                             the old --disable-direct-composition (which forced the
+;                                             GL CPU-readback path, #17).
+!define BROWSER_FLAGS "--enable-inline-3d --enable-blink-features=DisplayXRInline3D --inline-3d-sync-weave --disable-features=DelegatedCompositing"
 
 ;--------------------------------
 Name "DisplayXR Browser ${VERSION}"
