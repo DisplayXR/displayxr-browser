@@ -9,19 +9,17 @@
 ; (the weave already no-ops safely, so it just runs as a normal browser).
 ;
 ; Build (from a staged tree produced by scripts/package.sh):
-;   makensis -DVERSION=150.0.7871.24 -DBUILD_NUM=<n> \
+;   makensis -DVERSION=x.y.z \
 ;            -DSTAGE_DIR=<abs path to dist/DisplayXR-Browser> \
 ;            -DSOURCE_DIR=<abs path to this repo> -DOUTPUT_DIR=<abs out> \
 ;            [-DRUNTIME_SETUP=<abs path to DisplayXRSetup.exe to chain>] \
 ;            installer/DisplayXRBrowserInstaller.nsi
+; VERSION is a 3-part semantic version (major.minor.patch) for released builds.
 ; SIGN_CMD (optional) enables Authenticode + the two-pass signed uninstaller.
 
 ;--------------------------------
 !ifndef VERSION
 	!define VERSION "0.0.0"
-!endif
-!ifndef BUILD_NUM
-	!define BUILD_NUM "0"
 !endif
 !ifndef STAGE_DIR
 	!error "STAGE_DIR (staged DisplayXR-Browser tree) is required"
@@ -41,7 +39,7 @@
 	!ifdef SIGN_CMD
 		!if "${SIGN_CMD}" != ""
 			!finalize '${SIGN_CMD} "%1"'
-			!makensis '-DINNER "-DVERSION=${VERSION}" "-DBUILD_NUM=${BUILD_NUM}" "-DSTAGE_DIR=${STAGE_DIR}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DOUTPUT_DIR=${OUTPUT_DIR}" "${__FILE__}"' = 0
+			!makensis '-DINNER "-DVERSION=${VERSION}" "-DSTAGE_DIR=${STAGE_DIR}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DOUTPUT_DIR=${OUTPUT_DIR}" "${__FILE__}"' = 0
 			!system '"$%TEMP%\DisplayXRBrowser_inner.exe"' = 2
 			!system '${SIGN_CMD} "$%TEMP%\Uninstall.exe"' = 0
 			!define USE_PRESIGNED_UNINST
@@ -76,7 +74,7 @@ Name "DisplayXR Browser ${VERSION}"
 	OutFile "$%TEMP%\DisplayXRBrowser_inner.exe"
 	RequestExecutionLevel user
 !else
-	OutFile "${OUTPUT_DIR}\DisplayXR-Browser-Preview-Setup-${VERSION}.${BUILD_NUM}.exe"
+	OutFile "${OUTPUT_DIR}\DisplayXR-Browser-Preview-Setup-${VERSION}.exe"
 	RequestExecutionLevel admin
 !endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Browser"
