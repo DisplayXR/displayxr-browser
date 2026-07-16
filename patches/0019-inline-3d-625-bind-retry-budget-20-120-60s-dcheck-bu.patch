@@ -1,0 +1,32 @@
+From 66c151a978fb1b0d9253ced0a657d624004325a6 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 12 Jul 2026 17:22:08 -0700
+Subject: [PATCH 19/40] =?UTF-8?q?inline-3d(#625):=20bind-retry=20budget=20?=
+ =?UTF-8?q?20->120=20(60s)=20=E2=80=94=20dcheck=20builds=20exceed=2010s=20?=
+ =?UTF-8?q?to=20first=20window?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ components/displayxr/browser/displayxr_weave_client.cc | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index efe13c0ffb44d..79d3882d8a5ce 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -508,7 +508,9 @@ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+     return;
+   }
+ #if BUILDFLAG(IS_WIN)
+-  InitializeWin(/*attempts_left=*/20);
++  // 120 × 500ms = 60s: a dcheck_always_on build on a cold profile can take
++  // well over 10s to show its first window; the retry is a no-op once bound.
++  InitializeWin(/*attempts_left=*/120);
+ #else
+   LOG(ERROR) << "[DisplayXR] inline-3D is Windows-only in Step B";
+ #endif
+-- 
+2.42.0.windows.2
+

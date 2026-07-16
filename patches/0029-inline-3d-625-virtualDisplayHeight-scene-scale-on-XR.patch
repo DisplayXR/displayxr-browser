@@ -1,0 +1,185 @@
+From d14bf0c178d821a8cd4e50323a144ad75aef507d Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 14:57:05 -0700
+Subject: [PATCH 29/40] inline-3d(#625): virtualDisplayHeight scene-scale on
+ XRDisplayLayer (display-rig m2v)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The inline-3d session built its off-axis eye views with a hardcoded m2v=1
+(virtual display height == the element's few-cm physical height), so a
+metre-scale three.js scene didn't fit and apps had to scale the scene
+themselves each frame. Add the display-rig m2v knob the native
+XR_DXR_view_rig extension exposes (XrDisplayRigDXR::virtualDisplayHeight),
+so the runtime owns the scale and the app renders render-ready views
+directly — the same contract cube_handle_d3d11_win uses.
+
+- XRDisplayLayerInit gains `virtualDisplayHeight` (metres; 0 = disabled).
+- XRSession stores it (session-global; a scene layer sets it) and
+  UpdateInline3DViews scales each eye pose by m2v = virtualDisplayHeight /
+  element_physical_height. The frustum ANGLES are m2v-invariant (scaling
+  element half-size and eye together cancels in atan2), so the projection
+  is unchanged; only the pose moves, which makes the z=0 plane span the
+  virtual display instead of the physical element. Matches display3d_view.c
+  (eye_scaled = eye*m2v, projection from physical dims).
+
+Image/video windows leave it 0 (they paint their own SBS, don't use the
+views). No runtime change — inline-3d computes its projection in Blink.
+---
+ .../renderer/modules/xr/xr_display_layer.cc   | 17 ++++++++++++--
+ .../renderer/modules/xr/xr_display_layer.h    |  4 +++-
+ .../modules/xr/xr_display_layer_init.idl      | 11 +++++++++
+ .../blink/renderer/modules/xr/xr_session.cc   | 23 ++++++++++++++++---
+ .../blink/renderer/modules/xr/xr_session.h    | 13 +++++++++++
+ 5 files changed, 62 insertions(+), 6 deletions(-)
+
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+index a0c7e2a325e84..beb940adf1e35 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.cc
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/token.h"
+ #include "components/viz/common/surfaces/tracked_element_rects.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_init.h"
+ #include "third_party/blink/renderer/core/dom/element.h"
+ #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
+ #include "third_party/blink/renderer/modules/xr/xr_session.h"
+@@ -26,11 +27,23 @@ XRDisplayLayer* XRDisplayLayer::Create(XRSession* session,
+         "XRDisplayLayer target must be an HTMLCanvasElement.");
+     return nullptr;
+   }
+-  return MakeGarbageCollected<XRDisplayLayer>(session, target);
++  const double vdh = init ? init->virtualDisplayHeight() : 0.0;
++  return MakeGarbageCollected<XRDisplayLayer>(session, target, vdh);
+ }
+ 
+-XRDisplayLayer::XRDisplayLayer(XRSession* session, Element* target)
++XRDisplayLayer::XRDisplayLayer(XRSession* session,
++                               Element* target,
++                               double virtual_display_height)
+     : session_(session), target_(target) {
++  // Scene-scale (display-rig m2v): a live-rendered window authored for a
++  // virtual display of this height. The runtime scales the reported eye poses
++  // so the scene renders at its metre scale with no app-side scaling. Applies
++  // to the session's (shared) inline-3d views; a page with one scene window
++  // sets it, image/video windows leave it 0 (they don't consume the views).
++  if (virtual_display_height > 0.0 && session_) {
++    session_->SetInline3DVirtualDisplayHeight(
++        static_cast<float>(virtual_display_height));
++  }
+   // Register the target canvas with the session; each frame the session reports
+   // its window-relative rect to the compositor (XRSession::ReportInline3DRects),
+   // and Viz weaves that output sub-rect (B4b, design §13.3). Session-end
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.h b/third_party/blink/renderer/modules/xr/xr_display_layer.h
+index 716ccc5b027a6..d39adc7e0e72b 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.h
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.h
+@@ -42,7 +42,9 @@ class XRDisplayLayer final : public ScriptWrappable {
+                                 const XRDisplayLayerInit* init,
+                                 ExceptionState& exception_state);
+ 
+-  XRDisplayLayer(XRSession* session, Element* target);
++  XRDisplayLayer(XRSession* session,
++                 Element* target,
++                 double virtual_display_height);
+   ~XRDisplayLayer() override;
+ 
+   // The DOM element shown in 3D.
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer_init.idl b/third_party/blink/renderer/modules/xr/xr_display_layer_init.idl
+index fc24a2d829651..971f4bfe555b9 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer_init.idl
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer_init.idl
+@@ -7,4 +7,15 @@ dictionary XRDisplayLayerInit {
+   // Backing-store device pixels per CSS pixel (DPI / fractional zoom). Reserved
+   // for device-pixel-exact weave alignment; unused in the B3 reference path.
+   double pixelScale = 1.0;
++
++  // Scene-scale for a live-rendered (addScene) window, in metres — the display-
++  // rig m2v knob (XR_DXR_view_rig's virtualDisplayHeight). It tells the runtime
++  // "this scene is composed for a display this tall", so the off-axis eye poses
++  // the session reports are scaled by m2v = virtualDisplayHeight / element's
++  // physical height. The z=0 plane then spans a virtual display of this height
++  // instead of the element's few-centimetre physical rect, so the scene renders
++  // at its authored metre scale with NO per-frame world scaling in the app.
++  // 0 (default) = disabled (m2v = 1, physical-scale scene). Ignored for still
++  // image / video windows (which paint their own SBS and don't use the views).
++  double virtualDisplayHeight = 0.0;
+ };
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 0c8310c272f06..20d3bfc7ee879 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -2645,6 +2645,20 @@ void XRSession::UpdateInline3DViews() {
+   const float half_w_m = er.width() * pixel_m * 0.5f;
+   const float half_h_m = er.height() * pixel_m * 0.5f;
+ 
++  // Scene-scale (display-rig m2v, XR_DXR_view_rig's virtualDisplayHeight): the
++  // off-axis frustum ANGLES are physically correct and m2v-invariant (scaling
++  // the element half-size and the eye together cancels in atan2), so the
++  // projection is unchanged. m2v only scales WHERE THE EYE SITS: at eye*m2v the
++  // z=0 plane spans a virtual display of virtualDisplayHeight metres instead of
++  // the element's physical height, so a scene authored at that scale renders
++  // with no app-side scaling. Matches display3d_view.c: eye_scaled = eye*m2v,
++  // projection built from physical dims (buildKooimaProjection cancels m2v with
++  // perspectiveFactor=1). 0 = disabled -> m2v 1 -> physical-scale scene.
++  const float elem_phys_h = er.height() * pixel_m;
++  const float m2v = (inline_3d_virtual_display_height_ > 0.f && elem_phys_h > 0.f)
++                        ? (inline_3d_virtual_display_height_ / elem_phys_h)
++                        : 1.f;
++
+   const wtf_size_t eye_count =
+       static_cast<wtf_size_t>(inline_3d_eyes_.size() / 3u);
+   for (wtf_size_t i = 0; i < 2u; ++i) {
+@@ -2672,10 +2686,13 @@ void XRSession::UpdateInline3DViews() {
+     XRViewData* view = views_[i];
+     view->UpdateProjectionMatrixFromFoV(up_rad, down_rad, left_rad, right_rad,
+                                         near_depth, far_depth);
+-    // Per-eye pose: place the eye at its display-space position (world origin =
+-    // element centre), identity orientation. View faces -z toward the element.
++    // Per-eye pose: place the eye at its display-space position scaled into the
++    // scene's virtual units (rx*m2v...), so the z=0 plane spans the virtual
++    // display and the scene renders at authored scale. m2v == 1 leaves the
++    // physical-metre pose unchanged. World origin = element centre, identity
++    // orientation; view faces -z toward the element.
+     gfx::Transform mojo_from_view;
+-    mojo_from_view.Translate3d(rx, ry, rz);
++    mojo_from_view.Translate3d(rx * m2v, ry * m2v, rz * m2v);
+     view->SetMojoFromView(mojo_from_view);
+   }
+ }
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
+index 20ed4c009c1f9..93f04bc9f5049 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.h
++++ b/third_party/blink/renderer/modules/xr/xr_session.h
+@@ -339,6 +339,16 @@ class XRSession final : public EventTarget,
+   void RegisterDisplayLayer(XRDisplayLayer* layer);
+   void UnregisterDisplayLayer(XRDisplayLayer* layer);
+ 
++  // DisplayXR inline-3D scene-scale (display-rig m2v, XR_DXR_view_rig's
++  // virtualDisplayHeight): the height in metres of the virtual display the
++  // scene is authored for. UpdateInline3DViews scales the reported eye poses by
++  // m2v = this / element physical height, so a metre-scale scene renders
++  // correctly with no app-side scaling. 0 = disabled (m2v = 1). Set by a scene
++  // XRDisplayLayer; session-global (one shared inline-3d view set).
++  void SetInline3DVirtualDisplayHeight(float metres) {
++    inline_3d_virtual_display_height_ = metres;
++  }
++
+   // DisplayXR inline-3D (#625, Step B / B4b): collect each registered inline-3d
+   // canvas's window-relative device-px rect and forward it to the compositor
+   // (FrameWidget::SetInline3DRects) so Viz can weave those output sub-rects. Called
+@@ -723,6 +733,9 @@ class XRSession final : public EventTarget,
+   Vector<float> inline_3d_eyes_;
+   bool inline_3d_eyes_valid_ = false;
+   mojom::blink::DisplayXRDisplayInfoPtr inline_3d_info_;
++  // Scene-scale m2v knob (metres); 0 = disabled. See
++  // SetInline3DVirtualDisplayHeight + UpdateInline3DViews.
++  float inline_3d_virtual_display_height_ = 0.f;
+ 
+   // DisplayXR inline-3D (#625, Step B3e): live layers bound to this session.
+   HeapHashSet<Member<XRDisplayLayer>> display_layers_;
+-- 
+2.42.0.windows.2
+

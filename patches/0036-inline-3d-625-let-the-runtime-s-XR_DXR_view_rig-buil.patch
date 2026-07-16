@@ -1,0 +1,919 @@
+From 18157e460572217174c8f4f1c173779dd50772d8 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 19:17:30 -0700
+Subject: [PATCH 36/40] inline-3d(#625): let the runtime's XR_DXR_view_rig
+ build the off-axis views
+
+The three.js scene rig has never been right: the cube renders far too large,
+far too high, and with huge disparity. Each fix so far corrected one term of
+XRSession::UpdateInline3DViews' hand-rolled Kooima and moved the symptom
+without curing it, because the whole derivation was the problem, not any one
+term in it.
+
+Stop re-deriving. The runtime already computes exactly these views, and it is
+the authority on the two inputs the renderer can only reconstruct: the window's
+true screen origin and the display's physical pixel pitch. It also already
+knows how to scope that math to a sub-rect -- that is what a 3D zone IS ("the
+rect IS the canvas": u_canvas_apply_to_metrics rebases the window metrics to
+the zone rect and every downstream term, Kooima metres, eye offsets and the raw
+channel, then describes the zone with zero further changes).
+
+So an inline-3D element is just a zone. Per frame, for the scene element, the
+browser now calls xrLocateViews with XrDisplayZoneDXR{rect} -> XrDisplayRigDXR
+{virtualDisplayHeight} chained, and Blink installs the returned pose + fov
+verbatim. ~95 lines of renderer-side projection math are deleted.
+
+Key properties:
+
+- The zone rect is the WEAVE rect, unchanged. u_canvas_rect is defined in
+  client-window pixels, which is exactly the basis ReportInline3DRects already
+  submits -- and that basis is proven correct every frame by the photos and
+  video, which weave crisply at the right positions. The broken display-relative
+  rebase (ClientToScreen + metres-per-pixel, consumed only by the deleted math)
+  is gone, and with it the logical-vs-device-pixel hazard it carried.
+
+- No frame loop is added. xrLocateViews validates only the space, the view
+  config type and displayTime > 0 -- it does NOT require a running session -- so
+  the weave client stays submit-only (no xrBeginSession/xrEndFrame) and cannot
+  make the compositor present over the browser's own window. displayTime comes
+  from XR_KHR_win32_convert_performance_counter_time.
+
+- The session is a real present-owner (HWND + D3D11 binding), not a bridge
+  relay, so rig_route_native applies. This matters: for bridge relays the
+  runtime forces chained rig descriptors INERT (rig_type NONE) and hands back
+  raw eyes, which would have looked exactly like the bug we are fixing.
+
+Gated on view_rig + display_zones + the KHR time conversion all being present;
+otherwise views come back empty and the session stays mono, as before.
+---
+ .../displayxr/NOTE-runtime-canvas-rect-697.md | 110 ++++++++++
+ .../browser/displayxr_service_impl.cc         |  34 +++
+ .../browser/displayxr_service_impl.h          |   3 +
+ .../browser/displayxr_weave_client.cc         | 198 +++++++++++++++++-
+ .../browser/displayxr_weave_client.h          |  45 ++++
+ .../public/mojom/xr/displayxr_service.mojom   |  42 ++++
+ .../blink/renderer/modules/xr/xr_session.cc   | 161 +++++---------
+ .../blink/renderer/modules/xr/xr_session.h    |  26 +--
+ .../include/openxr/XR_DXR_display_zones.h     |   3 +-
+ .../include/openxr/XR_DXR_view_rig.h          |   5 +-
+ 10 files changed, 501 insertions(+), 126 deletions(-)
+ create mode 100644 components/displayxr/NOTE-runtime-canvas-rect-697.md
+
+diff --git a/components/displayxr/NOTE-runtime-canvas-rect-697.md b/components/displayxr/NOTE-runtime-canvas-rect-697.md
+new file mode 100644
+index 0000000000000..f71608517997e
+--- /dev/null
++++ b/components/displayxr/NOTE-runtime-canvas-rect-697.md
+@@ -0,0 +1,110 @@
++# Note from the runtime team → inline-3d browser agent
++
++**Re: does the new `XR_DXR_canvas_rect` (#697) extension help the browser weave path?**
++**From:** displayxr-runtime, branch `feat/697-canvas-rect-windowless` (built + lint-clean, **not merged** — parked pending a real consumer).
++**We need:** a yes/no + which process, so we decide *merge* vs *leave parked*.
++
++---
++
++## What the extension does (30-second version)
++
++Today the runtime learns *where on the 3D panel* a producer's content lands — which
++it needs for both **weave phase** (lenticular interlace is a function of absolute
++screen position) and **canvas-scoped Kooima** (off-axis projection framed to the
++content rect) — by reading a **bound OS window's** client rect (`GetClientRect` +
++`ClientToScreen`) every frame. The HWND is a *position/phase anchor*, never a render
++target.
++
++`XR_DXR_canvas_rect` lets a **windowless** producer **declare that rect directly**
++instead of binding a window:
++
++- `XrCanvasRectBindingDXR` (chained on `xrCreateSession`) — seed the rect.
++- `xrSetCanvasRectDXR(session, &rectPx)` — update it whenever the content moves/resizes.
++- `rectPx` is **display-relative device pixels** (origin = panel top-left; the runtime
++  already knows the panel's desktop origin via `XR_DXR_display_info`).
++
++The runtime feeds that rect through the *same* `get_window_metrics` producer the HWND
++path uses, so `canvasRectPx` / Kooima / weave phase all come out identical — with **no
++window**. The only thing lost vs. a bound window is OS *self-tracking*: the app owns
++rect updates (call the setter on move/resize). Drag phase-snap still works — it's
++`xrWeaveSnapWindowRectDXR` (already pure absolute-screen-coords, driven by a
++service-owned probe window, never the app's HWND).
++
++Implemented on the **D3D11 in-process** and **D3D11 service/IPC** compositors.
++
++## Why we're asking you specifically
++
++The extension only earns its keep for a producer that has **no usable OS window** but
++*is* compositing to a **known on-panel rect**. Anything with a real top-level HWND is
++already served by `XR_DXR_win32_window_binding` or `XR_DXR_weave`'s
++`xrWeaveBindWindowDXR` (bind a window + submit a window-relative rect, #625).
++
++Your integration is the one candidate where "no usable window" might be literally true.
++We see `components/displayxr/gpu/displayxr_weave_gpu.{cc,h}` (GPU-process weave) and
++`components/displayxr/browser/displayxr_weave_client.*` / `displayxr_weaver_impl.*`.
++
++## The questions (what would settle it)
++
++1. **Which process issues the weave / talks to the runtime?** The browser process
++   (which has the tab's top-level `HWND`) or the **GPU/Viz process** (which composites
++   all content and owns **no per-element window**)?
++2. **Today, does that path hand the runtime an HWND for phase/position?** If yes —
++   whose window, and is it a real usable one? If no — how does it currently get correct
++   weave phase and off-axis framing (or does it run display-scoped / fixed-fullscreen)?
++3. **Per inline-3d element** (a `<model>` / WebXR region that scrolls within a page):
++   can you cheaply produce that element's **absolute on-panel rect in device px** each
++   frame (page layout → screen)? That's the exact input `xrSetCanvasRectDXR` wants.
++4. **Would "declare a screen-relative rect, no HWND" simplify your integration**
++   vs. binding a window — especially if the weave lives GPU-process-side where there's
++   no window to bind? Or does `XR_DXR_weave` bindWindow+rect already fit because you do
++   have a usable HWND at the integration point?
++
++If the answer to (1) is "GPU/Viz process, no window" and (3) is "yes, we have the
++rect," then `XR_DXR_canvas_rect` is the clean anchor and we'll finish + merge it (and
++add the symmetric `xrWeaveBindRectDXR` to the weave service so the per-element
++synchronous weave can also run windowless). If you already bind a usable HWND, this is
++redundant and we'll park the branch.
++
++## Pointers (runtime side)
++
++- Header: `src/external/openxr_includes/openxr/XR_DXR_canvas_rect.h`
++- Spec: `docs/specs/extensions/XR_DXR_canvas_rect.md`
++- App-facing framing: `docs/getting-started/app-classes.md` (the `#697` section)
++- Reference exerciser (shared texture + rect, **no HWND**):
++  `test_apps/texture/cube_canvasrect_d3d11_win`
++- Related: `XR_DXR_weave.h` (`xrWeaveBindWindowDXR` / `xrWeaveSubmitDXR` /
++  `xrWeaveSnapWindowRectDXR`, #625) — the windowed present-owner weave service this
++  generalizes.
++
++Reply inline in this file (or ping the runtime side) with answers to 1–4. Thanks!
++
++---
++
++## UPDATE (after hardware test — important caveat)
++
++We built the full runtime path + a windowless exerciser (shared texture + rect, no
++HWND) and ran it on the Leia panel. Result: **flat / no 3D**, and the reason is
++decisive and vendor-side:
++
++- The runtime plumbing works: the declared display-relative rect reaches the DP as
++  its weave canvas (`canvas=(16,72 1280x720)`), the panel switches to 3D mode, and
++  Kooima is canvas-scoped.
++- **BUT** the vendor DP (Leia SR weaver) reports **both eye positions identical**
++  (collapsed to the single nominal-viewer point) when there is **no bound HWND** —
++  so there is zero stereo disparity and the image is flat, before phase even matters.
++- Per ADR-007/019 the runtime never synthesizes eyes and never weaves — distinct
++  per-eye positions and absolute weave phase are BOTH the vendor DP's job, and the
++  SR SDK weaver's only positional/tracking input is `setWindowHandle(HWND)` (no
++  `setScreenRect` / `setOffset`). So a runtime-only canvas rect is
++  **necessary-but-not-sufficient**.
++
++**Implication for you:** if your weave integration is genuinely windowless (GPU/Viz
++process, no HWND), `XR_DXR_canvas_rect` alone will NOT give you correct 3D on the
++current Leia DP — it needs a **coupled vendor-DP change first** (SR SDK / Leia plugin
++support for windowless operation: distinct eyes + absolute phase from a supplied
++screen rect instead of an HWND). If instead you DO have a usable HWND at the weave
++call site, use `XR_DXR_weave` bindWindow+rect (#625) and you're fine today.
++
++So the honest state: the runtime branch is **parked**. It becomes worth finishing
++only if (a) you confirm a windowless integration point AND (b) the vendor adds
++windowless DP support. Your answers to 1–4 still tell us whether (a) holds.
+diff --git a/components/displayxr/browser/displayxr_service_impl.cc b/components/displayxr/browser/displayxr_service_impl.cc
+index 19291b6af1d87..4caf82b70fdce 100644
+--- a/components/displayxr/browser/displayxr_service_impl.cc
++++ b/components/displayxr/browser/displayxr_service_impl.cc
+@@ -56,4 +56,38 @@ void DisplayXRServiceImpl::GetLatestEyes(const gfx::Rect& element_window_rect,
+   std::move(callback).Run(std::move(eyes), valid, std::move(info));
+ }
+ 
++void DisplayXRServiceImpl::GetLatestViews(const gfx::Rect& element_window_rect,
++                                          float virtual_display_height,
++                                          GetLatestViewsCallback callback) {
++  // Straight pass-through: the rect the renderer sends is already the
++  // window-client device-px rect the runtime's zone canvas is defined in, so
++  // there is nothing to rebase here. (Contrast GetLatestEyes above, which has
++  // to convert to display-relative for the renderer's own projection math.)
++  DisplayXRWeaveClient::WeaveRect rect;
++  rect.x = element_window_rect.x();
++  rect.y = element_window_rect.y();
++  rect.w = element_window_rect.width();
++  rect.h = element_window_rect.height();
++
++  std::vector<blink::mojom::DisplayXRViewPtr> out;
++  for (const DisplayXRWeaveClient::RigView& v :
++       DisplayXRWeaveClient::LocateViewsForRect(rect,
++                                                virtual_display_height)) {
++    auto mv = blink::mojom::DisplayXRView::New();
++    mv->pos_x = v.pos_x;
++    mv->pos_y = v.pos_y;
++    mv->pos_z = v.pos_z;
++    mv->orient_x = v.orient_x;
++    mv->orient_y = v.orient_y;
++    mv->orient_z = v.orient_z;
++    mv->orient_w = v.orient_w;
++    mv->fov_left = v.fov_left;
++    mv->fov_right = v.fov_right;
++    mv->fov_up = v.fov_up;
++    mv->fov_down = v.fov_down;
++    out.push_back(std::move(mv));
++  }
++  std::move(callback).Run(std::move(out));
++}
++
+ }  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_service_impl.h b/components/displayxr/browser/displayxr_service_impl.h
+index 191e3a71c80f9..fa5d104f82523 100644
+--- a/components/displayxr/browser/displayxr_service_impl.h
++++ b/components/displayxr/browser/displayxr_service_impl.h
+@@ -31,6 +31,9 @@ class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
+   void IsInline3DSupported(IsInline3DSupportedCallback callback) override;
+   void GetLatestEyes(const gfx::Rect& element_window_rect,
+                      GetLatestEyesCallback callback) override;
++  void GetLatestViews(const gfx::Rect& element_window_rect,
++                      float virtual_display_height,
++                      GetLatestViewsCallback callback) override;
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 000365c699483..3cee4a581d497 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -36,6 +36,9 @@
+ #include <openxr/openxr_platform.h>
+ 
+ #include <openxr/XR_DXR_display_info.h>
++#include <openxr/XR_DXR_display_zones.h>
++#include <openxr/XR_DXR_local_3d_zone.h>
++#include <openxr/XR_DXR_view_rig.h>
+ #include <openxr/XR_DXR_weave.h>
+ #include <openxr/XR_DXR_win32_window_binding.h>
+ #endif  // BUILDFLAG(IS_WIN)
+@@ -65,6 +68,16 @@ struct WeaveClientState {
+   // enables the batched submit (chained XrWeaveSubmitRectsDXR); older runtimes
+   // take the per-element Submit loop.
+   uint32_t weave_spec_version = 0;
++  // The rig triple (#625): view_rig + display_zones + the KHR time conversion.
++  // |has_rig_views| means all three are live, i.e. LocateViewsForRect can ask
++  // the runtime for render-ready per-element views.
++  bool has_view_rig = false;
++  bool has_display_zones = false;
++  bool has_rig_views = false;
++  PFN_xrConvertWin32PerformanceCounterToTimeKHR convert_time = nullptr;
++  // Locate space for the rig locates. LOCAL is display-anchored for a fixed 3D
++  // display, so a zone-scoped locate returns element-centred eye poses.
++  XrSpace ref_space = XR_NULL_HANDLE;
+   PFN_xrWeaveBindWindowDXR bind_window = nullptr;
+   PFN_xrWeaveSubmitDXR submit = nullptr;
+   PFN_xrWeaveSnapWindowRectDXR snap = nullptr;
+@@ -258,11 +271,32 @@ void InitializeCore(HWND hwnd) {
+   s.weave_spec_version =
+       GetExtensionVersion(exts, XR_DXR_WEAVE_EXTENSION_NAME);
+   s.has_weave = s.weave_spec_version > 0;
++  // The rig set: XR_DXR_view_rig makes the RUNTIME compute the off-axis
++  // (Kooima) views, XR_DXR_display_zones scopes each locate to one element's
++  // rect, and the KHR time conversion gives xrLocateViews a valid XrTime
++  // without a frame loop (this session never begins one).
++  //
++  // XR_DXR_local_3d_zone is a hard DEPENDENCY of display_zones, enforced at
++  // xrCreateInstance (oxr_verify.c: "XR_DXR_display_zones requires
++  // XR_DXR_local_3d_zone and XR_DXR_view_rig"). We never chain a local-2D
++  // layer, but enabling zones without it fails instance creation outright —
++  // which takes the WEAVE down with it, not just the rig.
++  s.has_view_rig = HasExtension(exts, XR_DXR_VIEW_RIG_EXTENSION_NAME);
++  s.has_display_zones =
++      HasExtension(exts, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) &&
++      HasExtension(exts, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
++  const bool has_convert_time = HasExtension(
++      exts, XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
++  s.has_rig_views = s.has_view_rig && s.has_display_zones && has_convert_time;
+ 
+   VLOG(1) << "[DisplayXR] inline-3D weave client: "
+           << "D3D11=" << has_d3d11 << " win32_window_binding=" << has_window
+           << " display_info=" << has_display_info << " weave=" << s.has_weave
+-          << " weave_spec=" << s.weave_spec_version;
++          << " weave_spec=" << s.weave_spec_version
++          << " view_rig=" << s.has_view_rig
++          << " display_zones=" << s.has_display_zones
++          << " convert_time=" << has_convert_time
++          << " rig_views=" << s.has_rig_views;
+ 
+   if (!has_d3d11 || !has_window || !s.has_weave) {
+     LOG(ERROR) << "[DisplayXR] required extensions missing — weave unavailable "
+@@ -278,6 +312,19 @@ void InitializeCore(HWND hwnd) {
+   if (has_display_info) {
+     enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+   }
++  // Everything up to here is load-bearing for the WEAVE; the rig extensions
++  // after it are an enhancement. Remember the boundary so a rig-side rejection
++  // can be retried away (see the xrCreateInstance fallback below).
++  const size_t weave_ext_count = enabled.size();
++  if (s.has_rig_views) {
++    enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
++    enabled.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
++    // Required by display_zones (see above) even though we chain no local-2D
++    // layer — omitting it fails xrCreateInstance.
++    enabled.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
++    enabled.push_back(
++        XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
++  }
+ 
+   XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
+   UNSAFE_TODO(std::strcpy(ci.applicationInfo.applicationName,
+@@ -289,6 +336,20 @@ void InitializeCore(HWND hwnd) {
+   ci.enabledExtensionNames = enabled.data();
+ 
+   XrResult r = xrCreateInstance(&ci, &s.instance);
++  if (XR_FAILED(r) && s.has_rig_views) {
++    // The rig extensions only improve inline-3D scene geometry; the weave is
++    // the core function. A rig-side rejection (an unmet extension dependency,
++    // a runtime that enumerates but won't enable one) must NOT take the weave
++    // with it — that turns a scene bug into "no 3D on the page at all". Retry
++    // with the weave-only set and run without the rig.
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance with the rig extensions failed: "
++               << r << " — retrying weave-only (inline-3D scenes stay mono)";
++    s.has_rig_views = false;
++    enabled.resize(weave_ext_count);
++    ci.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
++    ci.enabledExtensionNames = enabled.data();
++    r = xrCreateInstance(&ci, &s.instance);
++  }
+   if (XR_FAILED(r)) {
+     LOG(ERROR) << "[DisplayXR] xrCreateInstance failed: " << r
+                << " (is displayxr-service running?)";
+@@ -390,6 +451,32 @@ void InitializeCore(HWND hwnd) {
+                << reinterpret_cast<void*>(s.hwnd) << ") failed -> " << br;
+   }
+ 
++  // Rig locates (#625): a LOCAL reference space + a real XrTime. Neither needs
++  // a RUNNING session — xrLocateViews validates only the space, the view-config
++  // type and displayTime > 0 — so this stays compatible with the submit-only
++  // design (no xrBeginSession/xrEndFrame, hence no chance of the compositor
++  // presenting over the browser's own window).
++  if (s.has_rig_views) {
++    xrGetInstanceProcAddr(
++        s.instance, "xrConvertWin32PerformanceCounterToTimeKHR",
++        reinterpret_cast<PFN_xrVoidFunction*>(&s.convert_time));
++    XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
++    rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
++    rsci.poseInReferenceSpace.orientation = {0.f, 0.f, 0.f, 1.f};
++    rsci.poseInReferenceSpace.position = {0.f, 0.f, 0.f};
++    const XrResult rr =
++        xrCreateReferenceSpace(s.session, &rsci, &s.ref_space);
++    if (XR_FAILED(rr) || !s.convert_time) {
++      LOG(ERROR) << "[DisplayXR] rig locate setup failed (space=" << rr
++                 << " convert_time=" << (s.convert_time ? "ok" : "NULL")
++                 << ") — falling back to renderer-side projection";
++      s.has_rig_views = false;
++    } else {
++      VLOG(1) << "[DisplayXR] rig locate ready: LOCAL space + view_rig + "
++                 "display_zones (runtime computes the off-axis views)";
++    }
++  }
++
+   // Constrain the window to the DP phase grid during a drag (CEF parity). No-op
+   // in the GPU process (the window belongs to the browser); active only in the
+   // browser process where the window's message loop runs.
+@@ -904,6 +991,104 @@ void SetEyesFromGpuWin(const std::vector<float>& eyes, bool eyes_valid) {
+   s.latest_eyes_valid = eyes_valid;
+ }
+ 
++// XR_DXR_view_rig + XR_DXR_display_zones: let the RUNTIME build the off-axis
++// views for one element. See the header for why this replaces the renderer-side
++// Kooima entirely.
++std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectWin(
++    const DisplayXRWeaveClient::WeaveRect& rect,
++    float virtual_display_height) {
++  WeaveClientState& s = State();
++  std::vector<DisplayXRWeaveClient::RigView> out;
++  if (!s.has_rig_views || s.session == XR_NULL_HANDLE ||
++      s.ref_space == XR_NULL_HANDLE || !s.convert_time || rect.w <= 0 ||
++      rect.h <= 0) {
++    return out;
++  }
++
++  // xrLocateViews rejects displayTime <= 0. QPC -> XrTime is the canonical
++  // conversion; the time only drives the head/display-plane pose prediction
++  // (the eyes come from the DP's latest sample), so "now" is right here.
++  LARGE_INTEGER qpc = {};
++  if (!::QueryPerformanceCounter(&qpc)) {
++    return out;
++  }
++  XrTime now = 0;
++  if (XR_FAILED(s.convert_time(s.instance, &qpc, &now)) || now <= 0) {
++    return out;
++  }
++
++  // The rig: virtualDisplayHeight sets the scene scale (m2v = it / the
++  // element's physical height, computed runtime-side from the zone rect).
++  // Factors at 1.0 = no comfort attenuation, physical perspective.
++  XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
++  rig.pose.orientation = {0.f, 0.f, 0.f, 1.f};
++  rig.pose.position = {0.f, 0.f, 0.f};
++  rig.virtualDisplayHeight =
++      virtual_display_height > 0.f ? virtual_display_height : 0.f;
++  rig.ipdFactor = 1.f;
++  rig.parallaxFactor = 1.f;
++  rig.perspectiveFactor = 1.f;
++
++  // The zone: the element's rect IS the canvas. |rect| is window-client-relative
++  // device px — exactly what u_canvas_rect wants and exactly what the weave
++  // already submits, so there is no second coordinate derivation to get wrong.
++  XrDisplayZoneDXR zone = {XR_TYPE_DISPLAY_ZONE_DXR};
++  zone.next = &rig;
++  zone.zoneId = 0;
++  zone.rect.offset = {rect.x, rect.y};
++  zone.rect.extent = {rect.w, rect.h};
++
++  XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO};
++  li.next = &zone;
++  li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++  li.displayTime = now;
++  li.space = s.ref_space;
++
++  XrViewState vs = {XR_TYPE_VIEW_STATE};
++  XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
++  uint32_t view_count = 0;
++  const XrResult lr =
++      xrLocateViews(s.session, &li, &vs, 2, &view_count, views);
++  if (XR_FAILED(lr) || view_count == 0) {
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      LOG(ERROR) << "[DisplayXR] xrLocateViews (rig) failed -> " << lr;
++    }
++    return out;
++  }
++  // Both flags must be set: without POSITION_VALID the poses are meaningless
++  // and we would silently render a mono-ish scene at the origin.
++  if (!(vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ||
++      !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
++    return out;
++  }
++
++  // Range-for, not views[i]: indexing a fixed-size array by variable trips
++  // -Wunsafe-buffer-usage under UNSAFE_BUFFERS_BUILD.
++  uint32_t i = 0;
++  for (const XrView& xv : views) {
++    if (i >= view_count) {
++      break;
++    }
++    ++i;
++    DisplayXRWeaveClient::RigView v;
++    v.pos_x = xv.pose.position.x;
++    v.pos_y = xv.pose.position.y;
++    v.pos_z = xv.pose.position.z;
++    v.orient_x = xv.pose.orientation.x;
++    v.orient_y = xv.pose.orientation.y;
++    v.orient_z = xv.pose.orientation.z;
++    v.orient_w = xv.pose.orientation.w;
++    v.fov_left = xv.fov.angleLeft;
++    v.fov_right = xv.fov.angleRight;
++    v.fov_up = xv.fov.angleUp;
++    v.fov_down = xv.fov.angleDown;
++    out.push_back(v);
++  }
++  return out;
++}
++
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+ }  // namespace
+@@ -991,6 +1176,17 @@ void DisplayXRWeaveClient::SetEyesFromGpu(const std::vector<float>& eyes,
+ #endif
+ }
+ 
++// static
++std::vector<DisplayXRWeaveClient::RigView>
++DisplayXRWeaveClient::LocateViewsForRect(const WeaveRect& rect,
++                                         float virtual_display_height) {
++#if BUILDFLAG(IS_WIN)
++  return LocateViewsForRectWin(rect, virtual_display_height);
++#else
++  return {};
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::PreSandboxInitializeForGpuProcess() {
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index 03e87de421db1..5fa47b7332e1a 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -104,6 +104,51 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   // batched SubmitBatch path is available.
+   static uint32_t WeaveSpecVersion();
+ 
++  // One render-ready view, as the RUNTIME computed it for a zone-scoped
++  // xrLocateViews. OpenXR-free so this header stays includable from
++  // chromium_code TUs.
++  struct RigView {
++    // Eye position in SCENE units with the origin at the ELEMENT's centre and
++    // z = 0 on the zero-disparity plane (+x right, +y up, +z toward the
++    // viewer). Already scaled by the rig's m2v (= virtualDisplayHeight / the
++    // element's physical height), so a scene authored at that scale needs no
++    // app-side scaling.
++    float pos_x = 0.f;
++    float pos_y = 0.f;
++    float pos_z = 0.f;
++    float orient_x = 0.f;
++    float orient_y = 0.f;
++    float orient_z = 0.f;
++    float orient_w = 1.f;
++    // Off-axis frustum half-angles in radians, OpenXR sign convention:
++    // left/down NEGATIVE, right/up POSITIVE. (Blink's
++    // UpdateProjectionMatrixFromFoV wants magnitudes — negate left/down.)
++    float fov_left = 0.f;
++    float fov_right = 0.f;
++    float fov_up = 0.f;
++    float fov_down = 0.f;
++  };
++
++  // XR_DXR_view_rig + XR_DXR_display_zones (#625): ask the RUNTIME for the
++  // off-axis (Kooima) views of ONE inline-3D element, instead of rebuilding
++  // that math in the renderer.
++  //
++  // |rect| is the element's window-client-relative device-px rect — the SAME
++  // rect the weave submits. That is deliberate: u_canvas_rect is defined in
++  // client-window pixels, so the proven weave rect drops straight in and there
++  // is no second coordinate derivation (the display-relative rebase behind
++  // GetLatest's DisplayInfo::element_*) left to disagree with it.
++  // |virtual_display_height| is the scene scale in app units (m2v = it / the
++  // element's physical height, computed runtime-side from |rect|); <= 0 leaves
++  // the scene at physical scale.
++  //
++  // The runtime scopes the locate to |rect| ("the rect IS the canvas"), so the
++  // reply is element-centred and needs no post-processing. Returns empty when
++  // the session isn't live, the runtime lacks the extensions, or the pose isn't
++  // trackable yet — callers must treat empty as "don't switch to 2-view".
++  static std::vector<RigView> LocateViewsForRect(const WeaveRect& rect,
++                                                 float virtual_display_height);
++
+   // DisplayXR inline-3D (#625, Step B3d): the display + committed-element
+   // geometry the renderer's off-axis (Kooima) projection needs, delivered via
+   // the renderer<-browser DisplayXRService mojom. OpenXR-free so this header
+diff --git a/third_party/blink/public/mojom/xr/displayxr_service.mojom b/third_party/blink/public/mojom/xr/displayxr_service.mojom
+index 49dc581f959dc..d9a8324f297a7 100644
+--- a/third_party/blink/public/mojom/xr/displayxr_service.mojom
++++ b/third_party/blink/public/mojom/xr/displayxr_service.mojom
+@@ -22,6 +22,26 @@ struct DisplayXRDisplayInfo {
+   bool rect_valid;
+ };
+ 
++// DisplayXR inline-3D (#625): one render-ready view as the RUNTIME's
++// XR_DXR_view_rig computed it for a zone-scoped locate. Plain floats (no
++// geometry typemaps) so this stays trivially copyable across the boundary.
++struct DisplayXRView {
++  // Eye position in SCENE units, origin at the ELEMENT centre, z = 0 on the
++  // zero-disparity plane. Already scaled by the rig's m2v.
++  float pos_x;
++  float pos_y;
++  float pos_z;
++  float orient_x;
++  float orient_y;
++  float orient_z;
++  float orient_w;
++  // Off-axis frustum half-angles, radians, OpenXR signs (left/down negative).
++  float fov_left;
++  float fov_right;
++  float fov_up;
++  float fov_down;
++};
++
+ // Renderer -> browser, frame-scoped (bound via BrowserInterfaceBroker). The
+ // browser process hosts the OpenXR weave client — the GPU sandbox forbids the
+ // per-frame weave RPC to displayxr-service — so the inline-3d session pulls the
+@@ -48,4 +68,26 @@ interface DisplayXRService {
+   // submitted rect (single-window pages, legacy callers).
+   GetLatestEyes(gfx.mojom.Rect element_window_rect)
+       => (array<float> eyes, bool valid, DisplayXRDisplayInfo info);
++
++  // Render-ready off-axis views for ONE inline-3D element, computed by the
++  // RUNTIME (XR_DXR_view_rig chained onto a zone-scoped xrLocateViews).
++  //
++  // This supersedes GetLatestEyes for geometry: the renderer no longer rebuilds
++  // Kooima from eyes + rects, it just consumes |views|. The runtime owns that
++  // math already, is the authority on the window's true screen origin and the
++  // display's physical pixel pitch, and applies the same zone treatment it uses
++  // for native 3D zones — which removes the renderer-side re-derivation (and
++  // its logical-vs-device-pixel hazards) entirely.
++  //
++  // |element_window_rect| is the element's WINDOW-CLIENT-relative device-px
++  // rect — the same rect the weave submits, which is what the runtime's zone
++  // canvas is defined in. |virtual_display_height| is the scene scale in app
++  // units (<= 0 = physical scale).
++  //
++  // |views| is empty when the runtime can't answer (no rig/zones extensions,
++  // session not live, pose not yet trackable); callers must then keep their
++  // current views rather than switching to 3D.
++  GetLatestViews(gfx.mojom.Rect element_window_rect,
++                 float virtual_display_height)
++      => (array<DisplayXRView> views);
+ };
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 27b1f8c66f8f9..2f3d77e502979 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -75,6 +75,7 @@
+ #include "third_party/blink/renderer/platform/bindings/v8_throw_exception.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+ #include "ui/gfx/geometry/point3_f.h"
++#include "ui/gfx/geometry/quaternion.h"
+ #include "ui/gfx/geometry/transform.h"
+ 
+ #if BUILDFLAG(ENABLE_VR)
+@@ -2513,15 +2514,15 @@ void XRSession::UpdateInlineView() {
+       static int s_gate_log = 0;
+       if (s_gate_log < 20) {
+         ++s_gate_log;
+-        VLOG(1) << "[DisplayXR] inline3d gate: eyes_valid=" << inline_3d_eyes_valid_
+-                << " info=" << (inline_3d_info_ ? 1 : 0) << " rect_valid="
+-                << (inline_3d_info_ ? (inline_3d_info_->rect_valid ? 1 : 0) : -1)
++        VLOG(1) << "[DisplayXR] inline3d gate: rig_views="
++                << inline_3d_views_.size()
+                 << " out=" << output_width_ << "x" << output_height_
+                 << " scene_layer=" << (inline_3d_scene_layer_ ? 1 : 0);
+       }
+     }
+-    if (inline_3d_eyes_valid_ && inline_3d_info_ &&
+-        inline_3d_info_->rect_valid && output_width_ > 0 &&
++    // The runtime answered with render-ready views => 3D. Empty means it
++    // couldn't (no rig/zones, session not live, pose untracked) => stay mono.
++    if (inline_3d_views_.size() >= 2u && output_width_ > 0 &&
+         output_height_ > 0) {
+       UpdateInline3DViews();
+       return;
+@@ -2575,19 +2576,9 @@ void XRSession::RequestInline3DState() {
+   // empty rect means "no scene layer": the browser falls back to the submitted
+   // rect (single-window pages).
+   gfx::Rect scene_rect = Inline3DSceneWindowRect();
+-  svc->GetLatestEyes(
+-      scene_rect, BindOnce(&XRSession::OnInline3DState, WrapWeakPersistent(this)));
+-}
+-
+-// The frame's device-pixel ratio, or 0 if unavailable. Used to normalise the
+-// device-px element rect into the display's logical-px space (see
+-// UpdateInline3DViews) and to build the window-relative rects we report.
+-double XRSession::DevicePixelRatioForInline3D() const {
+-  LocalDOMWindow* window = DynamicTo<LocalDOMWindow>(GetExecutionContext());
+-  if (!window || !window->GetFrame()) {
+-    return 0.0;
+-  }
+-  return window->GetFrame()->DevicePixelRatio();
++  svc->GetLatestViews(
++      scene_rect, inline_3d_virtual_display_height_,
++      BindOnce(&XRSession::OnInline3DViews, WrapWeakPersistent(this)));
+ }
+ 
+ // The scene layer's canvas rect in window-relative device px — the same basis
+@@ -2617,12 +2608,9 @@ gfx::Rect XRSession::Inline3DSceneWindowRect() const {
+   return gfx::ToRoundedRect(css_rect);
+ }
+ 
+-void XRSession::OnInline3DState(const Vector<float>& eyes,
+-                               bool valid,
+-                               mojom::blink::DisplayXRDisplayInfoPtr info) {
+-  inline_3d_eyes_ = eyes;
+-  inline_3d_eyes_valid_ = valid;
+-  inline_3d_info_ = std::move(info);
++void XRSession::OnInline3DViews(
++    Vector<mojom::blink::DisplayXRViewPtr> views) {
++  inline_3d_views_ = std::move(views);
+ }
+ 
+ void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
+@@ -2686,12 +2674,24 @@ void XRSession::ReportInline3DRects() {
+   widget->SetInline3DRects(rects);
+ }
+ 
+-// DisplayXR inline-3D (#625, Step B3d): build two eye views with window-relative
+-// off-axis (Kooima) projections + per-eye poses from the tracked eyes. The
+-// element is treated as a physical window into the scene: the frustum edges are
+-// the element rect projected through each eye (docs/architecture/
+-// kooima-projection.md §7 + "Windowed Mode"). Head motion moves the eye, which
+-// shifts both the pose and the asymmetric frustum -> glasses-free look-around.
++// DisplayXR inline-3D (#625): install the two off-axis eye views the RUNTIME
++// computed for the scene element (XR_DXR_view_rig chained onto a zone-scoped
++// xrLocateViews — see DisplayXRWeaveClient::LocateViewsForRect).
++//
++// There is deliberately NO projection math here. This function used to rebuild
++// Kooima in the renderer from tracked eyes + a display-relative element rect
++// (metres-per-pixel, element centre offset, atan2 frusta, an m2v derived from
++// the element's physical height). Every term of that was a re-derivation of
++// what the runtime already computes from the zone rect — and the renderer had
++// to reconstruct the window's screen origin and reconcile device-vs-logical
++// pixels to do it, which is where it went wrong. The runtime holds the
++// authoritative window metrics and display pixel pitch, and applies to an
++// inline-3D element exactly the treatment it applies to a native 3D zone
++// ("the rect IS the canvas"), so the reply drops straight in:
++//   pose = eye position, element-centred, z = 0 on the zero-disparity plane,
++//          already scaled by the rig's m2v (virtualDisplayHeight / element h)
++//   fov  = that element's asymmetric frustum for that eye
++// Head motion moves the eye, which shifts both -> glasses-free look-around.
+ void XRSession::UpdateInline3DViews() {
+   const int w = output_width_;
+   const int h = output_height_;
+@@ -2706,99 +2706,42 @@ void XRSession::UpdateInline3DViews() {
+         gfx::Rect(half_w, 0, w - half_w, h), graphics_api_));
+   }
+ 
+-  const mojom::blink::DisplayXRDisplayInfo& di = *inline_3d_info_;
+   const float near_depth = static_cast<float>(render_state_->depthNear());
+   const float far_depth = static_cast<float>(render_state_->depthFar());
+ 
+-  // Metres per display pixel (square pixels; derive from height).
+-  const float pixel_m = di.display_height_px > 0
+-                            ? di.display_height_m / di.display_height_px
+-                            : 0.f;
+-
+-  // UNITS: both sides are DEVICE pixels and must stay that way — the display
+-  // info reports the panel's device resolution (e.g. 3840x2160, so |pixel_m| is
+-  // metres per device pixel) and element_display_rect arrives in device pixels
+-  // (getBoundingClientRect x dsf, rebased on a device-px ClientToScreen
+-  // origin). Do NOT "normalise" by devicePixelRatio here: that shrinks the
+-  // element by the DPI scale, which both mis-places it and inflates m2v
+-  // (= virtualDisplayHeight / element height), and shows up as a scene in the
+-  // wrong place with an over-scaled off-axis skew. Verified on a 250% display:
+-  // raw rect 584px x 89.6um = 0.0524 m, the element's true height.
+-  gfx::RectF er_f(di.element_display_rect);
+-  // TEMP DIAG (#625): which units actually arrive, and what geometry we derive.
++  // TEMP DIAG (#625): what the runtime's rig actually returned.
+   {
+     static int s_geo_log = 0;
+     if (s_geo_log < 8) {
+       ++s_geo_log;
+-      const gfx::Rect& raw = di.element_display_rect;
+-      VLOG(1) << "[DisplayXR] inline3d geom: raw_er=" << raw.x() << "," << raw.y()
+-              << " " << raw.width() << "x" << raw.height()
+-              << " er_f=" << er_f.width() << "x" << er_f.height()
+-              << " disp_px=" << di.display_width_px << "x" << di.display_height_px
+-              << " pixel_m=" << pixel_m
+-              << " elem_h_m=" << (er_f.height() * pixel_m)
+-              << " vdh=" << inline_3d_virtual_display_height_
+-              << " scene_layer=" << (inline_3d_scene_layer_ ? 1 : 0);
++      const auto& v0 = *inline_3d_views_[0];
++      VLOG(1) << "[DisplayXR] inline3d rig views: n=" << inline_3d_views_.size()
++              << " eye0_pos=" << v0.pos_x << "," << v0.pos_y << "," << v0.pos_z
++              << " eye0_fov(l,r,u,d)=" << v0.fov_left << "," << v0.fov_right
++              << "," << v0.fov_up << "," << v0.fov_down
++              << " vdh=" << inline_3d_virtual_display_height_;
+     }
+   }
+ 
+-  // Element rect centre offset from the display centre + half-size, in
+-  // display-space metres (+x right, +y up; screen y is top-down).
+-  const float disp_cx = di.display_width_px * 0.5f;
+-  const float disp_cy = di.display_height_px * 0.5f;
+-  const float elem_cx_m = (er_f.x() + er_f.width() * 0.5f - disp_cx) * pixel_m;
+-  const float elem_cy_m = (disp_cy - (er_f.y() + er_f.height() * 0.5f)) * pixel_m;
+-  const float half_w_m = er_f.width() * pixel_m * 0.5f;
+-  const float half_h_m = er_f.height() * pixel_m * 0.5f;
+-
+-  // Scene-scale (display-rig m2v, XR_DXR_view_rig's virtualDisplayHeight): the
+-  // off-axis frustum ANGLES are physically correct and m2v-invariant (scaling
+-  // the element half-size and the eye together cancels in atan2), so the
+-  // projection is unchanged. m2v only scales WHERE THE EYE SITS: at eye*m2v the
+-  // z=0 plane spans a virtual display of virtualDisplayHeight metres instead of
+-  // the element's physical height, so a scene authored at that scale renders
+-  // with no app-side scaling. Matches display3d_view.c: eye_scaled = eye*m2v,
+-  // projection built from physical dims (buildKooimaProjection cancels m2v with
+-  // perspectiveFactor=1). 0 = disabled -> m2v 1 -> physical-scale scene.
+-  const float elem_phys_h = er_f.height() * pixel_m;
+-  const float m2v = (inline_3d_virtual_display_height_ > 0.f && elem_phys_h > 0.f)
+-                        ? (inline_3d_virtual_display_height_ / elem_phys_h)
+-                        : 1.f;
+-
+-  const wtf_size_t eye_count =
+-      static_cast<wtf_size_t>(inline_3d_eyes_.size() / 3u);
+   for (wtf_size_t i = 0; i < 2u; ++i) {
+-    // eyes are ordered [left, right]; reuse eye 0 for both if only one tracked.
+-    const wtf_size_t e = (eye_count >= 2u) ? i : 0u;
+-    float ex = 0.f, ey = 0.f, ez = 0.5f;  // nominal 0.5 m if untracked
+-    if (e < eye_count) {
+-      ex = inline_3d_eyes_[e * 3u + 0u];
+-      ey = inline_3d_eyes_[e * 3u + 1u];
+-      ez = inline_3d_eyes_[e * 3u + 2u];
+-    }
+-    // Eye relative to the element centre; element plane at z = 0.
+-    const float rx = ex - elem_cx_m;
+-    const float ry = ey - elem_cy_m;
+-    float rz = ez;
+-    if (rz < 0.001f) {
+-      rz = 0.65f;  // arm's-length fallback (avoid divide-by-zero, doc §7)
+-    }
+-    // Asymmetric half-angles: each element edge projected through the eye.
+-    const float left_rad = std::atan2(half_w_m + rx, rz);
+-    const float right_rad = std::atan2(half_w_m - rx, rz);
+-    const float up_rad = std::atan2(half_h_m - ry, rz);
+-    const float down_rad = std::atan2(half_h_m + ry, rz);
++    // Views are ordered [left, right]; reuse view 0 if the runtime returned one.
++    const mojom::blink::DisplayXRView& v =
++        *inline_3d_views_[inline_3d_views_.size() >= 2u ? i : 0u];
+ 
+     XRViewData* view = views_[i];
+-    view->UpdateProjectionMatrixFromFoV(up_rad, down_rad, left_rad, right_rad,
+-                                        near_depth, far_depth);
+-    // Per-eye pose: place the eye at its display-space position scaled into the
+-    // scene's virtual units (rx*m2v...), so the z=0 plane spans the virtual
+-    // display and the scene renders at authored scale. m2v == 1 leaves the
+-    // physical-metre pose unchanged. World origin = element centre, identity
+-    // orientation; view faces -z toward the element.
++    // OpenXR signs its FOV half-angles (left/down negative, right/up positive);
++    // UpdateProjectionMatrixFromFoV wants magnitudes. Negating left/down is the
++    // whole conversion — the asymmetry is preserved, which is what makes the
++    // frustum off-axis.
++    view->UpdateProjectionMatrixFromFoV(v.fov_up, -v.fov_down, -v.fov_left,
++                                        v.fov_right, near_depth, far_depth);
++    // Pose verbatim: already element-centred and m2v-scaled by the runtime.
+     gfx::Transform mojo_from_view;
+-    mojo_from_view.Translate3d(rx * m2v, ry * m2v, rz * m2v);
++    mojo_from_view.Translate3d(v.pos_x, v.pos_y, v.pos_z);
++    // T * R: rotate in view space, then place at the eye. (Identity for a flat
++    // fixed display; carried through so a posed/rotated rig stays correct.)
++    mojo_from_view.PreConcat(gfx::Transform(
++        gfx::Quaternion(v.orient_x, v.orient_y, v.orient_z, v.orient_w)));
+     view->SetMojoFromView(mojo_from_view);
+   }
+ }
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
+index 5dfe03744553f..1c37b8baa581c 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.h
++++ b/third_party/blink/renderer/modules/xr/xr_session.h
+@@ -498,12 +498,7 @@ class XRSession final : public EventTarget,
+   // The scene layer's canvas rect in window-relative device px (empty if no
+   // scene layer). Same basis as ReportInline3DRects.
+   gfx::Rect Inline3DSceneWindowRect() const;
+-  // Frame device-pixel ratio (0 if unavailable) — the device-px vs logical-px
+-  // conversion the inline-3d element geometry needs.
+-  double DevicePixelRatioForInline3D() const;
+-  void OnInline3DState(const Vector<float>& eyes,
+-                       bool valid,
+-                       mojom::blink::DisplayXRDisplayInfoPtr info);
++  void OnInline3DViews(Vector<mojom::blink::DisplayXRViewPtr> views);
+   void UpdateCanvasDimensions(Element*);
+   void ApplyPendingRenderState();
+ 
+@@ -735,13 +730,18 @@ class XRSession final : public EventTarget,
+   int output_width_ = 1;
+   int output_height_ = 1;
+ 
+-  // DisplayXR inline-3D (#625, Step B3d): latest tracked eyes (display-space
+-  // metres, flattened xyz triples) + display/element geometry, pulled per
+-  // animation frame from XRSystem's DisplayXRService and consumed by
+-  // UpdateInline3DViews. |inline_3d_info_| is null until the first reply.
+-  Vector<float> inline_3d_eyes_;
+-  bool inline_3d_eyes_valid_ = false;
+-  mojom::blink::DisplayXRDisplayInfoPtr inline_3d_info_;
++  // DisplayXR inline-3D (#625): the RUNTIME's render-ready off-axis views for
++  // the scene layer's element, pulled per animation frame from XRSystem's
++  // DisplayXRService (XR_DXR_view_rig on a zone-scoped xrLocateViews) and
++  // consumed verbatim by UpdateInline3DViews. Empty until the first reply, and
++  // whenever the runtime can't answer — the session then stays mono.
++  //
++  // These are the runtime's OWN Kooima outputs, not inputs to rebuild it from:
++  // the eyes/display-geometry pull this replaced made the renderer re-derive
++  // the projection from a display-relative element rect, duplicating math the
++  // runtime already does (and does with the authoritative window origin and
++  // pixel pitch, which the renderer can only reconstruct).
++  Vector<mojom::blink::DisplayXRViewPtr> inline_3d_views_;
+   // Scene-scale m2v knob (metres); 0 = disabled. See SetInline3DSceneLayer +
+   // UpdateInline3DViews.
+   float inline_3d_virtual_display_height_ = 0.f;
+diff --git a/third_party/displayxr/include/openxr/XR_DXR_display_zones.h b/third_party/displayxr/include/openxr/XR_DXR_display_zones.h
+index 03537c65a2f08..da5b582c1cc42 100644
+--- a/third_party/displayxr/include/openxr/XR_DXR_display_zones.h
++++ b/third_party/displayxr/include/openxr/XR_DXR_display_zones.h
+@@ -6,7 +6,8 @@
+ // Khronos OpenXR registry: extension numbers and XrStructureType values sit
+ // in a provisional experimental block (1004999xxx) pending official
+ // assignment. Extension names are expected to be stable; numeric values are
+-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
++// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
++// interface history did not restart with the name).
+ // See GOVERNANCE.md.
+ //
+ /*!
+diff --git a/third_party/displayxr/include/openxr/XR_DXR_view_rig.h b/third_party/displayxr/include/openxr/XR_DXR_view_rig.h
+index f715e3f26f14f..b9f6a6273452d 100644
+--- a/third_party/displayxr/include/openxr/XR_DXR_view_rig.h
++++ b/third_party/displayxr/include/openxr/XR_DXR_view_rig.h
+@@ -6,7 +6,8 @@
+ // Khronos OpenXR registry: extension numbers and XrStructureType values sit
+ // in a provisional experimental block (1004999xxx) pending official
+ // assignment. Extension names are expected to be stable; numeric values are
+-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
++// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
++// interface history did not restart with the name).
+ // See GOVERNANCE.md.
+ //
+ /*!
+@@ -56,7 +57,7 @@ extern "C" {
+ #endif
+ 
+ #define XR_DXR_view_rig 1
+-#define XR_DXR_view_rig_SPEC_VERSION 1
++#define XR_DXR_view_rig_SPEC_VERSION 3
+ #define XR_DXR_VIEW_RIG_EXTENSION_NAME "XR_DXR_view_rig"
+ 
+ // Reserved 1004999xxx range, next free block after mcp_tools (…130-132).
+-- 
+2.42.0.windows.2
+

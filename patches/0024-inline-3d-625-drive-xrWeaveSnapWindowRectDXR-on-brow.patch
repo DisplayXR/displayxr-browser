@@ -1,0 +1,141 @@
+From c18875873f4c9d130076d906521d9a3d2d806f84 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Mon, 13 Jul 2026 10:03:25 -0700
+Subject: [PATCH 24/40] inline-3d(#625): drive xrWeaveSnapWindowRectDXR on
+ browser-window move (CEF parity)
+
+The GPU-process weave client bound the window and had the snap PFN but never
+called it, so the interlace lattice's phase reference didn't follow the window
+when the user dragged/repositioned it (it stayed on whatever the DP last
+referenced). Poll the bound window's client-area screen origin once per weave
+frame (DisplayXRWeaveClient::SnapWindowIfMoved, called from SubmitSync); when it
+changes, drive xrWeaveSnapWindowRectDXR so the DP re-locks the lattice to the
+window's new absolute panel position. Idempotent + cheap (a no-op when the
+window is stationary). Fires once on bind to set the initial phase reference.
+
+Matches the Step-A CEF host, which drove the phase-snap over IPC on window moves.
+---
+ .../browser/displayxr_weave_client.cc         | 57 +++++++++++++++++++
+ .../browser/displayxr_weave_client.h          |  7 +++
+ .../displayxr/gpu/displayxr_weave_gpu.cc      |  5 ++
+ 3 files changed, 69 insertions(+)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 1efbb5e69fe47..d04c834033cf2 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -80,6 +80,14 @@ struct WeaveClientState {
+   uint32_t rect_w = 0;
+   uint32_t rect_h = 0;
+   bool rect_valid = false;
++
++  // #625 phase-snap: the bound window's last client-area screen origin we told
++  // the DP about via xrWeaveSnapWindowRectDXR. The interlace lattice is aligned
++  // to the panel's physical pixel columns, so when the window MOVES the DP's
++  // phase reference must follow, or the woven output tears against the lattice.
++  // INT32_MIN = never snapped yet (force the first snap after bindWindow).
++  int32_t last_snap_x = INT32_MIN;
++  int32_t last_snap_y = INT32_MIN;
+ };
+ 
+ // Find this process's main top-level window (the browser's main window) so
+@@ -574,6 +582,48 @@ bool IsSupportedWin() {
+   return s.session != XR_NULL_HANDLE && s.submit != nullptr;
+ }
+ 
++// #625 phase-snap (CEF parity): poll the bound window's client-area screen
++// origin; when it changes (the user dragged/repositioned the browser window),
++// drive xrWeaveSnapWindowRectDXR so the DP re-locks the interlace lattice to the
++// window's new absolute panel position. Cheap and idempotent — a no-op when the
++// window hasn't moved — so it is safe to call every frame from the weave path.
++void SnapWindowIfMovedWin() {
++  WeaveClientState& s = State();
++  if (s.session == XR_NULL_HANDLE || !s.snap || !s.hwnd) {
++    return;
++  }
++  POINT origin = {0, 0};
++  if (!::ClientToScreen(s.hwnd, &origin)) {
++    return;
++  }
++  if (origin.x == s.last_snap_x && origin.y == s.last_snap_y) {
++    return;  // window hasn't moved since the last snap
++  }
++  // origin = where the DP's phase reference currently sits (the last position we
++  // snapped, or the same point on the very first snap); target = the new
++  // client-area origin. The DP updates its phase and returns a (possibly
++  // lattice-aligned) suggestion, which we don't force the OS window to — we only
++  // need the DP's phase reference to track the window.
++  const bool first = (s.last_snap_x == INT32_MIN);
++  XrRect2Di origin_rect = {
++      {first ? origin.x : s.last_snap_x, first ? origin.y : s.last_snap_y},
++      {0, 0}};
++  XrRect2Di target_rect = {{origin.x, origin.y}, {0, 0}};
++  XrRect2Di snapped = {};
++  const XrResult r = s.snap(s.session, &origin_rect, &target_rect, &snapped);
++  if (XR_SUCCEEDED(r)) {
++    s.last_snap_x = origin.x;
++    s.last_snap_y = origin.y;
++    static int s_log = 0;
++    if (s_log < 3) {
++      ++s_log;
++      VLOG(1) << "[DisplayXR] phase-snap: window moved to screen ("
++              << origin.x << "," << origin.y << ") -> snapped ("
++              << snapped.offset.x << "," << snapped.offset.y << ")";
++    }
++  }
++}
++
+ void GetLatestWin(std::vector<float>* eyes,
+                   bool* eyes_valid,
+                   DisplayXRWeaveClient::DisplayInfo* info) {
+@@ -635,6 +685,13 @@ bool DisplayXRWeaveClient::IsSupported() {
+ #endif
+ }
+ 
++// static
++void DisplayXRWeaveClient::SnapWindowIfMoved() {
++#if BUILDFLAG(IS_WIN)
++  SnapWindowIfMovedWin();
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::GetLatest(std::vector<float>* eyes,
+                                      bool* eyes_valid,
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index 8a80dbbf47682..e4eada6d612cf 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -99,6 +99,13 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   // WebXR isSessionSupported('inline-3d').
+   static bool IsSupported();
+ 
++  // #625 phase-snap (CEF parity): if the bound browser window has moved since the
++  // last call, drive xrWeaveSnapWindowRectDXR so the DP re-locks the interlace
++  // lattice to the window's new absolute screen position. Idempotent + cheap
++  // (a no-op when the window hasn't moved); call once per weave frame from the
++  // GPU-process sync path. Windows-only; a no-op elsewhere.
++  static void SnapWindowIfMoved();
++
+   // Latest tracked eyes (flattened xyz triples, display-space metres) + the
+   // display/element geometry, as cached from the most recent weave submission.
+   // |*eyes| is empty and |*eyes_valid| false until tracking is available.
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index 5fd950c302002..b760f626c5636 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -347,6 +347,11 @@ bool DisplayXRWeaveGpu::SubmitInput(WeaveInput& in,
+ bool DisplayXRWeaveGpu::SubmitSync(WeaveInput& in,
+                                    const gfx::Rect& window_rect,
+                                    uint32_t target_id) {
++  // #625 phase-snap (CEF parity): before submitting, re-lock the interlace
++  // lattice to the browser window's current screen position if it moved. Cheap
++  // and idempotent (no-op when the window is stationary).
++  DisplayXRWeaveClient::SnapWindowIfMoved();
++
+   // #625 zero-lag: xrWeaveSubmitDXR directly on the GPU-process session — no
+   // mojo, no browser hop, no deadlock. The woven output comes back in this call,
+   // stored into results_ immediately so Viz's same-frame TryTakeWovenResult
+-- 
+2.42.0.windows.2
+

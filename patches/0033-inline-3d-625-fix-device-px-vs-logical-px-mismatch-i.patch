@@ -1,0 +1,122 @@
+From fc4635553e2efb8ac66676fe8680e00d1a48b936 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 17:33:09 -0700
+Subject: [PATCH 33/40] inline-3d(#625): fix device-px vs logical-px mismatch
+ in the element geometry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With the 2-view path finally live, the scene rendered far off-centre with
+wildly exaggerated disparity. Cause: a unit mismatch in UpdateInline3DViews.
+
+The runtime reports the display in LOGICAL (DPI-scaled) pixels — 1536x864 for
+this 3840x2160 panel at 250% — so pixel_m is metres per LOGICAL pixel. But
+element_display_rect arrives in DEVICE pixels (getBoundingClientRect x dsf,
+rebased on a device-px ClientToScreen origin in the browser). Multiplying
+device-px element coordinates by a logical pixel_m inflates every element
+dimension by the DPI scale (2.5x here) and measures the centre offset against
+a display centre 2.5x too small, so:
+  - the element resolves far from its true position (scene pinned off-screen /
+    "way on top"), and
+  - its physical height is 2.5x wrong => m2v (virtualDisplayHeight /
+    element_physical_height) is wrong => the tracked eyes are mis-related to
+    the element => huge disparity.
+
+Normalise the rect into the display's pixel space (divide by the frame's
+devicePixelRatio) before deriving metres, and use it for the frustum extents,
+the centre offset AND the m2v scene scale.
+---
+ .../blink/renderer/modules/xr/xr_session.cc   | 39 +++++++++++++++----
+ .../blink/renderer/modules/xr/xr_session.h    |  3 ++
+ 2 files changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index db718f01ace91..4c0f82473417d 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -2579,6 +2579,17 @@ void XRSession::RequestInline3DState() {
+       scene_rect, BindOnce(&XRSession::OnInline3DState, WrapWeakPersistent(this)));
+ }
+ 
++// The frame's device-pixel ratio, or 0 if unavailable. Used to normalise the
++// device-px element rect into the display's logical-px space (see
++// UpdateInline3DViews) and to build the window-relative rects we report.
++double XRSession::DevicePixelRatioForInline3D() const {
++  LocalDOMWindow* window = DynamicTo<LocalDOMWindow>(GetExecutionContext());
++  if (!window || !window->GetFrame()) {
++    return 0.0;
++  }
++  return window->GetFrame()->DevicePixelRatio();
++}
++
+ // The scene layer's canvas rect in window-relative device px — the same basis
+ // ReportInline3DRects uses for the weave rects, so the views and the woven
+ // output describe the same element.
+@@ -2699,20 +2710,34 @@ void XRSession::UpdateInline3DViews() {
+   const float near_depth = static_cast<float>(render_state_->depthNear());
+   const float far_depth = static_cast<float>(render_state_->depthFar());
+ 
+-  // Metres per device pixel (square pixels; derive from height).
++  // Metres per display pixel (square pixels; derive from height).
+   const float pixel_m = di.display_height_px > 0
+                             ? di.display_height_m / di.display_height_px
+                             : 0.f;
+ 
++  // UNITS: the runtime reports the display in LOGICAL (DPI-scaled) pixels —
++  // e.g. 1536x864 for a 3840x2160 panel at 250% — so |pixel_m| is metres per
++  // LOGICAL pixel. But element_display_rect arrives in DEVICE pixels
++  // (getBoundingClientRect x dsf, rebased on a device-px ClientToScreen
++  // origin). Mixing them inflates every element dimension by the DPI scale:
++  // the element lands far off centre AND its physical height is wrong, so the
++  // m2v scene scale is wrong too — which shows up as a scene pinned to the
++  // wrong part of the display with wildly exaggerated disparity. Normalise the
++  // rect into the display's pixel space first.
++  const double dsf = DevicePixelRatioForInline3D();
++  gfx::RectF er_f(di.element_display_rect);
++  if (dsf > 0.0) {
++    er_f.Scale(static_cast<float>(1.0 / dsf));
++  }
++
+   // Element rect centre offset from the display centre + half-size, in
+   // display-space metres (+x right, +y up; screen y is top-down).
+-  const gfx::Rect& er = di.element_display_rect;
+   const float disp_cx = di.display_width_px * 0.5f;
+   const float disp_cy = di.display_height_px * 0.5f;
+-  const float elem_cx_m = (er.x() + er.width() * 0.5f - disp_cx) * pixel_m;
+-  const float elem_cy_m = (disp_cy - (er.y() + er.height() * 0.5f)) * pixel_m;
+-  const float half_w_m = er.width() * pixel_m * 0.5f;
+-  const float half_h_m = er.height() * pixel_m * 0.5f;
++  const float elem_cx_m = (er_f.x() + er_f.width() * 0.5f - disp_cx) * pixel_m;
++  const float elem_cy_m = (disp_cy - (er_f.y() + er_f.height() * 0.5f)) * pixel_m;
++  const float half_w_m = er_f.width() * pixel_m * 0.5f;
++  const float half_h_m = er_f.height() * pixel_m * 0.5f;
+ 
+   // Scene-scale (display-rig m2v, XR_DXR_view_rig's virtualDisplayHeight): the
+   // off-axis frustum ANGLES are physically correct and m2v-invariant (scaling
+@@ -2723,7 +2748,7 @@ void XRSession::UpdateInline3DViews() {
+   // with no app-side scaling. Matches display3d_view.c: eye_scaled = eye*m2v,
+   // projection built from physical dims (buildKooimaProjection cancels m2v with
+   // perspectiveFactor=1). 0 = disabled -> m2v 1 -> physical-scale scene.
+-  const float elem_phys_h = er.height() * pixel_m;
++  const float elem_phys_h = er_f.height() * pixel_m;
+   const float m2v = (inline_3d_virtual_display_height_ > 0.f && elem_phys_h > 0.f)
+                         ? (inline_3d_virtual_display_height_ / elem_phys_h)
+                         : 1.f;
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
+index 15a59de609beb..5dfe03744553f 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.h
++++ b/third_party/blink/renderer/modules/xr/xr_session.h
+@@ -498,6 +498,9 @@ class XRSession final : public EventTarget,
+   // The scene layer's canvas rect in window-relative device px (empty if no
+   // scene layer). Same basis as ReportInline3DRects.
+   gfx::Rect Inline3DSceneWindowRect() const;
++  // Frame device-pixel ratio (0 if unavailable) — the device-px vs logical-px
++  // conversion the inline-3d element geometry needs.
++  double DevicePixelRatioForInline3D() const;
+   void OnInline3DState(const Vector<float>& eyes,
+                        bool valid,
+                        mojom::blink::DisplayXRDisplayInfoPtr info);
+-- 
+2.42.0.windows.2
+

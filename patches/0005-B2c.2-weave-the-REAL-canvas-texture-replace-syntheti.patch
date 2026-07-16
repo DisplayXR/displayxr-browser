@@ -1,7 +1,7 @@
 From 656af477c0d3c4a1b327fcde010da4b9f0489c64 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sat, 27 Jun 2026 17:18:17 -0500
-Subject: [PATCH 05/18] B2c.2: weave the REAL canvas texture (replace synthetic
+Subject: [PATCH 05/40] B2c.2: weave the REAL canvas texture (replace synthetic
  SBS input)
 
 #625 Step B. Replaces the B2c.1 synthetic test-pattern input with the

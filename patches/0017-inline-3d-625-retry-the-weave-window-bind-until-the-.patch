@@ -1,7 +1,7 @@
 From 4516573a5ce13946ff1e73854ed6aa662ce61082 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 12:46:11 -0700
-Subject: [PATCH 17/18] inline-3d(#625): retry the weave window bind until the
+Subject: [PATCH 17/40] inline-3d(#625): retry the weave window bind until the
  browser window is visible
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

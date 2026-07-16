@@ -50,6 +50,19 @@
 !endif
 
 ;--------------------------------
+; Launch flags — REQUIRED for the inline-3D weave to work (displayxr-browser#15 + the
+; 2026-07-15 weave investigation). Baked into every launch path (shortcuts + finish-run):
+;   --enable-inline-3d                        native weave pipe (browser/GPU weave client)
+;   --enable-blink-features=DisplayXRInline3D exposes window.XRDisplayLayer (experimental Blink
+;                                             feature, no switch->feature map; without it the JS
+;                                             gate inline3DAvailable() is false -> page drops to 2D)
+;   --inline-3d-sync-weave                    GPU-resident zero-lag weave submit
+;   --disable-direct-composition              routes to the GL weave path (MaybeWeaveOutput); the
+;                                             default DComp path (MaybeWeaveRootRenderPass) currently
+;                                             gives no overlay backing -> no weave (regression, TODO)
+!define BROWSER_FLAGS "--enable-inline-3d --enable-blink-features=DisplayXRInline3D --inline-3d-sync-weave --disable-direct-composition"
+
+;--------------------------------
 Name "DisplayXR Browser ${VERSION}"
 !ifdef INNER
 	OutFile "$%TEMP%\DisplayXRBrowser_inner.exe"
@@ -75,9 +88,14 @@ ShowUninstDetails show
 !endif
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
-; Offer to launch on finish.
-!define MUI_FINISHPAGE_RUN "$INSTDIR\chrome.exe"
+; Offer to launch on finish. The installer runs elevated, so we must NOT Exec chrome.exe
+; directly (it would inherit High integrity — the OpenXR loader then ignores XR_RUNTIME_JSON and
+; the Low-integrity GPU weave process can't be DACL-widened by the Medium service). Launch the
+; Start-menu shortcut through explorer.exe instead: explorer is Medium integrity, so chrome runs
+; Medium with the shortcut's baked-in ${BROWSER_FLAGS}.
+!define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Launch DisplayXR Browser"
+!define MUI_FINISHPAGE_RUN_FUNCTION "LaunchBrowserDeElevated"
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
@@ -121,9 +139,9 @@ Section "DisplayXR Browser" SecBrowser
 	IntFmt $0 "0x%08X" $0
 	WriteRegDWORD HKLM "${ARP}" "EstimatedSize" "$0"
 
-	; Shortcuts.
-	CreateShortCut "$SMPROGRAMS\DisplayXR Browser.lnk" "$INSTDIR\chrome.exe"
-	CreateShortCut "$DESKTOP\DisplayXR Browser.lnk"    "$INSTDIR\chrome.exe"
+	; Shortcuts — launch chrome with the inline-3D weave flags baked in.
+	CreateShortCut "$SMPROGRAMS\DisplayXR Browser.lnk" "$INSTDIR\chrome.exe" "${BROWSER_FLAGS}"
+	CreateShortCut "$DESKTOP\DisplayXR Browser.lnk"    "$INSTDIR\chrome.exe" "${BROWSER_FLAGS}"
 SectionEnd
 
 ;--------------------------------
@@ -206,6 +224,13 @@ Section "Uninstall"
 	; NOTE: we intentionally do NOT uninstall the DisplayXR runtime / display plug-in —
 	; they are shared prerequisites other DisplayXR apps may depend on.
 SectionEnd
+
+;--------------------------------
+; Finish-page launch: run the Start-menu shortcut via explorer.exe so chrome starts at Medium
+; integrity (not the installer's High) with the shortcut's baked-in ${BROWSER_FLAGS}.
+Function LaunchBrowserDeElevated
+	Exec 'explorer.exe "$SMPROGRAMS\DisplayXR Browser.lnk"'
+FunctionEnd
 
 ;--------------------------------
 Function .onInit

@@ -1,0 +1,59 @@
+From 3283a46b5cbed62ffe7a00305090a911b25a9639 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 09:30:13 -0700
+Subject: [PATCH 28/40] displayxr: clear draw-back rects for off-window /
+ unsubmitted weave targets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase B paints displayxr_drawn_rect_[i] every frame, but the rect only
+updated when target i submitted — a tile scrolled fully off-window (its
+layer kept alive by the wall-3d IntersectionObserver rootMargin) or an
+index remapped by a layer close stopped submitting while its stale drawn
+rect kept painting the old woven region: permanent replica ghosts after a
+scroll. Clear pending+drawn when the window intersection is empty (both
+modes — an off-screen target must draw nothing), and in batch mode also
+when the copy failed (sync completes in-frame, so no submit = nothing
+woven; async keeps its one-frame-lag contract untouched).
+---
+ .../skia_output_surface_impl_on_gpu.cc         | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 3b750a23e820c..7a5c4dddcee8f 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3065,12 +3065,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     gfx::Rect probe = inline_3d_rects_[t];
+     probe.Intersect(window_bounds);
+     if (probe.IsEmpty()) {
++      // Nothing of this target is on screen, so nothing may be drawn back for
++      // it either: Phase B paints displayxr_drawn_rect_[t] every frame, and a
++      // stale value would pin this target's last woven region permanently at
++      // its old position (replica ghosts after a scroll — the lazy-layer
++      // wall-3d case, where off-window tiles keep live layers via the
++      // IntersectionObserver rootMargin).
++      displayxr_pending_rect_[t] = gfx::Rect();
++      displayxr_drawn_rect_[t] = gfx::Rect();
+       continue;
+     }
+     if (!batch && provider->SubmitInFlight(static_cast<uint32_t>(t))) {
+       continue;
+     }
+-    attempt_submit(t);
++    const bool submitted = attempt_submit(t);
++    // Batch mode completes synchronously, so "nothing submitted this frame"
++    // (copy failed) means nothing was woven for this target — clear rather
++    // than redraw a stale region. (Async mode keeps the last woven visible
++    // while a submit is in flight; that is its one-frame-lag contract.)
++    if (batch && !submitted) {
++      displayxr_pending_rect_[t] = gfx::Rect();
++      displayxr_drawn_rect_[t] = gfx::Rect();
++    }
+   }
+   if (batch) {
+     provider->SubmitBatchSync();
+-- 
+2.42.0.windows.2
+

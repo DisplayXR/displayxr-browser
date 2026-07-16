@@ -1,0 +1,517 @@
+From a106b5c9b3420677d0a5a2def2962b2c8b06e36b Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 16:37:32 -0700
+Subject: [PATCH 30/40] inline-3d(#625): restore the renderer's eye feed in
+ sync-weave mode + scope views to the scene element
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The inline-3d session has been silently serving its MONO fallback — one view
+at the origin, symmetric projection — so a rendered scene showed no cube (it
+sits at z=0, i.e. exactly at the camera, and is clipped) and no look-around.
+Confirmed live: getViewerPose().views == 1, eye "none", pos [0,0,0], no
+frustum skew.
+
+Root cause: XRSession::UpdateInline3DViews is gated on
+inline_3d_eyes_valid_ && rect_valid, which come from
+DisplayXRService::GetLatestEyes -> the BROWSER process's weave-client cache.
+That cache is only ever written by a weave submit (SubmitWin /
+SubmitBatchWin) — and since the sync-weave move (#625) the submits happen in
+the GPU process, so the browser's cache is never populated and the gate never
+opens. Dropping the async mojo WeaveSubmit path removed the only channel that
+carried eyes back to the browser; the scene path has been dead since (which
+is why hello-cube's look-around was never validated).
+
+- mojom DisplayXRWeaver gains ReportInline3DEyes(eyes, valid), fire-and-forget
+  GPU->browser; DisplayXRWeaveGpu pushes after every sync submit (single and
+  batch); DisplayXRWeaverImpl seeds the browser cache via
+  DisplayXRWeaveClient::SetEyesFromGpu. The remote is already bound in sync
+  mode (ShellContentGpuClient), so this needs no new plumbing.
+- mojom DisplayXRService::GetLatestEyes now takes the caller's
+  element_window_rect: the browser only knows the LAST SUBMITTED weave rect,
+  which on a page with several 3D windows is an arbitrary element — building
+  the scene's frustum from a photo's rect puts it in the wrong place at the
+  wrong scale. XRSession tracks the scene layer (the one carrying
+  virtualDisplayHeight) and sends its canvas rect, on the same
+  window-relative device-px basis ReportInline3DRects uses. Empty rect => the
+  old submitted-rect behavior (single-window pages).
+
+With the feed restored, tag+29's virtualDisplayHeight (display-rig m2v) stops
+being dead code and actually scales the eye poses.
+---
+ .../browser/displayxr_service_impl.cc         | 12 +++-
+ .../browser/displayxr_service_impl.h          |  3 +-
+ .../browser/displayxr_weave_client.cc         | 56 +++++++++++++++----
+ .../browser/displayxr_weave_client.h          | 20 ++++++-
+ .../browser/displayxr_weaver_impl.cc          |  8 +++
+ .../displayxr/browser/displayxr_weaver_impl.h |  5 ++
+ .../displayxr/common/displayxr_weave.mojom    | 16 ++++++
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 18 ++++++
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  8 +++
+ .../public/mojom/xr/displayxr_service.mojom   | 13 ++++-
+ .../renderer/modules/xr/xr_display_layer.cc   |  4 +-
+ .../blink/renderer/modules/xr/xr_session.cc   | 48 +++++++++++++++-
+ .../blink/renderer/modules/xr/xr_session.h    | 23 +++++---
+ 13 files changed, 207 insertions(+), 27 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_service_impl.cc b/components/displayxr/browser/displayxr_service_impl.cc
+index 140f8dd28dcae..19291b6af1d87 100644
+--- a/components/displayxr/browser/displayxr_service_impl.cc
++++ b/components/displayxr/browser/displayxr_service_impl.cc
+@@ -29,11 +29,19 @@ void DisplayXRServiceImpl::IsInline3DSupported(
+   std::move(callback).Run(DisplayXRWeaveClient::IsSupported());
+ }
+ 
+-void DisplayXRServiceImpl::GetLatestEyes(GetLatestEyesCallback callback) {
++void DisplayXRServiceImpl::GetLatestEyes(const gfx::Rect& element_window_rect,
++                                         GetLatestEyesCallback callback) {
+   std::vector<float> eyes;
+   bool valid = false;
+   DisplayXRWeaveClient::DisplayInfo di;
+-  DisplayXRWeaveClient::GetLatest(&eyes, &valid, &di);
++  // Scope the returned element geometry to the CALLER's element (its scene
++  // canvas) rather than the last submitted weave rect, which on a multi-window
++  // page belongs to an arbitrary element. Empty rect => fall back to the
++  // submitted rect.
++  DisplayXRWeaveClient::GetLatest(
++      &eyes, &valid, &di, element_window_rect.x(), element_window_rect.y(),
++      static_cast<uint32_t>(element_window_rect.width()),
++      static_cast<uint32_t>(element_window_rect.height()));
+ 
+   auto info = blink::mojom::DisplayXRDisplayInfo::New();
+   info->display_width_m = di.display_width_m;
+diff --git a/components/displayxr/browser/displayxr_service_impl.h b/components/displayxr/browser/displayxr_service_impl.h
+index 94160d154b6c6..191e3a71c80f9 100644
+--- a/components/displayxr/browser/displayxr_service_impl.h
++++ b/components/displayxr/browser/displayxr_service_impl.h
+@@ -29,7 +29,8 @@ class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
+ 
+   // blink::mojom::DisplayXRService:
+   void IsInline3DSupported(IsInline3DSupportedCallback callback) override;
+-  void GetLatestEyes(GetLatestEyesCallback callback) override;
++  void GetLatestEyes(const gfx::Rect& element_window_rect,
++                     GetLatestEyesCallback callback) override;
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 118c9ad9370e9..000365c699483 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -853,7 +853,11 @@ void SnapWindowIfMovedWin() {
+ 
+ void GetLatestWin(std::vector<float>* eyes,
+                   bool* eyes_valid,
+-                  DisplayXRWeaveClient::DisplayInfo* info) {
++                  DisplayXRWeaveClient::DisplayInfo* info,
++                  int32_t rect_x,
++                  int32_t rect_y,
++                  uint32_t rect_w,
++                  uint32_t rect_h) {
+   WeaveClientState& s = State();
+   if (eyes) {
+     *eyes = s.latest_eyes;
+@@ -867,23 +871,39 @@ void GetLatestWin(std::vector<float>* eyes,
+     info->display_width_px = s.display_px_w;
+     info->display_height_px = s.display_px_h;
+     info->element_rect_valid = false;
+-    // Convert the latest window-relative weave rect to physical-display device
+-    // px by adding the bound window's client-area origin on the desktop. The
+-    // weave display is assumed to host the window (same assumption bindWindow's
+-    // phase-snap already makes); exact multi-monitor mapping is a B4 refinement.
+-    if (s.rect_valid && s.hwnd) {
++    // Prefer the CALLER's element rect (its scene canvas) over the last
++    // submitted weave rect: on a page with several 3D windows the submitted
++    // rect is an arbitrary one, and the scene's frustum must be built from the
++    // scene's own element. Falls back to the submitted rect when the caller
++    // passes none (w/h == 0).
++    const bool use_caller_rect = (rect_w > 0 && rect_h > 0);
++    const int32_t rx = use_caller_rect ? rect_x : s.rect_x;
++    const int32_t ry = use_caller_rect ? rect_y : s.rect_y;
++    const uint32_t rw = use_caller_rect ? rect_w : s.rect_w;
++    const uint32_t rh = use_caller_rect ? rect_h : s.rect_h;
++    // Convert the window-relative rect to physical-display device px by adding
++    // the bound window's client-area origin on the desktop. The weave display is
++    // assumed to host the window (same assumption bindWindow's phase-snap
++    // already makes); exact multi-monitor mapping is a B4 refinement.
++    if ((use_caller_rect || s.rect_valid) && s.hwnd) {
+       POINT origin = {0, 0};
+       if (::ClientToScreen(s.hwnd, &origin)) {
+-        info->element_x = origin.x + s.rect_x;
+-        info->element_y = origin.y + s.rect_y;
+-        info->element_w = s.rect_w;
+-        info->element_h = s.rect_h;
++        info->element_x = origin.x + rx;
++        info->element_y = origin.y + ry;
++        info->element_w = rw;
++        info->element_h = rh;
+         info->element_rect_valid = true;
+       }
+     }
+   }
+ }
+ 
++void SetEyesFromGpuWin(const std::vector<float>& eyes, bool eyes_valid) {
++  WeaveClientState& s = State();
++  s.latest_eyes = eyes;
++  s.latest_eyes_valid = eyes_valid;
++}
++
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+ }  // namespace
+@@ -943,9 +963,13 @@ void DisplayXRWeaveClient::SnapWindowIfMoved() {
+ // static
+ void DisplayXRWeaveClient::GetLatest(std::vector<float>* eyes,
+                                      bool* eyes_valid,
+-                                     DisplayInfo* info) {
++                                     DisplayInfo* info,
++                                     int32_t rect_x,
++                                     int32_t rect_y,
++                                     uint32_t rect_w,
++                                     uint32_t rect_h) {
+ #if BUILDFLAG(IS_WIN)
+-  GetLatestWin(eyes, eyes_valid, info);
++  GetLatestWin(eyes, eyes_valid, info, rect_x, rect_y, rect_w, rect_h);
+ #else
+   if (eyes) {
+     eyes->clear();
+@@ -959,6 +983,14 @@ void DisplayXRWeaveClient::GetLatest(std::vector<float>* eyes,
+ #endif
+ }
+ 
++// static
++void DisplayXRWeaveClient::SetEyesFromGpu(const std::vector<float>& eyes,
++                                          bool eyes_valid) {
++#if BUILDFLAG(IS_WIN)
++  SetEyesFromGpuWin(eyes, eyes_valid);
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::PreSandboxInitializeForGpuProcess() {
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index a8e7eb229958f..03e87de421db1 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -137,9 +137,27 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   // Latest tracked eyes (flattened xyz triples, display-space metres) + the
+   // display/element geometry, as cached from the most recent weave submission.
+   // |*eyes| is empty and |*eyes_valid| false until tracking is available.
++  //
++  // |rect_*| optionally overrides which element the returned
++  // DisplayInfo::element_* describes: pass the caller's window-relative
++  // device-px rect (its scene canvas) and it is rebased onto the bound window's
++  // client origin. Pass rect_w/rect_h == 0 to use the last submitted rect
++  // instead. See DisplayXRService::GetLatestEyes for why the caller must supply
++  // this on a multi-window page.
+   static void GetLatest(std::vector<float>* eyes,
+                         bool* eyes_valid,
+-                        DisplayInfo* info);
++                        DisplayInfo* info,
++                        int32_t rect_x = 0,
++                        int32_t rect_y = 0,
++                        uint32_t rect_w = 0,
++                        uint32_t rect_h = 0);
++
++  // #625 sync weave: cache eyes reported by the GPU process (which owns the
++  // weave session and its submits in sync mode, so the browser-side cache is
++  // never populated by a local submit). Without this the renderer's inline-3d
++  // views never activate and the session falls back to a mono view. Called on
++  // the UI thread from DisplayXRWeaverImpl.
++  static void SetEyesFromGpu(const std::vector<float>& eyes, bool eyes_valid);
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_weaver_impl.cc b/components/displayxr/browser/displayxr_weaver_impl.cc
+index 793f4e831ee86..471d02908596b 100644
+--- a/components/displayxr/browser/displayxr_weaver_impl.cc
++++ b/components/displayxr/browser/displayxr_weaver_impl.cc
+@@ -71,6 +71,14 @@ void DisplayXRWeaverImpl::WeaveSubmit(gfx::DXGIHandle texture,
+   out->eyes_valid = r.eyes_valid;
+   std::move(callback).Run(std::move(out));
+ }
++
++void DisplayXRWeaverImpl::ReportInline3DEyes(const std::vector<float>& eyes,
++                                             bool eyes_valid) {
++  // Sync mode: the GPU process performed the submit and got the eyes, so seed
++  // the browser-side cache DisplayXRService serves to the renderer. Without
++  // this the renderer never sees valid eyes and UpdateInline3DViews is skipped.
++  DisplayXRWeaveClient::SetEyesFromGpu(eyes, eyes_valid);
++}
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_weaver_impl.h b/components/displayxr/browser/displayxr_weaver_impl.h
+index 13f755f5c9521..ce544cb3d8d67 100644
+--- a/components/displayxr/browser/displayxr_weaver_impl.h
++++ b/components/displayxr/browser/displayxr_weaver_impl.h
+@@ -33,6 +33,11 @@ class DisplayXRWeaverImpl : public mojom::DisplayXRWeaver {
+   void WeaveSubmit(gfx::DXGIHandle texture,
+                    const gfx::Rect& rect,
+                    WeaveSubmitCallback callback) override;
++  // #625 sync weave: cache eyes the GPU process reports (it owns the session +
++  // submits there, so the browser-side cache the renderer reads is otherwise
++  // never populated — which drops the inline-3d session to a mono view).
++  void ReportInline3DEyes(const std::vector<float>& eyes,
++                          bool eyes_valid) override;
+ #endif
+ };
+ 
+diff --git a/components/displayxr/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
+index d63e97c3ad391..1edd7454fdbde 100644
+--- a/components/displayxr/common/displayxr_weave.mojom
++++ b/components/displayxr/common/displayxr_weave.mojom
+@@ -54,4 +54,20 @@ interface DisplayXRWeaver {
+   [EnableIf=is_win]
+   WeaveSubmit(gfx.mojom.DXGIHandle texture, gfx.mojom.Rect rect)
+       => (DisplayXRWeaveResult? result);
++
++  // #625 sync weave: report the tracked eyes to the browser process.
++  //
++  // In sync mode the GPU process owns the weave session and performs the
++  // submits, so the eyes come back THERE — while the browser process's
++  // weave-client cache (which DisplayXRService serves to the renderer, and
++  // which the renderer needs to build its off-axis views) is only ever written
++  // by a submit and so stays empty forever. That silently drops the inline-3d
++  // session to its mono fallback: one view at the origin, no look-around. Push
++  // the eyes over after each sync submit to keep the renderer fed.
++  //
++  // Fire-and-forget (no reply): a stale-by-a-frame eye set is harmless — the
++  // renderer already treats these as "latest known" — and a reply would put a
++  // round-trip on the zero-lag present thread.
++  [EnableIf=is_win]
++  ReportInline3DEyes(array<float> eyes, bool eyes_valid);
+ };
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index ebc5803afa063..86915f2cb3627 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -55,6 +55,21 @@ void DisplayXRWeaveGpu::Bind() {
+       base::Unretained(this)));
+ }
+ 
++void DisplayXRWeaveGpu::ReportEyesToBrowser(const std::vector<float>& eyes,
++                                            bool eyes_valid) {
++  // Sync mode owns the weave session HERE, so the eyes land in this process —
++  // but the renderer reads them from the BROWSER process's weave-client cache
++  // (via DisplayXRService), which only a local submit would fill. Push them
++  // over so the renderer's off-axis views actually activate; without it the
++  // inline-3d session silently serves a single mono view at the origin (no
++  // cube, no look-around). Fire-and-forget: one frame of staleness is fine and
++  // a reply would cost a round-trip on the present thread.
++  if (!weaver_.is_bound()) {
++    return;
++  }
++  weaver_->ReportInline3DEyes(eyes, eyes_valid);
++}
++
+ // static
+ bool DisplayXRWeaveGpu::SyncMode() {
+   // The GPU-owned present session is live iff it was created pre-sandbox
+@@ -388,6 +403,7 @@ bool DisplayXRWeaveGpu::SubmitSync(WeaveInput& in,
+             << " woven=0x" << std::hex << sr.woven_handle << std::dec << " "
+             << sr.width << "x" << sr.height << " eyes_valid=" << sr.eyes_valid;
+   }
++  ReportEyesToBrowser(sr.eyes, sr.eyes_valid);
+ 
+   // Store the synchronous result exactly as OnWeaveReply would, so the existing
+   // Viz Phase-B import/draw path is unchanged. Fresh woven/fence handles arrive
+@@ -626,6 +642,8 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+     }
+     return false;
+   }
++  ReportEyesToBrowser(sr.eyes, sr.eyes_valid);
++
+   // Throttled batch-cost telemetry: this ONE call replaced n serialized ~1 ms
+   // submits — the number that lifts the visible-element ceiling.
+   static base::TimeTicks s_last_log;
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index 6ee4c94d15dea..3795ce65b29b0 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -118,6 +118,14 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+                    const gfx::Rect& window_rect,
+                    uint32_t target_id);
+ 
++  // #625 sync weave: forward the tracked eyes to the browser process so the
++  // renderer's inline-3d off-axis views get fed (the browser-side cache the
++  // renderer reads is only written by a local submit, which never happens in
++  // sync mode). No-op if the browser remote isn't bound. Takes the plain eye
++  // data rather than the client's result struct so this header needn't pull in
++  // displayxr_weave_client.h.
++  void ReportEyesToBrowser(const std::vector<float>& eyes, bool eyes_valid);
++
+   // #625 zero-lag: true iff the OpenXR weave session lives IN this GPU process
+   // (created pre-sandbox, --inline-3d-sync-weave). When true the submit is a
+   // direct synchronous xrWeaveSubmitDXR on this thread (no mojo, no browser hop);
+diff --git a/third_party/blink/public/mojom/xr/displayxr_service.mojom b/third_party/blink/public/mojom/xr/displayxr_service.mojom
+index 89222ac4a1cf2..49dc581f959dc 100644
+--- a/third_party/blink/public/mojom/xr/displayxr_service.mojom
++++ b/third_party/blink/public/mojom/xr/displayxr_service.mojom
+@@ -36,5 +36,16 @@ interface DisplayXRService {
+   // Latest tracked eye positions in display-space metres, flattened xyz
+   // triples (empty and |valid| == false until tracking is available). |info|
+   // carries the display + element geometry for the per-eye off-axis projection.
+-  GetLatestEyes() => (array<float> eyes, bool valid, DisplayXRDisplayInfo info);
++  //
++  // |element_window_rect| is the window-relative device-pixel rect of the
++  // element the caller wants views for — its scene canvas. The browser rebases
++  // it onto the bound window's client origin to produce
++  // |info.element_display_rect|. This must come from the caller because the
++  // browser only knows the LAST SUBMITTED weave rect, which on a page with
++  // several 3D windows is an arbitrary one (a photo, say) — building the
++  // scene's frustum from another element's rect puts the scene in the wrong
++  // place at the wrong scale. Pass an empty rect to fall back to the last
++  // submitted rect (single-window pages, legacy callers).
++  GetLatestEyes(gfx.mojom.Rect element_window_rect)
++      => (array<float> eyes, bool valid, DisplayXRDisplayInfo info);
+ };
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+index beb940adf1e35..d31221a579661 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.cc
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+@@ -41,8 +41,8 @@ XRDisplayLayer::XRDisplayLayer(XRSession* session,
+   // to the session's (shared) inline-3d views; a page with one scene window
+   // sets it, image/video windows leave it 0 (they don't consume the views).
+   if (virtual_display_height > 0.0 && session_) {
+-    session_->SetInline3DVirtualDisplayHeight(
+-        static_cast<float>(virtual_display_height));
++    session_->SetInline3DSceneLayer(this,
++                                    static_cast<float>(virtual_display_height));
+   }
+   // Register the target canvas with the session; each frame the session reports
+   // its window-relative rect to the compositor (XRSession::ReportInline3DRects),
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 20d3bfc7ee879..1c0afb7437ae0 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -2534,13 +2534,52 @@ void XRSession::UpdateInlineView() {
+       render_state_->depthFar());
+ }
+ 
++void XRSession::SetInline3DSceneLayer(XRDisplayLayer* layer, float metres) {
++  inline_3d_scene_layer_ = layer;
++  inline_3d_virtual_display_height_ = metres;
++}
++
+ void XRSession::RequestInline3DState() {
+   mojom::blink::DisplayXRService* svc = xr_->EnsureDisplayXRService();
+   if (!svc) {
+     return;
+   }
++  // Ask for views scoped to the SCENE layer's canvas. The browser only knows
++  // the last submitted weave rect, which on a page with several 3D windows is
++  // an arbitrary one — building the scene's off-axis frustum from a different
++  // element's rect would place the scene wrongly and at the wrong scale. An
++  // empty rect means "no scene layer": the browser falls back to the submitted
++  // rect (single-window pages).
++  gfx::Rect scene_rect = Inline3DSceneWindowRect();
+   svc->GetLatestEyes(
+-      BindOnce(&XRSession::OnInline3DState, WrapWeakPersistent(this)));
++      scene_rect, BindOnce(&XRSession::OnInline3DState, WrapWeakPersistent(this)));
++}
++
++// The scene layer's canvas rect in window-relative device px — the same basis
++// ReportInline3DRects uses for the weave rects, so the views and the woven
++// output describe the same element.
++gfx::Rect XRSession::Inline3DSceneWindowRect() const {
++  if (!inline_3d_scene_layer_) {
++    return gfx::Rect();
++  }
++  Element* target = inline_3d_scene_layer_->target();
++  if (!target) {
++    return gfx::Rect();
++  }
++  LocalDOMWindow* window = DynamicTo<LocalDOMWindow>(GetExecutionContext());
++  if (!window || !window->GetFrame()) {
++    return gfx::Rect();
++  }
++  DOMRect* r = target->GetBoundingClientRect();
++  if (!r) {
++    return gfx::Rect();
++  }
++  const double dsf = window->GetFrame()->DevicePixelRatio();
++  gfx::RectF css_rect(static_cast<float>(r->x()), static_cast<float>(r->y()),
++                      static_cast<float>(r->width()),
++                      static_cast<float>(r->height()));
++  css_rect.Scale(static_cast<float>(dsf));
++  return gfx::ToRoundedRect(css_rect);
+ }
+ 
+ void XRSession::OnInline3DState(const Vector<float>& eyes,
+@@ -2557,6 +2596,12 @@ void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
+ 
+ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
+   display_layers_.erase(layer);
++  // A closed scene layer must stop scoping the views (its canvas is gone), or
++  // we'd keep building frusta for a stale rect.
++  if (inline_3d_scene_layer_ == layer) {
++    inline_3d_scene_layer_ = nullptr;
++    inline_3d_virtual_display_height_ = 0.f;
++  }
+ }
+ 
+ void XRSession::ReportInline3DRects() {
+@@ -2988,6 +3033,7 @@ void XRSession::OnTransferComplete(const Vector<device::LayerId>& layer_ids) {
+ void XRSession::Trace(Visitor* visitor) const {
+   visitor->Trace(xr_);
+   visitor->Trace(display_layers_);
++  visitor->Trace(inline_3d_scene_layer_);
+   visitor->Trace(render_state_);
+   visitor->Trace(world_light_probe_);
+   visitor->Trace(pending_render_state_);
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
+index 93f04bc9f5049..15a59de609beb 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.h
++++ b/third_party/blink/renderer/modules/xr/xr_session.h
+@@ -343,11 +343,14 @@ class XRSession final : public EventTarget,
+   // virtualDisplayHeight): the height in metres of the virtual display the
+   // scene is authored for. UpdateInline3DViews scales the reported eye poses by
+   // m2v = this / element physical height, so a metre-scale scene renders
+-  // correctly with no app-side scaling. 0 = disabled (m2v = 1). Set by a scene
+-  // XRDisplayLayer; session-global (one shared inline-3d view set).
+-  void SetInline3DVirtualDisplayHeight(float metres) {
+-    inline_3d_virtual_display_height_ = metres;
+-  }
++  // correctly with no app-side scaling. 0 = disabled (m2v = 1).
++  //
++  // |layer| also becomes the session's SCENE layer: the views are built for its
++  // canvas's rect. The inline-3d view set is session-global (one viewer pose),
++  // so on a page mixing a rendered scene with image/video windows this is what
++  // scopes the frustum to the element that actually consumes the views. Last
++  // scene layer wins.
++  void SetInline3DSceneLayer(XRDisplayLayer* layer, float metres);
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): collect each registered inline-3d
+   // canvas's window-relative device-px rect and forward it to the compositor
+@@ -492,6 +495,9 @@ class XRSession final : public EventTarget,
+   // the per-frame renderer<-browser eye pull.
+   void UpdateInline3DViews();
+   void RequestInline3DState();
++  // The scene layer's canvas rect in window-relative device px (empty if no
++  // scene layer). Same basis as ReportInline3DRects.
++  gfx::Rect Inline3DSceneWindowRect() const;
+   void OnInline3DState(const Vector<float>& eyes,
+                        bool valid,
+                        mojom::blink::DisplayXRDisplayInfoPtr info);
+@@ -733,9 +739,12 @@ class XRSession final : public EventTarget,
+   Vector<float> inline_3d_eyes_;
+   bool inline_3d_eyes_valid_ = false;
+   mojom::blink::DisplayXRDisplayInfoPtr inline_3d_info_;
+-  // Scene-scale m2v knob (metres); 0 = disabled. See
+-  // SetInline3DVirtualDisplayHeight + UpdateInline3DViews.
++  // Scene-scale m2v knob (metres); 0 = disabled. See SetInline3DSceneLayer +
++  // UpdateInline3DViews.
+   float inline_3d_virtual_display_height_ = 0.f;
++  // The layer whose canvas the inline-3d views are built for (the rendered
++  // scene). Null => views fall back to the last submitted weave rect.
++  Member<XRDisplayLayer> inline_3d_scene_layer_;
+ 
+   // DisplayXR inline-3D (#625, Step B3e): live layers bound to this session.
+   HeapHashSet<Member<XRDisplayLayer>> display_layers_;
+-- 
+2.42.0.windows.2
+

@@ -1,0 +1,83 @@
+From d278a7c2609dd71b866232ce7a98df2cfd22ac26 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 14 Jul 2026 18:20:52 -0700
+Subject: [PATCH 35/40] =?UTF-8?q?inline-3d(#625):=20revert=20the=20deviceP?=
+ =?UTF-8?q?ixelRatio=20normalisation=20=E2=80=94=20units=20were=20already?=
+ =?UTF-8?q?=20device=20px?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instrumented on hardware (250% display):
+  inline3d geom: raw_er=91,849 584x584 dsf=2.5 disp_px=3840x2160
+                 pixel_m=8.964e-05 elem_h_m=0.0209 vdh=0.24 scene_layer=1
+
+Both sides were already DEVICE pixels: display info reports the panel's device
+resolution (3840x2160 -> pixel_m = 89.6um per device px) and
+element_display_rect arrives in device px (584 = 234 css x 2.5). The earlier
+"logical 1536x864" premise came from displayxr-cli selftest, a different code
+path; the weave client reports device px.
+
+So the normalisation shrank the element by the DPI scale: 584 x 89.6um =
+0.0524 m (true) became 0.0209 m, which mis-placed the element AND inflated
+m2v (0.24/0.0209 = 11.5 instead of 4.58), showing up as an over-scaled
+off-axis skew (-15 measured; ~-5.3 is correct for a tile 13.8 cm off-centre
+at 0.6 m).
+
+NOTE (follow-up): this whole code path re-implements the Kooima math that the
+runtime already owns and cube_handle_d3d11_win consumes via XR_DXR_view_rig
+(chain XrDisplayRigDXR on xrLocateViews, render the returned XrView{pose,
+fov}). Every geometry bug here has been a bug in that reimplementation. The
+weave client has an OpenXR session and can locate views itself, so the right
+end state is to delete this math and forward the runtime's render-ready
+pose+fov — pending a per-locate canvas rect so the frustum can be scoped per
+element rather than per bound window.
+---
+ .../blink/renderer/modules/xr/xr_session.cc   | 22 ++++++++-----------
+ 1 file changed, 9 insertions(+), 13 deletions(-)
+
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 5dec6ad41cd76..27b1f8c66f8f9 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -2715,20 +2715,16 @@ void XRSession::UpdateInline3DViews() {
+                             ? di.display_height_m / di.display_height_px
+                             : 0.f;
+ 
+-  // UNITS: the runtime reports the display in LOGICAL (DPI-scaled) pixels —
+-  // e.g. 1536x864 for a 3840x2160 panel at 250% — so |pixel_m| is metres per
+-  // LOGICAL pixel. But element_display_rect arrives in DEVICE pixels
++  // UNITS: both sides are DEVICE pixels and must stay that way — the display
++  // info reports the panel's device resolution (e.g. 3840x2160, so |pixel_m| is
++  // metres per device pixel) and element_display_rect arrives in device pixels
+   // (getBoundingClientRect x dsf, rebased on a device-px ClientToScreen
+-  // origin). Mixing them inflates every element dimension by the DPI scale:
+-  // the element lands far off centre AND its physical height is wrong, so the
+-  // m2v scene scale is wrong too — which shows up as a scene pinned to the
+-  // wrong part of the display with wildly exaggerated disparity. Normalise the
+-  // rect into the display's pixel space first.
+-  const double dsf = DevicePixelRatioForInline3D();
++  // origin). Do NOT "normalise" by devicePixelRatio here: that shrinks the
++  // element by the DPI scale, which both mis-places it and inflates m2v
++  // (= virtualDisplayHeight / element height), and shows up as a scene in the
++  // wrong place with an over-scaled off-axis skew. Verified on a 250% display:
++  // raw rect 584px x 89.6um = 0.0524 m, the element's true height.
+   gfx::RectF er_f(di.element_display_rect);
+-  if (dsf > 0.0) {
+-    er_f.Scale(static_cast<float>(1.0 / dsf));
+-  }
+   // TEMP DIAG (#625): which units actually arrive, and what geometry we derive.
+   {
+     static int s_geo_log = 0;
+@@ -2736,7 +2732,7 @@ void XRSession::UpdateInline3DViews() {
+       ++s_geo_log;
+       const gfx::Rect& raw = di.element_display_rect;
+       VLOG(1) << "[DisplayXR] inline3d geom: raw_er=" << raw.x() << "," << raw.y()
+-              << " " << raw.width() << "x" << raw.height() << " dsf=" << dsf
++              << " " << raw.width() << "x" << raw.height()
+               << " er_f=" << er_f.width() << "x" << er_f.height()
+               << " disp_px=" << di.display_width_px << "x" << di.display_height_px
+               << " pixel_m=" << pixel_m
+-- 
+2.42.0.windows.2
+

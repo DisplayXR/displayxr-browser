@@ -1,7 +1,7 @@
 From 485518796a94c439a77b7e98105e9eddb47c388d Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 9 Jul 2026 09:13:45 -0700
-Subject: [PATCH 13/18] =?UTF-8?q?DisplayXR=20inline-3D=20(#625=20B4c):=20w?=
+Subject: [PATCH 13/40] =?UTF-8?q?DisplayXR=20inline-3D=20(#625=20B4c):=20w?=
  =?UTF-8?q?eave=20under=20DirectComposition=20=E2=80=94=20retire=20--disab?=
  =?UTF-8?q?le-direct-composition?=
 MIME-Version: 1.0

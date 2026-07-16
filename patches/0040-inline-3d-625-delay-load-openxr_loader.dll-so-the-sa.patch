@@ -1,0 +1,86 @@
+From 70b64ba67c35527f916ea279e7c91253263ac115 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Wed, 15 Jul 2026 14:56:17 -0700
+Subject: [PATCH 40/40] inline-3d(#625): delay-load openxr_loader.dll so the
+ sandboxed renderer survives
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A patched non-component build never showed a browser window (displayxr-browser#15),
+and nothing of ours had to run: with zero flags set, chrome.dll's import table
+alone did it.
+
+In a component build the OpenXR loader import lands in the weave_client DLL,
+which only the browser and GPU processes load. In a non-component build every
+component collapses into chrome.dll, so chrome.dll itself imports
+openxr_loader.dll — and every process must resolve it at load time. The renderer
+is sandboxed (low integrity, restricted token) and cannot load a DLL outside its
+policy, so it died before running any Blink code. Measured against vanilla on the
+same box: identical browser/gpu/utility/crashpad counts, 3 renderers vs our 0;
+--no-sandbox brought 4 renderers back, isolating the sandbox from a crash. Zero
+renderers is what produced the symptom — the toolbar WebUI JS never ran, so
+BrowserView::Show()'s deferred-show gate never released.
+
+The fix delay-loads the loader so it resolves on the first xr* call. Renderers
+never make one; the browser (unsandboxed) and GPU (weave inits pre-sandbox in
+gpu_main.cc) processes that do are safe.
+
+Placement matters: a /DELAYLOAD ldflag in third_party/displayxr's link config does
+NOT reach chrome.dll — `libs` propagate transitively to the final link
+automatically, but a config's `ldflags` only propagate through an unbroken
+public_configs chain, which breaks before chrome.dll. So the entry lives in
+//build/config/win:delayloads_except_dbghelp, alongside d3d11/dxgi/dcomp, which
+chrome_dll pulls in directly.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ build/config/win/BUILD.gn      | 10 ++++++++++
+ third_party/displayxr/BUILD.gn | 10 ++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
+index 101c2339697ca..f00fed5c7e01a 100644
+--- a/build/config/win/BUILD.gn
++++ b/build/config/win/BUILD.gn
+@@ -433,6 +433,16 @@ config("delayloads_except_dbghelp") {
+     "/DELAYLOAD:netapi32.dll",
+     "/DELAYLOAD:ncrypt.dll",
+     "/DELAYLOAD:ole32.dll",
++
++    # DisplayXR inline-3D (#625, displayxr-browser#15): the vendored OpenXR
++    # loader. Only the browser and GPU processes ever call an xr* function; in a
++    # non-component build chrome.dll's static import of it would otherwise force
++    # the sandboxed renderer to resolve the DLL at load time, which it cannot do
++    # (low integrity, restricted token) — the renderer dies before running any
++    # Blink code and the browser window never shows. Delay-loading resolves it on
++    # first use instead, exactly like the d3d11/dxgi/dcomp entries above.
++    "/DELAYLOAD:openxr_loader.dll",
++
+     "/DELAYLOAD:oleacc.dll",
+     "/DELAYLOAD:oleaut32.dll",
+     "/DELAYLOAD:pdh.dll",
+diff --git a/third_party/displayxr/BUILD.gn b/third_party/displayxr/BUILD.gn
+index 3ecafc90fb7c5..0b91c0057a95e 100644
+--- a/third_party/displayxr/BUILD.gn
++++ b/third_party/displayxr/BUILD.gn
+@@ -16,6 +16,16 @@ config("openxr_headers") {
+ 
+ # Link the prebuilt OpenXR loader import lib (CRT-neutral). lib_dirs is resolved
+ # relative to this BUILD.gn directory.
++#
++# NOTE (displayxr-browser#15): openxr_loader.dll MUST be delay-loaded in a
++# non-component build, or chrome.dll's static import of it kills the sandboxed
++# renderer at load time (it can't load a DLL outside its policy) — zero
++# renderers, and the browser window never shows. A /DELAYLOAD ldflag here does
++# NOT work: `libs` propagate transitively to chrome.dll's link automatically, but
++# a config's `ldflags` only propagate through an unbroken public_configs chain,
++# which breaks before chrome.dll. So the delay-load lives where it is guaranteed
++# to reach the final link — //build/config/win:delayloads_except_dbghelp,
++# alongside d3d11/dxgi/dcomp — which chrome_dll pulls in directly.
+ config("openxr_loader_link") {
+   libs = [ "openxr_loader.lib" ]
+   lib_dirs = [ "lib" ]
+-- 
+2.42.0.windows.2
+

@@ -1,0 +1,196 @@
+From be01cb3f7e93c300ed2b88a5d379bcfe0df53db0 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Mon, 13 Jul 2026 10:51:12 -0700
+Subject: [PATCH 25/40] inline-3d(#625): constrain browser window to the DP
+ phase grid during a drag
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The earlier phase-snap only TOLD the DP the window position; it didn't stop the
+window from sliding across interlace-lattice columns, so the woven 3D stuttered
+during a drag. This matches what the Step-A CEF host actually did: CONSTRAIN the
+window to the DP's phase-aligned positions in WM_WINDOWPOSCHANGING (before the OS
+commits each drag step). The grid is a non-uniform 2D lattice (the slanted
+lenticular couples X and Y — probed empirically), so the real DP snap must be
+queried per drag step rather than replicated locally.
+
+Keeps the GPU-process sync weave (zero lag) untouched — the browser process
+re-creates its own present-owner session, used ONLY for the drag snap (and the
+isSupported/eyes queries) that must run where the window's message loop lives; it
+never submits a per-frame weave in sync mode. Verified the browser + GPU sessions
+coexist without the SR weaver recalibration breaking the weave.
+
+Implementation: SetWindowSubclass on the browser's own frame window (self-gated by
+process ownership — a no-op in the GPU process, whose bound HWND belongs to the
+browser). The subclass tracks the drag (WM_ENTERSIZEMOVE/EXITSIZEMOVE) and, per
+WM_WINDOWPOSCHANGING step, snaps the CLIENT-area origin (where the weave content
+lives, == what the GPU's per-frame SnapWindowIfMoved references) to the DP grid
+via the in-process browser session's snap PFN, then converts back to the window-
+frame origin the OS applies. The GPU session keeps syncing its DP's phase
+reference to the now-grid-aligned window each frame. User-eyeballed: drag holds
+the 3D, no stutter.
+---
+ components/displayxr/browser/BUILD.gn         |   1 +
+ .../browser/displayxr_weave_client.cc         | 108 +++++++++++++++++-
+ 2 files changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/components/displayxr/browser/BUILD.gn b/components/displayxr/browser/BUILD.gn
+index 569cc0822d8f5..6e3f4079fadbe 100644
+--- a/components/displayxr/browser/BUILD.gn
++++ b/components/displayxr/browser/BUILD.gn
+@@ -22,6 +22,7 @@ component("weave_client") {
+     deps += [ "//third_party/displayxr:openxr_loader" ]
+     libs = [
+       "advapi32.lib",  # GetSecurityInfo/SetEntriesInAcl (GPU-process DACL widen)
++      "comctl32.lib",  # SetWindowSubclass/DefSubclassProc (drag phase-snap)
+       "d3d11.lib",
+       "dxgi.lib",
+     ]
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index d04c834033cf2..710396b6e7b88 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -18,10 +18,12 @@
+ #include <windows.h>
+ 
+ #include <aclapi.h>
++#include <commctrl.h>  // SetWindowSubclass / DefSubclassProc (drag phase-snap)
+ #include <d3d11.h>
+ #include <dxgi1_2.h>
+ 
+ #include <cstring>
++#include <string>
+ #include <string_view>
+ #include <vector>
+ 
+@@ -192,6 +194,10 @@ bool HasExtension(const std::vector<XrExtensionProperties>& exts,
+   return false;
+ }
+ 
++// Defined below; installs the drag phase-snap window subclass (browser process
++// only). Forward-declared so InitializeCore can call it.
++void InstallDragSnapSubclassIfOwned(HWND hwnd);
++
+ // Everything after the window lookup: forced-IPC env, instance, system,
+ // display info, PFNs, D3D11 device, present-owner session, bindWindow. Shared
+ // between the browser-process async-retry init (InitializeWin) and the
+@@ -364,6 +370,95 @@ void InitializeCore(HWND hwnd) {
+     LOG(ERROR) << "[DisplayXR] xrWeaveBindWindowDXR(hwnd="
+                << reinterpret_cast<void*>(s.hwnd) << ") failed -> " << br;
+   }
++
++  // Constrain the window to the DP phase grid during a drag (CEF parity). No-op
++  // in the GPU process (the window belongs to the browser); active only in the
++  // browser process where the window's message loop runs.
++  if (s.snap) {
++    InstallDragSnapSubclassIfOwned(s.hwnd);
++  }
++}
++
++// #625 drag phase-snap (CEF parity, browser process). The interlace lattice is
++// fixed to the panel, so a freely-dragged window slides the woven content across
++// lattice columns → 3D stutter. Like the CEF host, constrain the window to the
++// DP's phase-aligned positions DURING a drag, in WM_WINDOWPOSCHANGING (before the
++// OS commits each step). The grid is a non-uniform 2D lattice (slanted lenticular
++// couples X/Y), so we query the real DP snap per step (in-process, browser->
++// service, ~1ms) rather than replicate it. We snap the CLIENT-area origin (where
++// the weave content lives, == what the GPU's per-frame SnapWindowIfMoved
++// references), converting to/from the window-frame coords WM_WINDOWPOSCHANGING
++// uses via the constant client-in-window inset captured at drag start.
++bool g_drag_active = false;
++LONG g_client_inset_x = 0;  // client_screen_x - window_frame_x (constant in drag)
++LONG g_client_inset_y = 0;
++POINT g_drag_client_origin = {0, 0};  // client-area screen origin at drag start
++
++LRESULT CALLBACK DisplayXRWndSubclassProc(HWND hwnd,
++                                          UINT msg,
++                                          WPARAM wparam,
++                                          LPARAM lparam,
++                                          UINT_PTR /*id*/,
++                                          DWORD_PTR /*ref*/) {
++  switch (msg) {
++    case WM_ENTERSIZEMOVE: {
++      g_drag_active = true;
++      POINT client_origin = {0, 0};
++      RECT wr = {};
++      if (::ClientToScreen(hwnd, &client_origin) && ::GetWindowRect(hwnd, &wr)) {
++        g_client_inset_x = client_origin.x - wr.left;
++        g_client_inset_y = client_origin.y - wr.top;
++        g_drag_client_origin = client_origin;
++      }
++      break;
++    }
++    case WM_EXITSIZEMOVE:
++      g_drag_active = false;
++      break;
++    case WM_WINDOWPOSCHANGING: {
++      WeaveClientState& s = State();
++      WINDOWPOS* pos = reinterpret_cast<WINDOWPOS*>(lparam);
++      if (g_drag_active && s.snap && s.session != XR_NULL_HANDLE && pos &&
++          !(pos->flags & SWP_NOMOVE)) {
++        // Proposed CLIENT origin = proposed window-frame origin + the constant
++        // client inset. Snap the client origin to the panel phase grid, then
++        // convert back to the frame origin the OS will apply.
++        XrRect2Di origin = {
++            {g_drag_client_origin.x, g_drag_client_origin.y}, {0, 0}};
++        XrRect2Di target = {{static_cast<int32_t>(pos->x + g_client_inset_x),
++                             static_cast<int32_t>(pos->y + g_client_inset_y)},
++                            {0, 0}};
++        XrRect2Di snapped = {};
++        if (XR_SUCCEEDED(s.snap(s.session, &origin, &target, &snapped))) {
++          pos->x = snapped.offset.x - g_client_inset_x;
++          pos->y = snapped.offset.y - g_client_inset_y;
++        }
++      }
++      break;
++    }
++  }
++  return ::DefSubclassProc(hwnd, msg, wparam, lparam);
++}
++
++// Install the drag phase-snap subclass on |hwnd|, but ONLY if it belongs to this
++// process — in the GPU process s.hwnd is the browser's window (another process)
++// and must not be subclassed. Idempotent (SetWindowSubclass replaces).
++void InstallDragSnapSubclassIfOwned(HWND hwnd) {
++  if (!hwnd) {
++    return;
++  }
++  DWORD wpid = 0;
++  ::GetWindowThreadProcessId(hwnd, &wpid);
++  if (wpid != ::GetCurrentProcessId()) {
++    return;  // GPU process: window owned by the browser — leave it alone
++  }
++  if (::SetWindowSubclass(hwnd, &DisplayXRWndSubclassProc, /*uIdSubclass=*/1,
++                          /*dwRefData=*/0)) {
++    VLOG(1) << "[DisplayXR] drag phase-snap subclass installed on browser window";
++  } else {
++    LOG(ERROR) << "[DisplayXR] SetWindowSubclass (drag phase-snap) failed: "
++               << ::GetLastError();
++  }
+ }
+ 
+ // Browser-process init: async window-lookup retry, then the shared core.
+@@ -724,11 +819,14 @@ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+   if (!cl.HasSwitch(kEnableInline3DSwitch)) {
+     return;
+   }
+-  // #625 zero-lag: the GPU process owns the weave session in sync mode; skip the
+-  // browser-process session so the two don't race on the service pipe.
+-  if (cl.HasSwitch(kInline3DSyncWeaveSwitch)) {
+-    return;
+-  }
++  // #625: in sync mode the GPU process owns the per-frame WEAVE session (zero
++  // lag). The browser process STILL creates its own present-owner session, but
++  // only for the operations that need to run where the window message loop lives:
++  // the drag-time window phase-snap (xrWeaveSnapWindowRectDXR must constrain the
++  // browser window pre-commit, CEF parity) and the isSupported/eyes queries. It
++  // never submits a per-frame weave in sync mode (SubmitSync in the GPU process
++  // does that), so the two sessions don't both drive the weave — the browser
++  // session is snap/query-only.
+ #if BUILDFLAG(IS_WIN)
+   // 120 × 500ms = 60s: a dcheck_always_on build on a cold profile can take
+   // well over 10s to show its first window; the retry is a no-op once bound.
+-- 
+2.42.0.windows.2
+
