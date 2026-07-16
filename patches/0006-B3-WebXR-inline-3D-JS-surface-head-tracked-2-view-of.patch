@@ -1,7 +1,7 @@
 From 37137183ee37f9fe4ba36ad363cbd9fd91265928 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 5 Jul 2026 23:29:35 -0700
-Subject: [PATCH 06/39] B3: WebXR inline-3D JS surface + head-tracked 2-view
+Subject: [PATCH 06/40] B3: WebXR inline-3D JS surface + head-tracked 2-view
  off-axis session + teardown (#625)
 
 Checkpoint of the full B3 slice on the displayxr-inline-3d patch branch (mirrors

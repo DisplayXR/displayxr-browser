@@ -1,7 +1,7 @@
 From 14efab4d45aaaa03505966b97e0b294ef46461a6 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 7 Jul 2026 15:25:13 -0700
-Subject: [PATCH 09/39] B4b cleanup: strip bring-up diagnostics + drop the dead
+Subject: [PATCH 09/40] B4b cleanup: strip bring-up diagnostics + drop the dead
  weave_target plumbing (#625)
 
 Post-eyeball cleanup of the B4b per-element inline-3D weave (CEF sub-rect model).

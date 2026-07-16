@@ -1,7 +1,7 @@
 From fc4635553e2efb8ac66676fe8680e00d1a48b936 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 17:33:09 -0700
-Subject: [PATCH 33/39] inline-3d(#625): fix device-px vs logical-px mismatch
+Subject: [PATCH 33/40] inline-3d(#625): fix device-px vs logical-px mismatch
  in the element geometry
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

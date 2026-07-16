@@ -1,7 +1,7 @@
 From d14bf0c178d821a8cd4e50323a144ad75aef507d Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 14:57:05 -0700
-Subject: [PATCH 29/39] inline-3d(#625): virtualDisplayHeight scene-scale on
+Subject: [PATCH 29/40] inline-3d(#625): virtualDisplayHeight scene-scale on
  XRDisplayLayer (display-rig m2v)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
