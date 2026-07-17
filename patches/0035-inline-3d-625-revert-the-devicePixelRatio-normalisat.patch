@@ -1,7 +1,7 @@
 From d278a7c2609dd71b866232ce7a98df2cfd22ac26 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 18:20:52 -0700
-Subject: [PATCH 35/42] =?UTF-8?q?inline-3d(#625):=20revert=20the=20deviceP?=
+Subject: [PATCH 35/44] =?UTF-8?q?inline-3d(#625):=20revert=20the=20deviceP?=
  =?UTF-8?q?ixelRatio=20normalisation=20=E2=80=94=20units=20were=20already?=
  =?UTF-8?q?=20device=20px?=
 MIME-Version: 1.0
@@ -78,6 +78,3 @@ index 5dec6ad41cd76..27b1f8c66f8f9 100644
                << " er_f=" << er_f.width() << "x" << er_f.height()
                << " disp_px=" << di.display_width_px << "x" << di.display_height_px
                << " pixel_m=" << pixel_m
--- 
-2.42.0.windows.2
-

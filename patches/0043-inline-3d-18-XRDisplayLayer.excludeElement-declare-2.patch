@@ -1,0 +1,360 @@
+From 93198aa85447ae06842ed60333ce9f39cd2695c1 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 17 Jul 2026 00:50:33 -0700
+Subject: [PATCH 43/44] =?UTF-8?q?inline-3d(#18):=20XRDisplayLayer.excludeE?=
+ =?UTF-8?q?lement=20=E2=80=94=20declare=202D=20overlays=20over=20a=20woven?=
+ =?UTF-8?q?=20element?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The web-facing half of overlay exclusion (displayxr-browser#18). A page marks a
+2D DOM element painted over a woven inline-3D canvas (a hover plate, badge) so
+the browser composites it as crisp 2D over the woven 3D instead of weaving it.
+
+- excludeElement(el, {composite}) / unexcludeElement(el) on XRDisplayLayer;
+  XRDisplayLayerExclusionInit + Composite enum ("over" in v1; "under" reserved,
+  throws NotSupportedError). excluded_elements_ cleared on close().
+- XRSession::ReportInline3DRects reports each excluded element's rect alongside
+  the canvas rects (one atomic push); FrameWidget / WebFrameWidgetImpl carry
+  both vectors together.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../bindings/generated_in_modules.gni         |  4 ++
+ .../renderer/bindings/idl_in_modules.gni      |  1 +
+ .../core/frame/web_frame_widget_impl.cc       |  5 +-
+ .../core/frame/web_frame_widget_impl.h        |  3 +-
+ .../renderer/modules/xr/xr_display_layer.cc   | 35 +++++++++++++
+ .../renderer/modules/xr/xr_display_layer.h    | 22 +++++++++
+ .../renderer/modules/xr/xr_display_layer.idl  | 10 ++++
+ .../xr/xr_display_layer_exclusion_init.idl    | 21 ++++++++
+ .../blink/renderer/modules/xr/xr_session.cc   | 49 +++++++++++++------
+ .../renderer/platform/widget/frame_widget.h   |  9 +++-
+ 10 files changed, 140 insertions(+), 19 deletions(-)
+ create mode 100644 third_party/blink/renderer/modules/xr/xr_display_layer_exclusion_init.idl
+
+diff --git a/third_party/blink/renderer/bindings/generated_in_modules.gni b/third_party/blink/renderer/bindings/generated_in_modules.gni
+index 6fafee3bda3fc..70b014c3ae39f 100644
+--- a/third_party/blink/renderer/bindings/generated_in_modules.gni
++++ b/third_party/blink/renderer/bindings/generated_in_modules.gni
+@@ -1428,6 +1428,8 @@ generated_dictionary_sources_in_modules = [
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_cylinder_layer_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_state_init.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_state_init.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_exclusion_init.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_exclusion_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_init.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_init.cc",
+@@ -1990,6 +1992,8 @@ generated_enumeration_sources_in_modules = [
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_type.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_usage.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_usage.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_exclusion_composite.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_exclusion_composite.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_type.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_type.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_environment_blend_mode.cc",
+diff --git a/third_party/blink/renderer/bindings/idl_in_modules.gni b/third_party/blink/renderer/bindings/idl_in_modules.gni
+index e13bc4c8fa197..ebc4421291bae 100644
+--- a/third_party/blink/renderer/bindings/idl_in_modules.gni
++++ b/third_party/blink/renderer/bindings/idl_in_modules.gni
+@@ -1232,6 +1232,7 @@ static_idl_files_in_modules = [
+   "//third_party/blink/renderer/modules/xr/xr_depth_information.idl",
+   "//third_party/blink/renderer/modules/xr/xr_depth_state_init.idl",
+   "//third_party/blink/renderer/modules/xr/xr_display_layer.idl",
++  "//third_party/blink/renderer/modules/xr/xr_display_layer_exclusion_init.idl",
+   "//third_party/blink/renderer/modules/xr/xr_display_layer_init.idl",
+   "//third_party/blink/renderer/modules/xr/xr_dom_overlay_init.idl",
+   "//third_party/blink/renderer/modules/xr/xr_dom_overlay_state.idl",
+diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
+index 5f6196c81b19d..c123fa77ab375 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
++++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
+@@ -1634,10 +1634,11 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
+ }
+ 
+ void WebFrameWidgetImpl::SetInline3DRects(
+-    const std::vector<gfx::Rect>& rects) {
++    const std::vector<gfx::Rect>& rects,
++    const std::vector<gfx::Rect>& exclusion_rects) {
+   if (!View()->does_composite())
+     return;
+-  widget_base_->LayerTreeHost()->SetInline3DRects(rects);
++  widget_base_->LayerTreeHost()->SetInline3DRects(rects, exclusion_rects);
+ }
+ 
+ void WebFrameWidgetImpl::SetPrefersReducedMotion(bool prefers_reduced_motion) {
+diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
+index c0c962548e953..0b8da419d6b95 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
++++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
+@@ -233,7 +233,8 @@ class CORE_EXPORT WebFrameWidgetImpl
+   void SetOverscrollBehavior(
+       const cc::OverscrollBehavior& overscroll_behavior) final;
+   // DisplayXR inline-3D (#625, Step B / B4b).
+-  void SetInline3DRects(const std::vector<gfx::Rect>& rects) final;
++  void SetInline3DRects(const std::vector<gfx::Rect>& rects,
++                        const std::vector<gfx::Rect>& exclusion_rects) final;
+   void SendEarlyFinalBeginMainFrame() override;
+   void RequestAnimationAfterDelay(const base::TimeDelta&, bool urgent) final;
+   void RequestAnimationAfterDelay(cc::BeginMainFrameReason,
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+index d31221a579661..68d7838abc955 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.cc
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/token.h"
+ #include "components/viz/common/surfaces/tracked_element_rects.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_exclusion_init.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_init.h"
+ #include "third_party/blink/renderer/core/dom/element.h"
+ #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
+@@ -88,11 +89,44 @@ XRViewport* XRDisplayLayer::getViewport(XRView* view) {
+   return MakeGarbageCollected<XRViewport>(x, 0, half, h);
+ }
+ 
++void XRDisplayLayer::excludeElement(Element* element,
++                                    const XRDisplayLayerExclusionInit* init,
++                                    ExceptionState& exception_state) {
++  if (!active_) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
++                                      "The layer is closed.");
++    return;
++  }
++  if (!element) {
++    exception_state.ThrowTypeError("element must not be null.");
++    return;
++  }
++  // v1 implements 2D-over only (the overlay wins the pixel, M=0 in the
++  // exclusion rect — the runtime auto-wish default). 2D-under is reserved in
++  // the enum so adding it later is additive, not breaking.
++  if (init && init->composite().AsEnum() ==
++                  V8XRDisplayLayerExclusionComposite::Enum::kUnder) {
++    exception_state.ThrowDOMException(
++        DOMExceptionCode::kNotSupportedError,
++        "composite:\"under\" is reserved for a future release; only "
++        "\"over\" is supported.");
++    return;
++  }
++  excluded_elements_.insert(element);
++}
++
++void XRDisplayLayer::unexcludeElement(Element* element) {
++  if (element) {
++    excluded_elements_.erase(element);
++  }
++}
++
+ void XRDisplayLayer::close() {
+   if (!active_) {
+     return;
+   }
+   active_ = false;
++  excluded_elements_.clear();
+   if (session_) {
+     session_->UnregisterDisplayLayer(this);
+   }
+@@ -106,6 +140,7 @@ void XRDisplayLayer::close() {
+ void XRDisplayLayer::Trace(Visitor* visitor) const {
+   visitor->Trace(session_);
+   visitor->Trace(target_);
++  visitor->Trace(excluded_elements_);
+   ScriptWrappable::Trace(visitor);
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.h b/third_party/blink/renderer/modules/xr/xr_display_layer.h
+index d39adc7e0e72b..f2bea0dd21d29 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.h
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.h
+@@ -6,6 +6,7 @@
+ #define THIRD_PARTY_BLINK_RENDERER_MODULES_XR_XR_DISPLAY_LAYER_H_
+ 
+ #include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
++#include "third_party/blink/renderer/platform/heap/collection_support/heap_linked_hash_set.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+ #include "third_party/blink/renderer/platform/heap/member.h"
+ #include "third_party/blink/renderer/platform/heap/visitor.h"
+@@ -14,6 +15,7 @@ namespace blink {
+ 
+ class Element;
+ class ExceptionState;
++class XRDisplayLayerExclusionInit;
+ class XRDisplayLayerInit;
+ class XRSession;
+ class XRView;
+@@ -54,6 +56,25 @@ class XRDisplayLayer final : public ScriptWrappable {
+   // half (side-by-side). Null if |view| is not from this layer's session.
+   XRViewport* getViewport(XRView* view);
+ 
++  // Overlay-exclusion regions (browser#18): mark |element| as 2D UI painted
++  // over the woven target. Each frame the session reports the element's rect
++  // alongside the layer rects (XRSession::ReportInline3DRects); Viz punches a
++  // per-pixel hole in the weave draw-back there — the zone formalism
++  // final = M·weave + (1−M)·2D with binary M=0 inside the rect, mirroring the
++  // runtime's ADR-027 masked-composite rect fast path. v1 composites 2D over
++  // the weave only; init.composite:"under" is reserved and throws.
++  void excludeElement(Element* element,
++                      const XRDisplayLayerExclusionInit* init,
++                      ExceptionState& exception_state);
++  void unexcludeElement(Element* element);
++
++  // The elements currently excluded from this layer's weave. Read by
++  // XRSession::ReportInline3DRects each frame; disconnected / display:none
++  // elements yield an empty client rect there and drop out naturally.
++  const HeapLinkedHashSet<Member<Element>>& excluded_elements() const {
++    return excluded_elements_;
++  }
++
+   // Stop weaving the target (untag its compositor layer). Idempotent.
+   void close();
+ 
+@@ -62,6 +83,7 @@ class XRDisplayLayer final : public ScriptWrappable {
+  private:
+   Member<XRSession> session_;
+   Member<Element> target_;
++  HeapLinkedHashSet<Member<Element>> excluded_elements_;
+   // True while the target is tagged as a weave target.
+   bool active_ = false;
+ };
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.idl b/third_party/blink/renderer/modules/xr/xr_display_layer.idl
+index 08cc0c0ad6b4d..6526dc1e68686 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.idl
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.idl
+@@ -22,6 +22,16 @@
+   // Per-eye viewport into the target (side-by-side halves).
+   XRViewport? getViewport(XRView view);
+ 
++  // Overlay-exclusion regions (browser#18): declare |element| as 2D UI painted
++  // over the woven target (hover plate, badge). Its on-screen rect becomes a
++  // per-pixel exclusion hole in the weave — final = M·weave + (1−M)·2D with
++  // M=0 inside the rect — so the overlay stays crisp 2D instead of being
++  // interleaved. v1 supports composite:"over" only ("under" reserved).
++  [RaisesException]
++  undefined excludeElement(Element element,
++                           optional XRDisplayLayerExclusionInit init = {});
++  undefined unexcludeElement(Element element);
++
+   // Stop weaving the target.
+   undefined close();
+ };
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer_exclusion_init.idl b/third_party/blink/renderer/modules/xr/xr_display_layer_exclusion_init.idl
+new file mode 100644
+index 0000000000000..7c65ddd6ac915
+--- /dev/null
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer_exclusion_init.idl
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// DisplayXR inline-3D overlay exclusion (browser#18). How an excluded 2D
++// element composites against the woven 3D output, per the zone formalism
++//   final = M*weave + (1-M)*2D          (per-pixel scalar mask M)
++// "over"  — the 2D overlay wins the pixel (M=0 inside the exclusion rect);
++//           the only mode implemented in v1.
++// "under" — reserved: 2D composited beneath the weave. Named now so adding it
++//           later is not a breaking change; requesting it throws
++//           NotSupportedError.
++enum XRDisplayLayerExclusionComposite {
++  "over",
++  "under"
++};
++
++// Options for XRDisplayLayer.excludeElement().
++dictionary XRDisplayLayerExclusionInit {
++  XRDisplayLayerExclusionComposite composite = "over";
++};
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 35c0b29efce4c..8c1a788af22c2 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -2664,31 +2664,52 @@ void XRSession::ReportInline3DRects() {
+     return;
+   }
+   const double dsf = frame->DevicePixelRatio();
++  // getBoundingClientRect() is viewport-relative CSS px; the composited output
++  // is window-relative device px. For the main frame the visual-viewport origin
++  // maps to the widget origin, so device px = CSS px x DSF (pinch-zoom /
++  // multi-monitor origin refinements are deferred).
++  auto device_rect_of = [dsf](Element* el) {
++    DOMRect* r = el->GetBoundingClientRect();
++    if (!r) {
++      return gfx::Rect();
++    }
++    gfx::RectF css_rect(static_cast<float>(r->x()), static_cast<float>(r->y()),
++                        static_cast<float>(r->width()),
++                        static_cast<float>(r->height()));
++    css_rect.Scale(static_cast<float>(dsf));
++    return gfx::ToRoundedRect(css_rect);
++  };
+   std::vector<gfx::Rect> rects;
+   rects.reserve(display_layers_.size());
++  // Overlay-exclusion rects (browser#18): 2D UI the page declared as painted
++  // over a woven element (XRDisplayLayer.excludeElement). They ride the same
++  // metadata push so holes arrive atomically with the frame's pixels; Viz
++  // associates them to weave targets geometrically (exclusion ∩ target rect),
++  // so a single flat list serves every layer. Disconnected / display:none
++  // overlays yield an empty rect and drop out here. Not clipped to the layer
++  // rect on purpose — the GPU stage clips against the (scroll-exact,
++  // possibly tracked-channel) target rect, not this main-thread one.
++  std::vector<gfx::Rect> exclusion_rects;
+   for (const auto& layer : display_layers_) {
+     Element* target = layer->target();
+     if (!target) {
+       continue;
+     }
+-    // getBoundingClientRect() is viewport-relative CSS px; the composited output
+-    // is window-relative device px. For the main frame the visual-viewport origin
+-    // maps to the widget origin, so device px = CSS px x DSF (pinch-zoom /
+-    // multi-monitor origin refinements are deferred).
+-    DOMRect* r = target->GetBoundingClientRect();
+-    if (!r) {
+-      continue;
+-    }
+-    gfx::RectF css_rect(static_cast<float>(r->x()), static_cast<float>(r->y()),
+-                        static_cast<float>(r->width()),
+-                        static_cast<float>(r->height()));
+-    css_rect.Scale(static_cast<float>(dsf));
+-    gfx::Rect device_rect = gfx::ToRoundedRect(css_rect);
++    gfx::Rect device_rect = device_rect_of(target);
+     if (!device_rect.IsEmpty()) {
+       rects.push_back(device_rect);
+     }
++    for (const auto& excluded : layer->excluded_elements()) {
++      if (!excluded->isConnected()) {
++        continue;
++      }
++      gfx::Rect hole = device_rect_of(excluded);
++      if (!hole.IsEmpty()) {
++        exclusion_rects.push_back(hole);
++      }
++    }
+   }
+-  widget->SetInline3DRects(rects);
++  widget->SetInline3DRects(rects, exclusion_rects);
+ }
+ 
+ // DisplayXR inline-3D (#625): install the two off-axis eye views the RUNTIME
+diff --git a/third_party/blink/renderer/platform/widget/frame_widget.h b/third_party/blink/renderer/platform/widget/frame_widget.h
+index d44654c317aee..02b3b317805f2 100644
+--- a/third_party/blink/renderer/platform/widget/frame_widget.h
++++ b/third_party/blink/renderer/platform/widget/frame_widget.h
+@@ -304,8 +304,13 @@ class PLATFORM_EXPORT FrameWidget {
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): forward the page's inline-3d canvas
+   // rects (window-relative device px) to the compositor for the next commit, so
+-  // they reach Viz via CompositorFrameMetadata::inline_3d_rects. Default no-op.
+-  virtual void SetInline3DRects(const std::vector<gfx::Rect>& rects) {}
++  // they reach Viz via CompositorFrameMetadata::inline_3d_rects. The exclusion
++  // rects (browser#18) are 2D-overlay holes punched into the weave draw-back
++  // (CompositorFrameMetadata::inline_3d_exclusion_rects); pushed together so
++  // rects + holes stay frame-atomic. Default no-op.
++  virtual void SetInline3DRects(const std::vector<gfx::Rect>& rects,
++                                const std::vector<gfx::Rect>& exclusion_rects) {
++  }
+ 
+   // Get and set the configuration for the debugging overlay managed by the
+   // underlying LayerTreeHost. This may return null if the widget does not

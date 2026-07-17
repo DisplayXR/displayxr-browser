@@ -1,7 +1,7 @@
 From 228f3ec8494f66b83df5f9da7311cf6ad62cd549 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 13 Jul 2026 21:31:31 -0700
-Subject: [PATCH 26/42] inline-3d(#625): source weave rects from
+Subject: [PATCH 26/44] inline-3d(#625): source weave rects from
  compositor-thread tracked-element rects
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -226,6 +226,3 @@ index 71de41af4198b..a0c7e2a325e84 100644
  }
  
  void XRDisplayLayer::Trace(Visitor* visitor) const {
--- 
-2.42.0.windows.2
-

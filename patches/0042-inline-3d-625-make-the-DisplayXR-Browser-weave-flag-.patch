@@ -1,7 +1,7 @@
 From b6e275c7d6db639c376896629cb796f044bf8b61 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 16 Jul 2026 19:25:24 -0700
-Subject: [PATCH 42/42] inline-3d(#625): make the DisplayXR Browser weave
+Subject: [PATCH 42/44] inline-3d(#625): make the DisplayXR Browser weave
  flag-free
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -90,6 +90,3 @@ index e456cc8198668..775ba4b91c8bb 100644
      },
      {
        // https://chromestatus.com/feature/5067126381215744
--- 
-2.42.0.windows.2
-

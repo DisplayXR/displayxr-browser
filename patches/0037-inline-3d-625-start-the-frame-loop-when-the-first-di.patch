@@ -1,7 +1,7 @@
 From ab2d5e2d1f7448a46498adcd275e03cd0480311b Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 22:02:43 -0700
-Subject: [PATCH 37/42] inline-3d(#625): start the frame loop when the first
+Subject: [PATCH 37/44] inline-3d(#625): start the frame loop when the first
  display layer registers
 
 Every page load showed ~10-13s of horizontally smeared tiles -- photos and the
@@ -63,6 +63,3 @@ index 2f3d77e502979..760c700a37891 100644
  }
  
  void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
--- 
-2.42.0.windows.2
-

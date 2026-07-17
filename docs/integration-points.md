@@ -14,8 +14,12 @@ out with ⚠.
 
 ## 1. Blink — the WebXR JS surface (`inline-3d` + `XRDisplayLayer`)
 The web-facing API: an `inline-3d` session mode and an `XRDisplayLayer` bound to a DOM canvas that
-reports its rect + consumes the eyes the runtime supplies.
-- **New:** `third_party/blink/renderer/modules/xr/xr_display_layer.{h,cc,idl}`, `xr_display_layer_init.idl`
+reports its rect + consumes the eyes the runtime supplies. Overlay exclusion (#18):
+`excludeElement(el)` / `unexcludeElement(el)` declare 2D DOM painted over the woven element; its rect
+rides the same per-frame report and the weave draw-back leaves those pixels as composited 2D
+(`final = M·weave + (1−M)·2D`, binary M in v1; `composite:"under"` reserved, throws).
+- **New:** `third_party/blink/renderer/modules/xr/xr_display_layer.{h,cc,idl}`, `xr_display_layer_init.idl`,
+  `xr_display_layer_exclusion_init.idl` (#18 enum + dict)
 - **New:** `third_party/blink/public/mojom/xr/displayxr_service.mojom` (eyes + display-info → renderer)
 - ⚠ **Edit:** `xr_session.{cc,h,idl}` (inline-3d session, 2-view off-axis Kooima frusta, rect report,
   the three animation gates that must open for a sensorless inline session), `xr_system.{cc,h}`
@@ -27,6 +31,8 @@ reports its rect + consumes the eyes the runtime supplies.
 ## 2. cc — carry `inline_3d_rects` from the renderer to Viz
 The canvas rects ride the compositor frame so they arrive at Viz atomically with the pixels they
 describe (kills one-frame staleness). Mirrors how `tracked_element_rects` are plumbed.
+`inline_3d_exclusion_rects` (#18) ride the same channel end-to-end (flat parallel vector; the
+Phase-2 impl-scroll shift applies to both so holes stay glued to their plates mid-fling).
 - ⚠ **Edit:** `cc/trees/commit_state.{cc,h}`, `layer_tree_host.{cc,h}`, `layer_tree_host_impl.{cc,h}`,
   `layer_tree_impl.{cc,h}`, `layer_context.h`, `cc/mojo_embedder/viz_layer_context.{cc,h}`
 - ⚠ **Edit (signature must match base + test impls):** `cc/test/{fake,test}_layer_context.{cc,h}`
@@ -42,7 +48,19 @@ GPU thread post-paint / pre-swap.
   `viz/service/layers/layer_context_impl.cc`
 - **The weave core:** `viz/service/display_embedder/skia_output_surface_impl_on_gpu.{h,cc}` —
   `WeaveCompositedSurface` (+ `prefer_zero_copy`), `MaybeWeaveOutput` (GL path), `MaybeWeaveRootRenderPass`
-  (DComp root render-pass path). Also `skia_output_surface_impl.{cc,h}`.
+  (DComp root render-pass path). Also `skia_output_surface_impl.{cc,h}`. **Overlay exclusion
+  (#18) — 2D-over-3D:** the page flattens into ONE render pass here (no child render passes), so
+  overlays can't be isolated as passes. Instead the SDK promotes each overlay onto its own
+  COMPOSITED LAYER (`will-change:transform`), which still emits a resource-bearing quad whose
+  SharedImage is the element rastered on transparency (isolated). The aggregator records every
+  ROOT resource-bearing quad `{parent ResourceId, root-space rect}` and matches them against the
+  exclusion rects (→ overlay resources) and canvas rects (→ canvas resources); `Display` resolves
+  each `ResourceId → gpu::Mailbox` (`DisplayResourceProvider::GetMailbox`) and hands the GPU stage
+  `{mailbox, rect}`. `WeaveCompositedSurface` then (a) sources the weave INPUT from the matched
+  canvas-layer resource (clean SBS, no overlay — falls back to the composited output sub-rect)
+  and (b) composites each overlay resource `kSrcOver` the woven output — `final = plate +
+  (1−plate.a)·woven`. Entirely browser-side; no runtime/DP change. Root-space rect = quad SQS
+  `quad_to_target_transform` then `transform_to_root_target`.
 - **New:** `viz/service/display_embedder/displayxr_weave_provider.{cc,h}` (`WeavePixels` + `WeaveCanvas`)
 
 ## 4. gpu — the two additive `ProduceOverlayForWeave` methods (the rebase-fragile layer)

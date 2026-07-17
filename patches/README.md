@@ -1,8 +1,10 @@
 # Patch series — inline-3D over Chromium `150.0.7871.24`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`150.0.7871.24` (M150). **42 commits, 117 files** (~30 are the vendored OpenXR SDK; the real
-integration surface is ~87 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+`150.0.7871.24` (M150). **44 commits, 125 files** (~30 are the vendored OpenXR SDK; the real
+integration surface is ~95 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patches 0043–0044 add overlay exclusion (browser#18): 2D overlays composited over the woven 3D
+via isolated composited-layer resources (browser-side; no runtime change).
 
 Apply with `git am --3way patches/*.patch` onto a fresh checkout of the tag (or just run
 `scripts/build.sh`). Verified to reproduce the fork branch **exactly** (identical tree hash).

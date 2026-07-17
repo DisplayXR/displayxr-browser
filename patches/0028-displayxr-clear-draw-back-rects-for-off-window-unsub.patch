@@ -1,7 +1,7 @@
 From 3283a46b5cbed62ffe7a00305090a911b25a9639 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 09:30:13 -0700
-Subject: [PATCH 28/42] displayxr: clear draw-back rects for off-window /
+Subject: [PATCH 28/44] displayxr: clear draw-back rects for off-window /
  unsubmitted weave targets
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -54,6 +54,3 @@ index 3b750a23e820c..7a5c4dddcee8f 100644
    }
    if (batch) {
      provider->SubmitBatchSync();
--- 
-2.42.0.windows.2
-

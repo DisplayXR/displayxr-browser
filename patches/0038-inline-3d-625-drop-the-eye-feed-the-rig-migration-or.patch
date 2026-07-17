@@ -1,7 +1,7 @@
 From 9b5813c3dd3a27e7963eb455f095a400449d4396 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 22:46:41 -0700
-Subject: [PATCH 38/42] inline-3d(#625): drop the eye feed the rig migration
+Subject: [PATCH 38/44] inline-3d(#625): drop the eye feed the rig migration
  orphaned, and the diags
 
 Once the renderer stopped rebuilding Kooima and started consuming the runtime's
@@ -543,6 +543,3 @@ index 760c700a37891..069d36dfe271d 100644
    for (wtf_size_t i = 0; i < 2u; ++i) {
      // Views are ordered [left, right]; reuse view 0 if the runtime returned one.
      const mojom::blink::DisplayXRView& v =
--- 
-2.42.0.windows.2
-

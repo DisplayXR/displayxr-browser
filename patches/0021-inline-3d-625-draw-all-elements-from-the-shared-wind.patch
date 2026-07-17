@@ -1,7 +1,7 @@
 From d6c174fc6f342148836c1248c3ce043560c19e29 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 22:26:13 -0700
-Subject: [PATCH 21/42] inline-3d(#625): draw all elements from the shared
+Subject: [PATCH 21/44] inline-3d(#625): draw all elements from the shared
  window-sized woven output
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -261,6 +261,3 @@ index 098b78cf95b02..3efb289c0eba4 100644
  #endif
  
    THREAD_CHECKER(thread_checker_);
--- 
-2.42.0.windows.2
-

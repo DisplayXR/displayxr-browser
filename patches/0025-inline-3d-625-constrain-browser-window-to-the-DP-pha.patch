@@ -1,7 +1,7 @@
 From be01cb3f7e93c300ed2b88a5d379bcfe0df53db0 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 13 Jul 2026 10:51:12 -0700
-Subject: [PATCH 25/42] inline-3d(#625): constrain browser window to the DP
+Subject: [PATCH 25/44] inline-3d(#625): constrain browser window to the DP
  phase grid during a drag
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -191,6 +191,3 @@ index d04c834033cf2..710396b6e7b88 100644
  #if BUILDFLAG(IS_WIN)
    // 120 × 500ms = 60s: a dcheck_always_on build on a cold profile can take
    // well over 10s to show its first window; the retry is a no-op once bound.
--- 
-2.42.0.windows.2
-

@@ -1,7 +1,7 @@
 From 656af477c0d3c4a1b327fcde010da4b9f0489c64 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sat, 27 Jun 2026 17:18:17 -0500
-Subject: [PATCH 05/42] B2c.2: weave the REAL canvas texture (replace synthetic
+Subject: [PATCH 05/44] B2c.2: weave the REAL canvas texture (replace synthetic
  SBS input)
 
 #625 Step B. Replaces the B2c.1 synthetic test-pattern input with the
@@ -530,6 +530,3 @@ index f871108f5afeb..40fd5bfea6163 100644
    std::unique_ptr<MemoryImageRepresentation> ProduceMemory(
        const Mailbox& mailbox,
        MemoryTypeTracker* ref);
--- 
-2.42.0.windows.2
-
