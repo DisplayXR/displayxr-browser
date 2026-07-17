@@ -1,7 +1,7 @@
 From d3913acf6947dc06dba64aa242e3046900516e11 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 23:34:35 -0700
-Subject: [PATCH 22/41] inline-3d(#625): WIP scroll-sync Phase 1 (per-element
+Subject: [PATCH 22/42] inline-3d(#625): WIP scroll-sync Phase 1 (per-element
  concurrent submit) + Phase 2 (impl-side scroll-fresh rects)
 
 Phase 1: DisplayXRWeaveGpu keeps a per-target keyed-mutex input pool (flat_map

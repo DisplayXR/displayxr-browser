@@ -1,7 +1,7 @@
 From c18875873f4c9d130076d906521d9a3d2d806f84 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 13 Jul 2026 10:03:25 -0700
-Subject: [PATCH 24/41] inline-3d(#625): drive xrWeaveSnapWindowRectDXR on
+Subject: [PATCH 24/42] inline-3d(#625): drive xrWeaveSnapWindowRectDXR on
  browser-window move (CEF parity)
 
 The GPU-process weave client bound the window and had the snap PFN but never

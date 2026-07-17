@@ -1,7 +1,7 @@
 From 8ac3244e9c8669e75196d76a81a04ca0133abe84 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 16 Jul 2026 11:07:34 -0700
-Subject: [PATCH 41/41] inline-3d(#625,#16): auto-disable delegated compositing
+Subject: [PATCH 41/42] inline-3d(#625,#16): auto-disable delegated compositing
  when --enable-inline-3d
 
 The inline-3D weave needs a flattened composited surface. Under DirectComposition,

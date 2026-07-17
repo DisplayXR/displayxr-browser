@@ -1,7 +1,7 @@
 From 05cac5611eb0e8aefaa0b9b0f4a33a2cf5d3acc1 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 17:42:36 -0700
-Subject: [PATCH 34/41] TEMP DIAG (#625): log inline-3d element geometry units
+Subject: [PATCH 34/42] TEMP DIAG (#625): log inline-3d element geometry units
 
 Which units element_display_rect actually arrives in (device vs logical px),
 the dsf, the normalised rect, the display px, and the derived element height

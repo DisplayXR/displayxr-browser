@@ -1,0 +1,95 @@
+From b6e275c7d6db639c376896629cb796f044bf8b61 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 16 Jul 2026 19:25:24 -0700
+Subject: [PATCH 42/42] inline-3d(#625): make the DisplayXR Browser weave
+ flag-free
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This IS the DisplayXR Browser — inline-3D is the product, so it should weave however
+it's launched, not only from a specifically-flagged shortcut. Default the inline-3D
+switches into the binary instead of requiring launch flags:
+
+- runtime_enabled_features.json5: DisplayXRInline3D experimental -> stable, so
+  window.XRDisplayLayer is exposed with no --enable-blink-features flag.
+- ChromeMainDelegate::BasicStartupComplete (browser process, before the FeatureList
+  is created): default --enable-inline-3d + --inline-3d-sync-weave on, and disable
+  DelegatedCompositing (which otherwise leaves no composited surface to weave).
+
+Result: launching chrome.exe with zero flags weaves inline-3D via the GPU-resident
+zero-copy path. The installer's launch flags become redundant.
+---
+ chrome/app/chrome_main_delegate.cc            | 33 ++++++++++++-------
+ .../platform/runtime_enabled_features.json5   |  9 +++--
+ 2 files changed, 27 insertions(+), 15 deletions(-)
+
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+index 8970caad45f2c..6da459441d53c 100644
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -1086,19 +1086,28 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
+   }
+ 
+ #if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, displayxr-browser#16): inline-3D weaving needs a
+-  // flattened composited surface. Delegated compositing decomposes the page into
+-  // DirectComposition visuals and destroys the root render-pass buffers
+-  // (skia_renderer.cc "delegating to the system compositor"), leaving nothing for
+-  // the display processor to weave. Auto-disable delegated compositing whenever
+-  // inline-3D is requested — keeping DirectComposition ON, so the weave stays
+-  // GPU-resident zero-copy — so the browser weaves without a manual
+-  // --disable-features launch flag. Done here (the earliest callback, before the
+-  // FeatureList is created) so the disabled state is in the browser FeatureList
+-  // and serialized to the GPU process, where delegated compositing is evaluated.
+-  if (!command_line.HasSwitch(switches::kProcessType) &&
+-      command_line.HasSwitch("enable-inline-3d")) {
++  // DisplayXR inline-3D (#625, displayxr-browser#16): this IS the DisplayXR Browser
++  // — inline-3D is the product, so enable it by default rather than requiring launch
++  // flags. In the browser process only, and here in the earliest callback (before the
++  // FeatureList is created), so the switches are on the browser command line when
++  // children are spawned (forwarded by AppendExtraCommandLineSwitches) and the disabled
++  // feature is serialized to the GPU process. The Blink-side surface
++  // (window.XRDisplayLayer) is enabled separately by the DisplayXRInline3D runtime
++  // feature being promoted to "stable" in runtime_enabled_features.json5.
++  if (!command_line.HasSwitch(switches::kProcessType)) {
+     auto* mutable_command_line = base::CommandLine::ForCurrentProcess();
++    // Native weave pipe (browser/GPU weave client) + zero-lag GPU-resident submit.
++    if (!mutable_command_line->HasSwitch("enable-inline-3d")) {
++      mutable_command_line->AppendSwitch("enable-inline-3d");
++    }
++    if (!mutable_command_line->HasSwitch("inline-3d-sync-weave")) {
++      mutable_command_line->AppendSwitch("inline-3d-sync-weave");
++    }
++    // Delegated compositing decomposes the page into DirectComposition visuals and
++    // destroys the root render-pass buffers (skia_renderer.cc "delegating to the
++    // system compositor"), leaving nothing for the display processor to weave.
++    // Disabling ONLY delegation keeps DirectComposition on, so the weave stays
++    // GPU-resident zero-copy.
+     std::string disabled =
+         mutable_command_line->GetSwitchValueASCII("disable-features");
+     if (disabled.find("DelegatedCompositing") == std::string::npos) {
+diff --git a/third_party/blink/renderer/platform/runtime_enabled_features.json5 b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+index e456cc8198668..775ba4b91c8bb 100644
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -2339,10 +2339,13 @@
+     {
+       // DisplayXR inline-3D (#625, Step B): the WebXR 'inline-3d' session mode +
+       // XRDisplayLayer that opt a canvas into glasses-free 3D via the OS weave
+-      // RPC. Experimental + off by default; the native weave pipe is
+-      // additionally gated by the --enable-inline-3d command-line switch.
++      // RPC. "stable" because this IS the DisplayXR Browser — inline-3D is the
++      // product, so window.XRDisplayLayer is exposed with no launch flag. The
++      // native weave pipe (--enable-inline-3d) + zero-lag submit
++      // (--inline-3d-sync-weave) are likewise defaulted on in
++      // ChromeMainDelegate::BasicStartupComplete, so the browser weaves flag-free.
+       name: "DisplayXRInline3D",
+-      status: "experimental",
++      status: "stable",
+     },
+     {
+       // https://chromestatus.com/feature/5067126381215744
+-- 
+2.42.0.windows.2
+

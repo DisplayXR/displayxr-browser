@@ -1,7 +1,7 @@
 From a106b5c9b3420677d0a5a2def2962b2c8b06e36b Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 16:37:32 -0700
-Subject: [PATCH 30/41] inline-3d(#625): restore the renderer's eye feed in
+Subject: [PATCH 30/42] inline-3d(#625): restore the renderer's eye feed in
  sync-weave mode + scope views to the scene element
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
