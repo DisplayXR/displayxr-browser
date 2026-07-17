@@ -1,0 +1,196 @@
+From 30a7069b1f872e8a6f96f6d8ee91044392d9e9b2 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 17 Jul 2026 14:40:13 -0700
+Subject: [PATCH] inline-3d(#18): fix scroll bugs A+B (overlay lag + tile
+ squish)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bug A (overlay lags the tile on scroll): the aggregator stored the Blink
+main-thread getBoundingClientRect exclusion rect for overlays, which trails the
+impl scroll by ~1 frame. best_match now returns the matched COMPOSITOR-EXACT
+root-space quad rect (qr) and stores it for both overlays and canvas resources,
+so the 2D overlay stays glued to the woven tile during a scroll/fling.
+
+Bug B (tile squishes vertically at top/bottom edges): the clean-canvas weave
+input scaled the whole tile SBS into the window-clipped rect. The fix sub-regions
+the SBS to the visible fraction — but keyed off the canvas LAYER's UNCLIPPED rect
+(inline_3d_canvas_layers_[].rect = the compositor-exact quad rect), NOT
+inline_3d_rects_[t] which is the already-clipped visible bounds (using that made
+rect==full so the sub-region never fired — the latent flaw in the prior attempt).
+
+Bisected one seam at a time with the batch-weave count as the regression guard:
+n stays non-zero (n=15..25, one submit, ~900us, eyes_valid=1) with A and B
+together — the combination that zeroed batch-weave in the earlier attempt. Both
+fixes validated on real Leia hardware (user-confirmed: overlays crisp 2D, tiles
+crop cleanly, no squish).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../viz/service/display/surface_aggregator.cc | 25 ++++++---
+ .../skia_output_surface_impl_on_gpu.cc        | 55 +++++++++++++++----
+ 2 files changed, 59 insertions(+), 21 deletions(-)
+
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index c3de37c98938b..a4967b6f91867 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2386,10 +2386,17 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   // bounds → near-identical). Require high overlap to avoid grabbing an
+   // unrelated co-located quad. LAST match wins per rect (the topmost/most-recent
+   // composited quad covering that element).
+-  auto best_match = [](const gfx::Rect& target,
+-                       const std::vector<std::pair<ResourceId, gfx::Rect>>&
+-                           quads) -> std::optional<ResourceId> {
+-    std::optional<ResourceId> found;
++  // Returns the matched {ResourceId, quad rect}. IMPORTANT: the quad rect is
++  // COMPOSITOR-EXACT (this frame's aggregated root-space quad), whereas the
++  // target (exclusion/canvas rect) is the Blink MAIN-THREAD getBoundingClientRect
++  // that trails the impl scroll by ~1 frame. Compositing/placing at the quad rect
++  // (not the target) is what keeps the overlay glued to the tile during a scroll
++  // (browser#18 bug A).
++  auto best_match =
++      [](const gfx::Rect& target,
++         const std::vector<std::pair<ResourceId, gfx::Rect>>& quads)
++      -> std::optional<std::pair<ResourceId, gfx::Rect>> {
++    std::optional<std::pair<ResourceId, gfx::Rect>> found;
+     for (const auto& [rid, qr] : quads) {
+       if (qr.IsEmpty()) {
+         continue;
+@@ -2402,19 +2409,19 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+           static_cast<int64_t>(target.width()) * target.height();
+       const int64_t max_area = std::max(qa, ta);
+       if (max_area > 0 && ia * 10 >= max_area * 7) {
+-        found = rid;  // keep scanning; last (topmost) wins
++        found = std::make_pair(rid, qr);  // keep scanning; last (topmost) wins
+       }
+     }
+     return found;
+   };
+   for (const gfx::Rect& excl : inline_3d_exclusion_rects_) {
+-    if (auto rid = best_match(excl, root_resource_quads_)) {
+-      frame.inline_3d_overlays.push_back({*rid, excl});
++    if (auto m = best_match(excl, root_resource_quads_)) {
++      frame.inline_3d_overlays.push_back({m->first, m->second});
+     }
+   }
+   for (const gfx::Rect& canvas : frame.inline_3d_rects) {
+-    if (auto rid = best_match(canvas, root_resource_quads_)) {
+-      frame.inline_3d_canvas_resources.push_back({*rid, canvas});
++    if (auto m = best_match(canvas, root_resource_quads_)) {
++      frame.inline_3d_canvas_resources.push_back({m->first, m->second});
+     }
+   }
+   if (!frame.inline_3d_overlays.empty() ||
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 8c66d3c3c732c..3c7c8eda92acc 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2841,20 +2841,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // canvas is never woven, so there is no "woven overlay" artifact under a
+   // translucent overlay. Returns a null mailbox when unmatched → fall back to
+   // the composited sub-rect (today's behavior).
+-  auto canvas_mailbox_for = [&](const gfx::Rect& r) -> gpu::Mailbox {
++  // Returns the matched canvas layer's {mailbox, UNCLIPPED root-space rect}. The
++  // rect is the full tile (compositor-exact quad rect), NOT the clipped visible
++  // bounds in inline_3d_rects_ — it is the reference for sub-regioning the SBS
++  // when the tile is clipped at a screen edge (browser#18 bug B).
++  auto canvas_mailbox_for =
++      [&](const gfx::Rect& r) -> std::pair<gpu::Mailbox, gfx::Rect> {
+     for (const auto& c : inline_3d_canvas_layers_) {
+       gfx::Rect inter = c.rect;
+       inter.Intersect(r);
+       const int64_t ia = static_cast<int64_t>(inter.width()) * inter.height();
+       const int64_t ta = static_cast<int64_t>(r.width()) * r.height();
+       if (ta > 0 && ia * 10 >= ta * 7) {
+-        return c.mailbox;
++        return {c.mailbox, c.rect};
+       }
+     }
+-    return gpu::Mailbox();
++    return {gpu::Mailbox(), gfx::Rect()};
+   };
+ 
+   auto attempt_submit = [&](size_t t) -> bool {
++    // inline_3d_rects_[t] is the tracked element's VISIBLE (already-clipped)
++    // bounds; the unclipped full tile comes from the matched canvas layer
++    // (clean_sbs_rect) below, used to sub-region the SBS at screen edges.
+     gfx::Rect rect = inline_3d_rects_[t];
+     rect.Intersect(window_bounds);
+     if (rect.IsEmpty()) {
+@@ -2862,7 +2870,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+     const int rw = rect.width();
+     const int rh = rect.height();
+-    const gpu::Mailbox clean_sbs_mailbox = canvas_mailbox_for(rect);
++    const std::pair<gpu::Mailbox, gfx::Rect> clean_sbs = canvas_mailbox_for(rect);
++    const gpu::Mailbox clean_sbs_mailbox = clean_sbs.first;
++    const gfx::Rect clean_sbs_rect = clean_sbs.second;  // UNCLIPPED full tile
+ 
+     // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the composited
+     // sub-rect on the GPU instead of the readPixels roundtrip: Skia-copy it into
+@@ -2955,6 +2965,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>
+               canvas_access;
+           sk_sp<SkImage> src_img;
++          bool src_from_canvas = false;
+           if (!clean_sbs_mailbox.IsZero()) {
+             canvas_rep = shared_image_representation_factory_->ProduceSkia(
+                 clean_sbs_mailbox, context_state_.get());
+@@ -2964,9 +2975,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                   canvas_rep->BeginScopedReadAccess(&cbegin, &cend);
+               if (canvas_access) {
+                 src_img = canvas_access->CreateSkImage(context_state_.get());
+-                if (src_img && !cbegin.empty()) {
+-                  scratch_surface->wait(cbegin.size(), cbegin.data(),
+-                                        /*deleteSemaphoresAfterWait=*/false);
++                if (src_img) {
++                  src_from_canvas = true;
++                  if (!cbegin.empty()) {
++                    scratch_surface->wait(cbegin.size(), cbegin.data(),
++                                          /*deleteSemaphoresAfterWait=*/false);
++                  }
+                 }
+               }
+             }
+@@ -2978,14 +2992,31 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           if (!src_img) {
+             return fail("makeImageSnapshot");
+           }
++          // Source rect. The canvas resource is the WHOLE tile's SBS, mapped to
++          // the canvas layer's UNCLIPPED rect |clean_sbs_rect| (NOT
++          // inline_3d_rects_[t], which is the already-clipped visible bounds —
++          // using that made rect==full and the sub-region never fired). When the
++          // tile is clipped at a screen edge (visible |rect| ⊊ |clean_sbs_rect|)
++          // take the SUB-REGION of the resource that maps to |rect| — NOT the
++          // full image scaled into the shorter scratch, which squishes the tile
++          // vertically at top/bottom (browser#18 bug B). The output-snapshot
++          // fallback is already the clipped region (rw×rh), so its src is full.
++          SkRect src = SkRect::MakeWH(src_img->width(), src_img->height());
++          if (src_from_canvas && !clean_sbs_rect.IsEmpty() &&
++              rect != clean_sbs_rect) {
++            const float iw = src_img->width();
++            const float ih = src_img->height();
++            const float fw = static_cast<float>(clean_sbs_rect.width());
++            const float fh = static_cast<float>(clean_sbs_rect.height());
++            src = SkRect::MakeXYWH((rect.x() - clean_sbs_rect.x()) / fw * iw,
++                                   (rect.y() - clean_sbs_rect.y()) / fh * ih,
++                                   rect.width() / fw * iw,
++                                   rect.height() / fh * ih);
++          }
+           SkPaint paint;
+           paint.setBlendMode(SkBlendMode::kSrc);
+-          // Source the FULL src image (canvas resource is the whole SBS; the
+-          // output snapshot is already rw×rh) → scale to the scratch rect.
+           scratch_surface->getCanvas()->drawImageRect(
+-              src_img.get(),
+-              SkRect::MakeWH(src_img->width(), src_img->height()),
+-              SkRect::MakeWH(rw, rh),
++              src_img.get(), src, SkRect::MakeWH(rw, rh),
+               SkSamplingOptions(SkFilterMode::kNearest), &paint,
+               SkCanvas::kStrict_SrcRectConstraint);
+           FlushSurface(scratch_surface, send, scratch_write.get());
+-- 
+2.42.0.windows.2
+
