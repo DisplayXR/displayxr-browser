@@ -22,6 +22,18 @@ OUT="$REPO/dist"; mkdir -p "$OUT"
 echo "[installer] staging browser tree (version $VER)"
 bash "$REPO/scripts/package.sh"
 
+# Inner-sign the staged first-party binaries (chrome.exe/chrome.dll/…) BEFORE makensis packs them,
+# so the installed browser — not just the outer Setup.exe — is Authenticode-signed. Order matters:
+# NSIS embeds the tree via `File /r`, so signing after the installer is built would not touch the
+# packed copies. sign.sh is non-fatal when the signer is unavailable (ships unsigned inner binaries
+# with a warning), consistent with "signing never gates publishing". Skip with SIGN_INNER=0.
+if [ "${SIGN_INNER:-1}" = "1" ]; then
+  echo "[installer] inner-signing staged first-party binaries"
+  bash "$REPO/scripts/sign.sh" "$STAGE" || echo "[installer] WARN inner-sign returned non-zero — continuing"
+else
+  echo "[installer] SIGN_INNER=0 — leaving staged binaries unsigned"
+fi
+
 # to-Windows path helper (makensis wants native paths)
 w() { cygpath -w "$1" 2>/dev/null || echo "$1"; }
 
