@@ -48,25 +48,14 @@
 !endif
 
 ;--------------------------------
-; Launch flags — REQUIRED for the inline-3D weave to work (displayxr-browser#15 + the
-; 2026-07-15 weave investigation). Baked into every launch path (shortcuts + finish-run):
-;   --enable-inline-3d                        native weave pipe (browser/GPU weave client)
-;   --enable-blink-features=DisplayXRInline3D exposes window.XRDisplayLayer (experimental Blink
-;                                             feature, no switch->feature map; without it the JS
-;                                             gate inline3DAvailable() is false -> page drops to 2D)
-;   --inline-3d-sync-weave                    GPU-resident zero-lag weave submit
-;   --disable-features=DelegatedCompositing   the real #16 fix (confirmed by instrumented build):
-;                                             delegated compositing decomposes the page into DComp
-;                                             visuals and destroys the root render-pass buffers
-;                                             (skia_renderer.cc "delegating to the system compositor"),
-;                                             so there is NO flattened composited surface for the
-;                                             weave to read. Disabling ONLY delegation keeps
-;                                             DirectComposition on and routes the root pass to a
-;                                             renderer-allocated backing that MaybeWeaveRootRenderPass
-;                                             weaves GPU-resident (zero-copy) — strictly better than
-;                                             the old --disable-direct-composition (which forced the
-;                                             GL CPU-readback path, #17).
-!define BROWSER_FLAGS "--enable-inline-3d --enable-blink-features=DisplayXRInline3D --inline-3d-sync-weave --disable-features=DelegatedCompositing"
+; Launch flags — NONE. The inline-3D weave used to require four launch flags
+; (--enable-inline-3d, --enable-blink-features=DisplayXRInline3D, --inline-3d-sync-weave,
+; --disable-features=DelegatedCompositing). As of the flag-free build they are all defaults
+; baked into the binary: DisplayXRInline3D is a "stable" runtime feature (exposes
+; window.XRDisplayLayer), and ChromeMainDelegate::BasicStartupComplete defaults the native
+; weave pipe + zero-lag submit on and disables delegated compositing. So the browser weaves
+; however it's launched, and the shortcuts pass no arguments.
+!define BROWSER_FLAGS ""
 
 ;--------------------------------
 Name "DisplayXR Browser (Developer Preview) ${VERSION}"
