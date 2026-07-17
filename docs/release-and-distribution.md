@@ -6,8 +6,8 @@ in [maintenance-policy.md](maintenance-policy.md) (the locked §6 decision).
 ## The release flow
 Per monthly milestone (after the rebase runbook's build + weave-verify):
 ```bash
-installer/build_installer.sh                       # → dist/DisplayXR-Browser-Preview-Setup-<ver>.<n>.exe
-scripts/sign.sh dist                               # EV-sign (folder-sign via $DXR_SIGN_REPO)
+installer/build_installer.sh                       # stages tree → INNER-signs first-party binaries → makensis → Setup.exe
+bash C:/displayxr-signing/sign-hook.sh dist        # outer-sign the Setup.exe (or set SIGN_CMD to sign in-build)
 scripts/release.sh preview-<ver> dist/DisplayXR-Browser-Preview-Setup-<ver>.<n>.exe
 ```
 `release.sh` creates a **prerelease** GitHub Release in `displayxr-browser` with the signed installer
@@ -16,8 +16,19 @@ the notes. That release is:
 - the **download** the website links to (below), and
 - the **feed** the in-browser version check reads (below).
 
-Signing never gates the release — if `$DXR_SIGN_REPO` is unreachable, the unsigned installer ships with a
-warning (see [`release-signing.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/release-signing.md)).
+### Two layers of signing
+- **Inner (the installed browser):** `build_installer.sh` runs `scripts/sign.sh "$STAGE"` on the staged
+  tree *before* `makensis` packs it, so `chrome.exe` / `chrome.dll` and the ELF/WER/proxy/pwa-launcher
+  stubs are Authenticode-signed. This is what SmartScreen re-checks when the user **runs** the browser,
+  and what enterprise publisher-allowlisting keys on. Only **first-party** binaries are signed — bundled
+  third-party redistributables (`vulkan-1.dll`, `vk_swiftshader*`, `d3dcompiler_47.dll`, `dxcompiler.dll`,
+  `dxil.dll`, `openxr_loader.dll`) keep their original signatures. Skip with `SIGN_INNER=0`.
+- **Outer (the installer):** the `Setup.exe` (+ its uninstaller) is signed either in-build via `SIGN_CMD`
+  (a runner-local `signtool` wrapper → NSIS `!finalize`) or post-hoc via the folder `sign-hook`. This is
+  what SmartScreen checks on **download**.
+
+Signing never gates the release — if the signer is unreachable, sign.sh warns and the unsigned artifact
+ships (see [`release-signing.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/release-signing.md)).
 
 ## Website download
 `displayxr-website` carries the **Download** button + the preview/security page. It links to the latest
