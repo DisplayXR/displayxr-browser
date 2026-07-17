@@ -69,7 +69,7 @@
 !define BROWSER_FLAGS "--enable-inline-3d --enable-blink-features=DisplayXRInline3D --inline-3d-sync-weave --disable-features=DelegatedCompositing"
 
 ;--------------------------------
-Name "DisplayXR Browser ${VERSION}"
+Name "DisplayXR Browser (Developer Preview) ${VERSION}"
 !ifdef INNER
 	OutFile "$%TEMP%\DisplayXRBrowser_inner.exe"
 	RequestExecutionLevel user
