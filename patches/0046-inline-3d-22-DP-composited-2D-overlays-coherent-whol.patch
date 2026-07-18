@@ -1,0 +1,778 @@
+From 5cdcf51c516647674e874f3bda8bb872c42aa584 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 17 Jul 2026 23:46:01 -0700
+Subject: [PATCH] inline-3d(#22): DP-composited 2D overlays + coherent
+ whole-window present
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+browser#22 Option B — move the 2D-over-3D composite into the display processor
+and present the woven output whole-window so 2D chrome spanning tile gaps is
+single-sourced (kills the sticky-header seam double the per-tile present had).
+
+Seams A/B/C (DP overlay atlas):
+- Sync vendored XR_DXR_weave.h to SPEC 5.
+- DisplayXRWeaveClient / DisplayXRWeaveGpu / DisplayXRWeaveProvider: assemble a
+  window-sized premul-RGBA overlay atlas from inline_3d_overlays_ and stage it as
+  the batch overlay input (SetBatchOverlay), chained on the last chunk's submit.
+- skia_output_surface_impl_on_gpu WeaveCompositedSurface: build the atlas
+  (kSrcOver into a scratch SharedImage), ProduceOverlayForWeave, stage before
+  SubmitBatchSync; delete the browser-side kSrcOver draw-back.
+
+B1 whole-window present (v5 firstChunk):
+- SubmitBatchWin sets XrWeaveSubmitInfoDXR::firstChunk = (done == 0) so the
+  runtime clears its woven output to transparent on the frame's first chunk
+  (correct for single-submit frames and the >MAX-rect chunk loop).
+- WeaveCompositedSurface phase (B): replace the per-tile displayxr_drawn_rect_[i]
+  kSrc draw-back with ONE whole-window kSrcOver of the woven output
+  (displayxr_shared_woven_size_ ∩ window_bounds, NEAREST) — opaque tiles replace
+  the page, transparent gaps show it through, DP-composited overlays on top.
+
+Validated on real Leia (runtime v5 g875971038 + this build): wall-3d clean —
+crisp 2D overlays, 3D woven tiles, no seam double.
+---
+ .../browser/displayxr_weave_client.cc         |  54 +++-
+ .../browser/displayxr_weave_client.h          |  15 +-
+ .../displayxr/gpu/displayxr_weave_gpu.cc      |  50 +++-
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  11 +
+ .../displayxr_weave_provider.cc               |   6 +
+ .../displayxr_weave_provider.h                |  15 +
+ .../skia_output_surface_impl_on_gpu.cc        | 267 ++++++++++++------
+ .../skia_output_surface_impl_on_gpu.h         |   9 +
+ .../displayxr/include/openxr/XR_DXR_weave.h   |  68 ++++-
+ 9 files changed, 393 insertions(+), 102 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 5dcb2f7aff9b5..b893cdb800904 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -602,7 +602,9 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+                                                   int32_t y,
+                                                   int32_t w,
+                                                   int32_t h,
+-                                                  bool input_is_dxgi = false) {
++                                                  bool input_is_dxgi = false,
++                                                  uintptr_t overlay_handle = 0,
++                                                  bool overlay_is_dxgi = false) {
+   DisplayXRWeaveClient::WeaveSubmitResult result;
+   WeaveClientState& s = State();
+   if (s.session == XR_NULL_HANDLE || !s.submit) {
+@@ -620,6 +622,18 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+   in.rect.extent.width = w;
+   in.rect.extent.height = h;
+ 
++  // v4 (browser#18/#22): chain the DP-composited 2D overlay atlas when present.
++  // Only touches the chain when a valid overlay handle was passed, so the weave
++  // is unchanged otherwise. Requires a spec-v4 runtime; older runtimes ignore an
++  // unknown chained struct type per the OpenXR next-chain contract.
++  XrWeaveSubmitOverlaysDXR overlays = {XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
++  if (overlay_handle != 0 && s.weave_spec_version >= 4) {
++    overlays.overlayTexture = reinterpret_cast<void*>(overlay_handle);
++    overlays.overlayIsDxgi = overlay_is_dxgi ? XR_TRUE : XR_FALSE;
++    overlays.rectCount = 0;  // whole-atlas composite (premul alpha authoritative)
++    in.next = &overlays;
++  }
++
+   XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+   const XrResult sr = s.submit(s.session, &in, &out);
+   if (XR_FAILED(sr)) {
+@@ -671,7 +685,9 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchWin(
+     uintptr_t input_handle,
+     const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
+-    bool input_is_dxgi) {
++    bool input_is_dxgi,
++    uintptr_t overlay_handle = 0,
++    bool overlay_is_dxgi = false) {
+   const size_t rect_count = rects.size();
+   DisplayXRWeaveClient::WeaveSubmitResult result;
+   WeaveClientState& s = State();
+@@ -719,6 +735,26 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchWin(
+     in.inputTexture = reinterpret_cast<void*>(input_handle);
+     in.inputIsDxgi = input_is_dxgi ? XR_TRUE : XR_FALSE;
+     // Base rect is ignored under the batch chain; keep it zero.
++    // v5 (browser#22): mark the FIRST chunk of the frame so the runtime clears
++    // its window-sized woven output to transparent before weaving — gaps between
++    // tiles come out transparent (not stale), letting Viz present the woven
++    // output WHOLE-WINDOW. Later chunks (done > 0) accumulate into the same
++    // output. No-op on a spec<5 runtime (the field is past its struct; ignored).
++    in.firstChunk = (done == 0) ? XR_TRUE : XR_FALSE;
++
++    // v4 (browser#18/#22): the DP-composited 2D overlay atlas composites OVER the
++    // whole woven output, so chain it on the LAST chunk only — it must land once,
++    // on top, after every rect has woven. Splice ahead of the rects struct
++    // (OpenXR next-chains are unordered) so the batch layout is preserved.
++    XrWeaveSubmitOverlaysDXR overlays = {XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
++    const bool last_chunk = (done + n) >= rect_count;
++    if (overlay_handle != 0 && last_chunk && s.weave_spec_version >= 4) {
++      overlays.overlayTexture = reinterpret_cast<void*>(overlay_handle);
++      overlays.overlayIsDxgi = overlay_is_dxgi ? XR_TRUE : XR_FALSE;
++      overlays.rectCount = 0;  // whole-atlas composite (premul alpha authoritative)
++      overlays.next = &batch;
++      in.next = &overlays;
++    }
+ 
+     XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+     const XrResult sr = s.submit(s.session, &in, &out);
+@@ -1041,9 +1077,12 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::Submit(
+     int32_t y,
+     int32_t w,
+     int32_t h,
+-    bool input_is_dxgi) {
++    bool input_is_dxgi,
++    uintptr_t overlay_handle,
++    bool overlay_is_dxgi) {
+ #if BUILDFLAG(IS_WIN)
+-  return SubmitWin(input_handle, x, y, w, h, input_is_dxgi);
++  return SubmitWin(input_handle, x, y, w, h, input_is_dxgi, overlay_handle,
++                   overlay_is_dxgi);
+ #else
+   return {};
+ #endif
+@@ -1053,9 +1092,12 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::Submit(
+ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::SubmitBatch(
+     uintptr_t input_handle,
+     const std::vector<WeaveRect>& rects,
+-    bool input_is_dxgi) {
++    bool input_is_dxgi,
++    uintptr_t overlay_handle,
++    bool overlay_is_dxgi) {
+ #if BUILDFLAG(IS_WIN)
+-  return SubmitBatchWin(input_handle, rects, input_is_dxgi);
++  return SubmitBatchWin(input_handle, rects, input_is_dxgi, overlay_handle,
++                        overlay_is_dxgi);
+ #else
+   return {};
+ #endif
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index 7e7f666641c8b..b6324b4a0e78b 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -69,12 +69,18 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   // handle (true for the GPU-owned sync path, whose Low-integrity process can't
+   // send an NT handle) vs an NT handle (false, the async mojo path). Returns
+   // ok=false if the weave session isn't live. Windows-only; a stub elsewhere.
++  // |overlay_handle| (XR_DXR_weave spec v4, browser#18/#22) is an optional
++  // window-sized PREMULTIPLIED-alpha RGBA overlay-atlas shared HANDLE the runtime
++  // DP composites OVER the woven output; 0 = no overlay (weave unchanged).
++  // |overlay_is_dxgi| tags it legacy-DXGI vs NT exactly like |input_is_dxgi|.
+   static WeaveSubmitResult Submit(uintptr_t input_handle,
+                                   int32_t x,
+                                   int32_t y,
+                                   int32_t w,
+                                   int32_t h,
+-                                  bool input_is_dxgi = false);
++                                  bool input_is_dxgi = false,
++                                  uintptr_t overlay_handle = 0,
++                                  bool overlay_is_dxgi = false);
+ 
+   // One window-relative device-pixel rect for SubmitBatch. Kept OpenXR- and
+   // gfx-free so this header stays includable from chromium_code TUs.
+@@ -95,9 +101,14 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   // earlier chunks on the runtime's single monotonic weave fence). Requires
+   // WeaveSpecVersion() >= 3; returns ok=false otherwise (callers fall back to
+   // per-element Submit() loops). Windows-only; a stub elsewhere.
++  // |overlay_handle| / |overlay_is_dxgi| (spec v4, browser#18/#22): an optional
++  // window-sized premultiplied-alpha RGBA overlay atlas composited by the runtime
++  // DP over the woven output; chained on the LAST batch chunk (0 = no overlay).
+   static WeaveSubmitResult SubmitBatch(uintptr_t input_handle,
+                                        const std::vector<WeaveRect>& rects,
+-                                       bool input_is_dxgi = false);
++                                       bool input_is_dxgi = false,
++                                       uintptr_t overlay_handle = 0,
++                                       bool overlay_is_dxgi = false);
+ 
+   // The XR_DXR_weave spec version the RUNTIME reported at extension
+   // enumeration (0 until initialized / extension absent). >= 3 means the
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index 11410f979bc9e..56be85236de97 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -32,6 +32,7 @@ DisplayXRWeaveGpu::~DisplayXRWeaveGpu() {
+     ResetInput(in);
+   }
+   ResetInput(shared_input_);
++  ResetInput(overlay_input_);
+   // Close any woven/fence handles Viz never took (e.g. process teardown).
+   for (auto& [id, pending] : results_) {
+     if (pending.have) {
+@@ -99,6 +100,7 @@ bool DisplayXRWeaveGpu::EnsureInput(WeaveInput& in,
+       ResetInput(other);
+     }
+     ResetInput(shared_input_);
++    ResetInput(overlay_input_);
+     batch_mutex_held_ = false;
+     device_ = device;
+     context_.Reset();
+@@ -434,6 +436,45 @@ void DisplayXRWeaveGpu::BeginBatchSync(const gfx::Size& window_size) {
+   batch_open_ = true;
+   batch_size_ = window_size;
+   batch_entries_.clear();
++  // v4: the overlay atlas is opt-in per frame. Cleared here so a frame with no
++  // overlays does not re-submit the previous frame's (stale) atlas.
++  overlay_set_this_batch_ = false;
++}
++
++// v4 DP-composited 2D overlays (browser#18/#22): stage the caller's window-sized
++// premultiplied-alpha RGBA atlas into a keyed-mutex overlay input whose legacy
++// DXGI handle rides the batch submit's XrWeaveSubmitOverlaysDXR chain. The whole
++// atlas is composited by the runtime DP (premul alpha authoritative), so there is
++// one full-resource copy, no per-overlay rects. Call once per batch frame between
++// BeginBatchSync and SubmitBatchSync.
++bool DisplayXRWeaveGpu::SetBatchOverlay(ID3D11Device* device,
++                                        ID3D11Texture2D* atlas_tex,
++                                        UINT array_slice) {
++  if (!batch_open_ || !device || !atlas_tex) {
++    return false;
++  }
++  D3D11_TEXTURE2D_DESC ad = {};
++  atlas_tex->GetDesc(&ad);
++  // EnsureInput allocates the overlay input on |device| with the atlas's own
++  // format/size and exports the legacy-DXGI keyed-mutex handle (same branch as the
++  // SBS input; sync mode → GetSharedHandle). Recreated only on size/format change.
++  if (!EnsureInput(overlay_input_, device, ad.Format, ad.Width, ad.Height)) {
++    return false;
++  }
++  if (overlay_input_.input_mutex->AcquireSync(0, 1000) != S_OK) {
++    LOG(ERROR) << "[DisplayXR] batch weave overlay: AcquireSync(0) failed";
++    return false;
++  }
++  // One whole-resource copy of the assembled premul atlas into the shared input
++  // (dims match by construction), respecting the source array slice.
++  context_->CopySubresourceRegion(overlay_input_.input_tex.Get(),
++                                  /*DstSubresource=*/0, /*DstX=*/0, /*DstY=*/0,
++                                  /*DstZ=*/0, atlas_tex, array_slice,
++                                  /*pSrcBox=*/nullptr);
++  context_->Flush();
++  overlay_input_.input_mutex->ReleaseSync(0);
++  overlay_set_this_batch_ = true;
++  return true;
+ }
+ 
+ bool DisplayXRWeaveGpu::EnsureBatchInputAndAcquire(ID3D11Device* device,
+@@ -611,10 +652,17 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+     rects.push_back({e.rect.x(), e.rect.y(), e.rect.width(), e.rect.height()});
+   }
+ 
++  // v4: hand the overlay atlas alongside the content input when one was staged
++  // this frame; 0 otherwise (runtime omits the overlay chain). Legacy DXGI like
++  // the content input (sync mode, Low-integrity GPU process).
++  const uintptr_t overlay_handle =
++      overlay_set_this_batch_
++          ? reinterpret_cast<uintptr_t>(overlay_input_.input_handle)
++          : 0;
+   const base::TimeTicks t0 = base::TimeTicks::Now();
+   DisplayXRWeaveClient::WeaveSubmitResult sr = DisplayXRWeaveClient::SubmitBatch(
+       reinterpret_cast<uintptr_t>(shared_input_.input_handle), rects,
+-      /*input_is_dxgi=*/true);
++      /*input_is_dxgi=*/true, overlay_handle, /*overlay_is_dxgi=*/true);
+   const base::TimeDelta dt = base::TimeTicks::Now() - t0;
+   if (!sr.ok) {
+     static int s_fail = 0;
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index 3a3804bd06533..4c582b1dcde05 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -72,6 +72,9 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   bool BatchMode() const override;
+   void BeginBatchSync(const gfx::Size& window_size) override;
+   bool SubmitBatchSync() override;
++  bool SetBatchOverlay(ID3D11Device* device,
++                       ID3D11Texture2D* atlas_tex,
++                       UINT array_slice) override;
+ 
+  private:
+   // Per-target weave SBS input (one entry per inline-3d element, keyed by
+@@ -192,6 +195,14 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   gfx::Size batch_size_;           // window client size this batch frame
+   std::vector<BatchEntry> batch_entries_;
+ 
++  // v4 DP-composited 2D overlay atlas (browser#18/#22): a second window-sized
++  // legacy-DXGI keyed-mutex input holding the caller's premultiplied-alpha RGBA
++  // overlay atlas, staged by SetBatchOverlay and submitted alongside
++  // shared_input_ in SubmitBatchSync. |input_handle| is 0 on frames with no
++  // overlay (the overlay chain is then omitted, weave unchanged).
++  WeaveInput overlay_input_;
++  bool overlay_set_this_batch_ = false;  // SetBatchOverlay called this frame
++
+   // The Viz GPU-main D3D11 device (device X, == the canvas SharedImage's device)
+   // the inputs live on, plus its immediate context (used for the canvas->input
+   // copy + keyed-mutex acquire/release). Held to detect a device change. Each
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+index f0f19ae18958a..02ccbbf7b82e9 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.cc
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -26,6 +26,12 @@ bool DisplayXRWeaveProvider::SubmitBatchSync() {
+   return false;
+ }
+ 
++bool DisplayXRWeaveProvider::SetBatchOverlay(ID3D11Device* device,
++                                             ID3D11Texture2D* atlas_tex,
++                                             UINT array_slice) {
++  return false;
++}
++
+ void SetDisplayXRWeaveProvider(DisplayXRWeaveProvider* p) {
+   g_provider = p;
+ }
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index ab0f0b6f224bf..8e5e7bc8d6cef 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -114,6 +114,21 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   virtual bool BatchMode() const;
+   virtual void BeginBatchSync(const gfx::Size& window_size);
+   virtual bool SubmitBatchSync();
++
++  // DP-composited 2D overlays (XR_DXR_weave spec v4, browser#18/#22). Set ONCE
++  // per batch frame, between BeginBatchSync and SubmitBatchSync, with a
++  // window-sized PREMULTIPLIED-alpha RGBA atlas the caller assembled (all 2D
++  // overlays flattened in z-order onto transparency). The atlas rides the batch
++  // submit as a second shared texture the runtime DP composites OVER the woven
++  // output (final = woven·(1 − a) + overlay), so the browser no longer composites
++  // overlays itself. |atlas_tex| / |array_slice| are the assembled atlas resolved
++  // on the GPU thread (its dims define the window size); copied into an owned
++  // keyed-mutex overlay input on |device|. Returns true if the atlas was staged.
++  // A frame that never calls this weaves with no overlay (unchanged). Default:
++  // no-op (non-batch providers don't carry overlays).
++  virtual bool SetBatchOverlay(ID3D11Device* device,
++                               ID3D11Texture2D* atlas_tex,
++                               UINT array_slice);
+ };
+ 
+ // Register / fetch the process-global provider (GPU process, GPU main thread).
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 3c7c8eda92acc..5edc4da1aa2e6 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3174,18 +3174,167 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       displayxr_drawn_rect_[t] = gfx::Rect();
+     }
+   }
++
++  // v4 (browser#18/#22): assemble this frame's isolated 2D overlays into ONE
++  // window-sized premultiplied-alpha atlas and stage it as the runtime DP's
++  // overlay input, so the DP composites 2D OVER the woven output
++  // (final = woven·(1 − a) + overlay). This REPLACES the browser-side kSrcOver
++  // draw-back that used to run in Phase B — the overlays now travel through the
++  // weave submit and land glued to their tiles (no main-thread-rect scroll lag).
++  // Runs before SubmitBatchSync (the overlay rides that submit). Any failure just
++  // skips the overlay this frame; the weave itself is unaffected.
++  if (batch && !inline_3d_overlays_.empty()) {
++    auto stage_overlay_atlas = [&]() -> bool {
++      DisplayXRScratchState& atlas = displayxr_overlay_atlas_state_;
++      // (1) Ensure a window-sized RGBA8 premul atlas (same overlay-exposable
++      // D3DImageBacking recipe as the weave scratch: DISPLAY_READ/WRITE keeps a
++      // sampleable ID3D11Texture2D, CPU_READ forces D3DImageBackingFactory and
++      // avoids the DComp-visual path). Recreated only on a window-size change.
++      if (atlas.mailbox.IsZero() || atlas.size != window_bounds.size()) {
++        if (!atlas.mailbox.IsZero()) {
++          shared_image_factory_->DestroySharedImage(atlas.mailbox);
++          skia_representations_.erase(atlas.mailbox);
++          atlas.mailbox = gpu::Mailbox();
++        }
++        gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++        gpu::SharedImageInfo si_info(
++            SinglePlaneFormat::kRGBA_8888, window_bounds.size(),
++            gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++            kPremul_SkAlphaType,
++            gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++                gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE |
++                gpu::SHARED_IMAGE_USAGE_CPU_READ,
++            "DisplayXROverlayAtlas");
++        if (!shared_image_factory_->CreateSharedImage(
++                mailbox, si_info, gpu::kNullSurfaceHandle)) {
++          return false;
++        }
++        atlas.mailbox = mailbox;
++        atlas.size = window_bounds.size();
++      }
++
++      // (2) Composite every isolated overlay kSrcOver into the (cleared) atlas at
++      // its compositor-exact window rect — the same per-overlay resolve/draw the
++      // old Phase-B block did, but into the atlas surface (z-order + overlap +
++      // translucency resolved here) instead of |out_canvas|.
++      int composited = 0;
++      {
++        auto atlas_rep = shared_image_representation_factory_->ProduceSkia(
++            atlas.mailbox, context_state_.get());
++        if (!atlas_rep) {
++          return false;
++        }
++        std::vector<GrBackendSemaphore> abegin, aend;
++        SkSurfaceProps props;
++        auto atlas_write = atlas_rep->BeginScopedWriteAccess(
++            /*final_msaa_count=*/0, props, &abegin, &aend,
++            gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++        if (!atlas_write || !atlas_write->surface()) {
++          return false;
++        }
++        SkSurface* atlas_surface = atlas_write->surface();
++        if (!abegin.empty()) {
++          atlas_surface->wait(abegin.size(), abegin.data(),
++                              /*deleteSemaphoresAfterWait=*/false);
++        }
++        // Reused across frames: clear last frame's overlays first (transparent =
++        // show the weave through; the premultiplied alpha is the 2D-vs-3D mask).
++        atlas_surface->getCanvas()->clear(SK_ColorTRANSPARENT);
++        SkPaint over_paint;
++        over_paint.setBlendMode(SkBlendMode::kSrcOver);
++        for (const SkiaOutputSurface::Inline3dLayerMailbox& overlay :
++             inline_3d_overlays_) {
++          gfx::Rect r = overlay.rect;
++          r.Intersect(window_bounds);
++          if (r.IsEmpty() || overlay.mailbox.IsZero()) {
++            continue;
++          }
++          auto overlay_rep = shared_image_representation_factory_->ProduceSkia(
++              overlay.mailbox, context_state_.get());
++          if (!overlay_rep) {
++            continue;
++          }
++          std::vector<GrBackendSemaphore> obegin, oend;
++          auto overlay_access =
++              overlay_rep->BeginScopedReadAccess(&obegin, &oend);
++          if (!overlay_access) {
++            continue;
++          }
++          sk_sp<SkImage> overlay_img =
++              overlay_access->CreateSkImage(context_state_.get());
++          if (!overlay_img) {
++            continue;
++          }
++          if (!obegin.empty()) {
++            atlas_surface->wait(obegin.size(), obegin.data(),
++                                /*deleteSemaphoresAfterWait=*/false);
++          }
++          const SkRect src =
++              SkRect::MakeWH(overlay_img->width(), overlay_img->height());
++          const SkRect dst =
++              SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
++          atlas_surface->getCanvas()->drawImageRect(
++              overlay_img.get(), src, dst,
++              SkSamplingOptions(SkFilterMode::kLinear), &over_paint,
++              SkCanvas::kStrict_SrcRectConstraint);
++          ++composited;
++        }
++        FlushSurface(atlas_surface, aend, atlas_write.get());
++        if (gr_context()) {
++          gr_context()->submit();
++        }
++        if (graphite_shared_context()) {
++          graphite_shared_context()->submit();
++        }
++      }
++      if (composited == 0) {
++        return false;  // nothing landed → weave with no overlay this frame
++      }
++
++      // (3) Export the atlas as a raw ID3D11Texture2D (SCANOUT-gate-free
++      // ProduceOverlayForWeave, as the weave scratch does) and stage it as the
++      // provider's overlay input for this batch submit.
++      auto overlay_rep =
++          shared_image_representation_factory_->ProduceOverlayForWeave(
++              atlas.mailbox);
++      if (!overlay_rep) {
++        return false;
++      }
++      auto overlay_read = overlay_rep->BeginScopedReadAccess();
++      if (!overlay_read) {
++        return false;
++      }
++      std::optional<gl::DCLayerOverlayImage> ov =
++          overlay_read->GetDCLayerOverlayImage();
++      if (!ov || ov->type() != gl::DCLayerOverlayType::kD3D11Texture ||
++          !ov->d3d11_video_texture()) {
++        return false;
++      }
++      return provider->SetBatchOverlay(
++          device_x.Get(), ov->d3d11_video_texture(),
++          static_cast<UINT>(ov->texture_array_slice()));
++    };
++    const bool staged = stage_overlay_atlas();
++    static int atlas_log_throttle = 0;
++    if ((atlas_log_throttle++ % 120) == 0) {
++      VLOG(1) << "[DisplayXR] weave overlay atlas: staged=" << staged << " ("
++              << inline_3d_overlays_.size() << " overlays, DP-composited)";
++    }
++  }
++
+   if (batch) {
+     provider->SubmitBatchSync();
+   }
+ 
+   // ---- (B) Draw back the accumulated window-sized woven output ----
+   // The runtime weaves EVERY submitted sub-rect into ONE window-sized handback
+-  // texture (process_atlas writes only the sub-rect, never clearing), so all
+-  // inline-3d elements accumulate into a single shared output at their window
+-  // positions. Import that shared texture once (a fresh handle arrives only on
+-  // the first submit / a window-size change; every later reply carries handle 0),
+-  // adopt the latest submit's fence, then draw EACH rect's region from it. Runs
+-  // after (A) so the submit read the clean pre-weave page.
++  // texture and (v5, browser#22) clears the gaps to transparent on the frame's
++  // first chunk, so all inline-3d elements accumulate into a single shared output
++  // at their window positions ON transparency. Import that shared texture once (a
++  // fresh handle arrives only on the first submit / a window-size change; every
++  // later reply carries handle 0), adopt the latest submit's fence, then draw the
++  // WHOLE woven output back over the page in one kSrcOver (below). Runs after (A)
++  // so the submit read the clean pre-weave page.
+   uint64_t latest_fence_value = 0;
+   bool got_result = false;
+   for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
+@@ -3271,95 +3420,39 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                  /*deleteSemaphoresAfterWait=*/false);
+   }
+ 
++  // v5 whole-window present (browser#22): the runtime now clears its woven
++  // output to premultiplied transparent on the FIRST chunk of the frame
++  // (XrWeaveSubmitInfoDXR::firstChunk), so the window-sized handback is "opaque
++  // woven tiles + DP-composited overlays, on transparent gaps". Draw it ONCE
++  // over the whole window with kSrcOver (device-pixel-exact NEAREST for the
++  // interlace lattice): opaque tiles (alpha 1) replace the page, transparent
++  // gaps (alpha 0) show the page through, premul overlays composite on top. This
++  // single-sources any 2D chrome that spans tile gaps — killing the per-tile
++  // header double the old per-rect kSrc draw-back produced (a full-width sticky
++  // header covered by both the DP composite over tiles AND the raw page in the
++  // gaps). The runtime's transparent clear also means gaps carry no stale/smear,
++  // so there is no longer a reason to scope the draw to submit-time rects.
+   bool drew_any = false;
+-  for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
+-    // Draw at the SUBMIT-TIME rect (where the runtime placed this target's woven
+-    // pixels in the shared window-sized output), NOT the current rect — sampling
+-    // the current rect during a scroll drift reads stale/empty regions (raw SBS
+-    // peek + smear). Empty = no completed submit for this target yet.
+-    gfx::Rect rect = displayxr_drawn_rect_[i];
+-    rect.Intersect(window_bounds);
+-    if (rect.IsEmpty()) {
+-      continue;
+-    }
+-    const SkRect src_dst =
+-        SkRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height());
++  gfx::Rect woven_rect(0, 0, displayxr_shared_woven_size_.width(),
++                       displayxr_shared_woven_size_.height());
++  woven_rect.Intersect(window_bounds);
++  if (!woven_rect.IsEmpty()) {
++    const SkRect src_dst = SkRect::MakeXYWH(woven_rect.x(), woven_rect.y(),
++                                            woven_rect.width(),
++                                            woven_rect.height());
+     SkPaint paint;
+-    paint.setBlendMode(SkBlendMode::kSrc);
++    paint.setBlendMode(SkBlendMode::kSrcOver);
+     out_canvas->drawImageRect(woven_img.get(), src_dst, src_dst,
+                               SkSamplingOptions(SkFilterMode::kNearest), &paint,
+                               SkCanvas::kStrict_SrcRectConstraint);
+     drew_any = true;
+   }
+ 
+-  // ---- Overlay layers over the woven output (browser#18) ----
+-  // True 2D-over-3D: each excluded overlay was isolated as its own render pass
+-  // (the page/SDK forced a render surface), so its backing holds the plate
+-  // rendered on TRANSPARENCY. The woven `kSrc` draw above already put clean 3D
+-  // where the overlay sits (overwriting the overlay's baked-in copy in the root
+-  // pass); compositing the isolated backing kSrcOver on top yields
+-  //   final = plate + (1−plate.a)·woven
+-  // so a translucent/gradient plate reveals the woven 3D underneath and an
+-  // opaque plate stays crisp. (The 3D directly under a translucent plate carries
+-  // a faint tint because the plate was still present in the weave INPUT — a
+-  // known v1 limitation in mid-alpha regions only; fully removing it needs the
+-  // overlay diverted from the weave input too.)
+-  if (drew_any && !inline_3d_overlays_.empty()) {
+-    SkPaint over_paint;
+-    over_paint.setBlendMode(SkBlendMode::kSrcOver);
+-    int composited = 0;
+-    for (const SkiaOutputSurface::Inline3dLayerMailbox& overlay :
+-         inline_3d_overlays_) {
+-      gfx::Rect r = overlay.rect;
+-      r.Intersect(window_bounds);
+-      if (r.IsEmpty() || overlay.mailbox.IsZero()) {
+-        continue;
+-      }
+-      auto overlay_rep = shared_image_representation_factory_->ProduceSkia(
+-          overlay.mailbox, context_state_.get());
+-      if (!overlay_rep) {
+-        continue;
+-      }
+-      std::vector<GrBackendSemaphore> obegin_sem, oend_sem;
+-      auto overlay_access =
+-          overlay_rep->BeginScopedReadAccess(&obegin_sem, &oend_sem);
+-      if (!overlay_access) {
+-        continue;
+-      }
+-      sk_sp<SkImage> overlay_img =
+-          overlay_access->CreateSkImage(context_state_.get());
+-      if (!overlay_img) {
+-        continue;
+-      }
+-      if (!obegin_sem.empty()) {
+-        output->wait(obegin_sem.size(), obegin_sem.data(),
+-                     /*deleteSemaphoresAfterWait=*/false);
+-      }
+-      // The backing is the overlay pass sized to its bounds; draw its full
+-      // extent to the overlay's root-space rect (they match by construction).
+-      const SkRect src = SkRect::MakeWH(overlay_img->width(),
+-                                        overlay_img->height());
+-      const SkRect dst =
+-          SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
+-      out_canvas->drawImageRect(overlay_img.get(), src, dst,
+-                                SkSamplingOptions(SkFilterMode::kLinear),
+-                                &over_paint, SkCanvas::kStrict_SrcRectConstraint);
+-      ++composited;
+-    }
+-    static int overlay_log_throttle = 0;
+-    if ((overlay_log_throttle++ % 120) == 0) {
+-      VLOG(1) << "[DisplayXR] weave overlay composite: " << composited << "/"
+-              << inline_3d_overlays_.size() << " layers over woven output"
+-              << " (canvas_layers=" << inline_3d_canvas_layers_.size() << ")";
+-    }
+-  } else if (!inline_3d_overlays_.empty()) {
+-    static int ov_gpu_dbg = 0;
+-    if ((ov_gpu_dbg++ % 120) == 0) {
+-      VLOG(1) << "[DisplayXR] weave overlay: " << inline_3d_overlays_.size()
+-              << " received but drew_any=" << drew_any
+-              << " canvas_layers=" << inline_3d_canvas_layers_.size();
+-    }
+-  }
++  // 2D overlays (browser#18) are NO LONGER composited here. They are assembled
++  // into a premultiplied-alpha atlas in Phase A and composited by the runtime DP
++  // OVER the woven output (v4 XrWeaveSubmitOverlaysDXR / browser#22), so the
++  // woven handback drawn back above already carries them at their tile-glued
++  // positions. See the stage_overlay_atlas block before SubmitBatchSync.
+ 
+   // Ensure the woven draws land in (and are submitted to) the output surface
+   // before |woven_access| releases — otherwise Ganesh reads the released woven
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 388ad41f9a039..d7b7676c8f83d 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -700,6 +700,15 @@ class SkiaOutputSurfaceImplOnGpu
+   };
+   std::vector<DisplayXRScratchState> displayxr_scratch_state_;
+ 
++  // DisplayXR inline-3D (browser#18/#22 — v4 DP-composited 2D overlays): ONE
++  // window-sized owned premultiplied-alpha SharedImage into which the frame's
++  // isolated 2D overlays are composited kSrcOver, then ProduceOverlayForWeave
++  // yields its ID3D11Texture2D for the provider's SetBatchOverlay to stage as the
++  // runtime DP's overlay atlas (composited OVER the woven output). This replaces
++  // the browser-side kSrcOver draw-back. Reused across frames; recreated on a
++  // window-size change; owned by shared_image_factory_.
++  DisplayXRScratchState displayxr_overlay_atlas_state_;
++
+   // DisplayXR inline-3D (#625, Step B — async per-element weave). The provider
+   // keys a SEPARATE keyed-mutex input per target, so every visible target is
+   // submitted EVERY frame (concurrently, gated only per-target by
+diff --git a/third_party/displayxr/include/openxr/XR_DXR_weave.h b/third_party/displayxr/include/openxr/XR_DXR_weave.h
+index 8786abb535f28..cb3b090caffba 100644
+--- a/third_party/displayxr/include/openxr/XR_DXR_weave.h
++++ b/third_party/displayxr/include/openxr/XR_DXR_weave.h
+@@ -98,9 +98,21 @@
+  * the end; eyes are returned once per call. A batch is NOT equivalent to N
+  * single-rect submits of the same texture — the layouts differ (see above).
+  *
++ * DP-composited 2D overlays (SPEC_VERSION 4, browser#18). Chain an
++ * XrWeaveSubmitOverlaysDXR onto XrWeaveSubmitInfoDXR::next (alongside
++ * XrWeaveSubmitRectsDXR) carrying one window-sized premultiplied-alpha RGBA
++ * atlas the DP composites OVER the woven output in the same pass
++ * (final = woven·(1 − overlay.a) + overlay), so crisp 2D lands on top of the
++ * interlaced 3D at screen depth. The caller flattens all its 2D overlays into
++ * that one atlas in stacking (z) order before submit — z-order is resolved
++ * caller-side and the wire carries one texture, not N layers. The premultiplied
++ * alpha channel is the 2D-vs-3D mask (alpha 1 = opaque 2D, alpha 0 = show the
++ * weave through). v4 overlays are all at screen depth, "over" the weave.
++ *
+  * Version history: 1 = initial (pre-rename numbering carried over); 2 =
+  * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
+- * submit.
++ * submit; 4 = XrWeaveSubmitOverlaysDXR DP-composited 2D overlay atlas; 5 =
++ * XrWeaveSubmitInfoDXR::firstChunk (coherent whole-window output, browser#22).
+  */
+ #ifndef XR_DXR_WEAVE_H
+ #define XR_DXR_WEAVE_H 1
+@@ -113,14 +125,15 @@ extern "C" {
+ #endif
+ 
+ #define XR_DXR_weave 1
+-#define XR_DXR_weave_SPEC_VERSION 3
++#define XR_DXR_weave_SPEC_VERSION 5
+ #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
+ 
+-// Reserved 1004999190..192. Final values reconcile with the Khronos registry
++// Reserved 1004999190..193. Final values reconcile with the Khronos registry
+ // before spec freeze. Allocation registry: README.md in this directory.
+-#define XR_TYPE_WEAVE_SUBMIT_INFO_DXR  ((XrStructureType)1004999190)
+-#define XR_TYPE_WEAVE_OUTPUT_DXR       ((XrStructureType)1004999191)
+-#define XR_TYPE_WEAVE_SUBMIT_RECTS_DXR ((XrStructureType)1004999192)
++#define XR_TYPE_WEAVE_SUBMIT_INFO_DXR     ((XrStructureType)1004999190)
++#define XR_TYPE_WEAVE_OUTPUT_DXR          ((XrStructureType)1004999191)
++#define XR_TYPE_WEAVE_SUBMIT_RECTS_DXR    ((XrStructureType)1004999192)
++#define XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR ((XrStructureType)1004999193)
+ 
+ //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
+ //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
+@@ -144,6 +157,18 @@ extern "C" {
+  * @c rect is the element's device-pixel rect WITHIN the bound window's client
+  * area (y-down). The runtime combines it with the tracked window position to
+  * derive the absolute-screen weave phase.
++ *
++ * @c firstChunk (spec v5, browser#22) marks the FIRST submit of a frame. When
++ * XR_TRUE the runtime clears its window-sized woven output to premultiplied
++ * transparent (0,0,0,0) before weaving this submit's rects, so regions between
++ * the woven tiles become transparent instead of stale — the caller can then
++ * present the woven output WHOLE-WINDOW (one "over" composite: opaque tiles
++ * replace the page, transparent gaps show it through) instead of per-tile,
++ * single-sourcing any 2D chrome that spans tile gaps. A caller that splits a
++ * frame across multiple submits (> XR_WEAVE_SUBMIT_MAX_RECTS_DXR elements) sets
++ * it XR_TRUE only on the first; later submits accumulate into the same output.
++ * Default XR_FALSE preserves the legacy behavior (no clear) for present-owners
++ * that draw back only their own tiles.
+  */
+ typedef struct XrWeaveSubmitInfoDXR {
+     XrStructureType          type;         //!< XR_TYPE_WEAVE_SUBMIT_INFO_DXR
+@@ -151,6 +176,7 @@ typedef struct XrWeaveSubmitInfoDXR {
+     void*                    inputTexture; //!< pre-weave SBS shared texture HANDLE (keyed-mutex)
+     XrBool32                 inputIsDxgi;  //!< XR_TRUE for a legacy global DXGI handle (else NT handle)
+     XrRect2Di                rect;         //!< window-relative sub-rect, device px (y-down)
++    XrBool32                 firstChunk;   //!< XR_TRUE = first submit of the frame; clears the woven output to transparent (v5)
+ } XrWeaveSubmitInfoDXR;
+ 
+ /*!
+@@ -175,6 +201,36 @@ typedef struct XrWeaveSubmitRectsDXR {
+     const XrRect2Di*         rects;     //!< window-relative sub-rects, device px (y-down)
+ } XrWeaveSubmitRectsDXR;
+ 
++/*!
++ * @brief DP-composited 2D overlay atlas — crisp 2D painted OVER the weave (spec v4).
++ *
++ * Chain onto XrWeaveSubmitInfoDXR::next (alongside XrWeaveSubmitRectsDXR). The
++ * DP composites @c overlayTexture over the woven output in the same pass, so the
++ * 2D content lands on top of the interlaced 3D as crisp screen-depth pixels
++ * (final = woven·(1 − overlay.a) + overlay).
++ *
++ * @c overlayTexture is a shared GPU texture HANDLE to a window-sized,
++ * PREMULTIPLIED-alpha RGBA atlas: every 2D overlay is already rastered at its
++ * own window position, flattened in stacking (z) order, on transparency
++ * elsewhere. The premultiplied alpha channel is the 2D-vs-3D mask — alpha 1 =
++ * opaque 2D, alpha 0 = show the weave through. Like @c inputTexture it is a
++ * keyed-mutex shared texture (key 0 = "caller done writing"); on Windows an NT
++ * shared handle unless @c overlayIsDxgi is XR_TRUE.
++ *
++ * @c rects (optional) name the window-relative regions the atlas actually
++ * touches, letting the DP scope the composite to those areas; @c rectCount 0
++ * means "composite the whole atlas". They are a performance hint, not a
++ * correctness input — the premultiplied alpha alone defines the result.
++ */
++typedef struct XrWeaveSubmitOverlaysDXR {
++    XrStructureType          type;           //!< XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR
++    const void* XR_MAY_ALIAS next;
++    void*                    overlayTexture; //!< window-sized premul-RGBA overlay atlas HANDLE (keyed-mutex)
++    XrBool32                 overlayIsDxgi;  //!< XR_TRUE for a legacy global DXGI handle (else NT handle)
++    uint32_t                 rectCount;      //!< 0..XR_WEAVE_SUBMIT_MAX_RECTS_DXR (0 = whole atlas)
++    const XrRect2Di*         rects;          //!< window-relative overlay regions, device px (y-down) — scope hint
++} XrWeaveSubmitOverlaysDXR;
++
+ /*!
+  * @brief Weaved output handed back to the present-owner.
+  *
+-- 
+2.42.0.windows.2
+
