@@ -1,0 +1,596 @@
+From 25149007505f78ebb7b6d0a9bff6e8dd7c7e5082 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 18 Jul 2026 05:51:23 +0000
+Subject: [PATCH] =?UTF-8?q?inline-3d(625):=20macOS=20weave=20client=20PR1?=
+ =?UTF-8?q?=20=E2=80=94=20MoltenVK=20IPC=20session=20bring-up?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Ports the browser-process weave client (DisplayXRWeaveClient statics) to
+macOS. dlopen the OpenXR loader + MoltenVK (dormant when the DisplayXR runtime
+is absent — the delay-load analogue), create a forced-IPC instance, a MoltenVK
+device (XR_KHR_vulkan_enable), the present-owner weave session
+(XrGraphicsBindingVulkanKHR — the only binding the mac IPC weave path accepts;
+metal/vk native compositors are disabled in service mode and headless cant
+weave), xrWeaveBindWindowDXR(0), and resolve the weave PFNs. Wires the IS_MAC
+dispatcher branches (MaybeInitializeFromCommandLine/IsSupported/WeaveSpecVersion).
+Mirrors test_apps/probes/weave_probe_vk_macos. Compiles + links on arm64.
+
+PR2 adds LocateViewsForRect (eyes); PR3 the GPU-process IOSurface weave.
+---
+ components/displayxr/browser/BUILD.gn         |  21 +
+ .../browser/displayxr_weave_client.cc         |  15 +-
+ .../browser/displayxr_weave_client_mac.h      |  29 ++
+ .../browser/displayxr_weave_client_mac.mm     | 443 ++++++++++++++++++
+ 4 files changed, 507 insertions(+), 1 deletion(-)
+ create mode 100644 components/displayxr/browser/displayxr_weave_client_mac.h
+ create mode 100644 components/displayxr/browser/displayxr_weave_client_mac.mm
+
+diff --git a/components/displayxr/browser/BUILD.gn b/components/displayxr/browser/BUILD.gn
+index 6e3f4079fadbe..091edc2fb2a67 100644
+--- a/components/displayxr/browser/BUILD.gn
++++ b/components/displayxr/browser/BUILD.gn
+@@ -26,6 +26,27 @@ component("weave_client") {
+       "d3d11.lib",
+       "dxgi.lib",
+     ]
++  } else if (is_mac) {
++    # macOS PR1: the OpenXR loader + MoltenVK are dlopen'd at runtime (dormant
++    # when the DisplayXR runtime is absent — the delay-load analogue), so we
++    # need the HEADERS only, not the link. The weave session binds MoltenVK
++    # (XrGraphicsBindingVulkanKHR) — the only binding the mac IPC weave path
++    # accepts (see displayxr_weave_client_mac.mm).
++    sources += [
++      "displayxr_weave_client_mac.h",
++      "displayxr_weave_client_mac.mm",
++    ]
++    # Reference the vendored OpenXR headers' include dir DIRECTLY rather than the
++    # //third_party/displayxr:openxr_headers config — that BUILD.gn imports
++    # visual_studio_version.gni at file scope and only loads on Windows.
++    include_dirs = [ "//third_party/displayxr/include" ]
++    deps += [ "//third_party/vulkan-headers/src:vulkan_headers" ]
++    frameworks = [
++      "Foundation.framework",
++      "IOSurface.framework",
++      "Metal.framework",
++      "QuartzCore.framework",
++    ]
+   }
+ }
+ 
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 5dcb2f7aff9b5..f74b4c5f71a86 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -43,6 +43,10 @@
+ #include <openxr/XR_DXR_win32_window_binding.h>
+ #endif  // BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_MAC)
++#include "components/displayxr/browser/displayxr_weave_client_mac.h"
++#endif
++
+ namespace displayxr {
+ 
+ namespace {
+@@ -1065,6 +1069,8 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::SubmitBatch(
+ uint32_t DisplayXRWeaveClient::WeaveSpecVersion() {
+ #if BUILDFLAG(IS_WIN)
+   return State().weave_spec_version;
++#elif BUILDFLAG(IS_MAC)
++  return WeaveSpecVersionMac();
+ #else
+   return 0;
+ #endif
+@@ -1074,6 +1080,8 @@ uint32_t DisplayXRWeaveClient::WeaveSpecVersion() {
+ bool DisplayXRWeaveClient::IsSupported() {
+ #if BUILDFLAG(IS_WIN)
+   return IsSupportedWin();
++#elif BUILDFLAG(IS_MAC)
++  return IsSupportedMac();
+ #else
+   return false;
+ #endif
+@@ -1122,8 +1130,13 @@ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+   // 120 × 500ms = 60s: a dcheck_always_on build on a cold profile can take
+   // well over 10s to show its first window; the retry is a no-op once bound.
+   InitializeWin(/*attempts_left=*/120);
++#elif BUILDFLAG(IS_MAC)
++  // macOS PR1: bring up the MoltenVK-bound IPC weave session directly (no HWND
++  // retry — the runtime stores window id 0 and the snap is identity). Dormant
++  // when the runtime/loader is absent.
++  InitializeCoreMac();
+ #else
+-  LOG(ERROR) << "[DisplayXR] inline-3D is Windows-only in Step B";
++  LOG(ERROR) << "[DisplayXR] inline-3D is not supported on this platform yet";
+ #endif
+ }
+ 
+diff --git a/components/displayxr/browser/displayxr_weave_client_mac.h b/components/displayxr/browser/displayxr_weave_client_mac.h
+new file mode 100644
+index 0000000000000..4c5f510fee8e6
+--- /dev/null
++++ b/components/displayxr/browser/displayxr_weave_client_mac.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_MAC_H_
++#define COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_MAC_H_
++
++// macOS platform impl of the DisplayXRWeaveClient statics (PR1). Defined in
++// displayxr_weave_client_mac.mm; called from the #elif BUILDFLAG(IS_MAC)
++// branches of the dispatchers in displayxr_weave_client.cc. OpenXR-free so
++// the C++ dispatcher TU can include it.
++
++#include <cstdint>
++
++namespace displayxr {
++
++// Bring up the MoltenVK-bound IPC weave session (idempotent). No-op / dormant
++// when the DisplayXR runtime + OpenXR loader aren't installed.
++void InitializeCoreMac();
++
++// True once the weave session is live (backs WebXR isSessionSupported).
++bool IsSupportedMac();
++
++// The runtime-reported XR_DXR_weave spec version (0 until initialized).
++uint32_t WeaveSpecVersionMac();
++
++}  // namespace displayxr
++
++#endif  // COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_MAC_H_
+diff --git a/components/displayxr/browser/displayxr_weave_client_mac.mm b/components/displayxr/browser/displayxr_weave_client_mac.mm
+new file mode 100644
+index 0000000000000..be6e31f14cd92
+--- /dev/null
++++ b/components/displayxr/browser/displayxr_weave_client_mac.mm
+@@ -0,0 +1,443 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// macOS inline-3D weave client (#625, Step B — macOS port PR1).
++//
++// The macOS sibling of the Windows body in displayxr_weave_client.cc. Same
++// contract (DisplayXRWeaveClient statics), different platform substrate:
++//
++//   * The weave session binds with MoltenVK (XrGraphicsBindingVulkanKHR), NOT
++//     Metal/D3D11. On the macOS IPC/service path both the metal_native and
++//     vk_native native compositors are disabled (oxr_session_gfx_*_native.c,
++//     is_service_mode), and a headless session can't weave (oxr_weave.c
++//     session_is_ipc requires xcn != NULL). The MoltenVK-bound IPC session is
++//     the only one the runtime's XR_DXR_weave accepts on macOS — verified by
++//     test_apps/probes/weave_probe_vk_macos, whose bring-up this mirrors.
++//   * The OpenXR loader AND MoltenVK are dlopen'd (not linked): inline-3D stays
++//     dormant (IsSupported()==false) when the DisplayXR runtime isn't installed,
++//     the macOS analogue of the Windows delay-load of openxr_loader.dll.
++//
++// PR1 scope (Seam-C de-risk): dlopen the loaders, create a forced-IPC instance,
++// a MoltenVK device, the present-owner weave session, xrWeaveBindWindowDXR, and
++// resolve the weave PFNs — proving the linkage/process path on macOS. The
++// per-frame weave (IOSurface submit) + the GPU-process provider land in PR3.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// Bring-up code over the vendored OpenXR / Vulkan C APIs (fixed-size name
++// buffers, extension-string arrays). TODO(#625): harden alongside the Windows
++// client. Matches the source_set's no_chromium_code relaxation.
++#pragma allow_unsafe_buffers
++#endif
++
++#include "components/displayxr/browser/displayxr_weave_client_mac.h"
++
++#include <dlfcn.h>
++
++#include <cstring>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/logging.h"
++
++// vulkan.h MUST precede openxr_platform.h: under XR_USE_GRAPHICS_API_VULKAN the
++// platform header references VkDevice/VkInstance/VkResult and expects them
++// already declared.
++#include <vulkan/vulkan.h>
++
++#define XR_USE_GRAPHICS_API_VULKAN
++#include <openxr/openxr.h>
++#include <openxr/openxr_platform.h>
++
++#include <openxr/XR_DXR_display_info.h>
++#include <openxr/XR_DXR_weave.h>
++
++namespace displayxr {
++namespace {
++
++// ---- Dynamically loaded entry points (dormant-when-absent) -----------------
++// We dlopen the two loaders and bootstrap everything else through their
++// proc-address getters, so a machine without the DisplayXR runtime simply
++// leaves these null and inline-3D reports unsupported.
++PFN_xrGetInstanceProcAddr g_xrGetInstanceProcAddr = nullptr;
++PFN_vkGetInstanceProcAddr g_vkGetInstanceProcAddr = nullptr;
++
++// Candidate paths for the runtime-shipped loaders. The runtime .pkg installs
++// them under /usr/local/lib (Homebrew-style) or alongside the active-runtime
++// JSON; also honor DYLD search + an explicit override for dev builds.
++void* DlopenFirst(const char* const* names, size_t n) {
++  for (size_t i = 0; i < n; ++i) {
++    if (void* h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL)) {
++      return h;
++    }
++  }
++  return nullptr;
++}
++
++bool LoadLoaders() {
++  static bool tried = false;
++  static bool ok = false;
++  if (tried) {
++    return ok;
++  }
++  tried = true;
++
++  const char* xr_names[] = {
++      "libopenxr_loader.dylib",
++      "/usr/local/lib/libopenxr_loader.dylib",
++      "/opt/homebrew/lib/libopenxr_loader.dylib",
++  };
++  const char* vk_names[] = {
++      "libvulkan.dylib",
++      "libMoltenVK.dylib",
++      "/usr/local/lib/libvulkan.dylib",
++      "/usr/local/lib/libMoltenVK.dylib",
++  };
++  void* xr_lib = DlopenFirst(xr_names, std::size(xr_names));
++  void* vk_lib = DlopenFirst(vk_names, std::size(vk_names));
++  if (!xr_lib || !vk_lib) {
++    VLOG(1) << "[DisplayXR] loaders absent (xr=" << (void*)xr_lib
++            << " vk=" << (void*)vk_lib << ") — inline-3D dormant";
++    return false;
++  }
++  g_xrGetInstanceProcAddr = reinterpret_cast<PFN_xrGetInstanceProcAddr>(
++      dlsym(xr_lib, "xrGetInstanceProcAddr"));
++  g_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++      dlsym(vk_lib, "vkGetInstanceProcAddr"));
++  ok = g_xrGetInstanceProcAddr && g_vkGetInstanceProcAddr;
++  return ok;
++}
++
++// Resolve an XR PFN through the bootstrapped getter. |instance| may be NULL for
++// the pre-instance calls (xrCreateInstance, xrEnumerateInstanceExtensionProperties).
++template <typename Fn>
++Fn GetXr(XrInstance instance, const char* name) {
++  PFN_xrVoidFunction p = nullptr;
++  if (g_xrGetInstanceProcAddr) {
++    g_xrGetInstanceProcAddr(instance, name, &p);
++  }
++  return reinterpret_cast<Fn>(p);
++}
++
++template <typename Fn>
++Fn GetVk(VkInstance instance, const char* name) {
++  return reinterpret_cast<Fn>(
++      g_vkGetInstanceProcAddr ? g_vkGetInstanceProcAddr(instance, name)
++                              : nullptr);
++}
++
++// ---- Process-global weave state (mac) --------------------------------------
++struct MacWeaveState {
++  XrInstance instance = XR_NULL_HANDLE;
++  XrSystemId system_id = XR_NULL_SYSTEM_ID;
++  XrSession session = XR_NULL_HANDLE;
++  VkInstance vk_instance = VK_NULL_HANDLE;
++  VkDevice vk_device = VK_NULL_HANDLE;
++  VkPhysicalDevice vk_phys = VK_NULL_HANDLE;
++  uint32_t vk_queue_family = 0;
++
++  bool has_weave = false;
++  uint32_t weave_spec_version = 0;
++
++  // Weave PFNs (resolved once the instance is up).
++  PFN_xrWeaveBindWindowDXR bind_window = nullptr;
++  PFN_xrWeaveSubmitDXR submit = nullptr;
++  PFN_xrWeaveSnapWindowRectDXR snap = nullptr;
++
++  bool initialized = false;
++};
++
++MacWeaveState& State() {
++  static MacWeaveState* s = new MacWeaveState();
++  return *s;
++}
++
++void SplitExts(const std::string& s,
++               std::vector<std::string>& storage,
++               std::vector<const char*>& ptrs) {
++  size_t start = 0;
++  for (size_t i = 0; i <= s.size(); ++i) {
++    if (i == s.size() || s[i] == ' ' || s[i] == '\0') {
++      if (i > start) {
++        storage.push_back(s.substr(start, i - start));
++      }
++      start = i + 1;
++    }
++  }
++  for (const auto& e : storage) {
++    ptrs.push_back(e.c_str());
++  }
++}
++
++// Create the MoltenVK VkInstance/VkDevice the XR session binds to, per
++// XR_KHR_vulkan_enable. Mirrors weave_probe_vk_macos exactly.
++bool CreateMoltenVkDevice(MacWeaveState& s) {
++  auto xrGetVkReq = GetXr<PFN_xrGetVulkanGraphicsRequirementsKHR>(
++      s.instance, "xrGetVulkanGraphicsRequirementsKHR");
++  auto xrGetVkIExt = GetXr<PFN_xrGetVulkanInstanceExtensionsKHR>(
++      s.instance, "xrGetVulkanInstanceExtensionsKHR");
++  auto xrGetVkDExt = GetXr<PFN_xrGetVulkanDeviceExtensionsKHR>(
++      s.instance, "xrGetVulkanDeviceExtensionsKHR");
++  auto xrGetVkDev = GetXr<PFN_xrGetVulkanGraphicsDeviceKHR>(
++      s.instance, "xrGetVulkanGraphicsDeviceKHR");
++  if (!xrGetVkReq || !xrGetVkIExt || !xrGetVkDExt || !xrGetVkDev) {
++    LOG(ERROR) << "[DisplayXR] XR_KHR_vulkan_enable PFNs missing";
++    return false;
++  }
++  XrGraphicsRequirementsVulkanKHR vk_req = {
++      XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
++  if (XR_FAILED(xrGetVkReq(s.instance, s.system_id, &vk_req))) {
++    return false;
++  }
++
++  auto vkCreateInstance =
++      GetVk<PFN_vkCreateInstance>(VK_NULL_HANDLE, "vkCreateInstance");
++  auto vkEnumInstExt = GetVk<PFN_vkEnumerateInstanceExtensionProperties>(
++      VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
++  if (!vkCreateInstance || !vkEnumInstExt) {
++    return false;
++  }
++
++  uint32_t len = 0;
++  xrGetVkIExt(s.instance, s.system_id, 0, &len, nullptr);
++  std::string iext_str(len, '\0');
++  xrGetVkIExt(s.instance, s.system_id, len, &len, iext_str.data());
++  std::vector<std::string> iext_storage;
++  std::vector<const char*> iexts;
++  SplitExts(iext_str, iext_storage, iexts);
++
++  uint32_t avail = 0;
++  vkEnumInstExt(nullptr, &avail, nullptr);
++  std::vector<VkExtensionProperties> avail_exts(avail);
++  vkEnumInstExt(nullptr, &avail, avail_exts.data());
++  bool has_portability = false;
++  for (const auto& e : avail_exts) {
++    if (std::string_view(e.extensionName) == "VK_KHR_portability_enumeration") {
++      has_portability = true;
++      iexts.push_back("VK_KHR_portability_enumeration");
++      break;
++    }
++  }
++
++  VkApplicationInfo app_info = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
++  app_info.pApplicationName = "DisplayXRBrowser";
++  app_info.apiVersion = VK_API_VERSION_1_1;
++  VkInstanceCreateInfo vici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++  vici.pApplicationInfo = &app_info;
++  vici.enabledExtensionCount = static_cast<uint32_t>(iexts.size());
++  vici.ppEnabledExtensionNames = iexts.data();
++  if (has_portability) {
++    vici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
++  }
++  if (vkCreateInstance(&vici, nullptr, &s.vk_instance) != VK_SUCCESS) {
++    LOG(ERROR) << "[DisplayXR] vkCreateInstance (MoltenVK) failed";
++    return false;
++  }
++
++  if (XR_FAILED(xrGetVkDev(s.instance, s.system_id, s.vk_instance,
++                           &s.vk_phys))) {
++    return false;
++  }
++
++  auto vkGetQF = GetVk<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
++      s.vk_instance, "vkGetPhysicalDeviceQueueFamilyProperties");
++  auto vkEnumDevExt = GetVk<PFN_vkEnumerateDeviceExtensionProperties>(
++      s.vk_instance, "vkEnumerateDeviceExtensionProperties");
++  auto vkCreateDevice =
++      GetVk<PFN_vkCreateDevice>(s.vk_instance, "vkCreateDevice");
++  if (!vkGetQF || !vkEnumDevExt || !vkCreateDevice) {
++    return false;
++  }
++
++  uint32_t qf_count = 0;
++  vkGetQF(s.vk_phys, &qf_count, nullptr);
++  std::vector<VkQueueFamilyProperties> qfs(qf_count);
++  vkGetQF(s.vk_phys, &qf_count, qfs.data());
++  s.vk_queue_family = UINT32_MAX;
++  for (uint32_t i = 0; i < qf_count; ++i) {
++    if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++      s.vk_queue_family = i;
++      break;
++    }
++  }
++  if (s.vk_queue_family == UINT32_MAX) {
++    return false;
++  }
++
++  len = 0;
++  xrGetVkDExt(s.instance, s.system_id, 0, &len, nullptr);
++  std::string dext_str(len, '\0');
++  xrGetVkDExt(s.instance, s.system_id, len, &len, dext_str.data());
++  std::vector<std::string> dext_storage;
++  std::vector<const char*> dexts;
++  SplitExts(dext_str, dext_storage, dexts);
++
++  uint32_t dav = 0;
++  vkEnumDevExt(s.vk_phys, nullptr, &dav, nullptr);
++  std::vector<VkExtensionProperties> dav_exts(dav);
++  vkEnumDevExt(s.vk_phys, nullptr, &dav, dav_exts.data());
++  for (const auto& e : dav_exts) {
++    if (std::string_view(e.extensionName) == "VK_KHR_portability_subset") {
++      bool already = false;
++      for (const char* d : dexts) {
++        if (std::string_view(d) == "VK_KHR_portability_subset") {
++          already = true;
++        }
++      }
++      if (!already) {
++        dexts.push_back("VK_KHR_portability_subset");
++      }
++      break;
++    }
++  }
++
++  float prio = 1.0f;
++  VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++  qci.queueFamilyIndex = s.vk_queue_family;
++  qci.queueCount = 1;
++  qci.pQueuePriorities = &prio;
++  VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++  dci.queueCreateInfoCount = 1;
++  dci.pQueueCreateInfos = &qci;
++  dci.enabledExtensionCount = static_cast<uint32_t>(dexts.size());
++  dci.ppEnabledExtensionNames = dexts.data();
++  if (vkCreateDevice(s.vk_phys, &dci, nullptr, &s.vk_device) != VK_SUCCESS) {
++    LOG(ERROR) << "[DisplayXR] vkCreateDevice (MoltenVK) failed";
++    return false;
++  }
++  return true;
++}
++
++}  // namespace
++
++// ---- Public mac entry points (called from the client.cc dispatchers) -------
++
++void InitializeCoreMac() {
++  MacWeaveState& s = State();
++  if (s.initialized) {
++    return;
++  }
++  s.initialized = true;
++
++  if (!LoadLoaders()) {
++    return;  // runtime absent — stay dormant
++  }
++
++  // Force the runtime onto the IPC path (the weave service is IPC-only). The
++  // runtime dylib reads its own getenv, so setenv on the process is sufficient.
++  setenv("XRT_FORCE_MODE", "ipc", /*overwrite=*/0);
++
++  auto xrEnumExt = GetXr<PFN_xrEnumerateInstanceExtensionProperties>(
++      XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties");
++  auto xrCreateInstance =
++      GetXr<PFN_xrCreateInstance>(XR_NULL_HANDLE, "xrCreateInstance");
++  if (!xrEnumExt || !xrCreateInstance) {
++    LOG(ERROR) << "[DisplayXR] loader present but core PFNs missing";
++    return;
++  }
++
++  uint32_t ext_count = 0;
++  if (XR_FAILED(xrEnumExt(nullptr, 0, &ext_count, nullptr))) {
++    LOG(ERROR) << "[DisplayXR] xrEnumerateInstanceExtensionProperties failed";
++    return;
++  }
++  std::vector<XrExtensionProperties> exts(ext_count,
++                                          {XR_TYPE_EXTENSION_PROPERTIES});
++  if (XR_FAILED(xrEnumExt(nullptr, ext_count, &ext_count, exts.data()))) {
++    return;
++  }
++  bool has_vk = false;
++  for (const auto& e : exts) {
++    std::string_view n(e.extensionName);
++    if (n == XR_DXR_WEAVE_EXTENSION_NAME) {
++      s.has_weave = true;
++      s.weave_spec_version = e.extensionVersion;
++    } else if (n == XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) {
++      has_vk = true;
++    }
++  }
++  if (!s.has_weave || !has_vk) {
++    LOG(WARNING) << "[DisplayXR] runtime lacks weave/vulkan_enable — inline-3D "
++                    "unsupported (weave="
++                 << s.has_weave << " vk=" << has_vk << ")";
++    return;
++  }
++
++  const char* enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
++                           XR_DXR_WEAVE_EXTENSION_NAME};
++  XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
++  std::snprintf(ici.applicationInfo.applicationName,
++                sizeof(ici.applicationInfo.applicationName), "%s",
++                "DisplayXRBrowser");
++  ici.applicationInfo.applicationVersion = 1;
++  std::snprintf(ici.applicationInfo.engineName,
++                sizeof(ici.applicationInfo.engineName), "%s", "Chromium");
++  ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
++  ici.enabledExtensionCount = 2;
++  ici.enabledExtensionNames = enabled;
++  if (XR_FAILED(xrCreateInstance(&ici, &s.instance))) {
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance failed";
++    return;
++  }
++
++  auto xrGetSystem = GetXr<PFN_xrGetSystem>(s.instance, "xrGetSystem");
++  XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
++  sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
++  if (!xrGetSystem ||
++      XR_FAILED(xrGetSystem(s.instance, &sgi, &s.system_id))) {
++    LOG(ERROR) << "[DisplayXR] xrGetSystem failed";
++    return;
++  }
++
++  if (!CreateMoltenVkDevice(s)) {
++    return;
++  }
++
++  // Present-owner weave session bound to the MoltenVK device.
++  auto xrCreateSession =
++      GetXr<PFN_xrCreateSession>(s.instance, "xrCreateSession");
++  XrGraphicsBindingVulkanKHR vk_binding = {
++      XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
++  vk_binding.instance = s.vk_instance;
++  vk_binding.physicalDevice = s.vk_phys;
++  vk_binding.device = s.vk_device;
++  vk_binding.queueFamilyIndex = s.vk_queue_family;
++  vk_binding.queueIndex = 0;
++  XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
++  sci.next = &vk_binding;
++  sci.systemId = s.system_id;
++  if (!xrCreateSession ||
++      XR_FAILED(xrCreateSession(s.instance, &sci, &s.session))) {
++    LOG(ERROR) << "[DisplayXR] xrCreateSession (weave present-owner) failed";
++    return;
++  }
++
++  // Resolve weave PFNs + bind the window (id 0: the runtime stores it and the
++  // macOS snap is identity — no NSWindow plumbing needed for the weave itself).
++  s.bind_window =
++      GetXr<PFN_xrWeaveBindWindowDXR>(s.instance, "xrWeaveBindWindowDXR");
++  s.submit = GetXr<PFN_xrWeaveSubmitDXR>(s.instance, "xrWeaveSubmitDXR");
++  s.snap = GetXr<PFN_xrWeaveSnapWindowRectDXR>(s.instance,
++                                               "xrWeaveSnapWindowRectDXR");
++  if (!s.bind_window || !s.submit) {
++    LOG(ERROR) << "[DisplayXR] weave PFNs unresolved";
++    return;
++  }
++  s.bind_window(s.session, /*windowHandle=*/nullptr);
++
++  LOG(WARNING) << "[DisplayXR] inline-3D weave client ready on macOS "
++                  "(MoltenVK IPC session, weave_spec="
++               << s.weave_spec_version << ")";
++}
++
++bool IsSupportedMac() {
++  MacWeaveState& s = State();
++  return s.session != XR_NULL_HANDLE && s.has_weave && s.submit != nullptr;
++}
++
++uint32_t WeaveSpecVersionMac() {
++  return State().weave_spec_version;
++}
++
++}  // namespace displayxr
+-- 
+2.50.1 (Apple Git-155)
+
