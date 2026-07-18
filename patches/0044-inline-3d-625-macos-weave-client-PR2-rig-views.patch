@@ -1,0 +1,325 @@
+From 0be39d5ab4534c1102da81e31d22b2e98f5d50cd Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 18 Jul 2026 06:36:30 +0000
+Subject: [PATCH] =?UTF-8?q?inline-3d(625):=20macOS=20weave=20client=20PR2?=
+ =?UTF-8?q?=20=E2=80=94=20rig=20views=20(LocateViewsForRect)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Ports LocateViewsForRectWin to macOS: enable the rig extension set at instance
+create (view_rig + display_zones + local_3d_zone + XR_KHR_convert_timespec_time),
+cache display info, create a LOCAL reference space, and resolve the timespec
+time-conversion PFN. LocateViewsForRectMac drives a zone-scoped xrLocateViews
+(clock_gettime(CLOCK_MONOTONIC) -> XrTime via xrConvertTimespecTimeToTimeKHR,
+the mac analogue of the Windows QPC path); the rig/zone/locate math is identical.
+Weave-only fallback if the rig exts are rejected. Wires the IS_MAC dispatcher.
+Compiles + links on arm64. PR3 = the GPU-process IOSurface weave.
+---
+ .../browser/displayxr_weave_client.cc         |   2 +
+ .../browser/displayxr_weave_client_mac.h      |  10 +
+ .../browser/displayxr_weave_client_mac.mm     | 185 +++++++++++++++++-
+ 3 files changed, 189 insertions(+), 8 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index f74b4c5f71a86..71f133dbad94d 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -1100,6 +1100,8 @@ DisplayXRWeaveClient::LocateViewsForRect(const WeaveRect& rect,
+                                          float virtual_display_height) {
+ #if BUILDFLAG(IS_WIN)
+   return LocateViewsForRectWin(rect, virtual_display_height);
++#elif BUILDFLAG(IS_MAC)
++  return LocateViewsForRectMac(rect, virtual_display_height);
+ #else
+   return {};
+ #endif
+diff --git a/components/displayxr/browser/displayxr_weave_client_mac.h b/components/displayxr/browser/displayxr_weave_client_mac.h
+index 4c5f510fee8e6..8c12c5f3611ec 100644
+--- a/components/displayxr/browser/displayxr_weave_client_mac.h
++++ b/components/displayxr/browser/displayxr_weave_client_mac.h
+@@ -11,6 +11,9 @@
+ // the C++ dispatcher TU can include it.
+ 
+ #include <cstdint>
++#include <vector>
++
++#include "components/displayxr/browser/displayxr_weave_client.h"
+ 
+ namespace displayxr {
+ 
+@@ -24,6 +27,13 @@ bool IsSupportedMac();
+ // The runtime-reported XR_DXR_weave spec version (0 until initialized).
+ uint32_t WeaveSpecVersionMac();
+ 
++// PR2: ask the runtime for the off-axis (Kooima) views of one inline-3D element
++// (XR_DXR_view_rig + XR_DXR_display_zones). macOS port of LocateViewsForRectWin
++// — same flow, timespec time-conversion. Empty when the rig isn't live.
++std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectMac(
++    const DisplayXRWeaveClient::WeaveRect& rect,
++    float virtual_display_height);
++
+ }  // namespace displayxr
+ 
+ #endif  // COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_MAC_H_
+diff --git a/components/displayxr/browser/displayxr_weave_client_mac.mm b/components/displayxr/browser/displayxr_weave_client_mac.mm
+index be6e31f14cd92..d5e7678828169 100644
+--- a/components/displayxr/browser/displayxr_weave_client_mac.mm
++++ b/components/displayxr/browser/displayxr_weave_client_mac.mm
+@@ -33,6 +33,7 @@
+ #include "components/displayxr/browser/displayxr_weave_client_mac.h"
+ 
+ #include <dlfcn.h>
++#include <time.h>
+ 
+ #include <cstring>
+ #include <string>
+@@ -46,11 +47,17 @@
+ // already declared.
+ #include <vulkan/vulkan.h>
+ 
++// XR_USE_TIMESPEC exposes xrConvertTimespecTimeToTimeKHR (the macOS analogue of
++// the Windows QPC->XrTime conversion the rig locate needs).
+ #define XR_USE_GRAPHICS_API_VULKAN
++#define XR_USE_TIMESPEC
+ #include <openxr/openxr.h>
+ #include <openxr/openxr_platform.h>
+ 
+ #include <openxr/XR_DXR_display_info.h>
++#include <openxr/XR_DXR_display_zones.h>
++#include <openxr/XR_DXR_local_3d_zone.h>
++#include <openxr/XR_DXR_view_rig.h>
+ #include <openxr/XR_DXR_weave.h>
+ 
+ namespace displayxr {
+@@ -145,6 +152,15 @@ Fn GetVk(VkInstance instance, const char* name) {
+   PFN_xrWeaveSubmitDXR submit = nullptr;
+   PFN_xrWeaveSnapWindowRectDXR snap = nullptr;
+ 
++  // PR2 rig locate (XR_DXR_view_rig + XR_DXR_display_zones + timespec time):
++  // the runtime computes the off-axis views for each element. has_rig_views is
++  // true only when all three are live + the LOCAL space and PFN came up.
++  bool has_view_rig = false;
++  bool has_display_zones = false;
++  bool has_rig_views = false;
++  PFN_xrConvertTimespecTimeToTimeKHR convert_time = nullptr;
++  XrSpace ref_space = XR_NULL_HANDLE;
++
+   bool initialized = false;
+ };
+ 
+@@ -347,7 +363,8 @@ void InitializeCoreMac() {
+   if (XR_FAILED(xrEnumExt(nullptr, ext_count, &ext_count, exts.data()))) {
+     return;
+   }
+-  bool has_vk = false;
++  bool has_vk = false, has_display_info = false, has_convert_time = false,
++       has_local3d = false;
+   for (const auto& e : exts) {
+     std::string_view n(e.extensionName);
+     if (n == XR_DXR_WEAVE_EXTENSION_NAME) {
+@@ -355,6 +372,16 @@ void InitializeCoreMac() {
+       s.weave_spec_version = e.extensionVersion;
+     } else if (n == XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) {
+       has_vk = true;
++    } else if (n == XR_DXR_DISPLAY_INFO_EXTENSION_NAME) {
++      has_display_info = true;
++    } else if (n == XR_DXR_VIEW_RIG_EXTENSION_NAME) {
++      s.has_view_rig = true;
++    } else if (n == XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) {
++      s.has_display_zones = true;
++    } else if (n == XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) {
++      has_local3d = true;
++    } else if (n == XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME) {
++      has_convert_time = true;
+     }
+   }
+   if (!s.has_weave || !has_vk) {
+@@ -363,9 +390,25 @@ void InitializeCoreMac() {
+                  << s.has_weave << " vk=" << has_vk << ")";
+     return;
+   }
++  // display_zones requires local_3d_zone (enforced at xrCreateInstance).
++  s.has_rig_views = s.has_view_rig && s.has_display_zones && has_local3d &&
++                    has_convert_time;
++
++  std::vector<const char*> enabled = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
++                                      XR_DXR_WEAVE_EXTENSION_NAME};
++  if (has_display_info) {
++    enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
++  }
++  // The weave is core; the rig only improves scene geometry. Track the boundary
++  // so a rig-side rejection retries weave-only rather than killing inline-3D.
++  const size_t weave_ext_count = enabled.size();
++  if (s.has_rig_views) {
++    enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
++    enabled.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
++    enabled.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
++    enabled.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
++  }
+ 
+-  const char* enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
+-                           XR_DXR_WEAVE_EXTENSION_NAME};
+   XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
+   std::snprintf(ici.applicationInfo.applicationName,
+                 sizeof(ici.applicationInfo.applicationName), "%s",
+@@ -374,10 +417,20 @@ void InitializeCoreMac() {
+   std::snprintf(ici.applicationInfo.engineName,
+                 sizeof(ici.applicationInfo.engineName), "%s", "Chromium");
+   ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+-  ici.enabledExtensionCount = 2;
+-  ici.enabledExtensionNames = enabled;
+-  if (XR_FAILED(xrCreateInstance(&ici, &s.instance))) {
+-    LOG(ERROR) << "[DisplayXR] xrCreateInstance failed";
++  ici.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
++  ici.enabledExtensionNames = enabled.data();
++  XrResult ir = xrCreateInstance(&ici, &s.instance);
++  if (XR_FAILED(ir) && s.has_rig_views) {
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance with rig exts failed (" << ir
++               << ") — retrying weave-only (scenes stay mono)";
++    s.has_rig_views = false;
++    enabled.resize(weave_ext_count);
++    ici.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
++    ici.enabledExtensionNames = enabled.data();
++    ir = xrCreateInstance(&ici, &s.instance);
++  }
++  if (XR_FAILED(ir)) {
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance failed: " << ir;
+     return;
+   }
+ 
+@@ -426,9 +479,33 @@ void InitializeCoreMac() {
+   }
+   s.bind_window(s.session, /*windowHandle=*/nullptr);
+ 
++  // PR2 rig locate: a LOCAL reference space + the timespec time-conversion PFN.
++  // Neither needs a RUNNING session (xrLocateViews validates only the space,
++  // view-config type, and displayTime > 0), so this stays submit-only.
++  if (s.has_rig_views) {
++    s.convert_time = GetXr<PFN_xrConvertTimespecTimeToTimeKHR>(
++        s.instance, "xrConvertTimespecTimeToTimeKHR");
++    auto xrCreateReferenceSpace = GetXr<PFN_xrCreateReferenceSpace>(
++        s.instance, "xrCreateReferenceSpace");
++    XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
++    rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
++    rsci.poseInReferenceSpace.orientation = {0.f, 0.f, 0.f, 1.f};
++    rsci.poseInReferenceSpace.position = {0.f, 0.f, 0.f};
++    XrResult rr = xrCreateReferenceSpace
++                      ? xrCreateReferenceSpace(s.session, &rsci, &s.ref_space)
++                      : XR_ERROR_FUNCTION_UNSUPPORTED;
++    if (XR_FAILED(rr) || !s.convert_time) {
++      LOG(ERROR) << "[DisplayXR] rig locate setup failed (space=" << rr
++                 << " convert_time=" << (s.convert_time ? "ok" : "NULL")
++                 << ") — scenes stay mono";
++      s.has_rig_views = false;
++    }
++  }
++
+   LOG(WARNING) << "[DisplayXR] inline-3D weave client ready on macOS "
+                   "(MoltenVK IPC session, weave_spec="
+-               << s.weave_spec_version << ")";
++               << s.weave_spec_version
++               << " rig_views=" << s.has_rig_views << ")";
+ }
+ 
+ bool IsSupportedMac() {
+@@ -440,4 +517,96 @@ uint32_t WeaveSpecVersionMac() {
+   return State().weave_spec_version;
+ }
+ 
++std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectMac(
++    const DisplayXRWeaveClient::WeaveRect& rect,
++    float virtual_display_height) {
++  MacWeaveState& s = State();
++  std::vector<DisplayXRWeaveClient::RigView> out;
++  if (!s.has_rig_views || s.session == XR_NULL_HANDLE ||
++      s.ref_space == XR_NULL_HANDLE || !s.convert_time || rect.w <= 0 ||
++      rect.h <= 0) {
++    return out;
++  }
++
++  // xrLocateViews rejects displayTime <= 0. CLOCK_MONOTONIC -> XrTime via the
++  // timespec conversion (the macOS analogue of the Windows QPC path). The time
++  // only drives head/display-plane prediction (the eyes come from the DP's
++  // latest sample), so "now" is right.
++  struct timespec ts = {};
++  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++    return out;
++  }
++  XrTime now = 0;
++  if (XR_FAILED(s.convert_time(s.instance, &ts, &now)) || now <= 0) {
++    return out;
++  }
++
++  XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
++  rig.pose.orientation = {0.f, 0.f, 0.f, 1.f};
++  rig.pose.position = {0.f, 0.f, 0.f};
++  rig.virtualDisplayHeight =
++      virtual_display_height > 0.f ? virtual_display_height : 0.f;
++  rig.ipdFactor = 1.f;
++  rig.parallaxFactor = 1.f;
++  rig.perspectiveFactor = 1.f;
++
++  // The element's rect IS the canvas (window-client-relative device px — the
++  // same rect the weave submits).
++  XrDisplayZoneDXR zone = {XR_TYPE_DISPLAY_ZONE_DXR};
++  zone.next = &rig;
++  zone.zoneId = 0;
++  zone.rect.offset = {rect.x, rect.y};
++  zone.rect.extent = {rect.w, rect.h};
++
++  XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO};
++  li.next = &zone;
++  li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++  li.displayTime = now;
++  li.space = s.ref_space;
++
++  auto xrLocateViews =
++      GetXr<PFN_xrLocateViews>(s.instance, "xrLocateViews");
++  if (!xrLocateViews) {
++    return out;
++  }
++  XrViewState vs = {XR_TYPE_VIEW_STATE};
++  XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
++  uint32_t view_count = 0;
++  if (XR_FAILED(xrLocateViews(s.session, &li, &vs, 2, &view_count, views)) ||
++      view_count == 0) {
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      LOG(ERROR) << "[DisplayXR] xrLocateViews (rig) failed on macOS";
++    }
++    return out;
++  }
++  if (!(vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ||
++      !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
++    return out;
++  }
++
++  uint32_t i = 0;
++  for (const XrView& xv : views) {
++    if (i >= view_count) {
++      break;
++    }
++    ++i;
++    DisplayXRWeaveClient::RigView v;
++    v.pos_x = xv.pose.position.x;
++    v.pos_y = xv.pose.position.y;
++    v.pos_z = xv.pose.position.z;
++    v.orient_x = xv.pose.orientation.x;
++    v.orient_y = xv.pose.orientation.y;
++    v.orient_z = xv.pose.orientation.z;
++    v.orient_w = xv.pose.orientation.w;
++    v.fov_left = xv.fov.angleLeft;
++    v.fov_right = xv.fov.angleRight;
++    v.fov_up = xv.fov.angleUp;
++    v.fov_down = xv.fov.angleDown;
++    out.push_back(v);
++  }
++  return out;
++}
++
+ }  // namespace displayxr
+-- 
+2.50.1 (Apple Git-155)
+
