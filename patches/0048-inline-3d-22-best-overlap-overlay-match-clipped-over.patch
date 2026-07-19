@@ -1,0 +1,200 @@
+From fae242772ccdf7f6546fb110885b02dffe717f2c Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 19 Jul 2026 18:35:06 +0900
+Subject: inline-3d(#22): best-overlap overlay match, clipped-overlay source
+ region, probes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three related correctness/diagnostic changes on the overlay path. Neither
+fix is credited with resolving an observed symptom — both were found while
+chasing the fast-scroll header artifact, which turned out to be elsewhere
+(see below) — but both are correct on their own terms and have run on
+hardware all day without regression.
+
+1. best_match now picks the BEST-overlapping candidate rather than the last
+   one over the 70% bar. The target is the Blink main-thread rect trailing
+   the impl scroll by ~1 frame, so a fast scroll can drag it far enough that
+   several quads qualify at once, and last-wins then selected by iteration
+   order. Ties still keep the topmost, so the single-candidate steady state
+   is unchanged by construction.
+
+   Also documents why a size-similarity guard does NOT belong here: the
+   target is visible_bounds (window-CLIPPED) while the quad rect is
+   UNCLIPPED, so a partly-scrolled-off element legitimately reports e.g.
+   1235x489 against 1235x696. An earlier guard rejected exactly those valid
+   matches.
+
+2. The overlay atlas mapped the WHOLE source image onto a destination rect
+   already clipped to the window, rescaling any overlay that is partly
+   off-screen. Now sub-regions the source by the same fraction the clip took
+   off the destination — the fix bug B applied to the canvas path.
+
+3. Two throttled VLOG(1) probes distinguishing "the global-overlay exclusion
+   is missing this frame" from "a declared overlay went unmatched over a 3D
+   canvas". These paid for themselves: they are what localised the residual
+   fast-scroll header blow-up to a truncated exclusion RECT (true 3825x142
+   device px, observed tail 57..99) rather than anything on this path. Kept
+   deliberately — VLOG(1) is inert without --v=1.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016XbEsBfb96NRCqZYindyzP
+---
+ .../viz/service/display/surface_aggregator.cc | 92 ++++++++++++++++++-
+ .../skia_output_surface_impl_on_gpu.cc        | 21 ++++-
+ 2 files changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index a4967b6f91867..912e924017628 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2397,6 +2397,16 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+          const std::vector<std::pair<ResourceId, gfx::Rect>>& quads)
+       -> std::optional<std::pair<ResourceId, gfx::Rect>> {
+     std::optional<std::pair<ResourceId, gfx::Rect>> found;
++    // Score = intersection area normalised by the larger of the two rects, in
++    // 1/1000ths. Pick the BEST-overlapping quad, not merely the last one over
++    // the bar (browser#22): because `target` is the main-thread rect trailing
++    // the impl scroll, a FAST scroll drags it far enough that several quads can
++    // clear the 70% bar at once, and last-wins then takes whichever happens to
++    // be last in iteration order rather than the true match. Compositing at a
++    // wrong-sized quad's geometry is what produced the transient blown-up
++    // header. Ties keep the later (topmost) quad, preserving the old behaviour
++    // when exactly one candidate qualifies — the slow-scroll/steady case.
++    int64_t best_score = -1;
+     for (const auto& [rid, qr] : quads) {
+       if (qr.IsEmpty()) {
+         continue;
+@@ -2408,15 +2418,93 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       const int64_t ta =
+           static_cast<int64_t>(target.width()) * target.height();
+       const int64_t max_area = std::max(qa, ta);
+-      if (max_area > 0 && ia * 10 >= max_area * 7) {
+-        found = std::make_pair(rid, qr);  // keep scanning; last (topmost) wins
++      if (max_area <= 0 || ia * 10 < max_area * 7) {
++        continue;
++      }
++      // NOTE: do NOT reject a candidate because its dimensions differ from the
++      // target's. The target is visible_bounds (ALREADY window-clipped) while
++      // the quad rect is UNCLIPPED, so a partly-scrolled-off element legitimately
++      // yields e.g. target 1235x489 vs candidate 1235x696. An earlier size-sanity
++      // guard here rejected exactly those valid matches. The oversize is handled
++      // downstream by clipping the composite rect to the visible fraction, not
++      // by dropping the match.
++      const int64_t score = (ia * 1000) / max_area;
++      if (score >= best_score) {
++        best_score = score;
++        found = std::make_pair(rid, qr);
++      }
++    }
++    if (!found) {
++      static int miss_dbg = 0;
++      if ((miss_dbg++ % 60) == 0) {
++        VLOG(1) << "[DisplayXR] inline-3D NO match for target="
++                << target.ToString() << " among " << quads.size()
++                << " root quads — overlay left to the page this frame";
+       }
+     }
+     return found;
+   };
++  // browser#22 DIAGNOSTIC: why does page-global chrome (the sticky header) blow
++  // up for a frame or two during a fast scroll? Two candidate mechanisms, and
++  // they need different fixes, so distinguish them explicitly:
++  //   (A) the EXCLUSION itself vanishes for a frame — the element is no longer
++  //       declared, so Blink paints it into the canvas layer, its pixels ride
++  //       along in that tile's SBS weave input, and the weave stretches each
++  //       eye-half to full tile width => BLOWN UP.
++  //   (B) the exclusion holds but the overlay finds no quad — it is kept out of
++  //       the weave yet missing from the DP atlas => a GAP, not a blow-up.
++  // Track the widest exclusion rect seen recently; if a frame drops it while
++  // canvas (3D) rects are still live, that is (A) and we log the overlap.
++  {
++    static int last_wide_w = 0, last_wide_h = 0, absent_run = 0;
++    int widest = 0;
++    for (const gfx::Rect& excl : inline_3d_exclusion_rects_) {
++      widest = std::max(widest, excl.width());
++    }
++    const bool have_wide = last_wide_w > 0 && widest * 4 >= last_wide_w * 3;
++    if (widest > last_wide_w) {
++      last_wide_w = widest;
++      for (const gfx::Rect& excl : inline_3d_exclusion_rects_) {
++        if (excl.width() == widest) {
++          last_wide_h = excl.height();
++        }
++      }
++    }
++    if (last_wide_w > 0 && !have_wide && !frame.inline_3d_rects.empty()) {
++      if (absent_run++ % 30 == 0) {
++        VLOG(1) << "[DisplayXR] #22 (A) GLOBAL-OVERLAY EXCLUSION MISSING this "
++                   "frame: widest excl="
++                << widest << "px (expected ~" << last_wide_w << "x"
++                << last_wide_h << "), " << inline_3d_exclusion_rects_.size()
++                << " excl rects, " << frame.inline_3d_rects.size()
++                << " canvas rects live => chrome paints INTO the canvas layer "
++                   "and is fed to the weave as SBS content (blow-up)";
++      }
++    } else {
++      absent_run = 0;
++    }
++  }
+   for (const gfx::Rect& excl : inline_3d_exclusion_rects_) {
+     if (auto m = best_match(excl, root_resource_quads_)) {
+       frame.inline_3d_overlays.push_back({m->first, m->second});
++    } else {
++      // (B) declared but unmatched: does it sit over a 3D canvas region? If so
++      // it is exactly the chrome-over-tile case we care about — report the
++      // overlap so a miss over empty page can be told from a miss over a tile.
++      for (const gfx::Rect& canvas : frame.inline_3d_rects) {
++        if (excl.Intersects(canvas)) {
++          static int b_dbg = 0;
++          if (b_dbg++ % 30 == 0) {
++            gfx::Rect ov = excl;
++            ov.Intersect(canvas);
++            VLOG(1) << "[DisplayXR] #22 (B) declared overlay UNMATCHED over a 3D "
++                       "canvas: excl="
++                    << excl.ToString() << " canvas=" << canvas.ToString()
++                    << " overlap=" << ov.ToString();
++          }
++          break;
++        }
++      }
+     }
+   }
+   for (const gfx::Rect& canvas : frame.inline_3d_rects) {
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 5edc4da1aa2e6..22da0b9cf3092 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3269,8 +3269,27 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+             atlas_surface->wait(obegin.size(), obegin.data(),
+                                 /*deleteSemaphoresAfterWait=*/false);
+           }
++          // Sub-region the SOURCE by whatever the window clip took off the
++          // destination (browser#22). |overlay.rect| is the UNCLIPPED quad and
++          // the image covers all of it; |r| is that rect clipped to the window.
++          // Mapping the whole image onto the clipped rect — as this did — rescales
++          // the overlay whenever it is partly scrolled off-screen, which is the
++          // transient blown-up/popping header on a fast scroll (fully on-screen
++          // frames are unclipped and therefore correct, so it alternates). Same
++          // fix bug B applied to the canvas path: key off the unclipped rect and
++          // take the matching fraction of the source.
++          const gfx::Rect full = overlay.rect;
++          const float sx = full.width() > 0
++                               ? static_cast<float>(overlay_img->width()) /
++                                     static_cast<float>(full.width())
++                               : 1.0f;
++          const float sy = full.height() > 0
++                               ? static_cast<float>(overlay_img->height()) /
++                                     static_cast<float>(full.height())
++                               : 1.0f;
+           const SkRect src =
+-              SkRect::MakeWH(overlay_img->width(), overlay_img->height());
++              SkRect::MakeXYWH((r.x() - full.x()) * sx, (r.y() - full.y()) * sy,
++                               r.width() * sx, r.height() * sy);
+           const SkRect dst =
+               SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
+           atlas_surface->getCanvas()->drawImageRect(
+-- 
+2.42.0.windows.2
+

@@ -1,7 +1,7 @@
 From a106b5c9b3420677d0a5a2def2962b2c8b06e36b Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 16:37:32 -0700
-Subject: [PATCH 30/42] inline-3d(#625): restore the renderer's eye feed in
+Subject: [PATCH 30/44] inline-3d(#625): restore the renderer's eye feed in
  sync-weave mode + scope views to the scene element
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -512,6 +512,3 @@ index 93f04bc9f5049..15a59de609beb 100644
  
    // DisplayXR inline-3D (#625, Step B3e): live layers bound to this session.
    HeapHashSet<Member<XRDisplayLayer>> display_layers_;
--- 
-2.42.0.windows.2
-

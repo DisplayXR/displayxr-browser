@@ -1,7 +1,7 @@
 From d14bf0c178d821a8cd4e50323a144ad75aef507d Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 14:57:05 -0700
-Subject: [PATCH 29/42] inline-3d(#625): virtualDisplayHeight scene-scale on
+Subject: [PATCH 29/44] inline-3d(#625): virtualDisplayHeight scene-scale on
  XRDisplayLayer (display-rig m2v)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -180,6 +180,3 @@ index 20ed4c009c1f9..93f04bc9f5049 100644
  
    // DisplayXR inline-3D (#625, Step B3e): live layers bound to this session.
    HeapHashSet<Member<XRDisplayLayer>> display_layers_;
--- 
-2.42.0.windows.2
-

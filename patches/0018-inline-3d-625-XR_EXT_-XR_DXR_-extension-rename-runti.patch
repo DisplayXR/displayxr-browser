@@ -1,7 +1,7 @@
 From a45d11a9d55a0bffb9329f5050fcd630daf7e22f Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 12:52:46 -0700
-Subject: [PATCH 18/42] inline-3d(#625): XR_EXT_ -> XR_DXR_ extension rename
+Subject: [PATCH 18/44] inline-3d(#625): XR_EXT_ -> XR_DXR_ extension rename
  (runtime v2.0.0)
 
 Applied displayxr-runtime scripts/dxr_rename.py (allowlist-driven, exact
@@ -4177,6 +4177,3 @@ index b162c0a6273e7..36aa0c9026651 100644
  
 -#endif // XR_EXT_WORKSPACE_FILE_DIALOG_H
 +#endif // XR_DXR_WORKSPACE_FILE_DIALOG_H
--- 
-2.42.0.windows.2
-

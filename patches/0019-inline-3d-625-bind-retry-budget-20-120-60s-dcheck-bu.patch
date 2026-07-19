@@ -1,7 +1,7 @@
 From 66c151a978fb1b0d9253ced0a657d624004325a6 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 17:22:08 -0700
-Subject: [PATCH 19/42] =?UTF-8?q?inline-3d(#625):=20bind-retry=20budget=20?=
+Subject: [PATCH 19/44] =?UTF-8?q?inline-3d(#625):=20bind-retry=20budget=20?=
  =?UTF-8?q?20->120=20(60s)=20=E2=80=94=20dcheck=20builds=20exceed=2010s=20?=
  =?UTF-8?q?to=20first=20window?=
 MIME-Version: 1.0
@@ -27,6 +27,3 @@ index efe13c0ffb44d..79d3882d8a5ce 100644
  #else
    LOG(ERROR) << "[DisplayXR] inline-3D is Windows-only in Step B";
  #endif
--- 
-2.42.0.windows.2
-

@@ -1,0 +1,1101 @@
+From 3faaa4329d3c0083da8f0b20362dcba72263a0c9 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 17 Jul 2026 00:51:29 -0700
+Subject: [PATCH 44/44] inline-3d(#18): 2D-over-3D via composited-layer
+ resources (isolate overlay + clean SBS)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The compositing half. In the inline-3D weave config the whole page flattens into
+ONE render pass (no child render passes), so an overlay can't be isolated as its
+own pass. But a COMPOSITED LAYER (will-change:transform) still emits a
+resource-bearing quad whose SharedImage is the element rastered on transparency
+— the isolation source. This uses it to composite the overlay OVER the woven 3D
+and to feed the weave CLEAN SBS, giving true 2D-over-3D (final = plate +
+(1-plate.a)*woven) with a translucent overlay revealing the woven 3D underneath.
+Entirely browser-side; no runtime/DP change.
+
+- Plumb inline_3d_exclusion_rects (overlay rects) alongside inline_3d_rects
+  (canvas rects) renderer -> CompositorFrameMetadata (+mojom/traits) -> Viz
+  (commit_state, layer_context, layer_tree_impl/host_impl, TreesInViz).
+- SurfaceAggregator: record every ROOT resource-bearing quad {parent ResourceId,
+  root-space rect} (root-space = SQS quad_to_target_transform then
+  transform_to_root_target); match against exclusion rects -> overlay resources,
+  canvas rects -> canvas resources -> AggregatedFrame::inline_3d_{overlays,
+  canvas_resources}.
+- Display resolves each ResourceId -> SharedImage mailbox
+  (DisplayResourceProvider::GetMailbox); hands the GPU stage {mailbox, rect}.
+- WeaveCompositedSurface: source the weave INPUT from the matched canvas-layer
+  resource (clean SBS, no overlay) instead of the composited output sub-rect
+  (falls back to output when unmatched) -> the runtime weaves clean 3D; then
+  composite each overlay resource kSrcOver the woven output.
+
+Replaces the exclusion-hole and render-pass approaches (both dead: the hole
+showed raw SBS under a translucent overlay; render passes don't exist here).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ cc/mojo_embedder/viz_layer_context.cc         |   4 +-
+ cc/mojo_embedder/viz_layer_context.h          |   3 +-
+ cc/test/fake_layer_context.cc                 |   3 +-
+ cc/test/fake_layer_context.h                  |   3 +-
+ cc/test/test_layer_context.cc                 |   3 +-
+ cc/test/test_layer_context.h                  |   3 +-
+ cc/trees/commit_state.cc                      |   1 +
+ cc/trees/commit_state.h                       |   5 +
+ cc/trees/layer_context.h                      |   3 +-
+ cc/trees/layer_tree_host.cc                   |   9 +-
+ cc/trees/layer_tree_host.h                    |   8 +-
+ cc/trees/layer_tree_host_impl.cc              |  24 +++-
+ cc/trees/layer_tree_host_impl.h               |   8 ++
+ cc/trees/layer_tree_impl.cc                   |   5 +-
+ cc/trees/layer_tree_impl.h                    |  13 +-
+ .../common/quads/compositor_frame_metadata.cc |   5 +-
+ .../common/quads/compositor_frame_metadata.h  |   8 ++
+ .../viz/service/display/aggregated_frame.h    |  22 +++
+ components/viz/service/display/display.cc     |  20 ++-
+ .../viz/service/display/skia_output_surface.h |  22 ++-
+ .../viz/service/display/surface_aggregator.cc |  92 ++++++++++++
+ .../viz/service/display/surface_aggregator.h  |  13 ++
+ .../skia_output_surface_impl.cc               |  16 ++-
+ .../skia_output_surface_impl.h                |   7 +-
+ .../skia_output_surface_impl_on_gpu.cc        | 132 +++++++++++++++++-
+ .../skia_output_surface_impl_on_gpu.h         |  19 ++-
+ .../viz/service/layers/layer_context_impl.cc  |   3 +
+ .../layers/viz_layer_context_unittest.cc      |   6 +-
+ .../compositor_frame_metadata_mojom_traits.cc |   3 +-
+ .../compositor_frame_metadata_mojom_traits.h  |   5 +
+ .../compositor_frame_metadata.mojom           |   4 +
+ .../mojom/compositing/layer_context.mojom     |   5 +
+ 32 files changed, 432 insertions(+), 45 deletions(-)
+
+diff --git a/cc/mojo_embedder/viz_layer_context.cc b/cc/mojo_embedder/viz_layer_context.cc
+index 3a7bcf768eed7..84bd45002b618 100644
+--- a/cc/mojo_embedder/viz_layer_context.cc
++++ b/cc/mojo_embedder/viz_layer_context.cc
+@@ -1464,7 +1464,8 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+     bool is_flush,
+     std::vector<ui::LatencyInfo> latency_info,
+     viz::TrackedElementRects tracked_element_rects,
+-    std::vector<gfx::Rect> inline_3d_rects) {
++    std::vector<gfx::Rect> inline_3d_rects,
++    std::vector<gfx::Rect> inline_3d_exclusion_rects) {
+   TRACE_EVENT0("viz", "VizLayerContext::UpdateDisplayTreeFrom");
+ 
+   auto& property_trees = *tree.property_trees();
+@@ -1499,6 +1500,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+   update->latency_info = std::move(latency_info);
+   update->tracked_element_rects = std::move(tracked_element_rects);
+   update->inline_3d_rects = std::move(inline_3d_rects);
++  update->inline_3d_exclusion_rects = std::move(inline_3d_exclusion_rects);
+   update->device_viewport = tree.GetDeviceViewport();
+   update->device_scale_factor = tree.device_scale_factor();
+   DUMP_WILL_BE_CHECK_GT(update->device_scale_factor, 0.f);
+diff --git a/cc/mojo_embedder/viz_layer_context.h b/cc/mojo_embedder/viz_layer_context.h
+index 8cf4e1e509898..d07d4da4e8edd 100644
+--- a/cc/mojo_embedder/viz_layer_context.h
++++ b/cc/mojo_embedder/viz_layer_context.h
+@@ -54,7 +54,8 @@ class CC_MOJO_EMBEDDER_EXPORT VizLayerContext
+       bool is_flush,
+       std::vector<ui::LatencyInfo> latency_info,
+       viz::TrackedElementRects tracked_element_rects,
+-      std::vector<gfx::Rect> inline_3d_rects) override;
++      std::vector<gfx::Rect> inline_3d_rects,
++      std::vector<gfx::Rect> inline_3d_exclusion_rects) override;
+   void UpdateDisplayTile(PictureLayerImpl& layer,
+                          const Tile& tile,
+                          viz::ClientResourceProvider& resource_provider,
+diff --git a/cc/test/fake_layer_context.cc b/cc/test/fake_layer_context.cc
+index d16c8b2516beb..7d5b76f60f7d8 100644
+--- a/cc/test/fake_layer_context.cc
++++ b/cc/test/fake_layer_context.cc
+@@ -25,7 +25,8 @@ base::TimeTicks FakeLayerContext::UpdateDisplayTreeFrom(
+     bool is_flush,
+     std::vector<ui::LatencyInfo> latency_info,
+     viz::TrackedElementRects tracked_element_rects,
+-    std::vector<gfx::Rect> inline_3d_rects) {
++    std::vector<gfx::Rect> inline_3d_rects,
++    std::vector<gfx::Rect> inline_3d_exclusion_rects) {
+   return base::TimeTicks::Now();
+ }
+ 
+diff --git a/cc/test/fake_layer_context.h b/cc/test/fake_layer_context.h
+index cbab66e7edf8f..6f06bc1cde18a 100644
+--- a/cc/test/fake_layer_context.h
++++ b/cc/test/fake_layer_context.h
+@@ -31,7 +31,8 @@ class FakeLayerContext : public LayerContext {
+       bool is_flush,
+       std::vector<ui::LatencyInfo> latency_info,
+       viz::TrackedElementRects tracked_element_rects,
+-      std::vector<gfx::Rect> inline_3d_rects) override;
++      std::vector<gfx::Rect> inline_3d_rects,
++      std::vector<gfx::Rect> inline_3d_exclusion_rects) override;
+ 
+   void UpdateDisplayTile(PictureLayerImpl& layer,
+                          const Tile& tile,
+diff --git a/cc/test/test_layer_context.cc b/cc/test/test_layer_context.cc
+index fa1b5ad0c1666..98139e234187f 100644
+--- a/cc/test/test_layer_context.cc
++++ b/cc/test/test_layer_context.cc
+@@ -24,7 +24,8 @@ base::TimeTicks TestLayerContext::UpdateDisplayTreeFrom(
+     bool is_flush,
+     std::vector<ui::LatencyInfo> latency_info,
+     viz::TrackedElementRects tracked_element_rects,
+-    std::vector<gfx::Rect> inline_3d_rects) {
++    std::vector<gfx::Rect> inline_3d_rects,
++    std::vector<gfx::Rect> inline_3d_exclusion_rects) {
+   return base::TimeTicks::Now();
+ }
+ 
+diff --git a/cc/test/test_layer_context.h b/cc/test/test_layer_context.h
+index 0829a8ccdc1fd..8162ca2b71497 100644
+--- a/cc/test/test_layer_context.h
++++ b/cc/test/test_layer_context.h
+@@ -31,7 +31,8 @@ class TestLayerContext : public LayerContext {
+       bool is_flush,
+       std::vector<ui::LatencyInfo> latency_info,
+       viz::TrackedElementRects tracked_element_rects,
+-      std::vector<gfx::Rect> inline_3d_rects) override;
++      std::vector<gfx::Rect> inline_3d_rects,
++      std::vector<gfx::Rect> inline_3d_exclusion_rects) override;
+ 
+   void UpdateDisplayTile(PictureLayerImpl& layer,
+                          const Tile& tile,
+diff --git a/cc/trees/commit_state.cc b/cc/trees/commit_state.cc
+index ed86e99f43fd2..712ddcbaabb76 100644
+--- a/cc/trees/commit_state.cc
++++ b/cc/trees/commit_state.cc
+@@ -20,6 +20,7 @@ CommitState::CommitState(const CommitState& prev)
+       prefers_reduced_motion(prev.prefers_reduced_motion),
+       browser_controls_params(prev.browser_controls_params),
+       inline_3d_rects(prev.inline_3d_rects),
++      inline_3d_exclusion_rects(prev.inline_3d_exclusion_rects),
+       event_listener_properties(prev.event_listener_properties),
+       bottom_controls_shown_ratio(prev.bottom_controls_shown_ratio),
+       device_scale_factor(prev.device_scale_factor),
+diff --git a/cc/trees/commit_state.h b/cc/trees/commit_state.h
+index a1960bcc2e55c..519878c62485c 100644
+--- a/cc/trees/commit_state.h
++++ b/cc/trees/commit_state.h
+@@ -92,6 +92,11 @@ struct CC_EXPORT CommitState {
+   // CompositorFrameMetadata so Viz can weave those output sub-rects atomically
+   // with the frame they describe.
+   std::vector<gfx::Rect> inline_3d_rects;
++  // Overlay-exclusion rects (browser#18): window-relative device-px rects of 2D
++  // UI painted over a woven element (XRDisplayLayer.excludeElement). Same
++  // channel/timing as inline_3d_rects; the weave draw-back leaves these pixels
++  // as composited 2D (final = M·weave + (1−M)·2D, M=0 inside).
++  std::vector<gfx::Rect> inline_3d_exclusion_rects;
+   std::array<EventListenerProperties, kEventListenerClassCount>
+       event_listener_properties = {EventListenerProperties::kNone};
+   float bottom_controls_shown_ratio = 0.f;
+diff --git a/cc/trees/layer_context.h b/cc/trees/layer_context.h
+index d09799a720422..dc79fda79dde3 100644
+--- a/cc/trees/layer_context.h
++++ b/cc/trees/layer_context.h
+@@ -55,7 +55,8 @@ class CC_EXPORT LayerContext {
+       bool is_flush,
+       std::vector<ui::LatencyInfo> latency_info,
+       viz::TrackedElementRects tracked_element_rects,
+-      std::vector<gfx::Rect> inline_3d_rects) = 0;
++      std::vector<gfx::Rect> inline_3d_rects,
++      std::vector<gfx::Rect> inline_3d_exclusion_rects) = 0;
+ 
+   // Pushes an update to a single tile in the context's display tree.
+   virtual void UpdateDisplayTile(
+diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
+index cc753c14f1799..29f899a040082 100644
+--- a/cc/trees/layer_tree_host.cc
++++ b/cc/trees/layer_tree_host.cc
+@@ -1564,10 +1564,15 @@ void LayerTreeHost::SetBrowserControlsParams(
+   SetNeedsCommit();
+ }
+ 
+-void LayerTreeHost::SetInline3DRects(std::vector<gfx::Rect> rects) {
+-  if (pending_commit_state()->inline_3d_rects == rects)
++void LayerTreeHost::SetInline3DRects(std::vector<gfx::Rect> rects,
++                                     std::vector<gfx::Rect> exclusion_rects) {
++  if (pending_commit_state()->inline_3d_rects == rects &&
++      pending_commit_state()->inline_3d_exclusion_rects == exclusion_rects) {
+     return;
++  }
+   pending_commit_state()->inline_3d_rects = std::move(rects);
++  pending_commit_state()->inline_3d_exclusion_rects =
++      std::move(exclusion_rects);
+   SetNeedsCommit();
+ }
+ 
+diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
+index 42e40d58ebc42..638267d2dd173 100644
+--- a/cc/trees/layer_tree_host.h
++++ b/cc/trees/layer_tree_host.h
+@@ -585,8 +585,12 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): set the window-relative device-px
+   // rects of the page's inline-3d canvases for the next commit. Carried to Viz
+-  // via CompositorFrameMetadata::inline_3d_rects.
+-  void SetInline3DRects(std::vector<gfx::Rect> rects);
++  // via CompositorFrameMetadata::inline_3d_rects. |exclusion_rects| (browser#18)
++  // are 2D-overlay holes for the weave draw-back, carried via
++  // CompositorFrameMetadata::inline_3d_exclusion_rects; set together so rects
++  // and holes stay frame-atomic.
++  void SetInline3DRects(std::vector<gfx::Rect> rects,
++                        std::vector<gfx::Rect> exclusion_rects);
+ 
+   void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
+   const OverscrollBehavior& overscroll_behavior() const {
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index b066a935b15e0..89a660342c158 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -2462,10 +2462,13 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+   if (settings().trees_in_viz_in_viz_process) {
+     metadata.tracked_element_rects = tracked_element_rects_from_client_;
+     metadata.inline_3d_rects = inline_3d_rects_from_client_;
++    metadata.inline_3d_exclusion_rects = inline_3d_exclusion_rects_from_client_;
+   } else {
+     metadata.tracked_element_rects = CollectTrackedElementRects(
+         /*is_for_compositor_frame_metadata=*/true);
+     metadata.inline_3d_rects = active_tree()->inline_3d_rects();
++    metadata.inline_3d_exclusion_rects =
++        active_tree()->inline_3d_exclusion_rects();
+   }
+   // DisplayXR inline-3D (#625, Step B / Phase 2 — scroll-sync): the rects above
+   // are getBoundingClientRect measured on the Blink main thread at the COMMITTED
+@@ -2476,7 +2479,8 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+   // offset − committed base) so the weave rect tracks the pixels presented THIS
+   // frame. Handles the dominant case (content scrolling with the root viewport);
+   // nested-scroller content is a follow-up.
+-  if (!metadata.inline_3d_rects.empty()) {
++  if (!metadata.inline_3d_rects.empty() ||
++      !metadata.inline_3d_exclusion_rects.empty()) {
+     const ScrollNode* viewport_scroll = OuterViewportScrollNode();
+     if (!viewport_scroll) {
+       viewport_scroll = InnerViewportScrollNode();
+@@ -2495,10 +2499,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+         const int dy = base::ClampRound(delta.y() * dsf);
+         if (dx != 0 || dy != 0) {
+           // Growing scroll offset moves content up/left → element window origin
+-          // decreases by the same device-px amount.
++          // decreases by the same device-px amount. Exclusion holes (browser#18)
++          // are positioned inside their tiles, so the identical shift keeps them
++          // glued to the overlay during a fling.
+           for (gfx::Rect& r : metadata.inline_3d_rects) {
+             r.Offset(-dx, -dy);
+           }
++          for (gfx::Rect& r : metadata.inline_3d_exclusion_rects) {
++            r.Offset(-dx, -dy);
++          }
+           static int log_throttle = 0;
+           if ((log_throttle++ % 30) == 0) {
+             VLOG(1) << "[DisplayXR] Phase2 scroll-sync: viewport impl delta dip="
+@@ -2685,7 +2694,7 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+     // Send updates to Viz even for no damage case when TreesInViz is enabled.
+     if (settings_.TreesInVizInClientProcess()) {
+       UpdateDisplayTree(*frame, {}, viz::TrackedElementRects(),
+-                        std::vector<gfx::Rect>());
++                        std::vector<gfx::Rect>(), std::vector<gfx::Rect>());
+     }
+ 
+     active_tree()->ResetAllChangeTracking();
+@@ -2778,7 +2787,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+     trees_in_viz_submit_time = UpdateDisplayTree(
+         *frame, std::move(compositor_frame.metadata.latency_info),
+         std::move(compositor_frame.metadata.tracked_element_rects),
+-        std::move(compositor_frame.metadata.inline_3d_rects));
++        std::move(compositor_frame.metadata.inline_3d_rects),
++        std::move(compositor_frame.metadata.inline_3d_exclusion_rects));
+ 
+     layer_tree_frame_sink_->ExportFrameTiming();
+   } else {
+@@ -3307,6 +3317,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+     std::vector<ui::LatencyInfo> latency_info,
+     viz::TrackedElementRects tracked_element_rects,
+     std::vector<gfx::Rect> inline_3d_rects,
++    std::vector<gfx::Rect> inline_3d_exclusion_rects,
+     bool is_flush) {
+   DCHECK(settings_.TreesInVizInClientProcess());
+   DCHECK(layer_context_);
+@@ -3318,7 +3329,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+       layer_tree_frame_sink_->shared_image_interface().get(),
+       viewport_damage_rect_, !frame.has_no_damage, is_flush,
+       std::move(latency_info), std::move(tracked_element_rects),
+-      std::move(inline_3d_rects));
++      std::move(inline_3d_rects), std::move(inline_3d_exclusion_rects));
+ }
+ 
+ void LayerTreeHostImpl::FlushDisplayTree() {
+@@ -3348,7 +3359,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
+   // (like frame tokens in ACKs) remains consistent.
+   ++next_frame_token_;
+   UpdateDisplayTree(frame, {}, viz::TrackedElementRects(),
+-                    std::vector<gfx::Rect>(), /*is_flush=*/true);
++                    std::vector<gfx::Rect>(), std::vector<gfx::Rect>(),
++                    /*is_flush=*/true);
+ 
+   // A flush update synchronizes state (e.g. tile evictions) to Viz but does not
+   // result in a frame draw. We reset internal damage tracking and tree change
+diff --git a/cc/trees/layer_tree_host_impl.h b/cc/trees/layer_tree_host_impl.h
+index aac12746cdb29..8fe6593739b27 100644
+--- a/cc/trees/layer_tree_host_impl.h
++++ b/cc/trees/layer_tree_host_impl.h
+@@ -425,6 +425,7 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+       std::vector<ui::LatencyInfo> latency_info,
+       viz::TrackedElementRects tracked_element_rects,
+       std::vector<gfx::Rect> inline_3d_rects,
++      std::vector<gfx::Rect> inline_3d_exclusion_rects,
+       bool is_flush = false);
+ 
+   // Synchronizes the current tree state to Viz without triggering a draw.
+@@ -584,6 +585,11 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+     inline_3d_rects_from_client_ = std::move(inline_3d_rects);
+   }
+ 
++  void set_inline_3d_exclusion_rects_from_client(
++      std::vector<gfx::Rect> exclusion_rects) {
++    inline_3d_exclusion_rects_from_client_ = std::move(exclusion_rects);
++  }
++
+   // Buffers `callback` until a relevant presentation feedback arrives, at which
+   // point the callback will be posted to run on the main thread. A presentation
+   // feedback is considered relevant if the frame's token is greater than or
+@@ -1376,6 +1382,8 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+   // inline-3d canvas rects passed from the client so they can be added to
+   // generated frame metadata in Viz (mirrors tracked_element_rects_from_client_).
+   std::vector<gfx::Rect> inline_3d_rects_from_client_;
++  // Overlay-exclusion holes (browser#18) riding the same client channel.
++  std::vector<gfx::Rect> inline_3d_exclusion_rects_from_client_;
+ 
+   // Settings whether we dump generated compositor frame during DrawLayers.
+   // They are for debug purposes for TreesInViz and TreeAnimationsInViz.
+diff --git a/cc/trees/layer_tree_impl.cc b/cc/trees/layer_tree_impl.cc
+index 915b041222b28..7fad55bdb07c7 100644
+--- a/cc/trees/layer_tree_impl.cc
++++ b/cc/trees/layer_tree_impl.cc
+@@ -885,7 +885,8 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
+                               commit_state.page_scale_factor_limits_set);
+ 
+   SetBrowserControlsParams(commit_state.browser_controls_params);
+-  SetInline3DRects(commit_state.inline_3d_rects);
++  SetInline3DRects(commit_state.inline_3d_rects,
++                   commit_state.inline_3d_exclusion_rects);
+   set_overscroll_behavior(commit_state.overscroll_behavior);
+   PushBrowserControlsFromMainThread(commit_state.top_controls_shown_ratio,
+                                     commit_state.bottom_controls_shown_ratio);
+@@ -1012,7 +1013,7 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
+   target_tree->SetExternalPageScaleFactor(external_page_scale_factor_);
+ 
+   target_tree->SetBrowserControlsParams(browser_controls_params_);
+-  target_tree->SetInline3DRects(inline_3d_rects_);
++  target_tree->SetInline3DRects(inline_3d_rects_, inline_3d_exclusion_rects_);
+   target_tree->PushBrowserControls(nullptr, nullptr);
+ 
+   target_tree->set_overscroll_behavior(overscroll_behavior_);
+diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
+index 438ba4dd67ee5..b359821886024 100644
+--- a/cc/trees/layer_tree_impl.h
++++ b/cc/trees/layer_tree_impl.h
+@@ -671,13 +671,19 @@ class CC_EXPORT LayerTreeImpl {
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): the inline-3d canvas rects for this
+   // tree, pushed from the main-thread commit state and read in
+-  // LayerTreeHostImpl::MakeCompositorFrameMetadata.
+-  void SetInline3DRects(std::vector<gfx::Rect> rects) {
++  // LayerTreeHostImpl::MakeCompositorFrameMetadata. The exclusion rects
++  // (browser#18) are the 2D-overlay weave holes riding the same push.
++  void SetInline3DRects(std::vector<gfx::Rect> rects,
++                        std::vector<gfx::Rect> exclusion_rects) {
+     inline_3d_rects_ = std::move(rects);
++    inline_3d_exclusion_rects_ = std::move(exclusion_rects);
+   }
+   const std::vector<gfx::Rect>& inline_3d_rects() const {
+     return inline_3d_rects_;
+   }
++  const std::vector<gfx::Rect>& inline_3d_exclusion_rects() const {
++    return inline_3d_exclusion_rects_;
++  }
+ 
+   bool browser_controls_shrink_blink_size() const {
+     return browser_controls_params_.browser_controls_shrink_blink_size;
+@@ -1033,8 +1039,9 @@ class CC_EXPORT LayerTreeImpl {
+ 
+   BrowserControlsParams browser_controls_params_;
+ 
+-  // DisplayXR inline-3D (#625, Step B / B4b).
++  // DisplayXR inline-3D (#625, Step B / B4b; exclusions browser#18).
+   std::vector<gfx::Rect> inline_3d_rects_;
++  std::vector<gfx::Rect> inline_3d_exclusion_rects_;
+ 
+   OverscrollBehavior overscroll_behavior_;
+ 
+diff --git a/components/viz/common/quads/compositor_frame_metadata.cc b/components/viz/common/quads/compositor_frame_metadata.cc
+index ecbea7cadfcc8..ed3145f10e146 100644
+--- a/components/viz/common/quads/compositor_frame_metadata.cc
++++ b/components/viz/common/quads/compositor_frame_metadata.cc
+@@ -122,6 +122,8 @@ void CompositorFrameMetadata::AsValueInto(
+                    TrackedElementRectsToString(tracked_element_rects));
+   value->SetInteger("inline_3d_rects",
+                     static_cast<int>(inline_3d_rects.size()));
++  value->SetInteger("inline_3d_exclusion_rects",
++                    static_cast<int>(inline_3d_exclusion_rects.size()));
+   value->EndDictionary();
+ 
+   // Ignore trees_in_viz_timing_details because it's for metrics only.
+@@ -158,7 +160,8 @@ CompositorFrameMetadata::CompositorFrameMetadata(
+       offset_tag_values(other.offset_tag_values),
+       frame_interval_inputs(other.frame_interval_inputs),
+       tracked_element_rects(other.tracked_element_rects),
+-      inline_3d_rects(other.inline_3d_rects) {
++      inline_3d_rects(other.inline_3d_rects),
++      inline_3d_exclusion_rects(other.inline_3d_exclusion_rects) {
+   if (other.delegated_ink_metadata) {
+     delegated_ink_metadata = std::make_unique<gfx::DelegatedInkMetadata>(
+         *other.delegated_ink_metadata.get());
+diff --git a/components/viz/common/quads/compositor_frame_metadata.h b/components/viz/common/quads/compositor_frame_metadata.h
+index 2d8cee41803af..d9d16de742989 100644
+--- a/components/viz/common/quads/compositor_frame_metadata.h
++++ b/components/viz/common/quads/compositor_frame_metadata.h
+@@ -233,6 +233,14 @@ class VIZ_COMMON_EXPORT CompositorFrameMetadata {
+   // describes, so the woven sub-rect always matches the composited pixels.
+   std::vector<gfx::Rect> inline_3d_rects;
+ 
++  // DisplayXR overlay-exclusion rects (browser#18): window-relative device-px
++  // rects of 2D UI painted over a woven element (XRDisplayLayer.excludeElement).
++  // The weave draw-back leaves these pixels as composited 2D — per-pixel
++  // final = M·weave + (1−M)·2D with binary M=0 inside. Same channel/atomicity
++  // as inline_3d_rects; association to weave targets is geometric in the GPU
++  // stage (exclusion ∩ target rect), so the list is flat.
++  std::vector<gfx::Rect> inline_3d_exclusion_rects;
++
+  private:
+   CompositorFrameMetadata(const CompositorFrameMetadata& other);
+   CompositorFrameMetadata operator=(const CompositorFrameMetadata&) = delete;
+diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
+index 94b53d23601bc..58a21f4d91b88 100644
+--- a/components/viz/service/display/aggregated_frame.h
++++ b/components/viz/service/display/aggregated_frame.h
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "components/viz/common/quads/aggregated_render_pass.h"
++#include "components/viz/common/resources/resource_id.h"
+ #include "components/viz/common/surfaces/tracked_element_rects.h"
+ #include "components/viz/service/viz_service_export.h"
+ #include "ui/gfx/delegated_ink_metadata.h"
+@@ -73,6 +74,27 @@ class VIZ_SERVICE_EXPORT AggregatedFrame {
+   // aggregated and transformed to the root render pass space, for the post-paint
+   // output weave loop.
+   std::vector<gfx::Rect> inline_3d_rects;
++
++  // DisplayXR overlay-exclusion rects (browser#18): the on-screen rects of 2D UI
++  // painted over a woven element, aggregated + transformed to root render pass
++  // space. Used to IDENTIFY which render passes are inline-3D overlays (below).
++  std::vector<gfx::Rect> inline_3d_exclusion_rects;
++
++  // DisplayXR isolated layer resources (browser#18). In the single-render-pass
++  // weave config there are no child render passes, BUT overlay/canvas elements
++  // promoted to their own COMPOSITED cc layer (will-change:transform) still emit
++  // a resource-bearing quad whose SharedImage holds JUST that layer's content on
++  // transparency (isolated). This pairs such a resource with its root-space rect
++  // so the weave stage can (a) composite the overlay's isolated resource OVER the
++  // woven output — true 2D-over-3D, translucent reveals the woven 3D — and (b)
++  // feed the canvas's isolated resource (clean SBS) as the weave INPUT. Matched
++  // geometrically to inline_3d_exclusion_rects / inline_3d_rects respectively.
++  struct Inline3dLayerResource {
++    ResourceId resource_id;
++    gfx::Rect rect;
++  };
++  std::vector<Inline3dLayerResource> inline_3d_overlays;
++  std::vector<Inline3dLayerResource> inline_3d_canvas_resources;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index 464a6afe51812..64e41be8633e7 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -988,7 +988,25 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+     // FinishPaintCurrentFrame), so the post-paint output weave loop reads the
+     // rects that match this frame's composited pixels.
+     if (skia_output_surface_) {
+-      skia_output_surface_->SetInline3DRects(frame.inline_3d_rects);
++      // Resolve each isolated overlay/canvas layer's ResourceId → its SharedImage
++      // mailbox here (Display owns the resource provider), handing the GPU stage
++      // plain {mailbox, rect} — the same shape the render-pass path used.
++      // browser#18.
++      auto resolve =
++          [this](const std::vector<AggregatedFrame::Inline3dLayerResource>& in) {
++            std::vector<SkiaOutputSurface::Inline3dLayerMailbox> out;
++            out.reserve(in.size());
++            for (const auto& layer : in) {
++              gpu::Mailbox m = resource_provider_->GetMailbox(layer.resource_id);
++              if (!m.IsZero()) {
++                out.push_back({m, layer.rect});
++              }
++            }
++            return out;
++          };
++      skia_output_surface_->SetInline3DRects(frame.inline_3d_rects,
++                                             resolve(frame.inline_3d_overlays),
++                                             resolve(frame.inline_3d_canvas_resources));
+     }
+     renderer_->DrawFrame(&frame.render_pass_list, device_scale_factor_,
+                          current_surface_size, display_color_spaces_,
+diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
+index 0a662c4c41fdf..4789f9b212bae 100644
+--- a/components/viz/service/display/skia_output_surface.h
++++ b/components/viz/service/display/skia_output_surface.h
+@@ -13,6 +13,7 @@
+ #include "build/build_config.h"
+ #include "components/viz/common/quads/aggregated_render_pass.h"
+ #include "components/viz/common/resources/resource_id.h"
++#include "components/viz/service/display/aggregated_frame.h"
+ #include "components/viz/service/display/external_use_client.h"
+ #include "components/viz/service/display/output_surface.h"
+ #include "components/viz/service/display/overlay_processor_interface.h"
+@@ -207,11 +208,24 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
+ 
+   virtual bool SupportsBGRA() const = 0;
+ 
++  // DisplayXR inline-3D (browser#18): an isolated composited-layer resource
++  // resolved to its SharedImage mailbox + root-space rect.
++  struct Inline3dLayerMailbox {
++    gpu::Mailbox mailbox;
++    gfx::Rect rect;
++  };
++
+   // DisplayXR inline-3D (#625, Step B / B4b): set the page's inline-3d canvas
+-  // rects (root-render-pass / window-relative device px) for the current frame.
+-  // Consumed by the GPU-thread post-paint output weave loop. Default no-op for
+-  // non-Skia / non-Windows paths.
+-  virtual void SetInline3DRects(std::vector<gfx::Rect> rects) {}
++  // rects for the current frame; the isolated OVERLAY layers (browser#18) the
++  // weave stage composites OVER the woven output (true 2D-over-3D); and the
++  // isolated CANVAS layers (browser#18) — the clean SBS resource — the weave
++  // stage feeds as INPUT so the 3D under a translucent overlay is clean. Each
++  // layer is a resolved SharedImage mailbox + root-space rect. Consumed by the
++  // GPU-thread post-paint output weave loop. Default no-op off Skia/Windows.
++  virtual void SetInline3DRects(
++      std::vector<gfx::Rect> rects,
++      std::vector<Inline3dLayerMailbox> overlays,
++      std::vector<Inline3dLayerMailbox> canvas_layers) {}
+ 
+ #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
+     BUILDFLAG(USE_V4L2_CODEC)
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 1f1bd1dee1cc0..c3de37c98938b 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -1483,6 +1483,26 @@ void SurfaceAggregator::CopyQuadsToPass(
+       }
+       if (dest_quad) {
+         dest_quad->resource_id = quad_data.remapped_resource_id;
++        // DisplayXR (browser#18): record every ROOT-pass resource-bearing quad
++        // as {parent-space ResourceId, root-space rect}. In the single-pass weave
++        // config the overlay/canvas composited layers emit such quads whose
++        // SharedImage is the layer's isolated content. At Aggregate() end the
++        // ones matching an inline-3D exclusion / canvas rect are the isolated
++        // overlay / canvas resources the weave stage consumes.
++        if (resolved_pass.is_root() &&
++            quad_data.remapped_resource_id != kInvalidResourceId) {
++          // Map quad->rect (quad content space) to ROOT space: first the quad's
++          // SharedQuadState quad_to_target_transform (→ dest pass target), then
++          // the dest pass's transform_to_root_target. Without the SQS transform
++          // the rect stays layer-local (x=0) and never matches the root-space
++          // exclusion/canvas rects.
++          gfx::Transform to_root = dest_pass->transform_to_root_target;
++          to_root.PreConcat(
++              dest_quad->shared_quad_state->quad_to_target_transform);
++          root_resource_quads_.emplace_back(
++              quad_data.remapped_resource_id,
++              cc::MathUtil::MapEnclosingClippedRect(to_root, quad->rect));
++        }
+       }
+     }
+   }
+@@ -2159,6 +2179,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   root_surface_id_ = surface_id;
+   tracked_element_rects_ = {};
+   inline_3d_rects_ = {};
++  inline_3d_exclusion_rects_ = {};
++  root_resource_quads_ = {};
+ 
+   ResolvedFrameData* resolved_frame = GetResolvedFrame(surface_id);
+ 
+@@ -2350,6 +2372,62 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+                std::make_tuple(b.y(), b.x(), b.width(), b.height());
+       });
+   frame.inline_3d_rects = std::move(inline_3d_rects_);
++  // Exclusion holes (browser#18): same deterministic order for stable logging /
++  // comparison only — the weave consumer associates them to targets
++  // geometrically, never by index.
++  std::ranges::sort(
++      inline_3d_exclusion_rects_, [](const gfx::Rect& a, const gfx::Rect& b) {
++        return std::make_tuple(a.y(), a.x(), a.width(), a.height()) <
++               std::make_tuple(b.y(), b.x(), b.width(), b.height());
++      });
++  // DisplayXR isolated-layer matching (browser#18): a recorded ROOT resource
++  // quad is an isolated overlay/canvas layer iff its root-space rect closely
++  // matches an exclusion/canvas rect (both derive from the same element's
++  // bounds → near-identical). Require high overlap to avoid grabbing an
++  // unrelated co-located quad. LAST match wins per rect (the topmost/most-recent
++  // composited quad covering that element).
++  auto best_match = [](const gfx::Rect& target,
++                       const std::vector<std::pair<ResourceId, gfx::Rect>>&
++                           quads) -> std::optional<ResourceId> {
++    std::optional<ResourceId> found;
++    for (const auto& [rid, qr] : quads) {
++      if (qr.IsEmpty()) {
++        continue;
++      }
++      gfx::Rect inter = qr;
++      inter.Intersect(target);
++      const int64_t ia = static_cast<int64_t>(inter.width()) * inter.height();
++      const int64_t qa = static_cast<int64_t>(qr.width()) * qr.height();
++      const int64_t ta =
++          static_cast<int64_t>(target.width()) * target.height();
++      const int64_t max_area = std::max(qa, ta);
++      if (max_area > 0 && ia * 10 >= max_area * 7) {
++        found = rid;  // keep scanning; last (topmost) wins
++      }
++    }
++    return found;
++  };
++  for (const gfx::Rect& excl : inline_3d_exclusion_rects_) {
++    if (auto rid = best_match(excl, root_resource_quads_)) {
++      frame.inline_3d_overlays.push_back({*rid, excl});
++    }
++  }
++  for (const gfx::Rect& canvas : frame.inline_3d_rects) {
++    if (auto rid = best_match(canvas, root_resource_quads_)) {
++      frame.inline_3d_canvas_resources.push_back({*rid, canvas});
++    }
++  }
++  if (!frame.inline_3d_overlays.empty() ||
++      !frame.inline_3d_canvas_resources.empty()) {
++    static int overlay_dbg = 0;
++    if ((overlay_dbg++ % 300) == 0) {
++      VLOG(1) << "[DisplayXR] inline-3D layers: overlays="
++              << frame.inline_3d_overlays.size() << " canvas_res="
++              << frame.inline_3d_canvas_resources.size() << " (from "
++              << root_resource_quads_.size() << " root resource quads)";
++    }
++  }
++  frame.inline_3d_exclusion_rects = std::move(inline_3d_exclusion_rects_);
+ 
+   return frame;
+ }
+@@ -2549,6 +2627,20 @@ void SurfaceAggregator::CollectTrackedElementRects(
+           root_target_clip_rect));
+     }
+   }
++  // DisplayXR overlay-exclusion rects (browser#18): unconditional — exclusions
++  // only ever ride the legacy metadata channel (arbitrary overlay DOM has no
++  // guaranteed paint chunk, so there is no tracked-element variant), and they
++  // must land regardless of which channel supplied the primary rects above.
++  // Transformed identically so holes and targets share root-target space; the
++  // GPU stage associates them geometrically (exclusion ∩ target rect).
++  for (const gfx::Rect& rect : frame_metadata.inline_3d_exclusion_rects) {
++    if (rect.IsEmpty()) {
++      continue;
++    }
++    inline_3d_exclusion_rects_.push_back(TransformRectToDestRootTargetSpace(
++        rect, target_transform, transform_to_root_target,
++        root_target_clip_rect));
++  }
+ }
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index cf8adee5f9d47..33d722accb2ed 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -474,6 +474,19 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+   // DisplayXR inline-3D (#625, Step B / B4b): inline-3d canvas rects from all
+   // surfaces, transformed to the root render pass space.
+   std::vector<gfx::Rect> inline_3d_rects_;
++
++  // DisplayXR overlay-exclusion rects (browser#18): the on-screen rects of 2D UI
++  // over a woven element, transformed to root render pass space. Used to identify
++  // which render passes are inline-3D overlays.
++  std::vector<gfx::Rect> inline_3d_exclusion_rects_;
++
++  // DisplayXR (browser#18): every resource-bearing quad in the ROOT pass,
++  // recorded as {parent-space ResourceId, root-space rect} during CopyQuadsToPass,
++  // then matched at Aggregate() end against inline_3d_exclusion_rects_ (→ overlay
++  // resources) and inline_3d_rects_ (→ canvas resources). Recorded (not matched
++  // inline) so both lists are complete before matching, independent of
++  // per-surface collection order.
++  std::vector<std::pair<ResourceId, gfx::Rect>> root_resource_quads_;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+index 03ec65aba481b..d3965d5809335 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+@@ -1070,15 +1070,21 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
+ }
+ #endif
+ 
+-void SkiaOutputSurfaceImpl::SetInline3DRects(std::vector<gfx::Rect> rects) {
++void SkiaOutputSurfaceImpl::SetInline3DRects(
++    std::vector<gfx::Rect> rects,
++    std::vector<Inline3dLayerMailbox> overlays,
++    std::vector<Inline3dLayerMailbox> canvas_layers) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(impl_on_gpu_);
+-  // Enqueue before the frame's FinishPaintCurrentFrame task (Display calls this
+-  // right before renderer_->DrawFrame), so the GPU-thread weave loop reads the
+-  // rects that match this frame.
++  // Overlays/canvas layers are already resolved to {mailbox, rect} in Display
++  // (via its DisplayResourceProvider). Enqueue before the frame's
++  // FinishPaintCurrentFrame task (Display calls this right before
++  // renderer_->DrawFrame) so the GPU-thread weave loop reads this frame's data;
++  // rects + overlays + canvas layers ride ONE task, frame-atomic. browser#18.
+   auto task = base::BindOnce(&SkiaOutputSurfaceImplOnGpu::SetInline3DRects,
+                              base::Unretained(impl_on_gpu_.get()),
+-                             std::move(rects));
++                             std::move(rects), std::move(overlays),
++                             std::move(canvas_layers));
+   EnqueueGpuTask(std::move(task), {}, /*make_current=*/false,
+                  /*need_framebuffer=*/false);
+ }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
+index af245cd95356f..969fa01f779fa 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
+@@ -176,8 +176,11 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
+   void SetSharedImagePurgeable(const gpu::Mailbox& mailbox,
+                                bool purgeable) override;
+   bool SupportsBGRA() const override;
+-  // DisplayXR inline-3D (#625, Step B / B4b).
+-  void SetInline3DRects(std::vector<gfx::Rect> rects) override;
++  // DisplayXR inline-3D (#625, Step B / B4b; overlays + canvas res browser#18).
++  void SetInline3DRects(
++      std::vector<gfx::Rect> rects,
++      std::vector<Inline3dLayerMailbox> overlays,
++      std::vector<Inline3dLayerMailbox> canvas_layers) override;
+ 
+   // ExternalUseClient implementation:
+   gpu::SyncToken ReleaseImageContexts(
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 7a5c4dddcee8f..8c66d3c3c732c 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2690,8 +2690,12 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+ }
+ 
+ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
+-    std::vector<gfx::Rect> rects) {
++    std::vector<gfx::Rect> rects,
++    std::vector<SkiaOutputSurface::Inline3dLayerMailbox> overlays,
++    std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers) {
+   inline_3d_rects_ = std::move(rects);
++  inline_3d_overlays_ = std::move(overlays);
++  inline_3d_canvas_layers_ = std::move(canvas_layers);
+ }
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -2830,6 +2834,26 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // Read the composited sub-rect and fire the weave without blocking. Returns
+   // true if a submit was dispatched. The single keyed-mutex input means only one
+   // submit may be in flight, so this runs for at most one target per frame.
++  // Clean-SBS input (browser#18): find this target's matched CANVAS-layer
++  // resource — the inline-3d canvas rendered on its own composited layer,
++  // WITHOUT any overlay painted over it. Weaving that (instead of the composited
++  // output sub-rect, which has overlays baked in) means an overlay over the
++  // canvas is never woven, so there is no "woven overlay" artifact under a
++  // translucent overlay. Returns a null mailbox when unmatched → fall back to
++  // the composited sub-rect (today's behavior).
++  auto canvas_mailbox_for = [&](const gfx::Rect& r) -> gpu::Mailbox {
++    for (const auto& c : inline_3d_canvas_layers_) {
++      gfx::Rect inter = c.rect;
++      inter.Intersect(r);
++      const int64_t ia = static_cast<int64_t>(inter.width()) * inter.height();
++      const int64_t ta = static_cast<int64_t>(r.width()) * r.height();
++      if (ta > 0 && ia * 10 >= ta * 7) {
++        return c.mailbox;
++      }
++    }
++    return gpu::Mailbox();
++  };
++
+   auto attempt_submit = [&](size_t t) -> bool {
+     gfx::Rect rect = inline_3d_rects_[t];
+     rect.Intersect(window_bounds);
+@@ -2838,6 +2862,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+     const int rw = rect.width();
+     const int rh = rect.height();
++    const gpu::Mailbox clean_sbs_mailbox = canvas_mailbox_for(rect);
+ 
+     // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the composited
+     // sub-rect on the GPU instead of the readPixels roundtrip: Skia-copy it into
+@@ -2922,15 +2947,45 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           if (context_state_->graphite_shared_context()) {
+             context_state_->FlushGraphiteRecorder();
+           }
+-          sk_sp<SkImage> src_img = output->makeImageSnapshot(
+-              SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
++          // Prefer the clean canvas-layer SBS resource (browser#18) so overlays
++          // painted over the canvas are NOT woven; fall back to the composited
++          // sub-rect. The canvas resource's read access is held until after the
++          // copy below.
++          std::unique_ptr<gpu::SkiaImageRepresentation> canvas_rep;
++          std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>
++              canvas_access;
++          sk_sp<SkImage> src_img;
++          if (!clean_sbs_mailbox.IsZero()) {
++            canvas_rep = shared_image_representation_factory_->ProduceSkia(
++                clean_sbs_mailbox, context_state_.get());
++            if (canvas_rep) {
++              std::vector<GrBackendSemaphore> cbegin, cend;
++              canvas_access =
++                  canvas_rep->BeginScopedReadAccess(&cbegin, &cend);
++              if (canvas_access) {
++                src_img = canvas_access->CreateSkImage(context_state_.get());
++                if (src_img && !cbegin.empty()) {
++                  scratch_surface->wait(cbegin.size(), cbegin.data(),
++                                        /*deleteSemaphoresAfterWait=*/false);
++                }
++              }
++            }
++          }
++          if (!src_img) {
++            src_img = output->makeImageSnapshot(
++                SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
++          }
+           if (!src_img) {
+             return fail("makeImageSnapshot");
+           }
+           SkPaint paint;
+           paint.setBlendMode(SkBlendMode::kSrc);
++          // Source the FULL src image (canvas resource is the whole SBS; the
++          // output snapshot is already rw×rh) → scale to the scratch rect.
+           scratch_surface->getCanvas()->drawImageRect(
+-              src_img.get(), SkRect::MakeWH(rw, rh), SkRect::MakeWH(rw, rh),
++              src_img.get(),
++              SkRect::MakeWH(src_img->width(), src_img->height()),
++              SkRect::MakeWH(rw, rh),
+               SkSamplingOptions(SkFilterMode::kNearest), &paint,
+               SkCanvas::kStrict_SrcRectConstraint);
+           FlushSurface(scratch_surface, send, scratch_write.get());
+@@ -3206,6 +3261,75 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     drew_any = true;
+   }
+ 
++  // ---- Overlay layers over the woven output (browser#18) ----
++  // True 2D-over-3D: each excluded overlay was isolated as its own render pass
++  // (the page/SDK forced a render surface), so its backing holds the plate
++  // rendered on TRANSPARENCY. The woven `kSrc` draw above already put clean 3D
++  // where the overlay sits (overwriting the overlay's baked-in copy in the root
++  // pass); compositing the isolated backing kSrcOver on top yields
++  //   final = plate + (1−plate.a)·woven
++  // so a translucent/gradient plate reveals the woven 3D underneath and an
++  // opaque plate stays crisp. (The 3D directly under a translucent plate carries
++  // a faint tint because the plate was still present in the weave INPUT — a
++  // known v1 limitation in mid-alpha regions only; fully removing it needs the
++  // overlay diverted from the weave input too.)
++  if (drew_any && !inline_3d_overlays_.empty()) {
++    SkPaint over_paint;
++    over_paint.setBlendMode(SkBlendMode::kSrcOver);
++    int composited = 0;
++    for (const SkiaOutputSurface::Inline3dLayerMailbox& overlay :
++         inline_3d_overlays_) {
++      gfx::Rect r = overlay.rect;
++      r.Intersect(window_bounds);
++      if (r.IsEmpty() || overlay.mailbox.IsZero()) {
++        continue;
++      }
++      auto overlay_rep = shared_image_representation_factory_->ProduceSkia(
++          overlay.mailbox, context_state_.get());
++      if (!overlay_rep) {
++        continue;
++      }
++      std::vector<GrBackendSemaphore> obegin_sem, oend_sem;
++      auto overlay_access =
++          overlay_rep->BeginScopedReadAccess(&obegin_sem, &oend_sem);
++      if (!overlay_access) {
++        continue;
++      }
++      sk_sp<SkImage> overlay_img =
++          overlay_access->CreateSkImage(context_state_.get());
++      if (!overlay_img) {
++        continue;
++      }
++      if (!obegin_sem.empty()) {
++        output->wait(obegin_sem.size(), obegin_sem.data(),
++                     /*deleteSemaphoresAfterWait=*/false);
++      }
++      // The backing is the overlay pass sized to its bounds; draw its full
++      // extent to the overlay's root-space rect (they match by construction).
++      const SkRect src = SkRect::MakeWH(overlay_img->width(),
++                                        overlay_img->height());
++      const SkRect dst =
++          SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
++      out_canvas->drawImageRect(overlay_img.get(), src, dst,
++                                SkSamplingOptions(SkFilterMode::kLinear),
++                                &over_paint, SkCanvas::kStrict_SrcRectConstraint);
++      ++composited;
++    }
++    static int overlay_log_throttle = 0;
++    if ((overlay_log_throttle++ % 120) == 0) {
++      VLOG(1) << "[DisplayXR] weave overlay composite: " << composited << "/"
++              << inline_3d_overlays_.size() << " layers over woven output"
++              << " (canvas_layers=" << inline_3d_canvas_layers_.size() << ")";
++    }
++  } else if (!inline_3d_overlays_.empty()) {
++    static int ov_gpu_dbg = 0;
++    if ((ov_gpu_dbg++ % 120) == 0) {
++      VLOG(1) << "[DisplayXR] weave overlay: " << inline_3d_overlays_.size()
++              << " received but drew_any=" << drew_any
++              << " canvas_layers=" << inline_3d_canvas_layers_.size();
++    }
++  }
++
+   // Ensure the woven draws land in (and are submitted to) the output surface
+   // before |woven_access| releases — otherwise Ganesh reads the released woven
+   // texture at flush time and the draws show nothing.
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index ee19656343f75..388ad41f9a039 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -30,6 +30,7 @@
+ #include "components/viz/service/display/output_surface_frame.h"
+ #include "components/viz/service/display/overlay_processor_interface.h"
+ #include "components/viz/service/display_embedder/skia_output_device.h"
++#include "components/viz/service/display/skia_output_surface.h"
+ #include "components/viz/service/display_embedder/skia_output_surface_dependency.h"
+ #include "components/viz/service/display_embedder/skia_render_copy_results.h"
+ #include "gpu/command_buffer/common/mailbox.h"
+@@ -229,9 +230,15 @@ class SkiaOutputSurfaceImplOnGpu
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): the page's inline-3d canvas rects
+   // (root-render-pass / window-relative device px) for the frame currently being
+-  // finished. Set from the compositor thread (Display, via SkiaOutputSurfaceImpl)
+-  // before FinishPaintCurrentFrame; read by MaybeWeaveOutput on the GPU thread.
+-  void SetInline3DRects(std::vector<gfx::Rect> rects);
++  // finished; the isolated OVERLAY layers (browser#18) composited OVER the woven
++  // output; and the isolated CANVAS layers (browser#18) — clean SBS — used as
++  // weave INPUT. Each layer is a resolved {mailbox, rect} (SkiaOutputSurface::
++  // Inline3dLayerMailbox). Set from the compositor thread (Display, via
++  // SkiaOutputSurfaceImpl) before FinishPaintCurrentFrame; read on the GPU thread.
++  void SetInline3DRects(
++      std::vector<gfx::Rect> rects,
++      std::vector<SkiaOutputSurface::Inline3dLayerMailbox> overlays,
++      std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers);
+ 
+   void SetCapabilitiesForTesting(
+       const OutputSurface::Capabilities& capabilities);
+@@ -661,6 +668,12 @@ class SkiaOutputSurfaceImplOnGpu
+   // MaybeWeaveOutput). Empty when inline-3d is inactive.
+   std::vector<gfx::Rect> inline_3d_rects_;
+ 
++  // DisplayXR isolated layers (browser#18): overlay layers composited kSrcOver
++  // the woven output; canvas layers (clean SBS) used as weave input. Each a
++  // resolved {mailbox, rect}. Empty when none this frame.
++  std::vector<SkiaOutputSurface::Inline3dLayerMailbox> inline_3d_overlays_;
++  std::vector<SkiaOutputSurface::Inline3dLayerMailbox> inline_3d_canvas_layers_;
++
+ #if BUILDFLAG(IS_WIN)
+   // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model) GPU-thread
+   // weave state. Per inline-3d rect (index-keyed), |woven_mailbox| is the
+diff --git a/components/viz/service/layers/layer_context_impl.cc b/components/viz/service/layers/layer_context_impl.cc
+index 9820a5a255d43..5551b755e7b83 100644
+--- a/components/viz/service/layers/layer_context_impl.cc
++++ b/components/viz/service/layers/layer_context_impl.cc
+@@ -2032,6 +2032,9 @@ base::expected<void, std::string> LayerContextImpl::DoUpdateDisplayTree(
+   host_impl_->set_inline_3d_rects_from_client(
+       std::move(update->inline_3d_rects));
+ 
++  host_impl_->set_inline_3d_exclusion_rects_from_client(
++      std::move(update->inline_3d_exclusion_rects));
++
+   for (const auto& latency : update->latency_info) {
+     if (latency.terminated()) {
+       return base::unexpected("Received already-terminated LatencyInfo");
+diff --git a/components/viz/service/layers/viz_layer_context_unittest.cc b/components/viz/service/layers/viz_layer_context_unittest.cc
+index 02e2069f2a324..33eac0f183df5 100644
+--- a/components/viz/service/layers/viz_layer_context_unittest.cc
++++ b/components/viz/service/layers/viz_layer_context_unittest.cc
+@@ -138,7 +138,8 @@ void VizLayerContextTest::UpdateDisplayTreeAndWait() {
+       *host_impl_->active_tree(), *host_impl_->resource_provider(),
+       /*shared_image_interface=*/nullptr, viewport_damage_rect,
+       frame_has_damage, /*is_flush=*/false, std::move(latency_info),
+-      TrackedElementRects(), std::vector<gfx::Rect>());
++      TrackedElementRects(), std::vector<gfx::Rect>(),
++      std::vector<gfx::Rect>());
+ 
+   base::RunLoop run_loop;
+   fake_layer_context_.on_update_display_tree_ = run_loop.QuitClosure();
+@@ -292,7 +293,8 @@ TEST_F(VizLayerContextTest, FlushOnlyUpdate) {
+       *host_impl_->active_tree(), *host_impl_->resource_provider(),
+       /*shared_image_interface=*/nullptr, viewport_damage_rect,
+       frame_has_damage, /*is_flush=*/true, std::move(latency_info),
+-      TrackedElementRects(), std::vector<gfx::Rect>());
++      TrackedElementRects(), std::vector<gfx::Rect>(),
++      std::vector<gfx::Rect>());
+ 
+   base::RunLoop run_loop;
+   fake_layer_context_.on_update_display_tree_ = run_loop.QuitClosure();
+diff --git a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
+index 0d93a983e87e6..35dc7992f09a6 100644
+--- a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
+@@ -83,7 +83,8 @@ bool StructTraits<viz::mojom::CompositorFrameMetadataDataView,
+         data.ReadFrameIntervalInputs(&out->frame_interval_inputs) &&
+         data.ReadTreesInVizTiming(&out->trees_in_viz_timing_details) &&
+         data.ReadTrackedElementRects(&out->tracked_element_rects) &&
+-        data.ReadInline3dRects(&out->inline_3d_rects))) {
++        data.ReadInline3dRects(&out->inline_3d_rects) &&
++        data.ReadInline3dExclusionRects(&out->inline_3d_exclusion_rects))) {
+     return false;
+   }
+ 
+diff --git a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
+index adec8dedf2486..b3a61647ce67f 100644
+--- a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
++++ b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
+@@ -201,6 +201,11 @@ struct StructTraits<viz::mojom::CompositorFrameMetadataDataView,
+     return metadata.inline_3d_rects;
+   }
+ 
++  static const std::vector<gfx::Rect>& inline_3d_exclusion_rects(
++      const viz::CompositorFrameMetadata& metadata) {
++    return metadata.inline_3d_exclusion_rects;
++  }
++
+   static bool Read(viz::mojom::CompositorFrameMetadataDataView data,
+                    viz::CompositorFrameMetadata* out);
+ };
+diff --git a/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom b/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
+index fcab519a0375f..60cf5a199ad04 100644
+--- a/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
++++ b/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
+@@ -101,4 +101,8 @@ struct CompositorFrameMetadata {
+   // DisplayXR inline-3D (#625, Step B / B4b): window-relative device-px rects of
+   // the page's inline-3d canvases, for the Viz post-paint output weave loop.
+   array<gfx.mojom.Rect> inline_3d_rects;
++
++  // DisplayXR overlay-exclusion rects (browser#18): 2D-overlay holes the weave
++  // draw-back leaves as composited 2D.
++  array<gfx.mojom.Rect> inline_3d_exclusion_rects;
+ };
+diff --git a/services/viz/public/mojom/compositing/layer_context.mojom b/services/viz/public/mojom/compositing/layer_context.mojom
+index ca94d2b6c67da..ed4e743b021c5 100644
+--- a/services/viz/public/mojom/compositing/layer_context.mojom
++++ b/services/viz/public/mojom/compositing/layer_context.mojom
+@@ -265,6 +265,11 @@ struct LayerTreeUpdate {
+   // DisplayXR inline-3D (#625, Step B): canvas rects (window-relative device px)
+   // to be added to the frame metadata so Viz can weave those output sub-rects.
+   array<gfx.mojom.Rect> inline_3d_rects;
++
++  // DisplayXR overlay-exclusion rects (browser#18): window-relative device-px
++  // rects of 2D UI painted over a woven element; the weave draw-back leaves
++  // these pixels as composited 2D.
++  array<gfx.mojom.Rect> inline_3d_exclusion_rects;
+ };
+ 
+ // Drives updates to a GPU-side LayerTreeHostImpl from its corresponding

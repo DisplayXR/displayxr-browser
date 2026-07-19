@@ -1,7 +1,7 @@
 From 93569f42ebb00ebea634cdf33d666810ea9b458d Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 17:16:31 -0700
-Subject: [PATCH 32/42] inline-3d(#625): refresh the off-axis views every frame
+Subject: [PATCH 32/44] inline-3d(#625): refresh the off-axis views every frame
  (the real mono-fallback cause)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -59,6 +59,3 @@ index 08eeaf98d6c0e..db718f01ace91 100644
        CHECK(animation_frame_ == nullptr);
        animation_frame_ = CreatePresentationFrame(true);
        {
--- 
-2.42.0.windows.2
-
