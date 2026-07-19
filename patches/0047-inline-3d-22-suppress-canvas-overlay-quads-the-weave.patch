@@ -1,0 +1,143 @@
+From 479b2243f3b13ec7195cd71f8018cb5d8d342ddf Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 19 Jul 2026 18:34:44 +0900
+Subject: inline-3d(#22): suppress canvas + overlay quads the weave draw-back
+ owns
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Under Option B the woven output is drawn back WHOLE-WINDOW with kSrcOver,
+which composites honestly against alpha. Two consequences the per-tile kSrc
+draw-back used to paper over:
+
+  - the inline-3D CANVAS resource (the raw side-by-side content) is weave
+    INPUT only, but the page still painted it, so it showed through wherever
+    the woven tile was transparent (visible under rounded tile corners as a
+    tighter-radius SBS copy underneath);
+  - the isolated 2D OVERLAY resources are composited over the weave by the
+    display processor, so a page-painted copy is a second source and doubles
+    against the DP's wherever the two don't align.
+
+Both are the same fix: let the weave draw-back be the single source and stop
+painting those quads. DirectRenderer grows a per-frame ResourceIdSet checked
+at the top of ShouldSkipQuad — it hooks the existing per-quad `continue` in
+DrawRenderPass, so it covers the plain and BSP-sorted paths alike. Display
+fills the set from the aggregated frame's canvas + overlay resources.
+
+Gated on the frame actually having inline-3D rects: with no weave in flight
+nothing would draw them back, and suppressing would blank the canvas rather
+than fix anything. Note the failure mode is asymmetric — if a frame ever has
+inline-3D rects but the weave does not land, this blanks rather than glitches.
+
+Hardware-validated on Leia (gallery + wall-3d): SBS no longer shows through
+transparent woven pixels, and rounded tile corners composite correctly
+instead of being stamped over.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016XbEsBfb96NRCqZYindyzP
+---
+ .../viz/service/display/direct_renderer.cc      | 15 +++++++++++++++
+ .../viz/service/display/direct_renderer.h       | 15 +++++++++++++++
+ components/viz/service/display/display.cc       | 17 +++++++++++++++++
+ 3 files changed, 47 insertions(+)
+
+diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
+index 3307656809c78..5635cd946b685 100644
+--- a/components/viz/service/display/direct_renderer.cc
++++ b/components/viz/service/display/direct_renderer.cc
+@@ -503,8 +503,23 @@ gfx::Rect DirectRenderer::OutputSurfaceRectInDrawSpace() const {
+   }
+ }
+ 
++void DirectRenderer::SetInline3dSuppressedResources(ResourceIdSet resources) {
++  inline_3d_suppressed_resources_ = std::move(resources);
++}
++
+ bool DirectRenderer::ShouldSkipQuad(const DrawQuad& quad,
+                                     const gfx::Rect& render_pass_scissor) {
++  // DisplayXR inline-3D (browser#22 B): the weave output drawn back
++  // whole-window owns these pixels; a page-painted copy would either bleed
++  // through the woven tile's transparency (canvas/SBS) or double against the
++  // DP's composite (2D overlays). Checked first — it is a cheap set lookup and
++  // independent of scissor state.
++  if (!inline_3d_suppressed_resources_.empty() &&
++      quad.resource_id != kInvalidResourceId &&
++      inline_3d_suppressed_resources_.contains(quad.resource_id)) {
++    return true;
++  }
++
+   if (render_pass_scissor.IsEmpty())
+     return true;
+ 
+diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
+index cdffcb6fc0787..6417c5fda27c7 100644
+--- a/components/viz/service/display/direct_renderer.h
++++ b/components/viz/service/display/direct_renderer.h
+@@ -18,6 +18,7 @@
+ #include "build/build_config.h"
+ #include "components/viz/common/quads/aggregated_render_pass.h"
+ #include "components/viz/common/quads/tile_draw_quad.h"
++#include "components/viz/common/resources/resource_id.h"
+ #include "components/viz/service/display/aggregated_frame.h"
+ #include "components/viz/service/display/delegated_ink_point_renderer_skia.h"
+ #include "components/viz/service/display/display_resource_provider.h"
+@@ -76,6 +77,16 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+ 
+   void SetOutputSurfaceClipRect(const gfx::Rect& clip_rect);
+   void SetVisible(bool visible);
++  // DisplayXR inline-3D (browser#22 Option B): resources whose quads must NOT be
++  // painted into the composited surface this frame because the weave output the
++  // browser draws back whole-window is their single source of truth. Two kinds
++  // land here: the inline-3D CANVAS resource (the raw side-by-side content — it
++  // is weave INPUT only, and under B's honest kSrcOver draw-back it would
++  // otherwise show through wherever the woven tile is transparent), and the
++  // isolated 2D OVERLAY resources (the DP composites them on top of the weave,
++  // so a page-painted copy would double against the DP's). Set per frame by
++  // Display before DrawFrame; empty when inline-3D is inactive.
++  void SetInline3dSuppressedResources(ResourceIdSet resources);
+   void ReallocatedFrameBuffers();
+   void DecideRenderPassAllocationsForFrame(
+       const AggregatedRenderPassList& render_passes_in_draw_order,
+@@ -372,6 +383,10 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+   // Track skipped non-root render passes in DrawRenderPass.
+   base::flat_set<AggregatedRenderPassId> skipped_render_pass_ids_;
+ 
++  // DisplayXR inline-3D: quads drawing these resources are skipped this frame
++  // (see SetInline3dSuppressedResources). Frame-scoped, like the set above.
++  ResourceIdSet inline_3d_suppressed_resources_;
++
+   bool visible_ = false;
+   bool disable_color_checks_for_testing_ = false;
+ 
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index 64e41be8633e7..f86420065c9de 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1008,6 +1008,23 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+                                              resolve(frame.inline_3d_overlays),
+                                              resolve(frame.inline_3d_canvas_resources));
+     }
++    // DisplayXR inline-3D (browser#22 B): hand the renderer the resources the
++    // weave draw-back is the single source for, so their quads are not painted
++    // into the composited surface. Gated on there being inline-3D content this
++    // frame (inline_3d_rects non-empty) — with no weave in flight nothing would
++    // draw them back, so suppressing would blank the canvas rather than fix it.
++    {
++      ResourceIdSet suppressed;
++      if (!frame.inline_3d_rects.empty()) {
++        for (const auto& layer : frame.inline_3d_canvas_resources) {
++          suppressed.insert(layer.resource_id);
++        }
++        for (const auto& layer : frame.inline_3d_overlays) {
++          suppressed.insert(layer.resource_id);
++        }
++      }
++      renderer_->SetInline3dSuppressedResources(std::move(suppressed));
++    }
+     renderer_->DrawFrame(&frame.render_pass_list, device_scale_factor_,
+                          current_surface_size, display_color_spaces_,
+                          std::move(frame.surface_damage_rect_list_),
+-- 
+2.42.0.windows.2
+
