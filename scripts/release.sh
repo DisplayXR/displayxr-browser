@@ -19,7 +19,11 @@ EXE="${2:?usage: release.sh <tag> <installer.exe>}"
 [ -f "$EXE" ] || { echo "[release] no installer at $EXE"; exit 1; }
 
 # Warn (don't block) if the installer isn't Authenticode-signed.
-SIG=$(powershell -NoProfile -Command "(Get-AuthenticodeSignature '$EXE').Status" 2>/dev/null | tr -d '\r') || SIG=Unknown
+# Windows PowerShell cannot resolve an MSYS "/c/..." path, so it silently returned an
+# EMPTY status for a genuinely signed installer (hit on 0.1.5). Hand it a native path.
+EXE_NATIVE="$(cygpath -w "$EXE" 2>/dev/null || echo "$EXE")"
+SIG=$(powershell -NoProfile -Command "(Get-AuthenticodeSignature '$EXE_NATIVE').Status" 2>/dev/null | tr -d '\r') || SIG=Unknown
+[ -n "$SIG" ] || SIG=Unknown
 [ "$SIG" = "Valid" ] || echo "[release] WARNING installer signature status = $SIG (publishing anyway)"
 
 NOTES="$(cat <<EOF
