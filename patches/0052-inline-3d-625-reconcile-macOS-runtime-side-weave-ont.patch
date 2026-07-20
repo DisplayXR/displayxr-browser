@@ -1,0 +1,2282 @@
+From 253a20fc5d429e38e0b761977f2eff80c119a86c Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Mon, 20 Jul 2026 12:24:45 +0000
+Subject: [PATCH] inline-3d(#625): reconcile macOS runtime-side weave onto
+ browser#18/#22
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Rebase the mac overlay-path weave backend onto displayxr-browser main
+(Windows browser 0.1.5 = patches 0043-0051: browser#18/#22 excludeElement
+2D-overlay exclusion + DP-composited whole-window present).
+
+- 17 mac-only files apply clean (weave_client_mac, weave_gpu_mac, BUILD.gn,
+  chrome un-gates, shared_image widening, overlay_candidate + skia_renderer
+  idle-ring / scroll-fix / multi-element — main never touches these).
+- 4 of the 7 conflict files auto-merged (weave_provider.{cc,h},
+  direct_renderer.h, display.cc — additive Win+Mac).
+- 3 hand-merged: displayxr_weave_client.cc (IS_WIN/IS_MAC dispatcher);
+  skia_output_surface_impl_on_gpu.{cc,h} (take main s #22 whole-window
+  WeaveCompositedSurface, DROP the dead mac STEP-5 FinishPaint path,
+  re-insert only the live overlay-path MaybeWeaveOverlaysMac hook).
+
+Supersedes the browser-side whole-window stopgap (e0be91ca).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ chrome/browser/chrome_browser_main.cc         |   4 +-
+ chrome/gpu/BUILD.gn                           |   2 +-
+ chrome/gpu/chrome_content_gpu_client.cc       |  31 +-
+ chrome/gpu/chrome_content_gpu_client.h        |  18 +-
+ components/displayxr/browser/BUILD.gn         |  21 +
+ .../browser/displayxr_weave_client.cc         |  19 +-
+ .../browser/displayxr_weave_client_mac.h      |  46 ++
+ .../browser/displayxr_weave_client_mac.mm     | 706 ++++++++++++++++++
+ components/displayxr/gpu/BUILD.gn             |  13 +
+ .../displayxr/gpu/displayxr_weave_gpu_mac.h   | 104 +++
+ .../displayxr/gpu/displayxr_weave_gpu_mac.mm  | 300 ++++++++
+ .../viz/service/display/direct_renderer.h     |   6 +
+ components/viz/service/display/display.cc     |   4 +
+ .../viz/service/display/overlay_candidate.h   |  11 +
+ .../viz/service/display/skia_renderer.cc      | 165 ++++
+ .../viz/service/display/skia_renderer.h       |  73 ++
+ .../displayxr_weave_provider.cc               |   4 +-
+ .../displayxr_weave_provider.h                |  31 +-
+ .../skia_output_surface_impl_on_gpu.cc        | 179 +++++
+ .../skia_output_surface_impl_on_gpu.h         |  36 +
+ .../shared_image/shared_image_factory.cc      |   2 +-
+ .../shared_image/shared_image_factory.h       |   2 +-
+ .../shared_image/shared_image_manager.cc      |   2 +-
+ .../shared_image/shared_image_manager.h       |   2 +-
+ 24 files changed, 1752 insertions(+), 29 deletions(-)
+ create mode 100644 components/displayxr/browser/displayxr_weave_client_mac.h
+ create mode 100644 components/displayxr/browser/displayxr_weave_client_mac.mm
+ create mode 100644 components/displayxr/gpu/displayxr_weave_gpu_mac.h
+ create mode 100644 components/displayxr/gpu/displayxr_weave_gpu_mac.mm
+
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 8e2d74ba5d98c..240e0f9c397d9 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -96,7 +96,7 @@
+ #include "chrome/installer/util/google_update_settings.h"
+ #include "components/color/color_mixers.h"
+ #include "components/device_event_log/device_event_log.h"
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR1
+ // DisplayXR inline-3D (#625, Step B / B4): browser-process weave client.
+ #include "components/displayxr/browser/displayxr_weave_client.h"
+ #endif
+@@ -1695,7 +1695,7 @@ void ChromeBrowserMainParts::PostBrowserStart() {
+   // task posted via PostAfterStartupTask until its complete.
+   AfterStartupTaskUtils::StartMonitoringStartup();
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR1: un-gate weave client init
+   // DisplayXR inline-3D (#625, Step B / B4): initialize the browser-process weave
+   // client after the first browser window is up. Deferred to a delayed UI-thread
+   // task because at PostBrowserStart the initial window's HWND exists but is not
+diff --git a/chrome/gpu/BUILD.gn b/chrome/gpu/BUILD.gn
+index 242e6140eef63..5c219c6b96c30 100644
+--- a/chrome/gpu/BUILD.gn
++++ b/chrome/gpu/BUILD.gn
+@@ -42,7 +42,7 @@ static_library("gpu") {
+     }
+   }
+ 
+-  if (is_win) {
++  if (is_win || is_mac) {  # DXR mac PR3
+     # DisplayXR inline-3D (#625, Step B / B4): the GPU-side weave provider and the
+     # Viz provider setter ChromeContentGpuClient registers it through.
+     deps += [
+diff --git a/chrome/gpu/chrome_content_gpu_client.cc b/chrome/gpu/chrome_content_gpu_client.cc
+index 8937f73875844..724a8161fd3d1 100644
+--- a/chrome/gpu/chrome_content_gpu_client.cc
++++ b/chrome/gpu/chrome_content_gpu_client.cc
+@@ -29,9 +29,14 @@
+ #include "media/media_buildflags.h"
+ #include "services/tracing/public/cpp/stack_sampling/tracing_sampler_profiler.h"
+ 
+-#if BUILDFLAG(IS_WIN)
+-// DisplayXR inline-3D (#625, Step B / B4): the Viz weave-provider setter.
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++// DisplayXR inline-3D (#625): Viz weave-provider setter + GPU provider impl.
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
++#if BUILDFLAG(IS_WIN)
++#include "components/displayxr/gpu/displayxr_weave_gpu.h"
++#elif BUILDFLAG(IS_APPLE)
++#include "components/displayxr/gpu/displayxr_weave_gpu_mac.h"
++#endif
+ #endif
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -61,7 +66,7 @@ ChromeContentGpuClient::ChromeContentGpuClient() {
+ }
+ 
+ ChromeContentGpuClient::~ChromeContentGpuClient() {
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+   if (weave_gpu_) {
+     viz::SetDisplayXRWeaveProvider(nullptr);
+   }
+@@ -147,15 +152,19 @@ void ChromeContentGpuClient::PostCompositorThreadCreated(
+                                 base::BindRepeating(
+                                     &CreateCoreUnwindersFactory)));
+ 
+-#if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B / B4 / B2c): create the GPU-side weave
+-  // provider on the GPU main thread (where ChildThread + the DirectComposition
+-  // device live), bind its Mojo remote to the browser weave bridge, and register
+-  // it so Viz (SkiaOutputSurfaceImplOnGpu) can drive the per-frame weave. Dormant
+-  // unless opted in — the browser only binds the bridge under --enable-inline-3d.
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++  // DisplayXR inline-3D (#625): create the GPU-side weave provider on the GPU
++  // main thread and register it with Viz. Windows binds a mojo bridge to the
++  // browser weave client; macOS (#760 sync weave) brings up its own in-process
++  // weave session in the provider ctor. Dormant unless --enable-inline-3d.
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
+-    weave_gpu_ = std::make_unique<displayxr::DisplayXRWeaveGpu>();
+-    weave_gpu_->Bind();
++#if BUILDFLAG(IS_WIN)
++    auto gpu = std::make_unique<displayxr::DisplayXRWeaveGpu>();
++    gpu->Bind();
++    weave_gpu_ = std::move(gpu);
++#elif BUILDFLAG(IS_APPLE)
++    weave_gpu_ = std::make_unique<displayxr::DisplayXRWeaveGpuMac>();
++#endif
+     viz::SetDisplayXRWeaveProvider(weave_gpu_.get());
+     VLOG(1) << "[DisplayXR] inline-3D GPU weave provider registered";
+   }
+diff --git a/chrome/gpu/chrome_content_gpu_client.h b/chrome/gpu/chrome_content_gpu_client.h
+index 08f496d0c6665..dd9325343e17b 100644
+--- a/chrome/gpu/chrome_content_gpu_client.h
++++ b/chrome/gpu/chrome_content_gpu_client.h
+@@ -12,10 +12,11 @@
+ #include "build/build_config.h"
+ #include "content/public/gpu/content_gpu_client.h"
+ 
+-#if BUILDFLAG(IS_WIN)
+-// DisplayXR inline-3D (#625, Step B / B4): GPU-side weave provider.
+-#include "components/displayxr/gpu/displayxr_weave_gpu.h"
+-#endif
++// DisplayXR inline-3D (#625): GPU-side weave provider (fwd-decl; concrete
++// subclass constructed in the .cc).
++namespace viz {
++class DisplayXRWeaveProvider;
++}  // namespace viz
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+ namespace arc {
+@@ -63,10 +64,11 @@ class ChromeContentGpuClient : public content::ContentGpuClient {
+   scoped_refptr<arc::ProtectedBufferManager> protected_buffer_manager_;
+ #endif
+ 
+-#if BUILDFLAG(IS_WIN)
+-  // DisplayXR inline-3D (#625, Step B / B4): created + registered with Viz in
+-  // PostCompositorThreadCreated when --enable-inline-3d is set.
+-  std::unique_ptr<displayxr::DisplayXRWeaveGpu> weave_gpu_;
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++  // DisplayXR inline-3D (#625): created + registered with Viz in
++  // PostCompositorThreadCreated when --enable-inline-3d is set. Base-typed
++  // so Win (DisplayXRWeaveGpu) and mac (DisplayXRWeaveGpuMac) share it.
++  std::unique_ptr<viz::DisplayXRWeaveProvider> weave_gpu_;
+ #endif
+ };
+ 
+diff --git a/components/displayxr/browser/BUILD.gn b/components/displayxr/browser/BUILD.gn
+index 6e3f4079fadbe..091edc2fb2a67 100644
+--- a/components/displayxr/browser/BUILD.gn
++++ b/components/displayxr/browser/BUILD.gn
+@@ -26,6 +26,27 @@ component("weave_client") {
+       "d3d11.lib",
+       "dxgi.lib",
+     ]
++  } else if (is_mac) {
++    # macOS PR1: the OpenXR loader + MoltenVK are dlopen'd at runtime (dormant
++    # when the DisplayXR runtime is absent — the delay-load analogue), so we
++    # need the HEADERS only, not the link. The weave session binds MoltenVK
++    # (XrGraphicsBindingVulkanKHR) — the only binding the mac IPC weave path
++    # accepts (see displayxr_weave_client_mac.mm).
++    sources += [
++      "displayxr_weave_client_mac.h",
++      "displayxr_weave_client_mac.mm",
++    ]
++    # Reference the vendored OpenXR headers' include dir DIRECTLY rather than the
++    # //third_party/displayxr:openxr_headers config — that BUILD.gn imports
++    # visual_studio_version.gni at file scope and only loads on Windows.
++    include_dirs = [ "//third_party/displayxr/include" ]
++    deps += [ "//third_party/vulkan-headers/src:vulkan_headers" ]
++    frameworks = [
++      "Foundation.framework",
++      "IOSurface.framework",
++      "Metal.framework",
++      "QuartzCore.framework",
++    ]
+   }
+ }
+ 
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index b893cdb800904..9d72c1bc63297 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -43,6 +43,10 @@
+ #include <openxr/XR_DXR_win32_window_binding.h>
+ #endif  // BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_MAC)
++#include "components/displayxr/browser/displayxr_weave_client_mac.h"
++#endif
++
+ namespace displayxr {
+ 
+ namespace {
+@@ -1098,6 +1102,8 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::SubmitBatch(
+ #if BUILDFLAG(IS_WIN)
+   return SubmitBatchWin(input_handle, rects, input_is_dxgi, overlay_handle,
+                         overlay_is_dxgi);
++#elif BUILDFLAG(IS_MAC)
++  return SubmitBatchMac(input_handle, rects, input_is_dxgi);
+ #else
+   return {};
+ #endif
+@@ -1107,6 +1113,8 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::SubmitBatch(
+ uint32_t DisplayXRWeaveClient::WeaveSpecVersion() {
+ #if BUILDFLAG(IS_WIN)
+   return State().weave_spec_version;
++#elif BUILDFLAG(IS_MAC)
++  return WeaveSpecVersionMac();
+ #else
+   return 0;
+ #endif
+@@ -1116,6 +1124,8 @@ uint32_t DisplayXRWeaveClient::WeaveSpecVersion() {
+ bool DisplayXRWeaveClient::IsSupported() {
+ #if BUILDFLAG(IS_WIN)
+   return IsSupportedWin();
++#elif BUILDFLAG(IS_MAC)
++  return IsSupportedMac();
+ #else
+   return false;
+ #endif
+@@ -1134,6 +1144,8 @@ DisplayXRWeaveClient::LocateViewsForRect(const WeaveRect& rect,
+                                          float virtual_display_height) {
+ #if BUILDFLAG(IS_WIN)
+   return LocateViewsForRectWin(rect, virtual_display_height);
++#elif BUILDFLAG(IS_MAC)
++  return LocateViewsForRectMac(rect, virtual_display_height);
+ #else
+   return {};
+ #endif
+@@ -1164,8 +1176,13 @@ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+   // 120 × 500ms = 60s: a dcheck_always_on build on a cold profile can take
+   // well over 10s to show its first window; the retry is a no-op once bound.
+   InitializeWin(/*attempts_left=*/120);
++#elif BUILDFLAG(IS_MAC)
++  // macOS PR1: bring up the MoltenVK-bound IPC weave session directly (no HWND
++  // retry — the runtime stores window id 0 and the snap is identity). Dormant
++  // when the runtime/loader is absent.
++  InitializeCoreMac();
+ #else
+-  LOG(ERROR) << "[DisplayXR] inline-3D is Windows-only in Step B";
++  LOG(ERROR) << "[DisplayXR] inline-3D is not supported on this platform yet";
+ #endif
+ }
+ 
+diff --git a/components/displayxr/browser/displayxr_weave_client_mac.h b/components/displayxr/browser/displayxr_weave_client_mac.h
+new file mode 100644
+index 0000000000000..f3817a98e7593
+--- /dev/null
++++ b/components/displayxr/browser/displayxr_weave_client_mac.h
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_MAC_H_
++#define COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_MAC_H_
++
++// macOS platform impl of the DisplayXRWeaveClient statics (PR1). Defined in
++// displayxr_weave_client_mac.mm; called from the #elif BUILDFLAG(IS_MAC)
++// branches of the dispatchers in displayxr_weave_client.cc. OpenXR-free so
++// the C++ dispatcher TU can include it.
++
++#include <cstdint>
++#include <vector>
++
++#include "components/displayxr/browser/displayxr_weave_client.h"
++
++namespace displayxr {
++
++// Bring up the MoltenVK-bound IPC weave session (idempotent). No-op / dormant
++// when the DisplayXR runtime + OpenXR loader aren't installed.
++void InitializeCoreMac();
++
++// True once the weave session is live (backs WebXR isSessionSupported).
++bool IsSupportedMac();
++
++// The runtime-reported XR_DXR_weave spec version (0 until initialized).
++uint32_t WeaveSpecVersionMac();
++
++// PR2: ask the runtime for the off-axis (Kooima) views of one inline-3D element
++// (XR_DXR_view_rig + XR_DXR_display_zones). macOS port of LocateViewsForRectWin
++// — same flow, timespec time-conversion. Empty when the rig isn't live.
++std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectMac(
++    const DisplayXRWeaveClient::WeaveRect& rect,
++    float virtual_display_height);
++
++// PR3: batched synchronous weave (spec v3). Returns the woven IOSurface (as an
++// IOSurfaceID in woven_handle) + eyes. input_handle is the input IOSurfaceID.
++DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchMac(
++    uintptr_t input_handle,
++    const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
++    bool input_is_dxgi);
++
++}  // namespace displayxr
++
++#endif  // COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_MAC_H_
+diff --git a/components/displayxr/browser/displayxr_weave_client_mac.mm b/components/displayxr/browser/displayxr_weave_client_mac.mm
+new file mode 100644
+index 0000000000000..d881d78881426
+--- /dev/null
++++ b/components/displayxr/browser/displayxr_weave_client_mac.mm
+@@ -0,0 +1,706 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// macOS inline-3D weave client (#625, Step B — macOS port PR1).
++//
++// The macOS sibling of the Windows body in displayxr_weave_client.cc. Same
++// contract (DisplayXRWeaveClient statics), different platform substrate:
++//
++//   * The weave session binds with MoltenVK (XrGraphicsBindingVulkanKHR), NOT
++//     Metal/D3D11. On the macOS IPC/service path both the metal_native and
++//     vk_native native compositors are disabled (oxr_session_gfx_*_native.c,
++//     is_service_mode), and a headless session can't weave (oxr_weave.c
++//     session_is_ipc requires xcn != NULL). The MoltenVK-bound IPC session is
++//     the only one the runtime's XR_DXR_weave accepts on macOS — verified by
++//     test_apps/probes/weave_probe_vk_macos, whose bring-up this mirrors.
++//   * The OpenXR loader AND MoltenVK are dlopen'd (not linked): inline-3D stays
++//     dormant (IsSupported()==false) when the DisplayXR runtime isn't installed,
++//     the macOS analogue of the Windows delay-load of openxr_loader.dll.
++//
++// PR1 scope (Seam-C de-risk): dlopen the loaders, create a forced-IPC instance,
++// a MoltenVK device, the present-owner weave session, xrWeaveBindWindowDXR, and
++// resolve the weave PFNs — proving the linkage/process path on macOS. The
++// per-frame weave (IOSurface submit) + the GPU-process provider land in PR3.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// Bring-up code over the vendored OpenXR / Vulkan C APIs (fixed-size name
++// buffers, extension-string arrays). TODO(#625): harden alongside the Windows
++// client. Matches the source_set's no_chromium_code relaxation.
++#pragma allow_unsafe_buffers
++#endif
++
++#include "components/displayxr/browser/displayxr_weave_client_mac.h"
++
++#include <dlfcn.h>
++#include <time.h>
++
++#include <cstring>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/logging.h"
++
++// vulkan.h MUST precede openxr_platform.h: under XR_USE_GRAPHICS_API_VULKAN the
++// platform header references VkDevice/VkInstance/VkResult and expects them
++// already declared.
++#include <vulkan/vulkan.h>
++
++// XR_USE_TIMESPEC exposes xrConvertTimespecTimeToTimeKHR (the macOS analogue of
++// the Windows QPC->XrTime conversion the rig locate needs).
++#define XR_USE_GRAPHICS_API_VULKAN
++#define XR_USE_TIMESPEC
++#include <openxr/openxr.h>
++#include <openxr/openxr_platform.h>
++
++#include <openxr/XR_DXR_display_info.h>
++#include <openxr/XR_DXR_display_zones.h>
++#include <openxr/XR_DXR_local_3d_zone.h>
++#include <openxr/XR_DXR_view_rig.h>
++#include <openxr/XR_DXR_weave.h>
++
++namespace displayxr {
++namespace {
++
++// ---- Dynamically loaded entry points (dormant-when-absent) -----------------
++// We dlopen the two loaders and bootstrap everything else through their
++// proc-address getters, so a machine without the DisplayXR runtime simply
++// leaves these null and inline-3D reports unsupported.
++PFN_xrGetInstanceProcAddr g_xrGetInstanceProcAddr = nullptr;
++PFN_vkGetInstanceProcAddr g_vkGetInstanceProcAddr = nullptr;
++
++// Candidate paths for the runtime-shipped loaders. The runtime .pkg installs
++// them under /usr/local/lib (Homebrew-style) or alongside the active-runtime
++// JSON; also honor DYLD search + an explicit override for dev builds.
++void* DlopenFirst(const char* const* names, size_t n) {
++  for (size_t i = 0; i < n; ++i) {
++    if (void* h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL)) {
++      return h;
++    }
++  }
++  return nullptr;
++}
++
++bool LoadLoaders() {
++  static bool tried = false;
++  static bool ok = false;
++  if (tried) {
++    return ok;
++  }
++  tried = true;
++
++  const char* xr_names[] = {
++      "libopenxr_loader.dylib",
++      "/usr/local/lib/libopenxr_loader.dylib",
++      "/opt/homebrew/lib/libopenxr_loader.dylib",
++  };
++  const char* vk_names[] = {
++      "libvulkan.dylib",
++      "libMoltenVK.dylib",
++      "/usr/local/lib/libvulkan.dylib",
++      "/usr/local/lib/libMoltenVK.dylib",
++  };
++  void* xr_lib = DlopenFirst(xr_names, std::size(xr_names));
++  void* vk_lib = DlopenFirst(vk_names, std::size(vk_names));
++  if (!xr_lib || !vk_lib) {
++    VLOG(1) << "[DisplayXR] loaders absent (xr=" << (void*)xr_lib
++            << " vk=" << (void*)vk_lib << ") — inline-3D dormant";
++    return false;
++  }
++  g_xrGetInstanceProcAddr = reinterpret_cast<PFN_xrGetInstanceProcAddr>(
++      dlsym(xr_lib, "xrGetInstanceProcAddr"));
++  g_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++      dlsym(vk_lib, "vkGetInstanceProcAddr"));
++  ok = g_xrGetInstanceProcAddr && g_vkGetInstanceProcAddr;
++  return ok;
++}
++
++// Resolve an XR PFN through the bootstrapped getter. |instance| may be NULL for
++// the pre-instance calls (xrCreateInstance, xrEnumerateInstanceExtensionProperties).
++template <typename Fn>
++Fn GetXr(XrInstance instance, const char* name) {
++  PFN_xrVoidFunction p = nullptr;
++  if (g_xrGetInstanceProcAddr) {
++    g_xrGetInstanceProcAddr(instance, name, &p);
++  }
++  return reinterpret_cast<Fn>(p);
++}
++
++template <typename Fn>
++Fn GetVk(VkInstance instance, const char* name) {
++  return reinterpret_cast<Fn>(
++      g_vkGetInstanceProcAddr ? g_vkGetInstanceProcAddr(instance, name)
++                              : nullptr);
++}
++
++// ---- Process-global weave state (mac) --------------------------------------
++struct MacWeaveState {
++  XrInstance instance = XR_NULL_HANDLE;
++  XrSystemId system_id = XR_NULL_SYSTEM_ID;
++  XrSession session = XR_NULL_HANDLE;
++  VkInstance vk_instance = VK_NULL_HANDLE;
++  VkDevice vk_device = VK_NULL_HANDLE;
++  VkPhysicalDevice vk_phys = VK_NULL_HANDLE;
++  uint32_t vk_queue_family = 0;
++
++  bool has_weave = false;
++  uint32_t weave_spec_version = 0;
++
++  // Weave PFNs (resolved once the instance is up).
++  PFN_xrWeaveBindWindowDXR bind_window = nullptr;
++  PFN_xrWeaveSubmitDXR submit = nullptr;
++  PFN_xrWeaveSnapWindowRectDXR snap = nullptr;
++
++  // PR2 rig locate (XR_DXR_view_rig + XR_DXR_display_zones + timespec time):
++  // the runtime computes the off-axis views for each element. has_rig_views is
++  // true only when all three are live + the LOCAL space and PFN came up.
++  bool has_view_rig = false;
++  bool has_display_zones = false;
++  bool has_rig_views = false;
++  PFN_xrConvertTimespecTimeToTimeKHR convert_time = nullptr;
++  XrSpace ref_space = XR_NULL_HANDLE;
++
++  bool initialized = false;
++};
++
++MacWeaveState& State() {
++  static MacWeaveState* s = new MacWeaveState();
++  return *s;
++}
++
++void SplitExts(const std::string& s,
++               std::vector<std::string>& storage,
++               std::vector<const char*>& ptrs) {
++  size_t start = 0;
++  for (size_t i = 0; i <= s.size(); ++i) {
++    if (i == s.size() || s[i] == ' ' || s[i] == '\0') {
++      if (i > start) {
++        storage.push_back(s.substr(start, i - start));
++      }
++      start = i + 1;
++    }
++  }
++  for (const auto& e : storage) {
++    ptrs.push_back(e.c_str());
++  }
++}
++
++// Create the MoltenVK VkInstance/VkDevice the XR session binds to, per
++// XR_KHR_vulkan_enable. Mirrors weave_probe_vk_macos exactly.
++bool CreateMoltenVkDevice(MacWeaveState& s) {
++  auto xrGetVkReq = GetXr<PFN_xrGetVulkanGraphicsRequirementsKHR>(
++      s.instance, "xrGetVulkanGraphicsRequirementsKHR");
++  auto xrGetVkIExt = GetXr<PFN_xrGetVulkanInstanceExtensionsKHR>(
++      s.instance, "xrGetVulkanInstanceExtensionsKHR");
++  auto xrGetVkDExt = GetXr<PFN_xrGetVulkanDeviceExtensionsKHR>(
++      s.instance, "xrGetVulkanDeviceExtensionsKHR");
++  auto xrGetVkDev = GetXr<PFN_xrGetVulkanGraphicsDeviceKHR>(
++      s.instance, "xrGetVulkanGraphicsDeviceKHR");
++  if (!xrGetVkReq || !xrGetVkIExt || !xrGetVkDExt || !xrGetVkDev) {
++    LOG(ERROR) << "[DisplayXR] XR_KHR_vulkan_enable PFNs missing";
++    return false;
++  }
++  XrGraphicsRequirementsVulkanKHR vk_req = {
++      XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
++  if (XR_FAILED(xrGetVkReq(s.instance, s.system_id, &vk_req))) {
++    return false;
++  }
++
++  auto vkCreateInstance =
++      GetVk<PFN_vkCreateInstance>(VK_NULL_HANDLE, "vkCreateInstance");
++  auto vkEnumInstExt = GetVk<PFN_vkEnumerateInstanceExtensionProperties>(
++      VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
++  if (!vkCreateInstance || !vkEnumInstExt) {
++    return false;
++  }
++
++  uint32_t len = 0;
++  xrGetVkIExt(s.instance, s.system_id, 0, &len, nullptr);
++  std::string iext_str(len, '\0');
++  xrGetVkIExt(s.instance, s.system_id, len, &len, iext_str.data());
++  std::vector<std::string> iext_storage;
++  std::vector<const char*> iexts;
++  SplitExts(iext_str, iext_storage, iexts);
++
++  uint32_t avail = 0;
++  vkEnumInstExt(nullptr, &avail, nullptr);
++  std::vector<VkExtensionProperties> avail_exts(avail);
++  vkEnumInstExt(nullptr, &avail, avail_exts.data());
++  bool has_portability = false;
++  for (const auto& e : avail_exts) {
++    if (std::string_view(e.extensionName) == "VK_KHR_portability_enumeration") {
++      has_portability = true;
++      iexts.push_back("VK_KHR_portability_enumeration");
++      break;
++    }
++  }
++
++  VkApplicationInfo app_info = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
++  app_info.pApplicationName = "DisplayXRBrowser";
++  app_info.apiVersion = VK_API_VERSION_1_1;
++  VkInstanceCreateInfo vici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++  vici.pApplicationInfo = &app_info;
++  vici.enabledExtensionCount = static_cast<uint32_t>(iexts.size());
++  vici.ppEnabledExtensionNames = iexts.data();
++  if (has_portability) {
++    vici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
++  }
++  if (vkCreateInstance(&vici, nullptr, &s.vk_instance) != VK_SUCCESS) {
++    LOG(ERROR) << "[DisplayXR] vkCreateInstance (MoltenVK) failed";
++    return false;
++  }
++
++  if (XR_FAILED(xrGetVkDev(s.instance, s.system_id, s.vk_instance,
++                           &s.vk_phys))) {
++    return false;
++  }
++
++  auto vkGetQF = GetVk<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
++      s.vk_instance, "vkGetPhysicalDeviceQueueFamilyProperties");
++  auto vkEnumDevExt = GetVk<PFN_vkEnumerateDeviceExtensionProperties>(
++      s.vk_instance, "vkEnumerateDeviceExtensionProperties");
++  auto vkCreateDevice =
++      GetVk<PFN_vkCreateDevice>(s.vk_instance, "vkCreateDevice");
++  if (!vkGetQF || !vkEnumDevExt || !vkCreateDevice) {
++    return false;
++  }
++
++  uint32_t qf_count = 0;
++  vkGetQF(s.vk_phys, &qf_count, nullptr);
++  std::vector<VkQueueFamilyProperties> qfs(qf_count);
++  vkGetQF(s.vk_phys, &qf_count, qfs.data());
++  s.vk_queue_family = UINT32_MAX;
++  for (uint32_t i = 0; i < qf_count; ++i) {
++    if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++      s.vk_queue_family = i;
++      break;
++    }
++  }
++  if (s.vk_queue_family == UINT32_MAX) {
++    return false;
++  }
++
++  len = 0;
++  xrGetVkDExt(s.instance, s.system_id, 0, &len, nullptr);
++  std::string dext_str(len, '\0');
++  xrGetVkDExt(s.instance, s.system_id, len, &len, dext_str.data());
++  std::vector<std::string> dext_storage;
++  std::vector<const char*> dexts;
++  SplitExts(dext_str, dext_storage, dexts);
++
++  uint32_t dav = 0;
++  vkEnumDevExt(s.vk_phys, nullptr, &dav, nullptr);
++  std::vector<VkExtensionProperties> dav_exts(dav);
++  vkEnumDevExt(s.vk_phys, nullptr, &dav, dav_exts.data());
++  for (const auto& e : dav_exts) {
++    if (std::string_view(e.extensionName) == "VK_KHR_portability_subset") {
++      bool already = false;
++      for (const char* d : dexts) {
++        if (std::string_view(d) == "VK_KHR_portability_subset") {
++          already = true;
++        }
++      }
++      if (!already) {
++        dexts.push_back("VK_KHR_portability_subset");
++      }
++      break;
++    }
++  }
++
++  float prio = 1.0f;
++  VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++  qci.queueFamilyIndex = s.vk_queue_family;
++  qci.queueCount = 1;
++  qci.pQueuePriorities = &prio;
++  VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++  dci.queueCreateInfoCount = 1;
++  dci.pQueueCreateInfos = &qci;
++  dci.enabledExtensionCount = static_cast<uint32_t>(dexts.size());
++  dci.ppEnabledExtensionNames = dexts.data();
++  if (vkCreateDevice(s.vk_phys, &dci, nullptr, &s.vk_device) != VK_SUCCESS) {
++    LOG(ERROR) << "[DisplayXR] vkCreateDevice (MoltenVK) failed";
++    return false;
++  }
++  return true;
++}
++
++}  // namespace
++
++// ---- Public mac entry points (called from the client.cc dispatchers) -------
++
++void InitializeCoreMac() {
++  MacWeaveState& s = State();
++  if (s.initialized) {
++    return;
++  }
++  s.initialized = true;
++
++  if (!LoadLoaders()) {
++    return;  // runtime absent — stay dormant
++  }
++
++  // Force the runtime onto the IPC path (the weave service is IPC-only). The
++  // runtime dylib reads its own getenv, so setenv on the process is sufficient.
++  setenv("XRT_FORCE_MODE", "ipc", /*overwrite=*/0);
++
++  auto xrEnumExt = GetXr<PFN_xrEnumerateInstanceExtensionProperties>(
++      XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties");
++  auto xrCreateInstance =
++      GetXr<PFN_xrCreateInstance>(XR_NULL_HANDLE, "xrCreateInstance");
++  if (!xrEnumExt || !xrCreateInstance) {
++    LOG(ERROR) << "[DisplayXR] loader present but core PFNs missing";
++    return;
++  }
++
++  uint32_t ext_count = 0;
++  if (XR_FAILED(xrEnumExt(nullptr, 0, &ext_count, nullptr))) {
++    LOG(ERROR) << "[DisplayXR] xrEnumerateInstanceExtensionProperties failed";
++    return;
++  }
++  std::vector<XrExtensionProperties> exts(ext_count,
++                                          {XR_TYPE_EXTENSION_PROPERTIES});
++  if (XR_FAILED(xrEnumExt(nullptr, ext_count, &ext_count, exts.data()))) {
++    return;
++  }
++  bool has_vk = false, has_display_info = false, has_convert_time = false,
++       has_local3d = false;
++  for (const auto& e : exts) {
++    std::string_view n(e.extensionName);
++    if (n == XR_DXR_WEAVE_EXTENSION_NAME) {
++      s.has_weave = true;
++      s.weave_spec_version = e.extensionVersion;
++    } else if (n == XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) {
++      has_vk = true;
++    } else if (n == XR_DXR_DISPLAY_INFO_EXTENSION_NAME) {
++      has_display_info = true;
++    } else if (n == XR_DXR_VIEW_RIG_EXTENSION_NAME) {
++      s.has_view_rig = true;
++    } else if (n == XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) {
++      s.has_display_zones = true;
++    } else if (n == XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) {
++      has_local3d = true;
++    } else if (n == XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME) {
++      has_convert_time = true;
++    }
++  }
++  if (!s.has_weave || !has_vk) {
++    LOG(WARNING) << "[DisplayXR] runtime lacks weave/vulkan_enable — inline-3D "
++                    "unsupported (weave="
++                 << s.has_weave << " vk=" << has_vk << ")";
++    return;
++  }
++  // display_zones requires local_3d_zone (enforced at xrCreateInstance).
++  s.has_rig_views = s.has_view_rig && s.has_display_zones && has_local3d &&
++                    has_convert_time;
++
++  std::vector<const char*> enabled = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
++                                      XR_DXR_WEAVE_EXTENSION_NAME};
++  if (has_display_info) {
++    enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
++  }
++  // The weave is core; the rig only improves scene geometry. Track the boundary
++  // so a rig-side rejection retries weave-only rather than killing inline-3D.
++  const size_t weave_ext_count = enabled.size();
++  if (s.has_rig_views) {
++    enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
++    enabled.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
++    enabled.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
++    enabled.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
++  }
++
++  XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
++  std::snprintf(ici.applicationInfo.applicationName,
++                sizeof(ici.applicationInfo.applicationName), "%s",
++                "DisplayXRBrowser");
++  ici.applicationInfo.applicationVersion = 1;
++  std::snprintf(ici.applicationInfo.engineName,
++                sizeof(ici.applicationInfo.engineName), "%s", "Chromium");
++  ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
++  ici.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
++  ici.enabledExtensionNames = enabled.data();
++  XrResult ir = xrCreateInstance(&ici, &s.instance);
++  if (XR_FAILED(ir) && s.has_rig_views) {
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance with rig exts failed (" << ir
++               << ") — retrying weave-only (scenes stay mono)";
++    s.has_rig_views = false;
++    enabled.resize(weave_ext_count);
++    ici.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
++    ici.enabledExtensionNames = enabled.data();
++    ir = xrCreateInstance(&ici, &s.instance);
++  }
++  if (XR_FAILED(ir)) {
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance failed: " << ir;
++    return;
++  }
++
++  auto xrGetSystem = GetXr<PFN_xrGetSystem>(s.instance, "xrGetSystem");
++  XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
++  sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
++  if (!xrGetSystem ||
++      XR_FAILED(xrGetSystem(s.instance, &sgi, &s.system_id))) {
++    LOG(ERROR) << "[DisplayXR] xrGetSystem failed";
++    return;
++  }
++
++  if (!CreateMoltenVkDevice(s)) {
++    return;
++  }
++
++  // Present-owner weave session bound to the MoltenVK device.
++  auto xrCreateSession =
++      GetXr<PFN_xrCreateSession>(s.instance, "xrCreateSession");
++  XrGraphicsBindingVulkanKHR vk_binding = {
++      XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
++  vk_binding.instance = s.vk_instance;
++  vk_binding.physicalDevice = s.vk_phys;
++  vk_binding.device = s.vk_device;
++  vk_binding.queueFamilyIndex = s.vk_queue_family;
++  vk_binding.queueIndex = 0;
++  XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
++  sci.next = &vk_binding;
++  sci.systemId = s.system_id;
++  if (!xrCreateSession ||
++      XR_FAILED(xrCreateSession(s.instance, &sci, &s.session))) {
++    LOG(ERROR) << "[DisplayXR] xrCreateSession (weave present-owner) failed";
++    return;
++  }
++
++  // Resolve weave PFNs + bind the window (id 0: the runtime stores it and the
++  // macOS snap is identity — no NSWindow plumbing needed for the weave itself).
++  s.bind_window =
++      GetXr<PFN_xrWeaveBindWindowDXR>(s.instance, "xrWeaveBindWindowDXR");
++  s.submit = GetXr<PFN_xrWeaveSubmitDXR>(s.instance, "xrWeaveSubmitDXR");
++  s.snap = GetXr<PFN_xrWeaveSnapWindowRectDXR>(s.instance,
++                                               "xrWeaveSnapWindowRectDXR");
++  if (!s.bind_window || !s.submit) {
++    LOG(ERROR) << "[DisplayXR] weave PFNs unresolved";
++    return;
++  }
++  s.bind_window(s.session, /*windowHandle=*/nullptr);
++
++  // PR2 rig locate: a LOCAL reference space + the timespec time-conversion PFN.
++  // Neither needs a RUNNING session (xrLocateViews validates only the space,
++  // view-config type, and displayTime > 0), so this stays submit-only.
++  if (s.has_rig_views) {
++    s.convert_time = GetXr<PFN_xrConvertTimespecTimeToTimeKHR>(
++        s.instance, "xrConvertTimespecTimeToTimeKHR");
++    auto xrCreateReferenceSpace = GetXr<PFN_xrCreateReferenceSpace>(
++        s.instance, "xrCreateReferenceSpace");
++    XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
++    rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
++    rsci.poseInReferenceSpace.orientation = {0.f, 0.f, 0.f, 1.f};
++    rsci.poseInReferenceSpace.position = {0.f, 0.f, 0.f};
++    XrResult rr = xrCreateReferenceSpace
++                      ? xrCreateReferenceSpace(s.session, &rsci, &s.ref_space)
++                      : XR_ERROR_FUNCTION_UNSUPPORTED;
++    if (XR_FAILED(rr) || !s.convert_time) {
++      LOG(ERROR) << "[DisplayXR] rig locate setup failed (space=" << rr
++                 << " convert_time=" << (s.convert_time ? "ok" : "NULL")
++                 << ") — scenes stay mono";
++      s.has_rig_views = false;
++    }
++  }
++
++  LOG(WARNING) << "[DisplayXR] inline-3D weave client ready on macOS "
++                  "(MoltenVK IPC session, weave_spec="
++               << s.weave_spec_version
++               << " rig_views=" << s.has_rig_views << ")";
++}
++
++bool IsSupportedMac() {
++  MacWeaveState& s = State();
++  return s.session != XR_NULL_HANDLE && s.has_weave && s.submit != nullptr;
++}
++
++uint32_t WeaveSpecVersionMac() {
++  return State().weave_spec_version;
++}
++
++std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectMac(
++    const DisplayXRWeaveClient::WeaveRect& rect,
++    float virtual_display_height) {
++  MacWeaveState& s = State();
++  std::vector<DisplayXRWeaveClient::RigView> out;
++  if (!s.has_rig_views || s.session == XR_NULL_HANDLE ||
++      s.ref_space == XR_NULL_HANDLE || !s.convert_time || rect.w <= 0 ||
++      rect.h <= 0) {
++    return out;
++  }
++
++  // xrLocateViews rejects displayTime <= 0. CLOCK_MONOTONIC -> XrTime via the
++  // timespec conversion (the macOS analogue of the Windows QPC path). The time
++  // only drives head/display-plane prediction (the eyes come from the DP's
++  // latest sample), so "now" is right.
++  struct timespec ts = {};
++  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++    return out;
++  }
++  XrTime now = 0;
++  if (XR_FAILED(s.convert_time(s.instance, &ts, &now)) || now <= 0) {
++    return out;
++  }
++
++  XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
++  rig.pose.orientation = {0.f, 0.f, 0.f, 1.f};
++  rig.pose.position = {0.f, 0.f, 0.f};
++  rig.virtualDisplayHeight =
++      virtual_display_height > 0.f ? virtual_display_height : 0.f;
++  rig.ipdFactor = 1.f;
++  rig.parallaxFactor = 1.f;
++  rig.perspectiveFactor = 1.f;
++
++  // The element's rect IS the canvas (window-client-relative device px — the
++  // same rect the weave submits).
++  XrDisplayZoneDXR zone = {XR_TYPE_DISPLAY_ZONE_DXR};
++  zone.next = &rig;
++  zone.zoneId = 0;
++  zone.rect.offset = {rect.x, rect.y};
++  zone.rect.extent = {rect.w, rect.h};
++
++  XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO};
++  li.next = &zone;
++  li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++  li.displayTime = now;
++  li.space = s.ref_space;
++
++  auto xrLocateViews =
++      GetXr<PFN_xrLocateViews>(s.instance, "xrLocateViews");
++  if (!xrLocateViews) {
++    return out;
++  }
++  XrViewState vs = {XR_TYPE_VIEW_STATE};
++  // The display's rendering mode may expose N views (sim_display's 2x2 Quad
++  // reports 4); inline-3D consumes the PRIMARY STEREO PAIR (views 0-1, the
++  // runtime's standard stereo layout). Size the buffer for up to 8 tiles so a
++  // >2-view mode doesn't trip XR_ERROR_SIZE_INSUFFICIENT (-11).
++  XrView views[8];
++  for (XrView& vv : views) vv = XrView{XR_TYPE_VIEW};
++  uint32_t view_count = 0;
++  XrResult lv_rc = xrLocateViews(s.session, &li, &vs, 8, &view_count, views);
++  if (XR_FAILED(lv_rc) || view_count == 0) {
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      LOG(ERROR) << "[DisplayXR] xrLocateViews (rig) failed on macOS";
++    }
++    return out;
++  }
++  if (!(vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ||
++      !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
++    return out;
++  }
++
++  const uint32_t take = view_count < 2u ? view_count : 2u;  // inline-3D stereo pair
++  for (uint32_t i = 0; i < take; ++i) {
++    const XrView& xv = views[i];
++    DisplayXRWeaveClient::RigView v;
++    v.pos_x = xv.pose.position.x;
++    v.pos_y = xv.pose.position.y;
++    v.pos_z = xv.pose.position.z;
++    v.orient_x = xv.pose.orientation.x;
++    v.orient_y = xv.pose.orientation.y;
++    v.orient_z = xv.pose.orientation.z;
++    v.orient_w = xv.pose.orientation.w;
++    v.fov_left = xv.fov.angleLeft;
++    v.fov_right = xv.fov.angleRight;
++    v.fov_up = xv.fov.angleUp;
++    v.fov_down = xv.fov.angleDown;
++    out.push_back(v);
++  }
++  return out;
++}
++
++
++// PR3: batched synchronous weave (XR_DXR_weave spec v3). macOS port of
++// SubmitBatchWin — same chained XrWeaveSubmitRectsDXR flow, but the input/output
++// weave handles are bare IOSurfaceIDs (the runtime IOSurfaceLookup's them; the
++// surfaces must be kIOSurfaceIsGlobal). No DXGI on macOS. Synchronous per the
++// #760 contract: the runtime waits on GPU completion before returning, so the
++// woven IOSurface is ready when this returns.
++DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchMac(
++    uintptr_t input_handle,
++    const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
++    bool /*input_is_dxgi*/) {
++  const size_t rect_count = rects.size();
++  DisplayXRWeaveClient::WeaveSubmitResult result;
++  MacWeaveState& s = State();
++  if (s.session == XR_NULL_HANDLE || !s.submit || rect_count == 0) {
++    return result;  // dormant / failed init / nothing to weave
++  }
++  if (s.weave_spec_version < 3) {
++    static bool logged_v2 = false;
++    if (!logged_v2) {
++      logged_v2 = true;
++      VLOG(1) << "[DisplayXR] SubmitBatch(mac) on spec-v" << s.weave_spec_version
++              << " runtime — needs v3 batch";
++    }
++    return result;
++  }
++
++  XrRect2Di xr_rects[XR_WEAVE_SUBMIT_MAX_RECTS_DXR];
++  size_t done = 0;
++  while (done < rect_count) {
++    const size_t n =
++        std::min<size_t>(rect_count - done, XR_WEAVE_SUBMIT_MAX_RECTS_DXR);
++    for (size_t i = 0; i < n; ++i) {
++      const DisplayXRWeaveClient::WeaveRect& r = rects[done + i];
++      XrRect2Di& xr = xr_rects[i];
++      xr.offset.x = r.x;
++      xr.offset.y = r.y;
++      xr.extent.width = r.w;
++      xr.extent.height = r.h;
++    }
++
++    XrWeaveSubmitRectsDXR batch = {XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
++    batch.rectCount = static_cast<uint32_t>(n);
++    batch.rects = xr_rects;
++
++    XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
++    in.next = &batch;
++    in.inputTexture = reinterpret_cast<void*>(input_handle);  // IOSurfaceRef ptr
++    in.inputIsDxgi = XR_FALSE;
++
++    XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
++    const XrResult sr = s.submit(s.session, &in, &out);
++    if (XR_FAILED(sr)) {
++      static int s_fail = 0;
++      if (s_fail < 3) {
++        ++s_fail;
++        LOG(ERROR) << "[DisplayXR] xrWeaveSubmitDXR(mac batch n=" << n
++                   << ") failed: " << sr;
++      }
++      result.ok = false;
++      return result;
++    }
++
++    result.ok = true;
++    if (out.weavedTexture) {
++      result.woven_handle = reinterpret_cast<uintptr_t>(out.weavedTexture);
++    }
++    if (out.fence) {
++      result.fence_handle = reinterpret_cast<uintptr_t>(out.fence);
++    }
++    result.fence_value = out.fenceValue;
++    result.width = out.width;
++    result.height = out.height;
++    result.eyes_valid = (out.eyesValid == XR_TRUE);
++    result.eyes.clear();
++    if (result.eyes_valid && out.eyeCount > 0) {
++      const uint32_t en = out.eyeCount > XR_WEAVE_MAX_EYES_DXR
++                              ? XR_WEAVE_MAX_EYES_DXR
++                              : out.eyeCount;
++      result.eyes.reserve(en * 3u);
++      for (uint32_t i = 0; i < en; ++i) {
++        const XrVector3f& eye = out.eyes[i];
++        result.eyes.push_back(eye.x);
++        result.eyes.push_back(eye.y);
++        result.eyes.push_back(eye.z);
++      }
++    }
++    done += n;
++  }
++  return result;
++}
++
++}  // namespace displayxr
+diff --git a/components/displayxr/gpu/BUILD.gn b/components/displayxr/gpu/BUILD.gn
+index ae66f1d96ef71..53e103bc6dadc 100644
+--- a/components/displayxr/gpu/BUILD.gn
++++ b/components/displayxr/gpu/BUILD.gn
+@@ -30,4 +30,17 @@ source_set("gpu") {
+       "dxgi.lib",
+     ]
+   }
++  if (is_mac) {
++    sources += [
++      "displayxr_weave_gpu_mac.h",
++      "displayxr_weave_gpu_mac.mm",
++    ]
++    frameworks = [
++      "IOSurface.framework",
++      "Metal.framework",
++      "QuartzCore.framework",
++      "CoreFoundation.framework",
++    ]
++  }
++
+ }
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_mac.h b/components/displayxr/gpu/displayxr_weave_gpu_mac.h
+new file mode 100644
+index 0000000000000..40729536bf3cf
+--- /dev/null
++++ b/components/displayxr/gpu/displayxr_weave_gpu_mac.h
+@@ -0,0 +1,104 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_MAC_H_
++#define COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_MAC_H_
++
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_APPLE)
++
++#include <IOSurface/IOSurfaceRef.h>
++
++#include <cstdint>
++#include <vector>
++
++#include "base/apple/scoped_cftyperef.h"
++#include "base/memory/raw_ptr_exclusion.h"
++#include "base/containers/flat_map.h"
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace displayxr {
++
++// macOS GPU-process implementation of viz::DisplayXRWeaveProvider (#625 PR3).
++//
++// Much simpler than the Windows DisplayXRWeaveGpu: the macOS runtime weave
++// service (#760) is SYNCHRONOUS (it waits on GPU completion before returning),
++// so there is no keyed mutex, no mojo bridge, and no async in-flight tracking.
++// Per frame the batch bracket copies each visible element's SBS sub-rect into
++// ONE shared window-sized input IOSurface (MTLBlit) at its window position, then
++// SubmitBatchSync fires ONE xrWeaveSubmitDXR and stores the woven output
++// IOSurface for Viz to composite (PR4). The GPU-process weave session is brought
++// up in the constructor via InitializeCoreMac().
++//
++// Created + called on the GPU main thread.
++class DisplayXRWeaveGpuMac : public viz::DisplayXRWeaveProvider {
++ public:
++  DisplayXRWeaveGpuMac();
++  DisplayXRWeaveGpuMac(const DisplayXRWeaveGpuMac&) = delete;
++  DisplayXRWeaveGpuMac& operator=(const DisplayXRWeaveGpuMac&) = delete;
++  ~DisplayXRWeaveGpuMac() override;
++
++  // viz::DisplayXRWeaveProvider:
++  bool SubmitInFlight(uint32_t target_id) const override;
++  bool WeaveCanvasMac(IOSurfaceRef canvas_iosurface,
++                      const gfx::Rect& src_rect,
++                      const gfx::Rect& window_rect,
++                      uint32_t target_id) override;
++  bool WeavePixelsMac(const uint8_t* bgra_pixels,
++                      uint32_t stride,
++                      const gfx::Rect& window_rect,
++                      uint32_t target_id) override;
++  bool BlitWovenToMac(IOSurfaceRef dst, const gfx::Rect& src_rect) override;
++  bool TryTakeWovenResult(uint32_t target_id, Result* out) override;
++  void PruneTargets(size_t count) override;
++  bool BatchMode() const override;
++  void BeginBatchSync(const gfx::Size& window_size) override;
++  bool SubmitBatchSync() override;
++
++ private:
++  // Lazily (re)create the shared window-sized input IOSurface (BGRA8, global so
++  // the runtime service can IOSurfaceLookup it by ID). Returns false on failure.
++  bool EnsureSharedInput(const gfx::Size& size);
++
++  // Metal objects, held as void* so this header stays ObjC-free for the C++ TUs
++  // that include it (the embedder ContentGpuClient). Retained/released via
++  // __bridge casts in the .mm.
++  RAW_PTR_EXCLUSION void* device_ = nullptr;  // id<MTLDevice>
++  RAW_PTR_EXCLUSION void* queue_ = nullptr;   // id<MTLCommandQueue>
++
++  base::apple::ScopedCFTypeRef<IOSurfaceRef> input_iosurface_;
++  gfx::Size input_size_;
++
++  // The runtime hands back the woven output IOSurfaceRef on the FIRST submit only
++  // (out.weavedTexture; NULL thereafter — it re-weaves into the same surface).
++  // Cache it so every frame's result carries the live woven surface.
++  base::apple::ScopedCFTypeRef<IOSurfaceRef> cached_woven_;
++
++  bool batch_open_ = false;
++  gfx::Size batch_size_;
++  struct BatchEntry {
++    uint32_t target_id = 0;
++    gfx::Rect rect;  // window-relative device px
++  };
++  std::vector<BatchEntry> batch_entries_;
++
++  // Latest woven result per target id. |woven| keeps the woven IOSurface alive
++  // (our ref) until the target is re-woven or pruned; |result.woven_handle| is
++  // its IOSurfaceID for Viz to look up.
++  struct Pending {
++    bool have = false;
++    Result result;
++    base::apple::ScopedCFTypeRef<IOSurfaceRef> woven;
++  };
++  base::flat_map<uint32_t, Pending> results_;
++};
++
++}  // namespace displayxr
++
++#endif  // BUILDFLAG(IS_APPLE)
++
++#endif  // COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_MAC_H_
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_mac.mm b/components/displayxr/gpu/displayxr_weave_gpu_mac.mm
+new file mode 100644
+index 0000000000000..59fc5bd3d2440
+--- /dev/null
++++ b/components/displayxr/gpu/displayxr_weave_gpu_mac.mm
+@@ -0,0 +1,300 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// TODO(crbug.com/351564777): Remove and convert to safer constructs.
++#pragma allow_unsafe_buffers
++#endif
++
++#include "components/displayxr/gpu/displayxr_weave_gpu_mac.h"
++
++#if BUILDFLAG(IS_APPLE)
++
++#import <Metal/Metal.h>
++
++
++#include "base/logging.h"
++#include "components/displayxr/browser/displayxr_weave_client.h"
++#include "components/displayxr/browser/displayxr_weave_client_mac.h"
++
++namespace displayxr {
++
++namespace {
++
++// Wrap an IOSurface as a BGRA8 MTLTexture for the blit copy (no data copy).
++id<MTLTexture> WrapIOSurface(id<MTLDevice> device, IOSurfaceRef surface) {
++  if (!device || !surface) {
++    return nil;
++  }
++  const NSUInteger w = IOSurfaceGetWidth(surface);
++  const NSUInteger h = IOSurfaceGetHeight(surface);
++  MTLTextureDescriptor* desc = [MTLTextureDescriptor
++      texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++                                   width:w
++                                  height:h
++                               mipmapped:NO];
++  desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++  desc.storageMode = MTLStorageModeShared;
++  return [device newTextureWithDescriptor:desc iosurface:surface plane:0];
++}
++
++}  // namespace
++
++DisplayXRWeaveGpuMac::DisplayXRWeaveGpuMac() {
++  // Bring up the GPU-process weave session (idempotent; dormant if the runtime
++  // + loaders aren't installed). The session lives in THIS process so the sync
++  // xrWeaveSubmitDXR runs in-process with zero hops.
++  InitializeCoreMac();
++  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++  if (device) {
++    id<MTLCommandQueue> queue = [device newCommandQueue];
++    device_ = (__bridge_retained void*)device;
++    queue_ = (__bridge_retained void*)queue;
++  } else {
++    LOG(ERROR) << "[DisplayXR] mac weave: no Metal device — weave disabled";
++  }
++}
++
++DisplayXRWeaveGpuMac::~DisplayXRWeaveGpuMac() {
++  if (queue_) {
++    id<MTLCommandQueue> q = (__bridge_transfer id<MTLCommandQueue>)queue_;
++    (void)q;
++    queue_ = nullptr;
++  }
++  if (device_) {
++    id<MTLDevice> d = (__bridge_transfer id<MTLDevice>)device_;
++    (void)d;
++    device_ = nullptr;
++  }
++}
++
++bool DisplayXRWeaveGpuMac::BatchMode() const {
++  // Sync GPU-process weave requires the session live + a spec-v3 runtime for the
++  // chained rect-array submit.
++  return DisplayXRWeaveClient::IsSupported() &&
++         DisplayXRWeaveClient::WeaveSpecVersion() >= 3;
++}
++
++bool DisplayXRWeaveGpuMac::SubmitInFlight(uint32_t /*target_id*/) const {
++  // Synchronous: nothing is ever outstanding across frames.
++  return false;
++}
++
++bool DisplayXRWeaveGpuMac::EnsureSharedInput(const gfx::Size& size) {
++  if (size.IsEmpty()) {
++    return false;
++  }
++  if (input_iosurface_ && input_size_ == size) {
++    return true;
++  }
++  // BGRA8, global so the runtime service can IOSurfaceLookup it by ID (#760).
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++  NSDictionary* props = @{
++    (id)kIOSurfaceWidth : @(size.width()),
++    (id)kIOSurfaceHeight : @(size.height()),
++    (id)kIOSurfaceBytesPerElement : @4,
++    (id)kIOSurfacePixelFormat : @((unsigned)'BGRA'),
++    (id)kIOSurfaceIsGlobal : @YES,
++  };
++#pragma clang diagnostic pop
++  IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
++  if (!surf) {
++    LOG(ERROR) << "[DisplayXR] mac weave: IOSurfaceCreate failed "
++               << size.width() << "x" << size.height();
++    return false;
++  }
++  input_iosurface_.reset(surf);  // adopts the +1 ref from Create
++  input_size_ = size;
++  return true;
++}
++
++void DisplayXRWeaveGpuMac::BeginBatchSync(const gfx::Size& window_size) {
++  batch_open_ = true;
++  batch_size_ = window_size;
++  batch_entries_.clear();
++  EnsureSharedInput(window_size);
++}
++
++bool DisplayXRWeaveGpuMac::WeaveCanvasMac(IOSurfaceRef canvas_iosurface,
++                                          const gfx::Rect& src_rect,
++                                          const gfx::Rect& window_rect,
++                                          uint32_t target_id) {
++  if (!batch_open_ || !canvas_iosurface || !device_ || !queue_ ||
++      !input_iosurface_) {
++    return false;
++  }
++  id<MTLDevice> device = (__bridge id<MTLDevice>)device_;
++  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)queue_;
++  id<MTLTexture> src = WrapIOSurface(device, canvas_iosurface);
++  id<MTLTexture> dst = WrapIOSurface(device, input_iosurface_.get());
++  if (!src || !dst) {
++    return false;
++  }
++  id<MTLCommandBuffer> cb = [queue commandBuffer];
++  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++  [blit copyFromTexture:src
++            sourceSlice:0
++            sourceLevel:0
++           sourceOrigin:MTLOriginMake(src_rect.x(), src_rect.y(), 0)
++             sourceSize:MTLSizeMake(src_rect.width(), src_rect.height(), 1)
++              toTexture:dst
++       destinationSlice:0
++       destinationLevel:0
++      destinationOrigin:MTLOriginMake(window_rect.x(), window_rect.y(), 0)];
++  [blit endEncoding];
++  [cb commit];
++  [cb waitUntilCompleted];
++  batch_entries_.push_back({target_id, window_rect});
++  return true;
++}
++
++bool DisplayXRWeaveGpuMac::BlitWovenToMac(IOSurfaceRef dst,
++                                          const gfx::Rect& src_rect) {
++  if (!dst || !cached_woven_ || !device_ || !queue_) {
++    return false;
++  }
++  id<MTLDevice> device = (__bridge id<MTLDevice>)device_;
++  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)queue_;
++  id<MTLTexture> src = WrapIOSurface(device, cached_woven_.get());
++  id<MTLTexture> d = WrapIOSurface(device, dst);
++  if (!src || !d) {
++    return false;
++  }
++  id<MTLCommandBuffer> cb = [queue commandBuffer];
++  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++  [blit copyFromTexture:src
++            sourceSlice:0
++            sourceLevel:0
++           sourceOrigin:MTLOriginMake(src_rect.x(), src_rect.y(), 0)
++             sourceSize:MTLSizeMake(src_rect.width(), src_rect.height(), 1)
++              toTexture:d
++       destinationSlice:0
++       destinationLevel:0
++      destinationOrigin:MTLOriginMake(0, 0, 0)];
++  [blit endEncoding];
++  [cb commit];
++  [cb waitUntilCompleted];
++  return true;
++}
++
++bool DisplayXRWeaveGpuMac::WeavePixelsMac(const uint8_t* bgra_pixels,
++                                          uint32_t stride,
++                                          const gfx::Rect& window_rect,
++                                          uint32_t target_id) {
++  if (!batch_open_ || !bgra_pixels || !input_iosurface_) {
++    return false;
++  }
++  IOSurfaceRef surf = input_iosurface_.get();
++  IOSurfaceLock(surf, 0, nullptr);
++  uint8_t* base = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(surf));
++  const size_t dst_stride = IOSurfaceGetBytesPerRow(surf);
++  const int rows = window_rect.height();
++  const size_t row_bytes = static_cast<size_t>(window_rect.width()) * 4u;
++  for (int r = 0; r < rows; ++r) {
++    uint8_t* dst = base + (window_rect.y() + r) * dst_stride +
++                   static_cast<size_t>(window_rect.x()) * 4u;
++    const uint8_t* srcp = bgra_pixels + static_cast<size_t>(r) * stride;
++    memcpy(dst, srcp, row_bytes);
++  }
++  IOSurfaceUnlock(surf, 0, nullptr);
++  batch_entries_.push_back({target_id, window_rect});
++  return true;
++}
++
++bool DisplayXRWeaveGpuMac::SubmitBatchSync() {
++  if (!batch_open_) {
++    return false;
++  }
++  batch_open_ = false;
++  if (batch_entries_.empty() || !input_iosurface_) {
++    return false;
++  }
++  DisplayXRWeaveClient::SnapWindowIfMoved();  // parity; identity on mac
++
++  std::vector<DisplayXRWeaveClient::WeaveRect> rects;
++  rects.reserve(batch_entries_.size());
++  for (const BatchEntry& e : batch_entries_) {
++    rects.push_back({e.rect.x(), e.rect.y(), e.rect.width(), e.rect.height()});
++  }
++
++  // The runtime IPC (ipc_metal_handle_to_iosurface_id) expects the input handle
++  // to be an IOSurface*REF* pointer and derives the global IOSurfaceID itself via
++  // IOSurfaceGetID(). Passing the raw IOSurfaceID makes the runtime deref a small
++  // integer -> EXC_BAD_ACCESS. Pass the ref pointer (matches the probe's
++  // submit.inputTexture = (void*)input contract).
++  DisplayXRWeaveClient::WeaveSubmitResult sr = DisplayXRWeaveClient::SubmitBatch(
++      reinterpret_cast<uintptr_t>(input_iosurface_.get()), rects,
++      /*input_is_dxgi=*/false);
++  if (!sr.ok) {
++    static int s_fail = 0;
++    if (s_fail < 3) {
++      ++s_fail;
++      LOG(ERROR) << "[DisplayXR] mac batch weave submit failed (n="
++                 << rects.size() << ")";
++    }
++    batch_entries_.clear();
++    return false;
++  }
++
++  // The woven output is one window-sized IOSurface (returned as an IOSurfaceID).
++  // Look it up (our own ref) and store per target — the first entry owns the
++  // ref; every entry carries the same woven_handle so Viz imports once and draws
++  // each rect's region (mirrors the Windows batch path).
++  // sr.woven_handle is `out.weavedTexture` — an IOSurface*REF* pointer, retained
++  // and handed back on the FIRST submit only (0 afterwards; the runtime re-weaves
++  // into the same surface). NOT an IOSurfaceID — do NOT IOSurfaceLookup it. Adopt
++  // the first handback into cached_woven_ and reuse it every frame.
++  if (sr.woven_handle) {
++    cached_woven_.reset(reinterpret_cast<IOSurfaceRef>(sr.woven_handle));
++  }
++  base::apple::ScopedCFTypeRef<IOSurfaceRef> woven = cached_woven_;
++
++  bool first = true;
++  for (const BatchEntry& e : batch_entries_) {
++    Pending& p = results_[e.target_id];
++    p.have = true;
++    p.result = Result{};
++    p.result.ok = true;
++    // Always hand viz the LIVE woven IOSurfaceRef (cached), not sr.woven_handle
++    // (non-zero on the first submit only). Viz imports it into a SharedImage and
++    // substitutes it into the overlay for on-screen compositing.
++    p.result.woven_handle =
++        reinterpret_cast<uintptr_t>(cached_woven_.get());
++    p.result.fence_value = sr.fence_value;
++    p.result.width = sr.width;
++    p.result.height = sr.height;
++    if (first) {
++      first = false;
++      p.woven = woven;  // hold the ref on the representative entry
++    } else {
++      p.woven.reset();
++    }
++  }
++  batch_entries_.clear();
++  return true;
++}
++
++bool DisplayXRWeaveGpuMac::TryTakeWovenResult(uint32_t target_id, Result* out) {
++  auto it = results_.find(target_id);
++  if (it == results_.end() || !it->second.have) {
++    return false;
++  }
++  *out = it->second.result;
++  return true;
++}
++
++void DisplayXRWeaveGpuMac::PruneTargets(size_t count) {
++  for (auto it = results_.begin(); it != results_.end();) {
++    if (it->first >= count) {
++      it = results_.erase(it);
++    } else {
++      ++it;
++    }
++  }
++}
++
++}  // namespace displayxr
++
++#endif  // BUILDFLAG(IS_APPLE)
+diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
+index 6417c5fda27c7..774806d2274ee 100644
+--- a/components/viz/service/display/direct_renderer.h
++++ b/components/viz/service/display/direct_renderer.h
+@@ -142,6 +142,12 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+   virtual void DidReceiveReleasedOverlays(
+       const std::vector<gpu::Mailbox>& released_overlays) {}
+ 
++  // DisplayXR inline-3D weave (mac): the window-relative device-px rects of the
++  // inline-3D elements in the frame about to be drawn. SkiaRenderer uses them to
++  // identify each element's canvas render-pass overlay and substitute its
++  // mailbox with a woven scratch. No-op on other renderers/platforms.
++  virtual void SetInline3DRects(const std::vector<gfx::Rect>& rects) {}
++
+   // Public for tests that poke at internals.
+   struct VIZ_SERVICE_EXPORT DrawingFrame {
+     DrawingFrame();
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index f86420065c9de..fb1cfd654297a 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1025,6 +1025,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+       }
+       renderer_->SetInline3dSuppressedResources(std::move(suppressed));
+     }
++    // DisplayXR inline-3D weave (mac): the renderer also needs the rects so it
++    // can substitute each inline-3d canvas overlay's mailbox with a woven
++    // scratch inside ScheduleOverlays (where the overlay lock is recorded).
++    renderer_->SetInline3DRects(frame.inline_3d_rects);
+     renderer_->DrawFrame(&frame.render_pass_list, device_scale_factor_,
+                          current_surface_size, display_color_spaces_,
+                          std::move(frame.surface_damage_rect_list_),
+diff --git a/components/viz/service/display/overlay_candidate.h b/components/viz/service/display/overlay_candidate.h
+index f4f938b156784..66dc9d8088339 100644
+--- a/components/viz/service/display/overlay_candidate.h
++++ b/components/viz/service/display/overlay_candidate.h
+@@ -248,6 +248,17 @@ class VIZ_SERVICE_EXPORT OverlayCandidate {
+ 
+   // The edge anti-aliasing mask property for the CALayer.
+   unsigned edge_aa_mask = 0;
++
++  // DisplayXR inline-3D weave (mac): when non-zero, |mailbox| has been
++  // substituted (by SkiaRenderer::ScheduleOverlays) to a Chromium-allocated
++  // scratch surface, and |displayxr_weave_source| is the original canvas
++  // render-pass backing that carries the pre-weave SBS pixels. The GPU thread
++  // weaves |displayxr_weave_source| and blits the woven anaglyph into |mailbox|
++  // before present, so any present path (incl. the async scroll fast-path)
++  // samples the woven surface, never the raw SBS. |displayxr_weave_target| is
++  // the inline-3D element index within the frame's inline_3d_rects.
++  gpu::Mailbox displayxr_weave_source;
++  uint32_t displayxr_weave_target = 0;
+ #endif  // BUILDFLAG(IS_APPLE)
+ 
+   // A (ideally) unique key used to temporally identify a specific overlay
+diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
+index facb72165f13d..e58097ee4748f 100644
+--- a/components/viz/service/display/skia_renderer.cc
++++ b/components/viz/service/display/skia_renderer.cc
+@@ -1320,6 +1320,12 @@ void SkiaRenderer::DidReceiveReleasedOverlays(
+ #endif
+ }
+ 
++void SkiaRenderer::SetInline3DRects(const std::vector<gfx::Rect>& rects) {
++#if BUILDFLAG(IS_APPLE)
++  inline_3d_rects_ = rects;
++#endif  // BUILDFLAG(IS_APPLE)
++}
++
+ void SkiaRenderer::EnsureScissorTestDisabled() {
+   scissor_rect_.reset();
+ }
+@@ -2847,6 +2853,27 @@ void SkiaRenderer::ScheduleOverlays() {
+   DCHECK(!current_gpu_commands_completed_fence_->was_set());
+   DCHECK(!current_release_fence_->was_set());
+ 
++#if BUILDFLAG(IS_APPLE)
++  // DisplayXR inline-3D weave (mac): release the canvas source locks held from
++  // the previous frame. That frame's synchronous GPU weave (which read those
++  // backings) has completed by now. Release them inside a
++  // ScopedBatchReturnResources so a texture-overlay source's SharedImage is
++  // actually RETURNED to the renderer (client) — plain OverlayLock destruction
++  // unlocks but doesn't trigger the batched resource return, which starves the
++  // renderer of canvas buffers ("cube rotates and stops"). The normal overlay
++  // release path (SwapBuffersComplete) uses the same wrapper.
++  {
++    std::vector<OverlayLock> released_prev =
++        std::move(inline_3d_held_source_locks_);
++    inline_3d_held_source_locks_.clear();
++    if (!released_prev.empty()) {
++      DisplayResourceProvider::ScopedBatchReturnResources returner(
++          resource_provider_.get(), /*allow_access_to_gpu_thread=*/true);
++      released_prev.clear();
++    }
++  }
++#endif  // BUILDFLAG(IS_APPLE)
++
+   // Always add an empty set of locks to be used in either SwapBuffersSkipped()
+   // or SwapBuffersComplete().
+   pending_overlay_locks_.emplace_back();
+@@ -3001,10 +3028,134 @@ void SkiaRenderer::ScheduleOverlays() {
+     }
+   }
+ 
++#if BUILDFLAG(IS_APPLE)
++  // DisplayXR inline-3D weave (mac): for each inline-3d element, pick the overlay
++  // that is its canvas — ANY mailbox-backed overlay (render-pass OR texture
++  // resource), ~full uv, width matching the element (height can differ when a
++  // vertical scroll clips the aggregator's element rect) — and substitute it
++  // with a woven scratch. Mirrors the GPU-side size-match (which scans all
++  // overlays regardless of type); each overlay is claimed at most once.
++  if (!inline_3d_rects_.empty()) {
++    auto& overlay_list = current_frame()->overlay_list;
++    std::vector<bool> overlay_used(overlay_list.size(), false);
++    for (size_t t = 0; t < inline_3d_rects_.size(); ++t) {
++      const gfx::Rect want = inline_3d_rects_[t];
++      if (want.IsEmpty()) {
++        continue;
++      }
++      // Match by the overlay's ON-SCREEN (target-space) position. display_rect
++      // is render-pass-LOCAL (0,0) for these promoted canvas overlays, so it
++      // cannot disambiguate multiple identically-sized elements (a gallery of
++      // same-size logos). DisplayRectInTargetSpace applies the overlay transform
++      // to recover each element's distinct window position; the canvas overlay
++      // keeps the element's full (unclipped) width while a vertical scroll clips
++      // the element rect's height, so filter on width and pick the nearest
++      // on-screen origin.
++      int best = -1;
++      int64_t best_d = std::numeric_limits<int64_t>::max();
++      for (size_t i = 0; i < overlay_list.size(); ++i) {
++        if (overlay_used[i]) {
++          continue;
++        }
++        const OverlayCandidate& ov = overlay_list[i];
++        if (ov.mailbox.IsZero()) {
++          continue;
++        }
++        if (ov.uv_rect.width() < 0.9f || ov.uv_rect.height() < 0.9f) {
++          continue;
++        }
++        // ToRoundedRect (NOT ToNearestRect): the target-space rect is
++        // fractional (sub-pixel transform / scroll-sync), and ToNearestRect
++        // DCHECKs integrality — that abort was crash-looping the GPU process.
++        const gfx::Rect tgt =
++            gfx::ToRoundedRect(OverlayCandidate::DisplayRectInTargetSpace(ov));
++        if (std::llabs(tgt.width() - want.width()) > 4) {
++          continue;
++        }
++        const int64_t d =
++            std::llabs(tgt.x() - want.x()) + std::llabs(tgt.y() - want.y());
++        if (d < best_d) {
++          best_d = d;
++          best = static_cast<int>(i);
++        }
++      }
++      if (best < 0 || best_d > 400) {
++        continue;
++      }
++      overlay_used[best] = true;
++      OverlayCandidate& ov = overlay_list[best];
++      // Find the lock recorded for this overlay (render_pass_lock or
++      // resource_lock share mailbox() == ov.mailbox); direct-scanout overlays
++      // have none (SIZE_MAX -> ADD a bare lock).
++      size_t lock_index = std::numeric_limits<size_t>::max();
++      for (size_t li = 0; li < locks.size(); ++li) {
++        if (locks[li].mailbox() == ov.mailbox) {
++          lock_index = li;
++          break;
++        }
++      }
++      SubstituteInline3DOverlayMac(&ov, &locks, lock_index,
++                                   static_cast<uint32_t>(t));
++    }
++  }
++#endif  // BUILDFLAG(IS_APPLE)
++
+   skia_output_surface_->ScheduleOverlays(
+       std::move(current_frame()->overlay_list), std::move(sync_tokens));
+ }
+ 
++#if BUILDFLAG(IS_APPLE)
++void SkiaRenderer::SubstituteInline3DOverlayMac(
++    OverlayCandidate* overlay,
++    std::vector<OverlayLock>* locks,
++    size_t lock_index,
++    uint32_t target) {
++  // The scratch must match the canvas backing (the full-resolution flat SBS),
++  // but the matched overlay is often a texture overlay whose
++  // |resource_size_in_pixels| is 0x0 — the true size only lives in the backing
++  // IOSurface, which viz can't read. So viz only mints a STABLE mailbox name per
++  // target here; the GPU thread (which reads the source IOSurface size) creates
++  // the actual SCANOUT BGRA8 SharedImage under this name at the right size.
++  if (inline_3d_scratch_.size() <= target) {
++    inline_3d_scratch_.resize(target + 1);
++  }
++  Inline3DScratch& sc = inline_3d_scratch_[target];
++  // Present a different ring slot each frame so CoreAnimation sees a new
++  // io_surface bound to the CALayer and re-composites the fresh woven pixels
++  // (a single stable scratch is cached by CA and only advances on interaction).
++  gpu::Mailbox& slot = sc.mailbox[sc.next];
++  if (slot.IsZero()) {
++    slot = gpu::Mailbox::Generate();
++  }
++  sc.next = (sc.next + 1) % Inline3DScratch::kRingSize;
++
++  // Carry the original canvas backing to the GPU thread (it weaves it), then
++  // present the woven scratch instead so every present path samples the woven
++  // surface — never the raw SBS canvas (fixes trackpad-scroll SBS flicker).
++  overlay->displayxr_weave_source = overlay->mailbox;
++  overlay->displayxr_weave_target = target;
++  overlay->mailbox = slot;
++
++  // Record the release accounting for the presented scratch so mac's
++  // DidReceiveReleasedOverlays finds it. The scratch's lifetime is owned by
++  // |inline_3d_scratch_|, so a bare-mailbox lock (which keeps nothing alive) is
++  // all that's needed.
++  if (lock_index == std::numeric_limits<size_t>::max()) {
++    // Direct-scanout source: had no lock; the original canvas backing lives in
++    // |render_pass_backings_| (stays alive for this frame's GPU weave), so just
++    // ADD a bare-mailbox lock for the scratch.
++    locks->emplace_back(slot);
++  } else {
++    // PrepareRenderPassOverlay source: hold the original render_pass_lock one
++    // frame (keeps the backing in-flight for the GPU weave, and off the
++    // awaiting-release path since the original is no longer presented), and
++    // REPLACE its lock with a bare-mailbox lock on the presented scratch.
++    inline_3d_held_source_locks_.push_back(std::move((*locks)[lock_index]));
++    (*locks)[lock_index] = OverlayLock(slot);
++  }
++}
++#endif  // BUILDFLAG(IS_APPLE)
++
+ namespace {
+ SkColorMatrix ToColorMatrix(const SkM44& mat) {
+   std::array<float, 20> values;
+@@ -4495,6 +4646,9 @@ SkiaRenderer::OverlayLock::OverlayLock(SkiaRenderer::OverlayLock&& other) {
+ #if BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
+   render_pass_lock = std::move(other.render_pass_lock);
+ #endif  // BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_APPLE)
++  substituted_mailbox = std::move(other.substituted_mailbox);
++#endif  // BUILDFLAG(IS_APPLE)
+ }
+ 
+ SkiaRenderer::OverlayLock& SkiaRenderer::OverlayLock::OverlayLock::operator=(
+@@ -4504,6 +4658,9 @@ SkiaRenderer::OverlayLock& SkiaRenderer::OverlayLock::OverlayLock::operator=(
+ #if BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
+   render_pass_lock = std::move(other.render_pass_lock);
+ #endif  // BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_APPLE)
++  substituted_mailbox = std::move(other.substituted_mailbox);
++#endif  // BUILDFLAG(IS_APPLE)
+ 
+   return *this;
+ }
+@@ -4515,6 +4672,14 @@ SkiaRenderer::OverlayLock::OverlayLock(SkiaRenderer* renderer,
+ }
+ #endif  // BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_APPLE)
++SkiaRenderer::OverlayLock::OverlayLock(
++    const gpu::Mailbox& substituted_scratch_mailbox) {
++  // DisplayXR inline-3D weave (mac): accounting-only lock; keeps nothing alive.
++  substituted_mailbox = substituted_scratch_mailbox;
++}
++#endif  // BUILDFLAG(IS_APPLE)
++
+ #if BUILDFLAG(IS_APPLE)
+ std::size_t SkiaRenderer::OverlayLockHash::operator()(
+     const OverlayLock& o) const {
+diff --git a/components/viz/service/display/skia_renderer.h b/components/viz/service/display/skia_renderer.h
+index a7a1874eef8d0..5884406f4e1b9 100644
+--- a/components/viz/service/display/skia_renderer.h
++++ b/components/viz/service/display/skia_renderer.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPONENTS_VIZ_SERVICE_DISPLAY_SKIA_RENDERER_H_
+ #define COMPONENTS_VIZ_SERVICE_DISPLAY_SKIA_RENDERER_H_
+ 
++#include <array>
+ #include <memory>
+ #include <optional>
+ #include <tuple>
+@@ -67,6 +68,7 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
+   void BuffersPresented() override;
+   void DidReceiveReleasedOverlays(
+       const std::vector<gpu::Mailbox>& released_overlays) override;
++  void SetInline3DRects(const std::vector<gfx::Rect>& rects) override;
+ 
+   DelegatedInkPointRendererBase* GetDelegatedInkPointRenderer(
+       bool create_if_necessary) override;
+@@ -457,6 +459,16 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
+     OverlayLock(SkiaRenderer* renderer, const gpu::Mailbox& mailbox);
+ #endif  // BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_APPLE)
++    // DisplayXR inline-3D weave (mac): a bare-mailbox lock used purely for the
++    // |awaiting_release_overlay_locks_| accounting when the inline-3d canvas
++    // overlay's mailbox has been substituted to a Chromium-allocated woven
++    // scratch. It keeps nothing alive (the scratch's lifetime is owned by the
++    // per-target |inline_3d_scratch_| registry), it only carries the mailbox so
++    // DidReceiveReleasedOverlays finds the substituted mailbox on release.
++    explicit OverlayLock(const gpu::Mailbox& substituted_scratch_mailbox);
++#endif  // BUILDFLAG(IS_APPLE)
++
+     ~OverlayLock();
+ 
+     OverlayLock(OverlayLock&& other);
+@@ -466,6 +478,11 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
+     OverlayLock& operator=(const OverlayLock&) = delete;
+ 
+     const gpu::Mailbox& mailbox() const {
++#if BUILDFLAG(IS_APPLE)
++      if (substituted_mailbox.has_value()) {
++        return substituted_mailbox.value();
++      }
++#endif  // BUILDFLAG(IS_APPLE)
+ #if BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
+       if (render_pass_lock.has_value()) {
+         return render_pass_lock->mailbox();
+@@ -505,6 +522,13 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
+ #if BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
+     std::optional<ScopedInFlightRenderPassOverlayBackingRef> render_pass_lock;
+ #endif  // BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_OZONE) || BUILDFLAG(IS_WIN)
++
++#if BUILDFLAG(IS_APPLE)
++    // DisplayXR inline-3D weave (mac): set for a bare-mailbox accounting lock on
++    // a substituted woven scratch (see the explicit ctor above). Mutually
++    // exclusive with resource_lock/render_pass_lock.
++    std::optional<gpu::Mailbox> substituted_mailbox;
++#endif  // BUILDFLAG(IS_APPLE)
+   };
+ 
+   // Locks for overlays that are pending for SwapBuffers().
+@@ -535,6 +559,55 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
+   // the mailbox() as the unique key.
+   std::unordered_set<OverlayLock, OverlayLockHash, OverlayLockKeyEqual>
+       awaiting_release_overlay_locks_;
++
++  // DisplayXR inline-3D weave (mac) ------------------------------------------
++  // For each inline-3d element (by index into |inline_3d_rects_|) a persistent
++  // Chromium-allocated BGRA8 SCANOUT scratch SharedImage. In ScheduleOverlays
++  // we substitute the element's canvas render-pass overlay mailbox with this
++  // scratch; the GPU thread blits the woven anaglyph into it before present, so
++  // every present path samples the woven surface (fixes trackpad-scroll SBS
++  // flicker). Recreated when the canvas backing size changes.
++  struct Inline3DScratch {
++    // Ring of scratch IOSurfaces. CoreAnimation only re-composites a CALayer
++    // when its bound io_surface CHANGES; a single stable scratch is blitted with
++    // fresh woven pixels every frame but CA keeps showing the cached contents
++    // until an unrelated event dirties the layer tree (=> inline-3d content only
++    // advances on interaction/scroll when idle). Presenting a different slot
++    // each frame — as the renderer rotates its own canvas buffers — makes CA
++    // re-sample the fresh woven surface every frame.
++    static constexpr size_t kRingSize = 3;
++    std::array<gpu::Mailbox, kRingSize> mailbox;
++    gfx::Size size;
++    uint32_t next = 0;
++  };
++  std::vector<Inline3DScratch> inline_3d_scratch_;
++
++  // The window-relative device-px rects of this frame's inline-3d elements,
++  // handed in by Display::DrawAndSwap before DrawFrame().
++  std::vector<gfx::Rect> inline_3d_rects_;
++
++  // The canvas render-pass-backing locks for the substituted inline-3d overlays.
++  // We move each original render_pass_lock here (instead of leaving it in
++  // |pending_overlay_locks_|) because the original canvas backing is no longer
++  // presented — leaving its lock in the pending set would leak it into
++  // |awaiting_release_overlay_locks_| forever (never reported by CoreAnimation).
++  // Held one frame so the backing stays in-flight (not reused) while the GPU
++  // thread reads it for the weave; released at the start of the next
++  // ScheduleOverlays (by which point that frame's synchronous GPU weave is
++  // done).
++  std::vector<OverlayLock> inline_3d_held_source_locks_;
++
++  // Substitutes |overlay| (an inline-3d canvas render-pass overlay for element
++  // |target|) mailbox with the per-target woven scratch (created/resized as
++  // needed), records the original in |overlay->displayxr_weave_source|, and
++  // rewrites (*locks)[lock_index] (the render_pass_lock just recorded for
++  // |overlay|) to a bare-mailbox lock on the scratch, moving the original into
++  // |inline_3d_held_source_locks_|. Selection of which overlay is the inline-3d
++  // canvas happens in ScheduleOverlays().
++  void SubstituteInline3DOverlayMac(OverlayCandidate* overlay,
++                                    std::vector<OverlayLock>* locks,
++                                    size_t lock_index,
++                                    uint32_t target);
+ #endif  // BUILDFLAG(IS_APPLE)
+ 
+   const bool is_using_raw_draw_;
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+index 02ccbbf7b82e9..b10e9062bc8ae 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.cc
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -4,7 +4,7 @@
+ 
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
+ 
+ namespace viz {
+ 
+@@ -26,11 +26,13 @@ bool DisplayXRWeaveProvider::SubmitBatchSync() {
+   return false;
+ }
+ 
++#if BUILDFLAG(IS_WIN)
+ bool DisplayXRWeaveProvider::SetBatchOverlay(ID3D11Device* device,
+                                              ID3D11Texture2D* atlas_tex,
+                                              UINT array_slice) {
+   return false;
+ }
++#endif  // BUILDFLAG(IS_WIN)
+ 
+ void SetDisplayXRWeaveProvider(DisplayXRWeaveProvider* p) {
+   g_provider = p;
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index 8e5e7bc8d6cef..eeaad1b996fb8 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -7,9 +7,13 @@
+ 
+ #include "build/build_config.h"
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
+ 
++#if BUILDFLAG(IS_WIN)
+ #include <d3d11.h>
++#elif BUILDFLAG(IS_APPLE)
++#include <IOSurface/IOSurfaceRef.h>
++#endif
+ 
+ #include <cstdint>
+ 
+@@ -69,6 +73,7 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   // keys the per-target woven result. Copies |src_rect| into the owned keyed-
+   // mutex SBS input on |device| and fires WeaveSubmit. Returns true if a submit
+   // was issued (false if one is already in flight or the inputs were invalid).
++#if BUILDFLAG(IS_WIN)
+   virtual bool WeaveCanvas(ID3D11Device* device,
+                            ID3D11Texture2D* canvas_tex,
+                            UINT array_slice,
+@@ -87,6 +92,28 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+                            uint32_t stride,
+                            const gfx::Rect& window_rect,
+                            uint32_t target_id) = 0;
++#elif BUILDFLAG(IS_APPLE)
++  // macOS (#625 PR3): the canvas overlay is an IOSurface (from
++  // ProduceOverlayForWeave->GetIOSurface). WeaveCanvasMac MTLBlits the
++  // |src_rect| region into the shared window-sized input IOSurface at
++  // |window_rect|; WeavePixelsMac uploads CPU BGRA pixels. Same batch
++  // contract as Windows.
++  virtual bool WeaveCanvasMac(IOSurfaceRef canvas_iosurface,
++                              const gfx::Rect& src_rect,
++                              const gfx::Rect& window_rect,
++                              uint32_t target_id) = 0;
++  virtual bool WeavePixelsMac(const uint8_t* bgra_pixels,
++                              uint32_t stride,
++                              const gfx::Rect& window_rect,
++                              uint32_t target_id) = 0;
++
++  // Metal-blit the last woven output IOSurface's |src_rect| into |dst| (a
++  // Chromium-allocated, properly-formatted overlay IOSurface) at its origin. The
++  // runtime's exported woven IOSurface has no CV pixel format (MoltenVK export),
++  // so it can't be imported as a Chromium SharedImage directly; copying into a
++  // Chromium-native surface is the bridge. Returns false if no woven output yet.
++  virtual bool BlitWovenToMac(IOSurfaceRef dst, const gfx::Rect& src_rect) = 0;
++#endif
+ 
+   // If a completed weave result for |target_id| is available and not yet taken,
+   // move it into |*out| (transferring the woven/fence HANDLE ownership to the
+@@ -126,9 +153,11 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   // keyed-mutex overlay input on |device|. Returns true if the atlas was staged.
+   // A frame that never calls this weaves with no overlay (unchanged). Default:
+   // no-op (non-batch providers don't carry overlays).
++#if BUILDFLAG(IS_WIN)
+   virtual bool SetBatchOverlay(ID3D11Device* device,
+                                ID3D11Texture2D* atlas_tex,
+                                UINT array_slice);
++#endif  // BUILDFLAG(IS_WIN)
+ };
+ 
+ // Register / fetch the process-global provider (GPU process, GPU main thread).
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index cd0bd9016cfc8..e350aa56c6ce1 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -111,6 +111,18 @@
+ #include "ui/gfx/win/d3d_shared_fence.h"
+ #include "ui/gl/dc_layer_overlay_image.h"
+ #include "ui/gl/direct_composition_support.h"
++#elif BUILDFLAG(IS_APPLE)
++#include <IOSurface/IOSurface.h>
++
++#include <algorithm>
++#include <cstdlib>
++#include <limits>
++
++#include "components/viz/common/resources/shared_image_format.h"
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
++#include "ui/gfx/geometry/rect_conversions.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
++#include "ui/gfx/mac/io_surface.h"
+ #endif
+ 
+ #if BUILDFLAG(ENABLE_VULKAN)
+@@ -2440,6 +2452,11 @@ bool SkiaOutputSurfaceImplOnGpu::PresentFrame(OutputSurfaceFrame frame) {
+   }
+ 
+   if (!overlays_.empty()) {
++#if BUILDFLAG(IS_APPLE)
++    // DisplayXR inline-3D (#625, mac overlay path): weave the inline-3d canvas
++    // overlay(s) before they are presented to CoreAnimation. See header.
++    MaybeWeaveOverlaysMac();
++#endif
+     for (auto& each : overlays_) {
+       DBG_DRAW_RECT("output.overlay.rect", each.display_rect);
+       DBG_DRAW_RECT("output.overlay.damage", each.damage_rect);
+@@ -3578,6 +3595,168 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_APPLE)
++bool SkiaOutputSurfaceImplOnGpu::EnsureScratchClearedMac(
++    const gpu::Mailbox& scratch_mailbox) {
++  if (scratch_mailbox.IsZero()) {
++    return false;
++  }
++  if (displayxr_cleared_scratch_mac_.count(scratch_mailbox)) {
++    return true;
++  }
++  // A fresh SharedImage is UNCLEARED; Skia-write it once (marks cleared) so the
++  // overlay present path's BeginScopedReadAccess accepts it. The woven pixels
++  // are Metal-blitted into its IOSurface each frame (incl. this one), so the
++  // clear colour is immediately overwritten.
++  auto rep = shared_image_representation_factory_->ProduceSkia(
++      scratch_mailbox, context_state_.get());
++  if (!rep) {
++    return false;
++  }
++  std::vector<GrBackendSemaphore> sbegin, send;
++  SkSurfaceProps props;
++  auto write = rep->BeginScopedWriteAccess(
++      /*final_msaa_count=*/0, props, &sbegin, &send,
++      gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++  if (!write || !write->surface()) {
++    return false;
++  }
++  SkSurface* surface = write->surface();
++  if (!sbegin.empty()) {
++    surface->wait(sbegin.size(), sbegin.data(),
++                  /*deleteSemaphoresAfterWait=*/false);
++  }
++  surface->getCanvas()->clear(SkColors::kBlack);
++  FlushSurface(surface, send, write.get());
++  if (gr_context()) {
++    gr_context()->submit();
++  }
++  if (graphite_shared_context()) {
++    graphite_shared_context()->submit();
++  }
++  displayxr_cleared_scratch_mac_.insert(scratch_mailbox);
++  return true;
++}
++
++void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOverlaysMac() {
++  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++  if (overlays_.empty()) {
++    return;
++  }
++  auto* provider = GetDisplayXRWeaveProvider();
++  if (!provider || !provider->BatchMode()) {
++    return;  // mac weave is batch-only
++  }
++  const gfx::Rect window_bounds(size_);
++  if (window_bounds.IsEmpty()) {
++    return;
++  }
++
++  // The inline-3d canvas overlays were substituted by SkiaRenderer: each now
++  // presents a woven scratch (|mailbox|) and carries the original canvas
++  // render-pass backing in |displayxr_weave_source|. We weave the source (the
++  // full-resolution flat SBS) and blit the woven anaglyph into the presented
++  // scratch, so every present path — including the async trackpad-scroll fast
++  // path — samples the woven surface, never the raw SBS.
++  struct Weave {
++    size_t idx;                       // index into overlays_
++    uint32_t target;                  // inline-3d element index
++    gfx::ScopedIOSurface source_ios;  // canvas SBS (weave input)
++    int iw;
++    int ih;
++    int px;  // packed x-offset in the batch input (elements side-by-side)
++  };
++  std::vector<Weave> weaves;
++  // Pack the elements side-by-side into one batch input (each source at a
++  // cumulative x-offset), NOT all at origin: overlapping them at (0,0) makes
++  // every element read the same (last-wins) woven output — the multi-element
++  // gallery bug. The runtime weaves each rect in place and its output is the
++  // input size, so each element reads back its own packed sub-region below.
++  int input_w = 0;  // packed total width (sum of element widths)
++  int input_h = 0;  // max element height
++  for (size_t i = 0; i < overlays_.size(); ++i) {
++    const auto& o = overlays_[i];
++    if (o.displayxr_weave_source.IsZero() || o.mailbox.IsZero()) {
++      continue;
++    }
++    auto rep = shared_image_representation_factory_->ProduceOverlayForWeave(
++        o.displayxr_weave_source);
++    auto acc = rep ? rep->BeginScopedReadAccess() : nullptr;
++    gfx::ScopedIOSurface ios =
++        acc ? acc->GetIOSurface() : gfx::ScopedIOSurface();
++    if (!ios) {
++      continue;
++    }
++    const int iw = static_cast<int>(IOSurfaceGetWidth(ios.get()));
++    const int ih = static_cast<int>(IOSurfaceGetHeight(ios.get()));
++    weaves.push_back({i, o.displayxr_weave_target, ios, iw, ih, input_w});
++    input_w += iw;  // next element packs to the right
++    input_h = std::max(input_h, ih);
++  }
++  if (weaves.empty()) {
++    return;
++  }
++
++  // Phase A: weave every canvas at full backing resolution (correct 2x1
++  // un-squeeze), one batched synchronous submit.
++  provider->BeginBatchSync(gfx::Size(input_w, input_h));
++  for (const Weave& w : weaves) {
++    provider->WeaveCanvasMac(w.source_ios.get(), gfx::Rect(0, 0, w.iw, w.ih),
++                             gfx::Rect(w.px, 0, w.iw, w.ih), w.target);
++  }
++  const bool submit_ok = provider->SubmitBatchSync();
++  if (!submit_ok) {
++    return;
++  }
++
++  // Phase B: create/size each target's scratch (SkiaRenderer minted the mailbox
++  // but couldn't size it — the source's real size only lives in its IOSurface,
++  // which we read above), then blit the woven output into the scratch IOSurface.
++  for (const Weave& w : weaves) {
++    const gpu::Mailbox scratch = overlays_[w.idx].mailbox;
++    if (scratch.IsZero()) {
++      continue;
++    }
++    const gfx::Size want(w.iw, w.ih);
++    auto it = displayxr_scratch_sizes_mac_.find(scratch);
++    if (it == displayxr_scratch_sizes_mac_.end() || it->second != want) {
++      if (it != displayxr_scratch_sizes_mac_.end()) {
++        shared_image_factory_->DestroySharedImage(scratch);
++        displayxr_cleared_scratch_mac_.erase(scratch);
++        displayxr_scratch_sizes_mac_.erase(it);
++      }
++      // SCANOUT routes the scratch to IOSurfaceImageBacking (BGRA8) — both
++      // Skia-writable (the one-time clear below) and Overlay-readable
++      // (ProduceOverlayForWeave -> GetIOSurface, blitted into and presented).
++      gpu::SharedImageInfo si_info(
++          SinglePlaneFormat::kBGRA_8888, want, gfx::ColorSpace::CreateSRGB(),
++          kTopLeft_GrSurfaceOrigin, kPremul_SkAlphaType,
++          gpu::SHARED_IMAGE_USAGE_SCANOUT | gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++              gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE,
++          "DisplayXRInline3DWovenScratch");
++      if (!shared_image_factory_->CreateSharedImage(scratch, si_info,
++                                                    gpu::kNullSurfaceHandle)) {
++        continue;
++      }
++      displayxr_scratch_sizes_mac_[scratch] = want;
++    }
++    const bool cleared = EnsureScratchClearedMac(scratch);
++    if (!cleared) {
++      continue;
++    }
++    auto rep =
++        shared_image_representation_factory_->ProduceOverlayForWeave(scratch);
++    auto acc = rep ? rep->BeginScopedReadAccess() : nullptr;
++    gfx::ScopedIOSurface dst =
++        acc ? acc->GetIOSurface() : gfx::ScopedIOSurface();
++    if (!dst) {
++      continue;
++    }
++    provider->BlitWovenToMac(dst.get(), gfx::Rect(w.px, 0, w.iw, w.ih));
++  }
++}
++#endif  // BUILDFLAG(IS_APPLE)
++
+ void SkiaOutputSurfaceImplOnGpu::CreateSharedImage(
+     gpu::Mailbox mailbox,
+     SharedImageFormat format,
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index d7b7676c8f83d..fb248ee10291b 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -528,6 +528,24 @@ class SkiaOutputSurfaceImplOnGpu
+                               bool prefer_zero_copy);
+ #endif
+ 
++#if BUILDFLAG(IS_APPLE)
++  // DisplayXR inline-3D (#625, mac overlay path). Unlike Windows (which weaves
++  // the composited root render pass in FinishPaint*), macOS delegates the whole
++  // page to CoreAnimation CALayer overlays and never composites a viz root, so
++  // the FinishPaint hook never fires. Instead, at present time (right before
++  // output_device_->ScheduleOverlays), find the overlay(s) whose display_rect
++  // matches an inline_3d_rects_ entry — that overlay's IOSurface holds the
++  // element's flat SBS pixels — weave that IOSurface (WeaveCanvasMac ->
++  // SubmitBatchSync) and (Phase 2) substitute the woven IOSurface into the
++  // overlay so CoreAnimation composites the woven result. GPU main thread.
++  void MaybeWeaveOverlaysMac();
++  // Skia-clears |scratch_mailbox| once (a fresh SharedImage is UNCLEARED, which
++  // the overlay present path rejects), tracking it in
++  // |displayxr_cleared_scratch_mac_|. Returns true if the scratch is (now)
++  // cleared and safe to present.
++  bool EnsureScratchClearedMac(const gpu::Mailbox& scratch_mailbox);
++#endif
++
+   class ReleaseCurrent {
+    public:
+     ReleaseCurrent(scoped_refptr<gl::GLSurface> gl_surface,
+@@ -736,6 +754,24 @@ class SkiaOutputSurfaceImplOnGpu
+   gfx::Size displayxr_shared_woven_size_;
+ #endif
+ 
++#if BUILDFLAG(IS_APPLE)
++  // DisplayXR inline-3D weave (mac): woven-scratch mailboxes (allocated by
++  // SkiaRenderer and substituted into the inline-3d canvas overlays) that have
++  // been Skia-cleared once. A fresh SharedImage is UNCLEARED, so the overlay
++  // present path's BeginScopedReadAccess would reject it — we Skia-clear each
++  // scratch once, then Metal-blit the woven pixels into its IOSurface every
++  // frame. A recreated scratch (canvas size change) gets a new mailbox, so this
++  // set self-heals. See MaybeWeaveOverlaysMac().
++  std::set<gpu::Mailbox> displayxr_cleared_scratch_mac_;
++
++  // Woven-scratch SharedImages the GPU thread owns, keyed by the stable mailbox
++  // SkiaRenderer minted for each inline-3d target. Value is the size they were
++  // created at (== the source canvas IOSurface size, which viz can't read since
++  // the matched overlay's resource_size_in_pixels is often 0x0). Created lazily
++  // in MaybeWeaveOverlaysMac(), recreated if the source size changes.
++  std::map<gpu::Mailbox, gfx::Size> displayxr_scratch_sizes_mac_;
++#endif  // BUILDFLAG(IS_APPLE)
++
+   THREAD_CHECKER(thread_checker_);
+ 
+ #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.cc b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+index 1af4b17e4e399..52bfec29edd43 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+@@ -1194,7 +1194,7 @@ SharedImageRepresentationFactory::ProduceOverlay(const gpu::Mailbox& mailbox) {
+   return manager_->ProduceOverlay(mailbox, memory_type_tracker_.get());
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
+ std::unique_ptr<OverlayImageRepresentation>
+ SharedImageRepresentationFactory::ProduceOverlayForWeave(
+     const gpu::Mailbox& mailbox) {
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.h b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+index dfe39d8c629d5..7d21623feb57c 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+@@ -305,7 +305,7 @@ class GPU_GLES2_EXPORT SharedImageRepresentationFactory {
+       scoped_refptr<SharedContextState> context_state);
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox);
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
+   // DisplayXR inline-3D (#625, Step B): SCANOUT-free overlay produce used to read
+   // a (DISPLAY_READ/WRITE, non-SCANOUT) D3DImageBacking's ID3D11Texture2D on the
+   // GPU thread for the weave copy. See SharedImageManager::ProduceOverlayForWeave.
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.cc b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+index 4422c45111df0..de3bbec3b72e7 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+@@ -384,7 +384,7 @@ std::unique_ptr<OverlayImageRepresentation> SharedImageManager::ProduceOverlay(
+   return representation;
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
+ std::unique_ptr<OverlayImageRepresentation>
+ SharedImageManager::ProduceOverlayForWeave(const gpu::Mailbox& mailbox,
+                                            gpu::MemoryTypeTracker* tracker) {
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.h b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+index 62ecba1d8f867..35b50eb38c862 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+@@ -117,7 +117,7 @@ class GPU_GLES2_EXPORT SharedImageManager
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
+   // DisplayXR inline-3D (#625, Step B). Identical to ProduceOverlay but WITHOUT
+   // the SCANOUT usage enforcement: the overlay representation is the GPU-thread
+   // path that exposes a backing's ID3D11Texture2D (via GetDCLayerOverlayImage),
+-- 
+2.50.1 (Apple Git-155)
+
