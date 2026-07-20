@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Mon, 20 Jul 2026 08:48:44 +0900
+Subject: [PATCH 50/51] inline-3d(#30): pre-blend page backdrop under the SBS
+ weave input
+
+A transparent inline-3D canvas (hello-cube: alpha:true + 0-alpha clear +
+scene.background=null + per-eye edge feather) was weaving without its
+backdrop. The weave input prefers the clean canvas-layer resource
+(clean_sbs_mailbox) over the composited snapshot so #18's 2D chrome stays
+out of the SBS -- but that also drops everything painted UNDER the canvas.
+
+The de-occluded band rendered BLACK, not page-showing-through, because the
+Windows Leia DP is NOT alpha-native (is_alpha_native == false): it
+reconstructs transparency with an all-views-AND gate whose test is a literal
+alpha > 0.0 with no epsilon. The feathered edge carries small non-zero alpha,
+so it fails "all transparent" and is forced opaque over black.
+
+Fix: resolve transparency PRE-weave in per-view RGB, sourced from the page
+(NOT the DP's WGC capture, which only ever sees the monitor behind the window,
+never the page's own back elements -- and is expensive + one frame stale).
+|output| at the tile rect IS that backdrop already, because browser#22
+suppression removed the canvas and #18 overlay quads from the composited
+output -- so it is exactly "composited output minus canvas minus overlays".
+Draw it under both eye halves at ZERO DISPARITY (same screen region per half)
+so it survives the interlace crisp at z=0, then composite the clean SBS OVER
+it (kSrcOver instead of kSrc). Gated on src_from_canvas -- precisely the tiles
+where suppression fired.
+
+The tile becomes opaque (alpha=1), which the gate handles correctly and which
+moots the premul-vs-straight alpha conflict inside the tile (runtime#771).
+Same primitive browser#23 needs for frosted banners -- built once.
+
+HW-validated on Leia (Official build): hello-cube feather band now shows the
+page through instead of black, and the gallery-theater poster-through-canvas
+artefact (previously triaged content-side) is gone -- it was this same gap
+from the other side.
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 81 ++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 22da0b9cf3092..79265d9318de0 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2966,6 +2966,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+               canvas_access;
+           sk_sp<SkImage> src_img;
+           bool src_from_canvas = false;
++          // Set when the page backdrop has been pre-blended into the scratch
++          // beneath the SBS (browser#30) -- the SBS must then composite OVER it
++          // rather than replace it.
++          bool blended_backdrop = false;
+           if (!clean_sbs_mailbox.IsZero()) {
+             canvas_rep = shared_image_representation_factory_->ProduceSkia(
+                 clean_sbs_mailbox, context_state_.get());
+@@ -2992,6 +2996,78 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           if (!src_img) {
+             return fail("makeImageSnapshot");
+           }
++
++          // browser#30: PRE-BLEND THE PAGE BACKDROP UNDER THE SBS.
++          //
++          // The clean canvas resource above is the RIGHT source for the weave
++          // (it keeps 2D chrome out of the SBS — browser#18), but it is only the
++          // canvas: an alpha:true canvas with a 0-alpha clear (hello-cube) is
++          // transparent over most of its area, so weaving it alone drops
++          // everything painted UNDER it.
++          //
++          // Transparency cannot be recovered after the weave. The Windows DP is
++          // NOT alpha-native (is_alpha_native == false on every Leia DP); it
++          // reconstructs transparency with an all-views-AND gate whose test is a
++          // literal alpha > 0.0 with no epsilon. A feathered edge has small
++          // non-zero alpha, so it fails "all transparent" and is forced OPAQUE
++          // over black -> the de-occluded band renders BLACK.
++          //
++          // So resolve transparency PRE-weave, in per-view RGB, while the
++          // subpixels are still separable -- the same principle that made
++          // alpha-weave unworkable and that the DP's own compose-under-bg uses.
++          // We source the backdrop from the page rather than from the DP's WGC
++          // capture: that capture is of the MONITOR behind the window (with the
++          // browser excluding itself), so it can only ever supply the desktop,
++          // never the page's own back elements -- and it costs a frame copy and
++          // is one WGC frame stale. The browser already holds these pixels.
++          //
++          // |output| at |rect| IS that backdrop already: browser#22 suppression
++          // removed the canvas quad and the #18 overlay quads from the
++          // composited output (they are drawn back over the weave), so the
++          // snapshot is exactly "composited output minus canvas minus
++          // overlays". Hence the gate below on |src_from_canvas| -- that is
++          // precisely the case where suppression fired for this tile.
++          //
++          // The backdrop is 2D, so it goes under BOTH eye halves at ZERO
++          // DISPARITY (the same screen region in each half), which is what makes
++          // it survive the interlace crisp at z = 0. Cost: it is squeezed to
++          // half width per view, so page content under the canvas carries the
++          // same horizontal resolution the 3D content does. This is the shared
++          // primitive browser#23 needs for frosted banners.
++          //
++          // Result: the tile becomes opaque (alpha = 1), which the gate handles
++          // correctly, and which also moots the premultiplied-vs-straight alpha
++          // conflict inside the tile (see displayxr-runtime#771).
++          if (src_from_canvas) {
++            sk_sp<SkImage> backdrop = output->makeImageSnapshot(
++                SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
++            if (backdrop) {
++              // The weave input is a side-by-side pair (the weave path is
++              // 2-view: process_atlas(..., W/2, H, 2, 1, ...)). Phase 2's
++              // N-view atlas would loop the same draw over N tiles.
++              constexpr int kWeaveViewCount = 2;
++              const SkRect backdrop_src =
++                  SkRect::MakeWH(backdrop->width(), backdrop->height());
++              SkPaint backdrop_paint;
++              backdrop_paint.setBlendMode(SkBlendMode::kSrc);
++              const float half_w =
++                  static_cast<float>(rw) / kWeaveViewCount;
++              for (int v = 0; v < kWeaveViewCount; ++v) {
++                // Float bounds so an odd |rw| leaves no seam between halves.
++                const SkRect dst = SkRect::MakeLTRB(v * half_w, 0,
++                                                    (v + 1) * half_w, rh);
++                // Linear, not nearest: this is a 2:1 horizontal downscale of
++                // page content (text), where nearest aliases badly.
++                scratch_surface->getCanvas()->drawImageRect(
++                    backdrop.get(), backdrop_src, dst,
++                    SkSamplingOptions(SkFilterMode::kLinear), &backdrop_paint,
++                    SkCanvas::kStrict_SrcRectConstraint);
++              }
++              // The SBS now composites OVER the backdrop instead of replacing
++              // it (see the kSrcOver selection below).
++              blended_backdrop = true;
++            }
++          }
+           // Source rect. The canvas resource is the WHOLE tile's SBS, mapped to
+           // the canvas layer's UNCLIPPED rect |clean_sbs_rect| (NOT
+           // inline_3d_rects_[t], which is the already-clipped visible bounds —
+@@ -3014,7 +3090,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                                    rect.height() / fh * ih);
+           }
+           SkPaint paint;
+-          paint.setBlendMode(SkBlendMode::kSrc);
++          // kSrcOver only when a backdrop was laid down first (browser#30);
++          // otherwise kSrc, so the scratch is fully defined by this one draw.
++          paint.setBlendMode(blended_backdrop ? SkBlendMode::kSrcOver
++                                              : SkBlendMode::kSrc);
+           scratch_surface->getCanvas()->drawImageRect(
+               src_img.get(), src, SkRect::MakeWH(rw, rh),
+               SkSamplingOptions(SkFilterMode::kNearest), &paint,
