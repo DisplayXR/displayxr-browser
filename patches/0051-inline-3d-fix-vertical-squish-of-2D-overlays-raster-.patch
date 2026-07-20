@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Mon, 20 Jul 2026 10:29:30 +0900
+Subject: [PATCH 51/51] inline-3d: fix vertical squish of 2D overlays (raster
+ padding sampled as content)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every DP-composited 2D overlay was vertically squished, badly for short/wide
+elements (a sticky header bar) and imperceptibly for tall ones. Distinct from the
+fixed browser#29 2x blow-up — this is a permanent Y-compression.
+
+Root cause, measured with a per-overlay VLOG on hardware: the isolated-layer
+raster (overlay_img) is allocated with GPU tile-alignment PADDING — width rounded
+up to a multiple of 32, HEIGHT to a multiple of 64. A 3844x140 header bar rasters
+into a 3872x192 image; a 750x750 square into 768x768. The element content sits 1:1
+in the top-left, the extra right/bottom texels are empty.
+
+The overlay-atlas draw computed sy = overlay_img->height()/full.height() (= 192/140
+= 1.371) and sampled the WHOLE padded image into the content-height dst, crushing
+the real 140px of content into 140*140/192 ~= 73% height. On a 750px square the
+ratio is 750/768 ~= 98%, invisible — which is exactly why wide-short bars squished
+while a 300px square looked perfect.
+
+Fix: the raster is the content at device scale plus padding, not a stretched copy
+of |full|, so sample the content region at SCALE 1 keyed off |full| and let the
+kStrict clamp exclude the padding. Clipped overlays (browser#18 bug B) still take
+only their visible fraction (r - full), now without the bogus img/full scale.
+
+HW-validated on Leia: the overlay-aspect-test probe matrix (full-width top/mid bars,
+narrow bars, 300px square — inscribed circles) went from P1-P4 squished / P5 fine to
+all round. David: "FIXED".
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 31 ++++++++++++-------
+ 1 file changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 79265d9318de0..cd0bd9016cfc8 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3358,17 +3358,26 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           // fix bug B applied to the canvas path: key off the unclipped rect and
+           // take the matching fraction of the source.
+           const gfx::Rect full = overlay.rect;
+-          const float sx = full.width() > 0
+-                               ? static_cast<float>(overlay_img->width()) /
+-                                     static_cast<float>(full.width())
+-                               : 1.0f;
+-          const float sy = full.height() > 0
+-                               ? static_cast<float>(overlay_img->height()) /
+-                                     static_cast<float>(full.height())
+-                               : 1.0f;
+-          const SkRect src =
+-              SkRect::MakeXYWH((r.x() - full.x()) * sx, (r.y() - full.y()) * sy,
+-                               r.width() * sx, r.height() * sy);
++          // The isolated-layer raster (overlay_img) is allocated with GPU
++          // tile-alignment PADDING — its width is rounded up to a multiple of 32
++          // and its HEIGHT to a multiple of 64 (measured: a 3844x140 bar → a
++          // 3872x192 image, a 750x750 square → 768x768). The element's content
++          // sits 1:1 in the TOP-LEFT of that image; the extra right/bottom texels
++          // are empty. So the raster is the content at device scale plus padding,
++          // NOT a stretched copy of |full|.
++          //
++          // Therefore sample the content region at SCALE 1, keyed off |full|, and
++          // let kStrict clamp keep the empty padding out. The earlier code scaled
++          // the source by overlay_img/full and thereby pulled the padding into
++          // |dst|, vertically SQUISHING every overlay by content/allocated —
++          // catastrophic for short elements (a 140px bar crushed into 140*140/192
++          // ≈ 73% height) and ~invisible for tall ones (750/768 ≈ 98%), which is
++          // exactly why wide-short bars squished while a 300px square did not
++          // (browser#29-Y). r ⊆ full, so (r − full) is the visible sub-rect of the
++          // content and maps 1:1 into |dst|; a clipped overlay (browser#18 bug B)
++          // still takes only its visible fraction, just without the bogus scale.
++          const SkRect src = SkRect::MakeXYWH(r.x() - full.x(), r.y() - full.y(),
++                                              r.width(), r.height());
+           const SkRect dst =
+               SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
+           atlas_surface->getCanvas()->drawImageRect(

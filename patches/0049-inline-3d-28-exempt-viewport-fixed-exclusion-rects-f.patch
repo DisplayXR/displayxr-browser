@@ -1,0 +1,426 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sun, 19 Jul 2026 22:34:59 +0900
+Subject: [PATCH 49/51] inline-3d(#28): exempt viewport-fixed exclusion rects
+ from the impl-scroll patch
+
+The sticky gallery header briefly blew up (~2x) over the woven tiles on a fast
+scroll. Root cause was not Blink: a CDP rAF probe showed
+#app-header.getBoundingClientRect() stable at y=0 h=56.8 CSS across 283 samples
+with flings up to 40000 px/s. The drift was injected downstream, in cc.
+
+LayerTreeHostImpl::MakeCompositorFrameMetadata's "#625 Phase 2 scroll-sync"
+block shifts every reported rect by the viewport's impl-accumulated scroll
+delta, to correct for scrolling that happened after the commit that supplied
+the rects. That is right for content that scrolls with the viewport -- its own
+comment says "the dominant case" -- and pure error for a viewport-fixed
+element, which does not move with the scroll at all. Measured shifts ran to
++/-4700 device px, so on a fling the header rect either missed its quad
+entirely or, when it went negative, got clipped at the surface top into a short
+hole. Either way the exclusion no longer matched a root resource quad, so
+display.cc never added it to SetInline3dSuppressedResources, so the header
+stayed in the tile's SBS weave input and got woven. At rest the delta is zero
+and on a slow scroll it stays inside best_match's 70% bar, which is why this
+only ever showed up on a fast scroll.
+
+Split the exclusion list: Blink puts rects whose element is viewport-fixed into
+exclusion_fixed_rects, cc patches only the scrolling lists, then appends the
+fixed list verbatim. Downstream (aggregator, GPU stage) still sees one flat
+list and needs no change -- the split exists only to decide who gets the shift.
+A position:sticky element is treated as fixed only while actually stuck
+(non-zero StickyPositionOffset), since before it reaches its threshold it does
+scroll with the content and the patch is correct for it.
+
+Measured on the gallery, Official build, identical 8-fling workload:
+  NO match for target      3652 -> 272 (the residual is mostly empty 0x0 rects)
+  #22 (B) unmatched          27 -> 0
+  header rects drifted    20/26 -> none logged
+  overlays= steady state     12 -> 12 (canvas_res=6 both) -- none dropped
+Weave healthy throughout (one submit, eyes_valid=1). Hardware-confirmed by
+David: the pop is gone.
+
+An earlier attempt moved exclusions onto the tracked-element channel
+(draw-time ScreenSpaceTransform, like the canvas rects). It fixed the drift but
+its per-frame fallback dropped overlays and let occasional bad frames through,
+so it was reverted in favour of this.
+
+The TreesInViz-in-client path is covered (it feeds UpdateDisplayTree from
+metadata, after the append). The in-viz-process path does not carry the split
+over its mojom update and keeps today's behaviour -- nothing dropped; noted in
+a comment as a follow-up.
+
+Refs: browser#28
+---
+ cc/trees/commit_state.cc                      |  1 +
+ cc/trees/commit_state.h                       |  7 ++++
+ cc/trees/layer_tree_host.cc                   | 12 ++++--
+ cc/trees/layer_tree_host.h                    |  6 ++-
+ cc/trees/layer_tree_host_impl.cc              | 34 ++++++++++++++++
+ cc/trees/layer_tree_host_impl.h               |  9 +++++
+ cc/trees/layer_tree_impl.cc                   |  6 ++-
+ cc/trees/layer_tree_impl.h                    |  8 +++-
+ .../core/frame/web_frame_widget_impl.cc       |  6 ++-
+ .../core/frame/web_frame_widget_impl.h        |  6 ++-
+ .../blink/renderer/modules/xr/xr_session.cc   | 40 ++++++++++++++++++-
+ .../renderer/platform/widget/frame_widget.h   | 11 +++--
+ 12 files changed, 130 insertions(+), 16 deletions(-)
+
+diff --git a/cc/trees/commit_state.cc b/cc/trees/commit_state.cc
+index 712ddcbaabb76..22f30c9fab402 100644
+--- a/cc/trees/commit_state.cc
++++ b/cc/trees/commit_state.cc
+@@ -21,6 +21,7 @@ CommitState::CommitState(const CommitState& prev)
+       browser_controls_params(prev.browser_controls_params),
+       inline_3d_rects(prev.inline_3d_rects),
+       inline_3d_exclusion_rects(prev.inline_3d_exclusion_rects),
++      inline_3d_exclusion_fixed_rects(prev.inline_3d_exclusion_fixed_rects),
+       event_listener_properties(prev.event_listener_properties),
+       bottom_controls_shown_ratio(prev.bottom_controls_shown_ratio),
+       device_scale_factor(prev.device_scale_factor),
+diff --git a/cc/trees/commit_state.h b/cc/trees/commit_state.h
+index 519878c62485c..8aa2c2a0d8897 100644
+--- a/cc/trees/commit_state.h
++++ b/cc/trees/commit_state.h
+@@ -97,6 +97,13 @@ struct CC_EXPORT CommitState {
+   // channel/timing as inline_3d_rects; the weave draw-back leaves these pixels
+   // as composited 2D (final = M·weave + (1−M)·2D, M=0 inside).
+   std::vector<gfx::Rect> inline_3d_exclusion_rects;
++  // DisplayXR (browser#28): exclusion rects whose element is VIEWPORT-FIXED
++  // (position:fixed, or a currently-stuck position:sticky). Same units and
++  // timing as inline_3d_exclusion_rects, carried separately because they must
++  // NOT receive the impl-scroll-delta patch in
++  // LayerTreeHostImpl::MakeCompositorFrameMetadata: a viewport-fixed element
++  // does not move with the scroll, so shifting it by the delta IS the error.
++  std::vector<gfx::Rect> inline_3d_exclusion_fixed_rects;
+   std::array<EventListenerProperties, kEventListenerClassCount>
+       event_listener_properties = {EventListenerProperties::kNone};
+   float bottom_controls_shown_ratio = 0.f;
+diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
+index 29f899a040082..87c43460a91b0 100644
+--- a/cc/trees/layer_tree_host.cc
++++ b/cc/trees/layer_tree_host.cc
+@@ -1564,15 +1564,21 @@ void LayerTreeHost::SetBrowserControlsParams(
+   SetNeedsCommit();
+ }
+ 
+-void LayerTreeHost::SetInline3DRects(std::vector<gfx::Rect> rects,
+-                                     std::vector<gfx::Rect> exclusion_rects) {
++void LayerTreeHost::SetInline3DRects(
++    std::vector<gfx::Rect> rects,
++    std::vector<gfx::Rect> exclusion_rects,
++    std::vector<gfx::Rect> exclusion_fixed_rects) {
+   if (pending_commit_state()->inline_3d_rects == rects &&
+-      pending_commit_state()->inline_3d_exclusion_rects == exclusion_rects) {
++      pending_commit_state()->inline_3d_exclusion_rects == exclusion_rects &&
++      pending_commit_state()->inline_3d_exclusion_fixed_rects ==
++          exclusion_fixed_rects) {
+     return;
+   }
+   pending_commit_state()->inline_3d_rects = std::move(rects);
+   pending_commit_state()->inline_3d_exclusion_rects =
+       std::move(exclusion_rects);
++  pending_commit_state()->inline_3d_exclusion_fixed_rects =
++      std::move(exclusion_fixed_rects);
+   SetNeedsCommit();
+ }
+ 
+diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
+index 638267d2dd173..12cc1cfcd1590 100644
+--- a/cc/trees/layer_tree_host.h
++++ b/cc/trees/layer_tree_host.h
+@@ -589,8 +589,12 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
+   // are 2D-overlay holes for the weave draw-back, carried via
+   // CompositorFrameMetadata::inline_3d_exclusion_rects; set together so rects
+   // and holes stay frame-atomic.
++  // |exclusion_fixed_rects| (browser#28) are exclusion rects whose element is
++  // viewport-fixed; they are exempt from the impl-scroll-delta patch applied to
++  // the other two lists.
+   void SetInline3DRects(std::vector<gfx::Rect> rects,
+-                        std::vector<gfx::Rect> exclusion_rects);
++                        std::vector<gfx::Rect> exclusion_rects,
++                        std::vector<gfx::Rect> exclusion_fixed_rects);
+ 
+   void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
+   const OverscrollBehavior& overscroll_behavior() const {
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index 89a660342c158..2c5fdfae88100 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -2459,16 +2459,31 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+   // rects (window-relative device px) so Viz can weave those output sub-rects.
+   // In TreesInViz-in-viz mode the Viz-side active tree never receives the rects,
+   // so take them from the client-supplied copy (mirrors tracked_element_rects).
++  // DisplayXR (browser#28): viewport-fixed exclusion rects are held aside while
++  // the scroll-delta patch below runs, then appended verbatim.
++  std::vector<gfx::Rect> inline_3d_exclusion_fixed_rects;
+   if (settings().trees_in_viz_in_viz_process) {
+     metadata.tracked_element_rects = tracked_element_rects_from_client_;
+     metadata.inline_3d_rects = inline_3d_rects_from_client_;
+     metadata.inline_3d_exclusion_rects = inline_3d_exclusion_rects_from_client_;
++    // NOTE (browser#28): the TreesInViz-in-VIZ-process path does not carry the
++    // scrolling/fixed split over its mojom update, so this stays empty and that
++    // mode keeps today's behaviour (fixed exclusions still get the scroll
++    // patch). No rects are dropped — it is exactly as before the split. That
++    // mode is off by default; wiring the split through the mojom update is a
++    // follow-up. The TreesInViz-in-CLIENT-process path is unaffected: it feeds
++    // UpdateDisplayTree from metadata.inline_3d_exclusion_rects, which by then
++    // already has the fixed rects appended below.
++    inline_3d_exclusion_fixed_rects =
++        inline_3d_exclusion_fixed_rects_from_client_;
+   } else {
+     metadata.tracked_element_rects = CollectTrackedElementRects(
+         /*is_for_compositor_frame_metadata=*/true);
+     metadata.inline_3d_rects = active_tree()->inline_3d_rects();
+     metadata.inline_3d_exclusion_rects =
+         active_tree()->inline_3d_exclusion_rects();
++    inline_3d_exclusion_fixed_rects =
++        active_tree()->inline_3d_exclusion_fixed_rects();
+   }
+   // DisplayXR inline-3D (#625, Step B / Phase 2 — scroll-sync): the rects above
+   // are getBoundingClientRect measured on the Blink main thread at the COMMITTED
+@@ -2508,6 +2523,9 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+           for (gfx::Rect& r : metadata.inline_3d_exclusion_rects) {
+             r.Offset(-dx, -dy);
+           }
++          // NOTE (browser#28): viewport-fixed exclusion rects are deliberately
++          // NOT in either list above — see the append below. They do not move
++          // with the scroll, so this shift would be pure error for them.
+           static int log_throttle = 0;
+           if ((log_throttle++ % 30) == 0) {
+             VLOG(1) << "[DisplayXR] Phase2 scroll-sync: viewport impl delta dip="
+@@ -2520,6 +2538,22 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+     }
+   }
+ 
++  // DisplayXR (browser#28): now that the scroll-delta patch has run, fold the
++  // viewport-fixed exclusion rects in UNPATCHED. Downstream (Viz aggregator,
++  // GPU stage) sees one flat list and needs no change — the distinction exists
++  // only to decide who gets the shift. Before this split, a `position: sticky`
++  // header was shifted by the full impl delta during a fling: hundreds to
++  // thousands of device px, which either drove the rect off its quad entirely
++  // or, when it went negative, got it clipped at the surface top into a short
++  // hole — leaving a strip of the header inside the tile's SBS weave input to
++  // be woven (~2x blow-up). At rest and on slow scrolls the delta is small
++  // enough that the rect still matched, which is why this only ever showed up
++  // on a fast scroll.
++  metadata.inline_3d_exclusion_rects.insert(
++      metadata.inline_3d_exclusion_rects.end(),
++      inline_3d_exclusion_fixed_rects.begin(),
++      inline_3d_exclusion_fixed_rects.end());
++
+   if (!screenshot_destination_.is_empty()) {
+     metadata.screenshot_destination =
+         blink::SameDocNavigationScreenshotDestinationToken(
+diff --git a/cc/trees/layer_tree_host_impl.h b/cc/trees/layer_tree_host_impl.h
+index 8fe6593739b27..53567f86cc604 100644
+--- a/cc/trees/layer_tree_host_impl.h
++++ b/cc/trees/layer_tree_host_impl.h
+@@ -590,6 +590,13 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+     inline_3d_exclusion_rects_from_client_ = std::move(exclusion_rects);
+   }
+ 
++  // browser#28: viewport-fixed exclusion rects, exempt from the scroll patch.
++  void set_inline_3d_exclusion_fixed_rects_from_client(
++      std::vector<gfx::Rect> exclusion_fixed_rects) {
++    inline_3d_exclusion_fixed_rects_from_client_ =
++        std::move(exclusion_fixed_rects);
++  }
++
+   // Buffers `callback` until a relevant presentation feedback arrives, at which
+   // point the callback will be posted to run on the main thread. A presentation
+   // feedback is considered relevant if the frame's token is greater than or
+@@ -1384,6 +1391,8 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+   std::vector<gfx::Rect> inline_3d_rects_from_client_;
+   // Overlay-exclusion holes (browser#18) riding the same client channel.
+   std::vector<gfx::Rect> inline_3d_exclusion_rects_from_client_;
++  // Viewport-fixed subset (browser#28), exempt from the scroll-delta patch.
++  std::vector<gfx::Rect> inline_3d_exclusion_fixed_rects_from_client_;
+ 
+   // Settings whether we dump generated compositor frame during DrawLayers.
+   // They are for debug purposes for TreesInViz and TreeAnimationsInViz.
+diff --git a/cc/trees/layer_tree_impl.cc b/cc/trees/layer_tree_impl.cc
+index 7fad55bdb07c7..696cd96bdce6d 100644
+--- a/cc/trees/layer_tree_impl.cc
++++ b/cc/trees/layer_tree_impl.cc
+@@ -886,7 +886,8 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
+ 
+   SetBrowserControlsParams(commit_state.browser_controls_params);
+   SetInline3DRects(commit_state.inline_3d_rects,
+-                   commit_state.inline_3d_exclusion_rects);
++                   commit_state.inline_3d_exclusion_rects,
++                   commit_state.inline_3d_exclusion_fixed_rects);
+   set_overscroll_behavior(commit_state.overscroll_behavior);
+   PushBrowserControlsFromMainThread(commit_state.top_controls_shown_ratio,
+                                     commit_state.bottom_controls_shown_ratio);
+@@ -1013,7 +1014,8 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
+   target_tree->SetExternalPageScaleFactor(external_page_scale_factor_);
+ 
+   target_tree->SetBrowserControlsParams(browser_controls_params_);
+-  target_tree->SetInline3DRects(inline_3d_rects_, inline_3d_exclusion_rects_);
++  target_tree->SetInline3DRects(inline_3d_rects_, inline_3d_exclusion_rects_,
++                                inline_3d_exclusion_fixed_rects_);
+   target_tree->PushBrowserControls(nullptr, nullptr);
+ 
+   target_tree->set_overscroll_behavior(overscroll_behavior_);
+diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
+index b359821886024..d9f3199b9d7dc 100644
+--- a/cc/trees/layer_tree_impl.h
++++ b/cc/trees/layer_tree_impl.h
+@@ -674,9 +674,11 @@ class CC_EXPORT LayerTreeImpl {
+   // LayerTreeHostImpl::MakeCompositorFrameMetadata. The exclusion rects
+   // (browser#18) are the 2D-overlay weave holes riding the same push.
+   void SetInline3DRects(std::vector<gfx::Rect> rects,
+-                        std::vector<gfx::Rect> exclusion_rects) {
++                        std::vector<gfx::Rect> exclusion_rects,
++                        std::vector<gfx::Rect> exclusion_fixed_rects) {
+     inline_3d_rects_ = std::move(rects);
+     inline_3d_exclusion_rects_ = std::move(exclusion_rects);
++    inline_3d_exclusion_fixed_rects_ = std::move(exclusion_fixed_rects);
+   }
+   const std::vector<gfx::Rect>& inline_3d_rects() const {
+     return inline_3d_rects_;
+@@ -684,6 +686,9 @@ class CC_EXPORT LayerTreeImpl {
+   const std::vector<gfx::Rect>& inline_3d_exclusion_rects() const {
+     return inline_3d_exclusion_rects_;
+   }
++  const std::vector<gfx::Rect>& inline_3d_exclusion_fixed_rects() const {
++    return inline_3d_exclusion_fixed_rects_;
++  }
+ 
+   bool browser_controls_shrink_blink_size() const {
+     return browser_controls_params_.browser_controls_shrink_blink_size;
+@@ -1042,6 +1047,7 @@ class CC_EXPORT LayerTreeImpl {
+   // DisplayXR inline-3D (#625, Step B / B4b; exclusions browser#18).
+   std::vector<gfx::Rect> inline_3d_rects_;
+   std::vector<gfx::Rect> inline_3d_exclusion_rects_;
++  std::vector<gfx::Rect> inline_3d_exclusion_fixed_rects_;
+ 
+   OverscrollBehavior overscroll_behavior_;
+ 
+diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
+index c123fa77ab375..3e3974cd84ddc 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
++++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
+@@ -1635,10 +1635,12 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
+ 
+ void WebFrameWidgetImpl::SetInline3DRects(
+     const std::vector<gfx::Rect>& rects,
+-    const std::vector<gfx::Rect>& exclusion_rects) {
++    const std::vector<gfx::Rect>& exclusion_rects,
++    const std::vector<gfx::Rect>& exclusion_fixed_rects) {
+   if (!View()->does_composite())
+     return;
+-  widget_base_->LayerTreeHost()->SetInline3DRects(rects, exclusion_rects);
++  widget_base_->LayerTreeHost()->SetInline3DRects(rects, exclusion_rects,
++                                                  exclusion_fixed_rects);
+ }
+ 
+ void WebFrameWidgetImpl::SetPrefersReducedMotion(bool prefers_reduced_motion) {
+diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
+index 0b8da419d6b95..a01e5db7cd54a 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
++++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
+@@ -233,8 +233,10 @@ class CORE_EXPORT WebFrameWidgetImpl
+   void SetOverscrollBehavior(
+       const cc::OverscrollBehavior& overscroll_behavior) final;
+   // DisplayXR inline-3D (#625, Step B / B4b).
+-  void SetInline3DRects(const std::vector<gfx::Rect>& rects,
+-                        const std::vector<gfx::Rect>& exclusion_rects) final;
++  void SetInline3DRects(
++      const std::vector<gfx::Rect>& rects,
++      const std::vector<gfx::Rect>& exclusion_rects,
++      const std::vector<gfx::Rect>& exclusion_fixed_rects) final;
+   void SendEarlyFinalBeginMainFrame() override;
+   void RequestAnimationAfterDelay(const base::TimeDelta&, bool urgent) final;
+   void RequestAnimationAfterDelay(cc::BeginMainFrameReason,
+diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
+index 8c1a788af22c2..bdce2d264c4a2 100644
+--- a/third_party/blink/renderer/modules/xr/xr_session.cc
++++ b/third_party/blink/renderer/modules/xr/xr_session.cc
+@@ -37,6 +37,8 @@
+ #include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/geometry/rect_f.h"
+ #include "third_party/blink/renderer/core/inspector/console_message.h"
++#include "third_party/blink/renderer/core/layout/layout_box_model_object.h"
++#include "third_party/blink/renderer/core/layout/layout_object.h"
+ #include "third_party/blink/renderer/core/probe/async_task_context.h"
+ #include "third_party/blink/renderer/core/resize_observer/resize_observer.h"
+ #include "third_party/blink/renderer/core/resize_observer/resize_observer_entry.h"
+@@ -2690,6 +2692,35 @@ void XRSession::ReportInline3DRects() {
+   // rect on purpose — the GPU stage clips against the (scroll-exact,
+   // possibly tracked-channel) target rect, not this main-thread one.
+   std::vector<gfx::Rect> exclusion_rects;
++  // browser#28: exclusion rects whose element is VIEWPORT-FIXED go in their own
++  // list. Both lists are the same getBoundingClientRect measurement; the split
++  // exists purely so cc can skip its impl-scroll-delta patch on these. The
++  // patch assumes the rect describes content that scrolls with the viewport
++  // and corrects for scrolling that happened after this commit — true for a
++  // caption inside a tile, false for a sticky header, which stays put. Applying
++  // it there moved the header rect by the whole fling delta, so it missed its
++  // quad (or got clipped short at the surface top) and a strip of the header
++  // stayed in the tile's SBS weave input and got woven.
++  std::vector<gfx::Rect> exclusion_fixed_rects;
++  // A `position: sticky` element is viewport-fixed only while it is actually
++  // STUCK; before it reaches its threshold it scrolls with the content and the
++  // patch is correct for it. StickyPositionOffset() is non-zero exactly when
++  // the constraint is currently displacing the element, so it is the live test
++  // rather than a static style check.
++  auto is_viewport_fixed = [](Element* el) {
++    for (LayoutObject* lo = el->GetLayoutObject(); lo; lo = lo->Parent()) {
++      if (lo->IsFixedPositioned()) {
++        return true;
++      }
++      if (lo->IsStickyPositioned()) {
++        const auto* box_model = DynamicTo<LayoutBoxModelObject>(lo);
++        if (box_model && !box_model->StickyPositionOffset().IsZero()) {
++          return true;
++        }
++      }
++    }
++    return false;
++  };
+   for (const auto& layer : display_layers_) {
+     Element* target = layer->target();
+     if (!target) {
+@@ -2704,12 +2735,17 @@ void XRSession::ReportInline3DRects() {
+         continue;
+       }
+       gfx::Rect hole = device_rect_of(excluded);
+-      if (!hole.IsEmpty()) {
++      if (hole.IsEmpty()) {
++        continue;
++      }
++      if (is_viewport_fixed(excluded)) {
++        exclusion_fixed_rects.push_back(hole);
++      } else {
+         exclusion_rects.push_back(hole);
+       }
+     }
+   }
+-  widget->SetInline3DRects(rects, exclusion_rects);
++  widget->SetInline3DRects(rects, exclusion_rects, exclusion_fixed_rects);
+ }
+ 
+ // DisplayXR inline-3D (#625): install the two off-axis eye views the RUNTIME
+diff --git a/third_party/blink/renderer/platform/widget/frame_widget.h b/third_party/blink/renderer/platform/widget/frame_widget.h
+index 02b3b317805f2..2201230b40831 100644
+--- a/third_party/blink/renderer/platform/widget/frame_widget.h
++++ b/third_party/blink/renderer/platform/widget/frame_widget.h
+@@ -308,9 +308,14 @@ class PLATFORM_EXPORT FrameWidget {
+   // rects (browser#18) are 2D-overlay holes punched into the weave draw-back
+   // (CompositorFrameMetadata::inline_3d_exclusion_rects); pushed together so
+   // rects + holes stay frame-atomic. Default no-op.
+-  virtual void SetInline3DRects(const std::vector<gfx::Rect>& rects,
+-                                const std::vector<gfx::Rect>& exclusion_rects) {
+-  }
++  // |exclusion_fixed_rects| (browser#28) are the exclusion rects whose element
++  // is viewport-fixed (position:fixed, or a currently-stuck position:sticky).
++  // They are exempt from the impl-scroll-delta patch cc applies to the other
++  // lists, because a viewport-fixed element does not move with the scroll.
++  virtual void SetInline3DRects(
++      const std::vector<gfx::Rect>& rects,
++      const std::vector<gfx::Rect>& exclusion_rects,
++      const std::vector<gfx::Rect>& exclusion_fixed_rects) {}
+ 
+   // Get and set the configuration for the debugging overlay managed by the
+   // underlying LayerTreeHost. This may return null if the widget does not
