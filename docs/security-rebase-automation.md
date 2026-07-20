@@ -141,11 +141,30 @@ a Chrome 0-day fix landing in stable.
   cadence. (DRM confirmed absent today → non-DRM 1.0.)
 - **macOS / Linux weave** — Windows/D3D11 only for 1.0.
 
-## Open decisions
+## Decisions (resolved 2026-07-20)
 
-1. **AWS access model** — OIDC→AWS role (recommended) vs a scoped IAM key.
-2. **Weave gate** — ship the file-diff heuristic first, or invest up front in the headless `sim`
-   weave smoke?
-3. **`build-browser.yml`** — delete, or repoint at the AWS box + strip in-place signing?
-4. **Publish target on auto-pass** — fully auto-publish security dot-releases, or always land in a
-   staged/pre-release state a human promotes? (Trades 0-day latency against a human backstop.)
+1. **AWS access → GitHub OIDC→AWS role.** No long-lived secret to store or rotate; Actions mints
+   short-lived STS creds trust-scoped to this repo + workflow (+ environment). Mirrors the no-token
+   posture we just adopted for npm (trusted publishing), which matters for a *security* pipeline.
+   One-time IAM setup: an OIDC provider + a role whose policy is `ec2:{Start,Stop,Describe}Instances`
+   on the build instance + `ssm:SendCommand`. *(Rejected: a scoped IAM key — a long-lived secret is
+   the wrong posture here even though it's simpler.)*
+2. **Weave gate → file-diff heuristic first; sim smoke deferred.** Ship the `integration-points.md`
+   `⚠ Edit` file-diff auto-pass (sound: no weave-file change ⇒ a green build cannot have broken the
+   weave). Weave-file-touching rebases HOLD for a human hardware eyeball. Add the headless
+   `sim_display` weave smoke only as a fast-follow **if** the eyeball cadence proves burdensome —
+   don't block v1 on an unproven headless-weave path that only helps the minority case the heuristic
+   already routes to a human.
+3. **`build-browser.yml` → delete.** It's a once-failed, wrong-label, in-place-signing trap;
+   "repoint + de-sign" would rewrite it into the new pipeline anyway. The new orchestration
+   (#34–#38) is authored fresh with correct box separation; git history preserves the old file.
+   Deleting kills the ambiguity (it already misled this design pass).
+4. **Publish → auto-publish to a signed pre-release; the update-feed flip is a one-command human
+   promote; the emergency 0-day lane auto-flips live.** Build → sign → publish-artifact stay
+   hands-off (the whole point). But because we have **no staged rollout yet** (that lands with the
+   auto-updater, #40), an auto-flip would push a possibly-bad build to *every* user at once — so a
+   cheap human backstop gates the feed flip for routine releases: the on-call promotes with one
+   command within SLA, and an **auto-escalation re-ping** fires if it isn't flipped within N hours
+   (prevents the silent-slip failure mode this whole system exists to avoid). The 0-day lane skips
+   the promote — a human already made the call to trigger it, and speed dominates. **Evolve to full
+   auto-flip once #40 supports percentage/staged rollout.**
