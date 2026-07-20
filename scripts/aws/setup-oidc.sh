@@ -39,6 +39,12 @@ ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-displayxr-browser-artifacts}"
 
 aws() { command aws --profile "$AWS_PROFILE" --region "$AWS_REGION" "$@"; }
 say() { echo "[setup-oidc] $*"; }
+# A Windows-native aws.exe cannot read an MSYS/Cygwin "/tmp/..." path out of a file://
+# reference (it reads it as C:\tmp\...). Emit a native path when we're on such a shell.
+pathref() {
+  if command -v cygpath >/dev/null 2>&1; then printf 'file://%s' "$(cygpath -w "$1")"
+  else printf 'file://%s' "$1"; fi
+}
 run() {
   if [ "$APPLY" = "1" ]; then "$@"; else say "DRY RUN would: $*"; fi
 }
@@ -91,12 +97,12 @@ JSON
 TRUST_FILE="$(mktemp)"; printf '%s' "$TRUST" > "$TRUST_FILE"
 if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
   say "role $ROLE_NAME exists -> update trust policy"
-  run aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document "file://$TRUST_FILE"
+  run aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document "$(pathref "$TRUST_FILE")"
 else
   say "role $ROLE_NAME MISSING -> create"
   run aws iam create-role --role-name "$ROLE_NAME" \
     --description "GitHub Actions (browser#34): drive the Chromium build box, no long-lived secret" \
-    --assume-role-policy-document "file://$TRUST_FILE"
+    --assume-role-policy-document "$(pathref "$TRUST_FILE")"
 fi
 
 # ── 3. least-privilege permissions ───────────────────────────────────────────────────
@@ -150,7 +156,7 @@ JSON
 PERMS_FILE="$(mktemp)"; printf '%s' "$PERMS" > "$PERMS_FILE"
 say "attach inline policy $POLICY_NAME to $ROLE_NAME"
 run aws iam put-role-policy --role-name "$ROLE_NAME" \
-  --policy-name "$POLICY_NAME" --policy-document "file://$PERMS_FILE"
+  --policy-name "$POLICY_NAME" --policy-document "$(pathref "$PERMS_FILE")"
 
 # ── 4. prerequisite checks (report only — these need instance-side changes) ───────────
 say "--- prerequisite checks ---"
