@@ -1,0 +1,112 @@
+name: chromium-watch
+
+# Watches Chrome STABLE (Windows) and tells us when we're behind the security cadence
+# (browser#35, part of #33).
+#
+# Today it DETECTS and files/updates a tracking issue — immediately useful on its own,
+# and it needs no AWS. Once #34 lands (the OIDC build role), flip DISPATCH_BUILD to true
+# and it will also kick build-box.yml automatically.
+#
+# The emergency 0-day lane is `workflow_dispatch` with an explicit tag.
+
+on:
+  schedule:
+    - cron: "17 6,18 * * *" # twice daily, off the hour to avoid the cron stampede
+  workflow_dispatch:
+    inputs:
+      chromium_tag:
+        description: "Force a specific Chromium tag (emergency 0-day lane; blank = just check)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+  actions: write # to dispatch build-box.yml once enabled
+
+env:
+  # Flip to "true" once browser#34 has provisioned the OIDC role + build-box environment.
+  DISPATCH_BUILD: "false"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve current pin and latest stable
+        id: v
+        run: |
+          set -euo pipefail
+          PINNED=$(sed -n 's/.*CHROMIUM_TAG="\${CHROMIUM_TAG:-\([0-9.]*\)}".*/\1/p' scripts/config.env | head -1)
+          [ -n "$PINNED" ] || { echo "::error::could not parse CHROMIUM_TAG from scripts/config.env"; exit 1; }
+
+          FORCED="${{ inputs.chromium_tag }}"
+          if [ -n "$FORCED" ]; then
+            LATEST="$FORCED"; SOURCE="forced (emergency lane)"
+          else
+            # chromiumdash is the authoritative release feed; fail loudly rather than
+            # silently reporting "up to date" if it is unreachable.
+            JSON=$(curl -fsS --max-time 30 \
+              "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Windows&num=1") \
+              || { echo "::error::chromiumdash unreachable — cannot determine stable version"; exit 1; }
+            LATEST=$(printf '%s' "$JSON" | jq -r '.[0].version // empty')
+            [ -n "$LATEST" ] || { echo "::error::chromiumdash returned no version"; exit 1; }
+            SOURCE="chromiumdash Stable/Windows"
+          fi
+
+          echo "pinned=$PINNED"  >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST"  >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE"  >> "$GITHUB_OUTPUT"
+          # Sort-based compare so 7871.129 > 7871.24 (string compare would get this wrong).
+          if [ "$PINNED" = "$LATEST" ] || \
+             [ "$(printf '%s\n%s\n' "$PINNED" "$LATEST" | sort -V | tail -1)" = "$PINNED" ]; then
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "behind=true"  >> "$GITHUB_OUTPUT"
+          fi
+          echo "pinned=$PINNED latest=$LATEST ($SOURCE)"
+
+      - name: Up to date
+        if: steps.v.outputs.behind != 'true'
+        run: echo "Pinned ${{ steps.v.outputs.pinned }} is current — nothing to do."
+
+      - name: File / update the rebase tracking issue
+        if: steps.v.outputs.behind == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED: ${{ steps.v.outputs.pinned }}
+          LATEST: ${{ steps.v.outputs.latest }}
+        run: |
+          set -euo pipefail
+          TITLE="Chromium stable $LATEST available — we are pinned at $PINNED"
+          # One issue per target version; don't spam twice a day.
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                      --search "in:title \"stable $LATEST available\"" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "tracking issue #$EXISTING already open — nothing to do"; exit 0
+          fi
+          # Body built with printf (not a heredoc): a heredoc terminator has to sit at
+          # column 0 for bash, which would close this YAML block scalar early.
+          {
+            printf 'Chrome **stable** for Windows is now `%s`; `scripts/config.env` pins `%s`.\n\n' "$LATEST" "$PINNED"
+            printf 'Every dot-release in between carries Chrome security fixes we are not shipping —\n'
+            printf 'exactly the gap the Preview disclaimer describes ([maintenance-policy](../blob/main/docs/maintenance-policy.md)).\n\n'
+            printf '**To close this:** rebase the patch series onto `%s`, run the weave gate, build,\n' "$LATEST"
+            printf 'sign, publish — see [security-rebase-automation](../blob/main/docs/security-rebase-automation.md).\n\n'
+            printf '```sh\n'
+            printf 'scripts/weave-gate.sh --old %s --new %s --src <chromium-src>\n' "$PINNED" "$LATEST"
+            printf '```\n'
+            printf 'A clean gate (`rc=0`) means no hardware eyeball is needed for this one.\n\n'
+            printf '_Filed automatically by `chromium-watch` (#35)._\n'
+          } > /tmp/issue-body.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+            --label enhancement --body-file /tmp/issue-body.md
+
+      - name: Dispatch the build (enabled after #34)
+        if: steps.v.outputs.behind == 'true' && env.DISPATCH_BUILD == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run build-box.yml --repo "$GITHUB_REPOSITORY" \
+            -f chromium_tag="${{ steps.v.outputs.latest }}"
