@@ -36,11 +36,14 @@ It is the enabling work for a **"1.0 — Public Release: security-maintained, Wi
 **Build and signing are on two different boxes by design** — the Leia signing box is **sign-only**
 so long-running Chromium builds never clobber it. The pipeline must preserve that separation.
 
-> **Trap: `build-browser.yml` (on `LeiaInc/codesign-runner`) is NOT the path to build on.** It targets
-> a `[self-hosted, chromium-build]` runner (not our working AWS/`schtasks` path), has run exactly once
-> and failed, **and signs in-place on the build box** — which would put the EV cert on the build box,
-> violating sign-only-on-Leia. Either delete it or repoint it at the AWS box with the in-place signing
-> stripped. Do not treat it as existing pipeline. (This doc's author was misled by it once.)
+> **Removed (browser#39, 2026-07-20): `build-browser.yml` on `LeiaInc/codesign-runner` is gone.** It
+> was never a working path — it targeted a `[self-hosted, chromium-build]` runner (not our AWS/
+> `schtasks` path), ran exactly once and failed, **and signed in-place on the build box**, which would
+> put the EV cert wherever that label lives and undermine sign-only-on-the-Leia-box. Deleted rather
+> than repointed (decision #3 on #33): repointing would have rewritten it into this pipeline anyway.
+> `scripts/remote-build.sh` + `docs/remote-build.md`, which dispatched it, were removed with it.
+> **Nothing should build Chromium anywhere but the AWS box.** (This doc's author was misled by it once
+> — hence the explicit note.)
 
 ## Pipeline
 

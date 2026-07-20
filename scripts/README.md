@@ -13,7 +13,6 @@ single source of truth for the pinned Chromium tag + checkout paths. Override an
 | `package.sh` | Stage the runnable browser tree into `dist/DisplayXR-Browser/` (what the P2 installer packs). |
 | `sign.sh` | EV-sign the staged tree via the signing provider (`$DXR_SIGN_REPO`, folder-sign path). Degrades to unsigned + warn if unreachable. |
 | `release.sh` | `gh release create` a signed installer as a preview GitHub Release (`../docs/release-and-distribution.md`). |
-| `remote-build.sh` | Dispatch the `build-browser` workflow on the remote build box (`$DXR_SIGN_REPO`) + download the tree — frees this machine (`../docs/remote-build.md`). |
 | `args.official.gn` | The official static build args `build.sh` writes into `out/$OUT_DIR/args.gn`. |
 
 Typical flow: `fetch.sh` → `build.sh` → verify the weave (see `../docs/rebase-runbook.md` §6) →
