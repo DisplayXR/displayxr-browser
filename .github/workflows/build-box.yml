@@ -1,0 +1,158 @@
+name: build-box
+
+# Drives the Chromium build box (AWS EC2, stop-by-default) from CI with NO long-lived
+# secret — GitHub OIDC → a least-privilege AWS role (browser#34, decision #1 on #33).
+#
+# Reusable: the rebase pipeline (#35/#36) calls this to do the actual build. Also
+# workflow_dispatch-able on its own for smoke-testing the lifecycle.
+#
+# CONTRACT: the box is STOPPED before and after. The stop step runs with `if: always()`
+# so a failed/cancelled build can never leave the instance (and the bill) running.
+#
+# One-time AWS setup: scripts/aws/setup-oidc.sh --apply
+# Repo variable required: AWS_BUILD_ROLE_ARN (printed by that script).
+
+on:
+  workflow_call:
+    inputs:
+      chromium_tag:
+        description: "Chromium tag to build (blank = the pin in scripts/config.env)"
+        type: string
+        default: ""
+      build_command:
+        description: "PowerShell to run on the box"
+        type: string
+        default: 'powershell -ExecutionPolicy Bypass -File C:\build\do_build.ps1'
+      timeout_minutes:
+        description: "Max minutes to wait for the remote build"
+        type: number
+        default: 90
+    outputs:
+      artifact_key:
+        description: "S3 key of the produced tarball"
+        value: ${{ jobs.build.outputs.artifact_key }}
+  workflow_dispatch:
+    inputs:
+      chromium_tag:
+        description: "Chromium tag to build (blank = pin)"
+        type: string
+        default: ""
+      lifecycle_only:
+        description: "Start + stop the box without building (smoke-test OIDC)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # mint the OIDC token we trade for the AWS role
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_ID: i-0150c4a09e3852120
+  ARTIFACT_BUCKET: displayxr-browser-artifacts
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The role's trust policy pins sub to `...:environment:build-box`, so this line is
+    # load-bearing: without it the OIDC token has a different sub and AssumeRole fails.
+    environment: build-box
+    outputs:
+      artifact_key: ${{ steps.fetch.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS role (OIDC, no stored secret)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-build-box-${{ github.run_id }}
+
+      - name: Start the build box
+        run: |
+          set -euo pipefail
+          state=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+                  --query 'Reservations[0].Instances[0].State.Name' --output text)
+          echo "current state: $state"
+          if [ "$state" != "running" ]; then
+            aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+          fi
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          echo "instance running"
+
+      - name: Wait for SSM agent
+        run: |
+          set -euo pipefail
+          # The agent registers a little after the instance reports running.
+          for i in $(seq 1 40); do
+            ping=$(aws ssm describe-instance-information \
+                    --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+                    --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)
+            [ "$ping" = "Online" ] && { echo "SSM online"; exit 0; }
+            echo "  ssm ping=$ping ($i/40)"; sleep 15
+          done
+          echo "::error::SSM agent never came Online — cannot drive the build remotely."
+          exit 1
+
+      - name: Run the build (SSM RunCommand)
+        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
+        id: build
+        env:
+          CHROMIUM_TAG: ${{ inputs.chromium_tag }}
+          BUILD_CMD: ${{ inputs.build_command || 'powershell -ExecutionPolicy Bypass -File C:\build\do_build.ps1' }}
+          TIMEOUT_MIN: ${{ inputs.timeout_minutes || 90 }}
+        run: |
+          set -euo pipefail
+          cmd_id=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunPowerShellScript" \
+            --comment "browser#34 CI build ${GITHUB_RUN_ID}" \
+            --parameters commands="[\"\$env:CHROMIUM_TAG='${CHROMIUM_TAG}'; ${BUILD_CMD}\"]" \
+            --query 'Command.CommandId' --output text)
+          echo "ssm command: $cmd_id"
+          deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
+          while :; do
+            status=$(aws ssm get-command-invocation --command-id "$cmd_id" \
+                      --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in
+              Success) echo "build succeeded"; break;;
+              Failed|Cancelled|TimedOut|Undeliverable|Terminated)
+                echo "::error::remote build $status"
+                aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text | tail -40
+                exit 1;;
+            esac
+            [ "$(date +%s)" -gt "$deadline" ] && { echo "::error::build exceeded ${TIMEOUT_MIN}m"; exit 1; }
+            echo "  status=$status"; sleep 30
+          done
+
+      - name: Fetch the artifact
+        id: fetch
+        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
+        run: |
+          set -euo pipefail
+          key=$(aws s3 ls "s3://$ARTIFACT_BUCKET/" --recursive \
+                | sort -k1,2 | tail -1 | awk '{print $4}')
+          [ -n "$key" ] || { echo "::error::no artifact in s3://$ARTIFACT_BUCKET"; exit 1; }
+          mkdir -p dist && aws s3 cp "s3://$ARTIFACT_BUCKET/$key" "dist/$(basename "$key")"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
+        with:
+          name: browser-build
+          path: dist/
+          retention-days: 7
+
+      # ── the load-bearing cleanup ────────────────────────────────────────────────────
+      # always(): a failed build, a cancelled run, or a timeout must still stop the box.
+      - name: Stop the build box
+        if: always()
+        run: |
+          set -uo pipefail
+          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
+          aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID" || true
+          aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text
