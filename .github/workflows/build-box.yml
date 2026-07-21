@@ -22,6 +22,14 @@ on:
       build_command:
         description: "PowerShell to run on the box"
         type: string
+        # WARNING (verified 2026-07-21): SSM RunCommand executes as NT AUTHORITY\SYSTEM,
+        # but depot_tools must run as Administrator — so invoking do_build.ps1 directly
+        # here is NOT equivalent to the proven manual pattern
+        # (`schtasks /Run /TN crbuild`, which carries stored Administrator creds).
+        # This default is still UNVALIDATED end-to-end; the SSM *channel* is proven, the
+        # build-under-SYSTEM is not. Fix before the first real CI build: either trigger
+        # crbuild and poll for the C:\build\*.done marker, or re-register the task to run
+        # as Administrator on demand.
         default: 'powershell -ExecutionPolicy Bypass -File C:\build\do_build.ps1'
       timeout_minutes:
         description: "Max minutes to wait for the remote build"
