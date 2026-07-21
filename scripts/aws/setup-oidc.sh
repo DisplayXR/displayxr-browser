@@ -194,7 +194,43 @@ else
   say "instance profile already attached: $CUR_PROFILE"
 fi
 
-# ── 5. prerequisite checks (report only) ─────────────────────────────────────────────
+# ── 5. artifact bucket + instance-scoped write ───────────────────────────────────────
+# The build box uploads the tarball itself, using its instance-profile credentials. Those
+# come from the SHARED SSM role, so we grant the write resource-side with a bucket policy
+# conditioned on ec2:SourceInstanceARN instead of attaching s3:PutObject to that role -
+# otherwise every instance sharing the profile could write here. Confined to builds/*.
+say "--- artifact bucket ---"
+if aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" >/dev/null 2>&1; then
+  say "bucket $ARTIFACT_BUCKET exists"
+else
+  say "bucket $ARTIFACT_BUCKET MISSING -> create + block public access"
+  run aws s3api create-bucket --bucket "$ARTIFACT_BUCKET"
+  run aws s3api put-public-access-block --bucket "$ARTIFACT_BUCKET" \
+    --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+fi
+BUCKET_POLICY=$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "BuildBoxInstanceMayUploadBuildsOnly",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::${ACCOUNT}:role/${SSM_INSTANCE_PROFILE}" },
+    "Action": "s3:PutObject",
+    "Resource": "arn:aws:s3:::${ARTIFACT_BUCKET}/builds/*",
+    "Condition": {
+      "StringEquals": { "ec2:SourceInstanceARN": "${INSTANCE_ARN}" }
+    }
+  }]
+}
+JSON
+)
+BUCKET_POLICY_FILE="$(mktemp)"; printf '%s' "$BUCKET_POLICY" > "$BUCKET_POLICY_FILE"
+say "apply instance-scoped bucket policy"
+run aws s3api put-bucket-policy --bucket "$ARTIFACT_BUCKET" \
+  --policy "$(pathref "$BUCKET_POLICY_FILE")"
+
+# ── 6. prerequisite checks (report only) ─────────────────────────────────────────────
 say "--- prerequisite checks ---"
 SSM_OK="$(aws ssm describe-instance-information \
   --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
@@ -207,12 +243,20 @@ else
 fi
 if aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" >/dev/null 2>&1; then
   say "S3: artifact bucket $ARTIFACT_BUCKET reachable"
+  # The box uploads with its OWN instance-profile credentials. Those come from the shared
+  # SSM role, so the write is granted resource-side by a BUCKET POLICY conditioned on
+  # ec2:SourceInstanceARN, not by adding s3:PutObject to that role - which would have let
+  # all 20+ instances sharing it write here. Verified: builds/* from this instance
+  # succeeds, anything outside builds/* is denied.
+  if aws s3api get-bucket-policy --bucket "$ARTIFACT_BUCKET" >/dev/null 2>&1; then
+    say "S3: bucket policy present (instance-scoped PutObject under builds/*)"
+  else
+    say "S3: NO bucket policy - the box cannot upload. See browser#45."
+  fi
+  say "NOTE: SWE-DEV is denied s3:PutLifecycleConfiguration, so builds/ does NOT expire"
+  say "      automatically. Each build is ~380 MB; prune it or ask DevOps for a rule."
 else
-  say "S3: bucket $ARTIFACT_BUCKET does not exist yet — the artifact hand-off is unbuilt."
-  say "     Create it, then hand the box a PRESIGNED PUT URL in the SSM command rather than"
-  say "     granting the instance role s3:PutObject: that role ($SSM_INSTANCE_PROFILE) is"
-  say "     shared by 20+ instances in this account, so bucket writes granted there would be"
-  say "     fleet-wide. The workflow role already holds s3:PutObject to presign with."
+  say "S3: bucket $ARTIFACT_BUCKET does not exist - the artifact hand-off cannot work."
 fi
 
 echo
