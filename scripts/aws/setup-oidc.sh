@@ -33,9 +33,14 @@ INSTANCE_ID="${INSTANCE_ID:-i-0150c4a09e3852120}"
 GH_ORG="${GH_ORG:-DisplayXR}"
 GH_REPO="${GH_REPO:-displayxr-browser}"
 GH_ENV="${GH_ENV:-build-box}"
-ROLE_NAME="${ROLE_NAME:-displayxr-browser-build-box}"
-POLICY_NAME="${POLICY_NAME:-displayxr-browser-build-box}"
+ROLE_NAME="${ROLE_NAME:-DisplayXRBrowserBuildBox}"
+POLICY_NAME="${POLICY_NAME:-BuildBoxAndArtifacts}"
 ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-displayxr-browser-artifacts}"
+# The account-standard SSM instance profile (20+ instances use it). SWE-DEV can attach an
+# EXISTING profile (ec2:AssociateIamInstanceProfile is allowed) but cannot mint a new one
+# (iam:CreateInstanceProfile / AddRoleToInstanceProfile are DENIED), so we reuse this one
+# rather than creating a dedicated build-box profile.
+SSM_INSTANCE_PROFILE="${SSM_INSTANCE_PROFILE:-AmazonSSMRoleForInstancesQuickSetup}"
 
 aws() { command aws --profile "$AWS_PROFILE" --region "$AWS_REGION" "$@"; }
 say() { echo "[setup-oidc] $*"; }
@@ -96,7 +101,11 @@ JSON
 )
 TRUST_FILE="$(mktemp)"; printf '%s' "$TRUST" > "$TRUST_FILE"
 if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-  say "role $ROLE_NAME exists -> update trust policy"
+  # NOTE: AWSReservedSSO_SWE-DEV is DENIED iam:UpdateAssumeRolePolicy — CreateRole,
+  # PutRolePolicy, DeleteRole and DeleteRolePolicy are allowed, but changing an existing
+  # trust policy is not. To re-scope trust under SWE-DEV you must delete and recreate the
+  # role (DeleteRolePolicy on every inline policy first, then DeleteRole, then re-run).
+  say "role $ROLE_NAME exists -> update trust policy (expect AccessDenied under SWE-DEV)"
   run aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document "$(pathref "$TRUST_FILE")"
 else
   say "role $ROLE_NAME MISSING -> create"
@@ -114,13 +123,13 @@ PERMS=$(cat <<JSON
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "DescribeInstancesReadOnly",
+      "Sid": "Describe",
       "Effect": "Allow",
-      "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"],
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ec2:DescribeTags"],
       "Resource": "*"
     },
     {
-      "Sid": "StartStopTheBuildBoxOnly",
+      "Sid": "StartStopBuildBoxOnly",
       "Effect": "Allow",
       "Action": ["ec2:StartInstances", "ec2:StopInstances"],
       "Resource": "${INSTANCE_ARN}"
@@ -137,17 +146,28 @@ PERMS=$(cat <<JSON
     {
       "Sid": "PollSSMResults",
       "Effect": "Allow",
-      "Action": ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations", "ssm:ListCommands"],
+      "Action": [
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+        "ssm:ListCommands",
+        "ssm:DescribeInstanceInformation"
+      ],
       "Resource": "*"
     },
     {
-      "Sid": "ReadBuildArtifact",
+      "Sid": "Artifacts",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
       "Resource": [
         "arn:aws:s3:::${ARTIFACT_BUCKET}",
         "arn:aws:s3:::${ARTIFACT_BUCKET}/*"
       ]
+    },
+    {
+      "Sid": "NeverTerminate",
+      "Effect": "Deny",
+      "Action": ["ec2:TerminateInstances", "ec2:RunInstances"],
+      "Resource": "*"
     }
   ]
 }
@@ -158,7 +178,23 @@ say "attach inline policy $POLICY_NAME to $ROLE_NAME"
 run aws iam put-role-policy --role-name "$ROLE_NAME" \
   --policy-name "$POLICY_NAME" --policy-document "$(pathref "$PERMS_FILE")"
 
-# ── 4. prerequisite checks (report only — these need instance-side changes) ───────────
+# ── 4. instance side: the SSM instance profile ───────────────────────────────────────
+# The build box shipped with IamInstanceProfile=None, so the SSM Agent had no credentials
+# to register with and RunCommand was impossible (PingStatus none, empty
+# describe-instance-information). Attaching the account-standard profile fixes it; the
+# agent registers within ~20s of the instance reaching `running`.
+say "--- instance profile ---"
+CUR_PROFILE="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].IamInstanceProfile.Arn' --output text 2>/dev/null)"
+if [ "${CUR_PROFILE:-None}" = "None" ] || [ -z "${CUR_PROFILE:-}" ]; then
+  say "instance has NO profile -> associate $SSM_INSTANCE_PROFILE"
+  run aws ec2 associate-iam-instance-profile --instance-id "$INSTANCE_ID" \
+    --iam-instance-profile "Name=$SSM_INSTANCE_PROFILE"
+else
+  say "instance profile already attached: $CUR_PROFILE"
+fi
+
+# ── 5. prerequisite checks (report only) ─────────────────────────────────────────────
 say "--- prerequisite checks ---"
 SSM_OK="$(aws ssm describe-instance-information \
   --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
@@ -166,16 +202,17 @@ SSM_OK="$(aws ssm describe-instance-information \
 if [ "$SSM_OK" = "Online" ]; then
   say "SSM: instance is Online (RunCommand will work)"
 else
-  say "SSM: instance NOT registered (PingStatus=${SSM_OK:-none})."
-  say "     FIX: attach an instance profile with AmazonSSMManagedInstanceCore and ensure"
-  say "     the SSM Agent runs. Without this the workflow cannot start the build remotely."
+  say "SSM: not Online (PingStatus=${SSM_OK:-none}) — expected while the box is stopped;"
+  say "     SSM drops stopped EC2 instances out of describe-instance-information entirely."
 fi
 if aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" >/dev/null 2>&1; then
   say "S3: artifact bucket $ARTIFACT_BUCKET reachable"
 else
-  say "S3: bucket $ARTIFACT_BUCKET missing/unreachable."
-  say "     FIX: create it, and give the INSTANCE role s3:PutObject on it so the build box"
-  say "     can upload the tarball the workflow then downloads."
+  say "S3: bucket $ARTIFACT_BUCKET does not exist yet — the artifact hand-off is unbuilt."
+  say "     Create it, then hand the box a PRESIGNED PUT URL in the SSM command rather than"
+  say "     granting the instance role s3:PutObject: that role ($SSM_INSTANCE_PROFILE) is"
+  say "     shared by 20+ instances in this account, so bucket writes granted there would be"
+  say "     fleet-wide. The workflow role already holds s3:PutObject to presign with."
 fi
 
 echo
