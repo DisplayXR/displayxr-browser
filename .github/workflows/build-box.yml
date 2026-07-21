@@ -16,25 +16,25 @@ on:
   workflow_call:
     inputs:
       chromium_tag:
-        description: "Chromium tag to build (blank = the pin in scripts/config.env)"
+        # NOTE: do_build.ps1 does not read this - it builds whatever C:\cr\src is currently
+        # checked out at. Applying a tag is do_rebase.ps1's job (the #36 rebase lane), so
+        # this input is informational until that lane calls us. It was previously exported
+        # as $env:CHROMIUM_TAG into the build command, which nothing consumed.
+        description: "Chromium tag to build (informational; the rebase lane applies the pin)"
         type: string
         default: ""
-      build_command:
-        description: "PowerShell to run on the box"
+      job:
+        description: "Marker/job name written by do_build.ps1 (C:\\build\\<job>.done)"
         type: string
-        # WARNING (verified 2026-07-21): SSM RunCommand executes as NT AUTHORITY\SYSTEM,
-        # but depot_tools must run as Administrator — so invoking do_build.ps1 directly
-        # here is NOT equivalent to the proven manual pattern
-        # (`schtasks /Run /TN crbuild`, which carries stored Administrator creds).
-        # This default is still UNVALIDATED end-to-end; the SSM *channel* is proven, the
-        # build-under-SYSTEM is not. Fix before the first real CI build: either trigger
-        # crbuild and poll for the C:\build\*.done marker, or re-register the task to run
-        # as Administrator on demand.
-        default: 'powershell -ExecutionPolicy Bypass -File C:\build\do_build.ps1'
+        default: "official18"
+      task_name:
+        description: "Scheduled task that runs do_build.ps1 as Administrator"
+        type: string
+        default: "crbuild"
       timeout_minutes:
         description: "Max minutes to wait for the remote build"
         type: number
-        default: 90
+        default: 180
     outputs:
       artifact_key:
         description: "S3 key of the produced tarball"
@@ -103,46 +103,58 @@ jobs:
           echo "::error::SSM agent never came Online — cannot drive the build remotely."
           exit 1
 
-      - name: Run the build (SSM RunCommand)
+      # Trigger the build through the `crbuild` scheduled task, NOT by invoking
+      # do_build.ps1 directly: RunCommand is SYSTEM, depot_tools needs Administrator.
+      # remote-build.ps1 does the trigger + marker poll and translates the verdict into an
+      # exit code. See its header for the marker contract.
+      - name: Run the build (SSM RunCommand -> crbuild)
         if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
         id: build
         env:
           CHROMIUM_TAG: ${{ inputs.chromium_tag }}
-          BUILD_CMD: ${{ inputs.build_command || 'powershell -ExecutionPolicy Bypass -File C:\build\do_build.ps1' }}
-          TIMEOUT_MIN: ${{ inputs.timeout_minutes || 90 }}
+          JOB: ${{ inputs.job || 'official18' }}
+          TASK: ${{ inputs.task_name || 'crbuild' }}
+          TIMEOUT_MIN: ${{ inputs.timeout_minutes || 180 }}
         run: |
           set -euo pipefail
-          cmd_id=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunPowerShellScript" \
-            --comment "browser#34 CI build ${GITHUB_RUN_ID}" \
-            --parameters commands="[\"\$env:CHROMIUM_TAG='${CHROMIUM_TAG}'; ${BUILD_CMD}\"]" \
-            --query 'Command.CommandId' --output text)
-          echo "ssm command: $cmd_id"
-          deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
-          while :; do
-            status=$(aws ssm get-command-invocation --command-id "$cmd_id" \
-                      --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
-            case "$status" in
-              Success) echo "build succeeded"; break;;
-              Failed|Cancelled|TimedOut|Undeliverable|Terminated)
-                echo "::error::remote build $status"
-                aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
-                  --query 'StandardErrorContent' --output text | tail -40
-                exit 1;;
-            esac
-            [ "$(date +%s)" -gt "$deadline" ] && { echo "::error::build exceeded ${TIMEOUT_MIN}m"; exit 1; }
-            echo "  status=$status"; sleep 30
-          done
+          chmod +x scripts/aws/ssm-run.sh
+          b64=$(base64 -w0 scripts/aws/remote-build.ps1)
+          # printf '%s\n' with ARGUMENTS only - never put the PowerShell in printf's format
+          # string, which eats \b in C:\build and yields C:uild.
+          printf '%s\n' \
+            "[IO.File]::WriteAllBytes(\"C:\\build\\remote-build.ps1\", [Convert]::FromBase64String(\"${b64}\"))" \
+            "& powershell -NoProfile -ExecutionPolicy Bypass -File C:\\build\\remote-build.ps1 -TaskName '${TASK}' -Job '${JOB}' -TimeoutMinutes ${TIMEOUT_MIN}" \
+            'exit $LASTEXITCODE' \
+          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#45 CI build ${GITHUB_RUN_ID}" "$TIMEOUT_MIN"
+
+      # The box uploads to a RUN-SCOPED key and we download that exact key. The old version
+      # took "newest object in the bucket", which picks up another run's artifact whenever
+      # two builds overlap.
+      - name: Upload the artifact from the box
+        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
+        env:
+          JOB: ${{ inputs.job || 'official18' }}
+        run: |
+          set -euo pipefail
+          key="builds/${GITHUB_RUN_ID}/dxr_browser_${JOB}.tar.gz"
+          echo "ARTIFACT_KEY=$key" >> "$GITHUB_ENV"
+          # The instance writes with its own instance-profile credentials; the bucket policy
+          # allows PutObject under builds/* only, and only from this instance
+          # (ec2:SourceInstanceARN), so the shared SSM role grants nothing fleet-wide.
+          printf '%s\n' \
+            "\$src = \"C:\\build\\dxr_browser_${JOB}.tar.gz\"" \
+            'if (-not (Test-Path $src)) { "ERROR: no tarball at $src"; exit 1 }' \
+            "& \"C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe\" s3 cp \$src s3://${ARTIFACT_BUCKET}/${key}" \
+            'if ($LASTEXITCODE -ne 0) { "ERROR: upload failed"; exit 1 }' \
+            '"uploaded"' \
+          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#45 artifact upload ${GITHUB_RUN_ID}" 60
 
       - name: Fetch the artifact
         id: fetch
         if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
         run: |
           set -euo pipefail
-          key=$(aws s3 ls "s3://$ARTIFACT_BUCKET/" --recursive \
-                | sort -k1,2 | tail -1 | awk '{print $4}')
-          [ -n "$key" ] || { echo "::error::no artifact in s3://$ARTIFACT_BUCKET"; exit 1; }
+          key="$ARTIFACT_KEY"
           mkdir -p dist && aws s3 cp "s3://$ARTIFACT_BUCKET/$key" "dist/$(basename "$key")"
           echo "key=$key" >> "$GITHUB_OUTPUT"
           ls -la dist/
