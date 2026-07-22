@@ -1,0 +1,138 @@
+name: pipeline
+
+# The security-maintenance pipeline (browser#38, the path to a maintained 1.0 on #33).
+# Chains: rebase (#36) -> build (#45) -> weave-gate (#37) -> sign -> release -> feed,
+# with ONE human confirmation: the `go-live` environment approval promotes a signed
+# pre-release to the full-rollout feed. The clean path is a single Approve click; the two
+# "needs a human" cases (rebase conflict, weave-gate HOLD) only appear when warranted.
+#
+# STATUS: the rebase + build + gate half is wired to the proven build-box lane. The
+# publish half (sign on the Leia box, release, feed host) is present for review but gated
+# behind `enable_publish` and UNVALIDATED end to end - see the handoff prompt in
+# displayxr-runtime. Do NOT flip chromium-watch's DISPATCH_BUILD until a real dispatch has
+# run clean through `go-live` at least once.
+
+on:
+  workflow_dispatch:
+    inputs:
+      chromium_tag:
+        description: "Chromium stable tag to rebase onto + build (blank = rebuild current pin)"
+        type: string
+        default: ""
+      rollout:
+        description: "Staged-rollout % the feed lands at pre-approval (promote flips to 100)"
+        type: number
+        default: 10
+      enable_publish:
+        description: "Run sign/release/feed. OFF until the cross-machine publish path is validated."
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      chromium_tag:
+        type: string
+        default: ""
+      rollout:
+        type: number
+        default: 10
+      enable_publish:
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # release.sh creates a GitHub release
+  id-token: write   # build-box assumes the AWS role via OIDC
+  actions: read
+
+jobs:
+  # Rebase (#36) + build (#45), on the AWS box, credential-free via OIDC. Reuses the
+  # proven lane; a patch conflict or build failure stops the pipeline here.
+  build:
+    uses: ./.github/workflows/build-box.yml
+    with:
+      chromium_tag: ${{ inputs.chromium_tag }}
+
+  # Weave gate (#37): does the Chromium bump touch any file our patches modify? Empty
+  # intersection -> auto-pass (weave bytes unchanged). Non-empty -> HOLD, and the approval
+  # note tells the human to eyeball hardware before promoting. Runs on the box, which has
+  # both the old (pin) and new checkout in git.
+  gate:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: build-box
+    outputs:
+      verdict: ${{ steps.gate.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: gha-gate-${{ github.run_id }}
+      - name: Run the weave gate on the box
+        id: gate
+        env:
+          INSTANCE_ID: i-0150c4a09e3852120
+          NEW_TAG: ${{ inputs.chromium_tag }}
+        run: |
+          set -euo pipefail
+          # No tag = rebuild of the current pin = nothing rebased = weave unchanged.
+          if [ -z "$NEW_TAG" ]; then echo "verdict=PASS (no rebase)" >> "$GITHUB_OUTPUT"; exit 0; fi
+          chmod +x scripts/aws/ssm-run.sh
+          OLD_TAG=$(sed -n 's/.*CHROMIUM_TAG="\${CHROMIUM_TAG:-\([0-9.]*\)}".*/\1/p' scripts/config.env | head -1)
+          # weave-gate.sh exits 0 = auto-pass, 2 = HOLD, 3 = error(hold). Capture, don't
+          # let a HOLD fail the job - it must reach the approver as a verdict, not a red X.
+          set +e
+          printf '%s\n' \
+            "cd C:\\cr\\src; bash C:\\build\\weave-gate.sh --old '${OLD_TAG}' --new '${NEW_TAG}' --src C:\\cr\\src; exit \$LASTEXITCODE" \
+          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#37 weave-gate ${GITHUB_RUN_ID}" 15
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then echo "verdict=PASS" >> "$GITHUB_OUTPUT";
+          else echo "verdict=HOLD (weave-bearing files changed - eyeball hardware before promote)" >> "$GITHUB_OUTPUT"; fi
+
+  # --- publish half: present for review, inert until enable_publish + live validation. ---
+
+  sign:
+    needs: gate
+    if: ${{ inputs.enable_publish }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sign first-party binaries (Leia signing box)
+        run: |
+          echo "::warning::sign stage is UNVALIDATED in CI - needs DXR_SIGN_REPO + the Leia box (handoff)."
+          # scripts/sign.sh dist/DisplayXR-Browser   # cross-machine; wire in the handoff session
+          exit 1
+
+  release:
+    needs: sign
+    if: ${{ inputs.enable_publish }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish a PRE-release + feed at staged rollout
+        env:
+          ROLLOUT: ${{ inputs.rollout }}
+        run: |
+          echo "::warning::release+feed stage is UNVALIDATED - feed host is an open #40 decision (handoff)."
+          # scripts/release.sh <tag> <signed.exe>          # as a PRE-release
+          # scripts/update-feed.sh --rollout "$ROLLOUT" ... # NOT flipped to 100 yet
+          exit 1
+
+  # THE ONE CLICK. `go-live` is a protected environment (required reviewer = maintainer).
+  # Approving promotes the staged pre-release to full rollout. The gate verdict is surfaced
+  # in the job summary so the approver sees PASS vs HOLD before clicking.
+  promote:
+    needs: [gate, release]
+    if: ${{ inputs.enable_publish }}
+    runs-on: ubuntu-latest
+    environment: go-live
+    steps:
+      - uses: actions/checkout@v4
+      - name: Promote to full rollout
+        run: |
+          echo "weave-gate verdict: ${{ needs.gate.outputs.verdict }}"
+          echo "::warning::promote (feed rollout -> 100) is UNVALIDATED - wire with the feed host (#40)."
+          # scripts/update-feed.sh --rollout 100 ...   # the go-wide flip
+          exit 1
