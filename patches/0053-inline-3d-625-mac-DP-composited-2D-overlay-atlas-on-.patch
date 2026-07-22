@@ -1,6 +1,6 @@
-From 9ba208d0f4e590463af4b43c4f5c4449a35b4666 Mon Sep 17 00:00:00 2001
+From b25017b5277e08f6b753e51fb26b31b1a1a51175 Mon Sep 17 00:00:00 2001
 From: DisplayXR Dev <dev@displayxr.local>
-Date: Wed, 22 Jul 2026 16:32:47 +0000
+Date: Wed, 22 Jul 2026 17:41:32 +0000
 Subject: [PATCH] inline-3d(#625): mac DP-composited 2D-overlay atlas on the
  composited-surface weave
 
@@ -9,18 +9,19 @@ overlays through the runtime DP overlay-atlas (Windows-parity: final =
 woven*(1-a)+overlay), instead of the browser reading renderer-owned overlay
 backings on the GPU thread (which lost the mac Graphite single-writer-XOR-reader
 race during scroll -> dropped overlay -> flicker). WeaveCompositedSurface builds
-a persistent window-sized premul atlas (no per-frame clear; redraw only readable
-overlays, keep last-good on a mid-write read, erase vacated rects) and stages it
-via SetBatchOverlayMac; gpu_mac MTL-blits it into a kIOSurfaceIsGlobal surface so
-the runtime service can IOSurfaceLookup it cross-process. The draw-back reads the
-DP-composited overlays from the woven scratch, never the renderer backings.
-Result: tiles solid, header + plates crisp with transparency, no present-time
-read race. (Residual hover-plate scroll flicker was page-side; fixed in the
-gallery.)
+a persistent window-sized premul atlas (no per-frame clear; one-time transparent
+clear on create; redraw only readable overlays, keep last-good on a mid-write
+read, erase vacated rects) and stages it via SetBatchOverlayMac; gpu_mac MTL-blits
+it into a kIOSurfaceIsGlobal surface so the runtime service can IOSurfaceLookup it
+cross-process. The draw-back reads the DP-composited overlays from the woven
+scratch, never the renderer backings. Vendored XR_DXR_weave.h synced to canonical
+v6 (SPEC_VERSION 6). David-verified on M1 Pro: tiles solid, header + plates crisp
+with transparency, no read race. (Residual hover-plate scroll flicker was
+page-side; fixed in the gallery.)
 ---
  .../browser/displayxr_weave_client.cc         |   4 +-
  .../browser/displayxr_weave_client_mac.h      |  19 +-
- .../browser/displayxr_weave_client_mac.mm     |  75 +-
+ .../browser/displayxr_weave_client_mac.mm     |  74 +-
  .../displayxr/gpu/displayxr_weave_gpu_mac.h   |  18 +
  .../displayxr/gpu/displayxr_weave_gpu_mac.mm  | 143 ++-
  .../viz/service/display/skia_renderer.cc      |  11 +
@@ -28,8 +29,8 @@ gallery.)
  .../displayxr_weave_provider.h                |  26 +
  .../skia_output_surface_impl_on_gpu.cc        | 871 ++++++++++++++++--
  .../skia_output_surface_impl_on_gpu.h         |  48 +-
- .../displayxr/include/openxr/XR_DXR_weave.h   |  73 +-
- 11 files changed, 1221 insertions(+), 84 deletions(-)
+ .../displayxr/include/openxr/XR_DXR_weave.h   |  75 +-
+ 11 files changed, 1221 insertions(+), 85 deletions(-)
 
 diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
 index 9d72c1bc63297..99469afe2b791 100644
@@ -80,10 +81,10 @@ index f3817a98e7593..5d5c6421f1946 100644
  }  // namespace displayxr
  
 diff --git a/components/displayxr/browser/displayxr_weave_client_mac.mm b/components/displayxr/browser/displayxr_weave_client_mac.mm
-index d881d78881426..8c663d43ba649 100644
+index d881d78881426..55538a381d92d 100644
 --- a/components/displayxr/browser/displayxr_weave_client_mac.mm
 +++ b/components/displayxr/browser/displayxr_weave_client_mac.mm
-@@ -621,13 +621,48 @@ uint32_t WeaveSpecVersionMac() {
+@@ -621,13 +621,47 @@ uint32_t WeaveSpecVersionMac() {
  DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchMac(
      uintptr_t input_handle,
      const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
@@ -107,17 +108,16 @@ index d881d78881426..8c663d43ba649 100644
 +  // PRESENCE (OXR_GET_INPUT_FROM_CHAIN), NOT by advertised version, so a v6-
 +  // capable runtime consumes it regardless of the spec number it reports.
 +  //
-+  // NOTE(v6 gate — read before "fixing" to >= 6): the shipping v6 runtime
-+  // (feat/macos-weave-v6-nview, #774) still advertises XR_DXR_weave
-+  // SPEC_VERSION 5 — it did NOT bump the version macro even though it added the
-+  // layout struct. Gating on >= 6 would therefore NEVER fire against the very
-+  // runtime this path targets, leaving the mac gallery broken. We gate on >= 5
-+  // (the minimum a v6-capable runtime reports) and log once. A genuine v5-only
-+  // runtime that predates #774 would misread the content-sized atlas as
-+  // window-sized SBS, but the browser's mac assembly is now v6-only, so there is
-+  // no v5 layout to fall back to anyway.
-+  // TODO(v6): once the runtime bumps XR_DXR_weave_SPEC_VERSION to 6, tighten
-+  // this to >= 6 and drop the note. N>2 is blocked on #776 (mode negotiation).
++  // NOTE(v6 gate — read before "fixing" to >= 6): runtime main advertises
++  // XR_DXR_weave SPEC_VERSION 6 as of #774 (commit 87ef20a1c bumped 5->6). We
++  // deliberately gate on >= 5, not >= 6, for back-comfort with an older INSTALLED
++  // runtime that predates the bump but is otherwise v6-capable (the layout struct
++  // is consumed by chain PRESENCE, not advertised version). A genuine v5-only
++  // runtime that predates the layout struct would misread the content-sized atlas
++  // as window-sized SBS, but the browser's mac assembly is now v6-only, so there
++  // is no v5 layout to fall back to anyway.
++  // TODO(v6): once no pre-bump installed runtime is in the field, tighten this to
++  // >= 6 and drop the note. N>2 is blocked on #776 (mode negotiation).
 +  const bool want_v6 = view_count > 0;
 +  const bool v6 = want_v6 && s.weave_spec_version >= 5;
 +  if (want_v6 && !v6) {
@@ -133,7 +133,7 @@ index d881d78881426..8c663d43ba649 100644
    if (s.weave_spec_version < 3) {
      static bool logged_v2 = false;
      if (!logged_v2) {
-@@ -656,10 +691,48 @@ uint32_t WeaveSpecVersionMac() {
+@@ -656,10 +690,48 @@ uint32_t WeaveSpecVersionMac() {
      batch.rectCount = static_cast<uint32_t>(n);
      batch.rects = xr_rects;
  
@@ -1693,7 +1693,7 @@ index fb248ee10291b..c51932aa4741e 100644
  
    THREAD_CHECKER(thread_checker_);
 diff --git a/third_party/displayxr/include/openxr/XR_DXR_weave.h b/third_party/displayxr/include/openxr/XR_DXR_weave.h
-index cb3b090caffba..4c0203141bbcf 100644
+index cb3b090caffba..421e625062507 100644
 --- a/third_party/displayxr/include/openxr/XR_DXR_weave.h
 +++ b/third_party/displayxr/include/openxr/XR_DXR_weave.h
 @@ -98,16 +98,25 @@
@@ -1732,6 +1732,15 @@ index cb3b090caffba..4c0203141bbcf 100644
   *
   * Version history: 1 = initial (pre-rename numbering carried over); 2 =
   * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
+@@ -125,7 +134,7 @@ extern "C" {
+ #endif
+ 
+ #define XR_DXR_weave 1
+-#define XR_DXR_weave_SPEC_VERSION 5
++#define XR_DXR_weave_SPEC_VERSION 6
+ #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
+ 
+ // Reserved 1004999190..193. Final values reconcile with the Khronos registry
 @@ -134,6 +143,7 @@ extern "C" {
  #define XR_TYPE_WEAVE_OUTPUT_DXR          ((XrStructureType)1004999191)
  #define XR_TYPE_WEAVE_SUBMIT_RECTS_DXR    ((XrStructureType)1004999192)
