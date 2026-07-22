@@ -1,0 +1,1795 @@
+From 9ba208d0f4e590463af4b43c4f5c4449a35b4666 Mon Sep 17 00:00:00 2001
+From: DisplayXR Dev <dev@displayxr.local>
+Date: Wed, 22 Jul 2026 16:32:47 +0000
+Subject: [PATCH] inline-3d(#625): mac DP-composited 2D-overlay atlas on the
+ composited-surface weave
+
+The mac composited-surface weave now composites the browser#18-excluded 2D
+overlays through the runtime DP overlay-atlas (Windows-parity: final =
+woven*(1-a)+overlay), instead of the browser reading renderer-owned overlay
+backings on the GPU thread (which lost the mac Graphite single-writer-XOR-reader
+race during scroll -> dropped overlay -> flicker). WeaveCompositedSurface builds
+a persistent window-sized premul atlas (no per-frame clear; redraw only readable
+overlays, keep last-good on a mid-write read, erase vacated rects) and stages it
+via SetBatchOverlayMac; gpu_mac MTL-blits it into a kIOSurfaceIsGlobal surface so
+the runtime service can IOSurfaceLookup it cross-process. The draw-back reads the
+DP-composited overlays from the woven scratch, never the renderer backings.
+Result: tiles solid, header + plates crisp with transparency, no present-time
+read race. (Residual hover-plate scroll flicker was page-side; fixed in the
+gallery.)
+---
+ .../browser/displayxr_weave_client.cc         |   4 +-
+ .../browser/displayxr_weave_client_mac.h      |  19 +-
+ .../browser/displayxr_weave_client_mac.mm     |  75 +-
+ .../displayxr/gpu/displayxr_weave_gpu_mac.h   |  18 +
+ .../displayxr/gpu/displayxr_weave_gpu_mac.mm  | 143 ++-
+ .../viz/service/display/skia_renderer.cc      |  11 +
+ .../displayxr_weave_provider.cc               |  17 +
+ .../displayxr_weave_provider.h                |  26 +
+ .../skia_output_surface_impl_on_gpu.cc        | 871 ++++++++++++++++--
+ .../skia_output_surface_impl_on_gpu.h         |  48 +-
+ .../displayxr/include/openxr/XR_DXR_weave.h   |  73 +-
+ 11 files changed, 1221 insertions(+), 84 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 9d72c1bc63297..99469afe2b791 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -1103,7 +1103,9 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::SubmitBatch(
+   return SubmitBatchWin(input_handle, rects, input_is_dxgi, overlay_handle,
+                         overlay_is_dxgi);
+ #elif BUILDFLAG(IS_MAC)
+-  return SubmitBatchMac(input_handle, rects, input_is_dxgi);
++  // |overlay_is_dxgi| is ignored on mac (no DXGI); |overlay_handle| (v4/v5) is the
++  // 2D overlay atlas IOSurface*REF* pointer, 0 if none.
++  return SubmitBatchMac(input_handle, rects, input_is_dxgi, overlay_handle);
+ #else
+   return {};
+ #endif
+diff --git a/components/displayxr/browser/displayxr_weave_client_mac.h b/components/displayxr/browser/displayxr_weave_client_mac.h
+index f3817a98e7593..5d5c6421f1946 100644
+--- a/components/displayxr/browser/displayxr_weave_client_mac.h
++++ b/components/displayxr/browser/displayxr_weave_client_mac.h
+@@ -36,10 +36,27 @@ std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectMac(
+ 
+ // PR3: batched synchronous weave (spec v3). Returns the woven IOSurface (as an
+ // IOSurfaceID in woven_handle) + eyes. input_handle is the input IOSurfaceID.
++// |overlay_handle| (XR_DXR_weave spec v4/v5, browser#18/#22) is an optional
++// window-sized premul-BGRA 2D overlay atlas IOSurface*REF* pointer (0 = none) the
++// DP composites OVER the woven output; chained as XrWeaveSubmitOverlaysDXR on the
++// last chunk. There is no DXGI on mac, so no overlay_is_dxgi.
++//
++// v6 (#774): when |view_count| > 0 the |input_handle| is a WORST-CASE N-view
++// atlas (tiles packed contiguously from the top-left at
++// |content_view_width|x|content_view_height|, grid |tile_columns|x|tile_rows|)
++// rather than the per-rect squeezed SBS of v3/v4/v5. An XrWeaveSubmitLayoutDXR is
++// then chained; |rects| degrade to a scope hint. |view_count| == 0 keeps the
++// v3/v4/v5 layout byte-for-byte (the default). N>2 is blocked on #776.
+ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchMac(
+     uintptr_t input_handle,
+     const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
+-    bool input_is_dxgi);
++    bool input_is_dxgi,
++    uintptr_t overlay_handle,
++    uint32_t view_count = 0,
++    uint32_t tile_columns = 0,
++    uint32_t tile_rows = 0,
++    uint32_t content_view_width = 0,
++    uint32_t content_view_height = 0);
+ 
+ }  // namespace displayxr
+ 
+diff --git a/components/displayxr/browser/displayxr_weave_client_mac.mm b/components/displayxr/browser/displayxr_weave_client_mac.mm
+index d881d78881426..8c663d43ba649 100644
+--- a/components/displayxr/browser/displayxr_weave_client_mac.mm
++++ b/components/displayxr/browser/displayxr_weave_client_mac.mm
+@@ -621,13 +621,48 @@ uint32_t WeaveSpecVersionMac() {
+ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchMac(
+     uintptr_t input_handle,
+     const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
+-    bool /*input_is_dxgi*/) {
++    bool /*input_is_dxgi*/,
++    uintptr_t overlay_handle,
++    uint32_t view_count,
++    uint32_t tile_columns,
++    uint32_t tile_rows,
++    uint32_t content_view_width,
++    uint32_t content_view_height) {
+   const size_t rect_count = rects.size();
+   DisplayXRWeaveClient::WeaveSubmitResult result;
+   MacWeaveState& s = State();
+   if (s.session == XR_NULL_HANDLE || !s.submit || rect_count == 0) {
+     return result;  // dormant / failed init / nothing to weave
+   }
++
++  // v6 (#774): chain XrWeaveSubmitLayoutDXR when the caller assembled an N-view
++  // worst-case atlas (view_count > 0). The runtime parses the struct by TYPE
++  // PRESENCE (OXR_GET_INPUT_FROM_CHAIN), NOT by advertised version, so a v6-
++  // capable runtime consumes it regardless of the spec number it reports.
++  //
++  // NOTE(v6 gate — read before "fixing" to >= 6): the shipping v6 runtime
++  // (feat/macos-weave-v6-nview, #774) still advertises XR_DXR_weave
++  // SPEC_VERSION 5 — it did NOT bump the version macro even though it added the
++  // layout struct. Gating on >= 6 would therefore NEVER fire against the very
++  // runtime this path targets, leaving the mac gallery broken. We gate on >= 5
++  // (the minimum a v6-capable runtime reports) and log once. A genuine v5-only
++  // runtime that predates #774 would misread the content-sized atlas as
++  // window-sized SBS, but the browser's mac assembly is now v6-only, so there is
++  // no v5 layout to fall back to anyway.
++  // TODO(v6): once the runtime bumps XR_DXR_weave_SPEC_VERSION to 6, tighten
++  // this to >= 6 and drop the note. N>2 is blocked on #776 (mode negotiation).
++  const bool want_v6 = view_count > 0;
++  const bool v6 = want_v6 && s.weave_spec_version >= 5;
++  if (want_v6 && !v6) {
++    static bool logged_v6 = false;
++    if (!logged_v6) {
++      logged_v6 = true;
++      VLOG(1) << "[DisplayXR] SubmitBatch(mac) v6 N-view atlas requested but "
++                 "runtime weave spec="
++              << s.weave_spec_version << " (<5) — cannot chain layout";
++    }
++  }
++
+   if (s.weave_spec_version < 3) {
+     static bool logged_v2 = false;
+     if (!logged_v2) {
+@@ -656,10 +691,48 @@ uint32_t WeaveSpecVersionMac() {
+     batch.rectCount = static_cast<uint32_t>(n);
+     batch.rects = xr_rects;
+ 
++    // v6 (#774): the N-view worst-case atlas layout. Chained onto in.next
++    // AFTER the rects (chain order: in -> [overlays] -> rects -> layout; the
++    // runtime walks by type so order is not load-bearing, but this mirrors the
++    // runtime probe). With this present, |input_handle| is the packed N-view
++    // atlas and |rects| are a scope hint. Only chained once the whole frame is
++    // in this single chunk (rect_count <= MAX); a split frame would need the
++    // layout on every chunk, which the browser never hits at N=2 anaglyph.
++    XrWeaveSubmitLayoutDXR layout = {XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
++    if (v6) {
++      layout.viewCount = view_count;
++      layout.tileColumns = tile_columns;
++      layout.tileRows = tile_rows;
++      layout.contentViewWidth = content_view_width;
++      layout.contentViewHeight = content_view_height;
++      batch.next = &layout;
++    }
++
+     XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+     in.next = &batch;
+     in.inputTexture = reinterpret_cast<void*>(input_handle);  // IOSurfaceRef ptr
+     in.inputIsDxgi = XR_FALSE;
++    // v5 (browser#22): mark the FIRST chunk of the frame so the runtime clears its
++    // window-sized woven output to premultiplied transparent before weaving — gaps
++    // between tiles come out transparent (not stale), letting the caller present
++    // the woven output whole-window. Later chunks (done > 0) accumulate into the
++    // same output. No-op on a spec<5 runtime (field past its struct; ignored).
++    in.firstChunk = (done == 0) ? XR_TRUE : XR_FALSE;
++
++    // v4 (browser#18/#22): the DP-composited 2D overlay atlas composites OVER the
++    // whole woven output, so chain it on the LAST chunk only — once, on top, after
++    // every rect has woven. Splice ahead of the rects struct (next-chains are
++    // unordered) so the batch layout is preserved. The atlas is an IOSurface*REF*
++    // pointer like the input; no DXGI on mac.
++    XrWeaveSubmitOverlaysDXR overlays = {XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
++    const bool last_chunk = (done + n) >= rect_count;
++    if (overlay_handle != 0 && last_chunk && s.weave_spec_version >= 4) {
++      overlays.overlayTexture = reinterpret_cast<void*>(overlay_handle);
++      overlays.overlayIsDxgi = XR_FALSE;
++      overlays.rectCount = 0;  // whole-atlas composite (premul alpha authoritative)
++      overlays.next = &batch;
++      in.next = &overlays;
++    }
+ 
+     XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+     const XrResult sr = s.submit(s.session, &in, &out);
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_mac.h b/components/displayxr/gpu/displayxr_weave_gpu_mac.h
+index 40729536bf3cf..754eee642c80c 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_mac.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu_mac.h
+@@ -53,11 +53,19 @@ class DisplayXRWeaveGpuMac : public viz::DisplayXRWeaveProvider {
+                       const gfx::Rect& window_rect,
+                       uint32_t target_id) override;
+   bool BlitWovenToMac(IOSurfaceRef dst, const gfx::Rect& src_rect) override;
++  bool SubmitAtlasV6Mac(IOSurfaceRef atlas,
++                        uint32_t view_count,
++                        uint32_t tile_columns,
++                        uint32_t tile_rows,
++                        uint32_t content_view_width,
++                        uint32_t content_view_height,
++                        const std::vector<gfx::Rect>& rects) override;
+   bool TryTakeWovenResult(uint32_t target_id, Result* out) override;
+   void PruneTargets(size_t count) override;
+   bool BatchMode() const override;
+   void BeginBatchSync(const gfx::Size& window_size) override;
+   bool SubmitBatchSync() override;
++  bool SetBatchOverlayMac(IOSurfaceRef atlas) override;
+ 
+  private:
+   // Lazily (re)create the shared window-sized input IOSurface (BGRA8, global so
+@@ -80,6 +88,16 @@ class DisplayXRWeaveGpuMac : public viz::DisplayXRWeaveProvider {
+ 
+   bool batch_open_ = false;
+   gfx::Size batch_size_;
++
++  // v4/v5 (browser#18/#22): the window-sized premul-BGRA 2D overlay atlas staged
++  // by SetBatchOverlayMac between BeginBatchSync and SubmitBatchSync, submitted
++  // alongside input_iosurface_ (chained XrWeaveSubmitOverlaysDXR) so the DP
++  // composites 2D OVER the woven output. Retained (CFRetain via RETAIN policy)
++  // until the next batch overwrites it. |overlay_set_this_batch_| is cleared in
++  // BeginBatchSync and set by SetBatchOverlayMac; a frame that never stages an
++  // overlay weaves with none.
++  base::apple::ScopedCFTypeRef<IOSurfaceRef> overlay_atlas_;
++  bool overlay_set_this_batch_ = false;
+   struct BatchEntry {
+     uint32_t target_id = 0;
+     gfx::Rect rect;  // window-relative device px
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_mac.mm b/components/displayxr/gpu/displayxr_weave_gpu_mac.mm
+index 59fc5bd3d2440..3bec0ae8eab1c 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_mac.mm
++++ b/components/displayxr/gpu/displayxr_weave_gpu_mac.mm
+@@ -15,6 +15,7 @@
+ 
+ 
+ #include "base/logging.h"
++#include "base/memory/scoped_policy.h"
+ #include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "components/displayxr/browser/displayxr_weave_client_mac.h"
+ 
+@@ -114,9 +115,72 @@
+   batch_open_ = true;
+   batch_size_ = window_size;
+   batch_entries_.clear();
++  overlay_set_this_batch_ = false;
+   EnsureSharedInput(window_size);
+ }
+ 
++// v4/v5 (browser#18/#22): stage the window-sized premul-BGRA 2D overlay atlas for
++// THIS batch. Called (at most once) between BeginBatchSync and SubmitBatchSync.
++//
++// The caller's |atlas| is a Chromium shared-image IOSurface — it is NOT global,
++// so the runtime service (a SEPARATE process) cannot IOSurfaceLookup it by ID and
++// the whole submit fails ("weave failed xrt_result=-1" + broken pipe → white
++// tiles; #0053). Like the weave INPUT (EnsureSharedInput), the overlay MUST be a
++// kIOSurfaceIsGlobal surface. So MTL-blit the caller's atlas into a gpu_mac-owned
++// GLOBAL overlay IOSurface and submit THAT — the runtime derives its global ID.
++bool DisplayXRWeaveGpuMac::SetBatchOverlayMac(IOSurfaceRef atlas) {
++  if (!batch_open_ || !atlas || !device_ || !queue_) {
++    return false;
++  }
++  const size_t w = IOSurfaceGetWidth(atlas);
++  const size_t h = IOSurfaceGetHeight(atlas);
++  if (w == 0 || h == 0) {
++    return false;
++  }
++  // Reuse a gpu_mac-owned GLOBAL BGRA8 overlay IOSurface; recreate on size change.
++  if (!overlay_atlas_ || IOSurfaceGetWidth(overlay_atlas_.get()) != w ||
++      IOSurfaceGetHeight(overlay_atlas_.get()) != h) {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++    NSDictionary* props = @{
++      (id)kIOSurfaceWidth : @((unsigned)w),
++      (id)kIOSurfaceHeight : @((unsigned)h),
++      (id)kIOSurfaceBytesPerElement : @4,
++      (id)kIOSurfacePixelFormat : @((unsigned)'BGRA'),
++      (id)kIOSurfaceIsGlobal : @YES,
++    };
++#pragma clang diagnostic pop
++    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
++    if (!surf) {
++      return false;
++    }
++    overlay_atlas_.reset(surf);  // adopts the +1 ref from Create
++  }
++  id<MTLDevice> device = (__bridge id<MTLDevice>)device_;
++  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)queue_;
++  id<MTLTexture> src = WrapIOSurface(device, atlas);
++  id<MTLTexture> dst = WrapIOSurface(device, overlay_atlas_.get());
++  if (!src || !dst) {
++    return false;
++  }
++  id<MTLCommandBuffer> cb = [queue commandBuffer];
++  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++  [blit copyFromTexture:src
++            sourceSlice:0
++            sourceLevel:0
++           sourceOrigin:MTLOriginMake(0, 0, 0)
++             sourceSize:MTLSizeMake(w, h, 1)
++              toTexture:dst
++       destinationSlice:0
++       destinationLevel:0
++      destinationOrigin:MTLOriginMake(0, 0, 0)];
++  [blit endEncoding];
++  [cb commit];
++  [cb waitUntilCompleted];
++  overlay_set_this_batch_ = true;
++  return true;
++}
++
+ bool DisplayXRWeaveGpuMac::WeaveCanvasMac(IOSurfaceRef canvas_iosurface,
+                                           const gfx::Rect& src_rect,
+                                           const gfx::Rect& window_rect,
+@@ -224,9 +288,17 @@
+   // IOSurfaceGetID(). Passing the raw IOSurfaceID makes the runtime deref a small
+   // integer -> EXC_BAD_ACCESS. Pass the ref pointer (matches the probe's
+   // submit.inputTexture = (void*)input contract).
++  // v4: hand the overlay atlas alongside the content input when one was staged
++  // this frame; 0 otherwise (runtime omits the overlay chain). Like the input,
++  // the wire handle is the IOSurface*REF* pointer (the runtime derives the global
++  // IOSurfaceID itself). No DXGI on mac.
++  const uintptr_t overlay_handle =
++      (overlay_set_this_batch_ && overlay_atlas_)
++          ? reinterpret_cast<uintptr_t>(overlay_atlas_.get())
++          : 0;
+   DisplayXRWeaveClient::WeaveSubmitResult sr = DisplayXRWeaveClient::SubmitBatch(
+       reinterpret_cast<uintptr_t>(input_iosurface_.get()), rects,
+-      /*input_is_dxgi=*/false);
++      /*input_is_dxgi=*/false, overlay_handle, /*overlay_is_dxgi=*/false);
+   if (!sr.ok) {
+     static int s_fail = 0;
+     if (s_fail < 3) {
+@@ -276,6 +348,75 @@
+   return true;
+ }
+ 
++bool DisplayXRWeaveGpuMac::SubmitAtlasV6Mac(
++    IOSurfaceRef atlas,
++    uint32_t view_count,
++    uint32_t tile_columns,
++    uint32_t tile_rows,
++    uint32_t content_view_width,
++    uint32_t content_view_height,
++    const std::vector<gfx::Rect>& rects) {
++  // v6 (#774): the caller (SkiaOutputSurfaceImplOnGpu::MaybeWeaveOverlaysMac) has
++  // already Skia-assembled the packed N-view atlas into |atlas|, so we skip the
++  // BeginBatchSync/WeaveCanvasMac MTLBlit packing entirely — just submit |atlas|
++  // with the layout chained. |rects| are the element window rects (scope hint).
++  batch_open_ = false;  // close the batch the caller opened (no WeaveCanvasMac)
++  batch_entries_.clear();
++  if (!atlas) {
++    return false;
++  }
++  DisplayXRWeaveClient::SnapWindowIfMoved();  // parity; identity on mac
++
++  std::vector<DisplayXRWeaveClient::WeaveRect> wrects;
++  wrects.reserve(rects.size());
++  for (const gfx::Rect& r : rects) {
++    wrects.push_back({r.x(), r.y(), r.width(), r.height()});
++  }
++
++  // v4/v5 overlay atlas (staged via SetBatchOverlayMac between BeginBatchSync and
++  // here) rides the same submit; 0 if none this frame. IOSurface*REF* pointer.
++  const uintptr_t overlay_handle =
++      (overlay_set_this_batch_ && overlay_atlas_)
++          ? reinterpret_cast<uintptr_t>(overlay_atlas_.get())
++          : 0;
++
++  // Pass the atlas as an IOSurface*REF* pointer (the runtime derives the global
++  // IOSurfaceID itself — see SubmitBatchSync's note). view_count > 0 chains the
++  // XrWeaveSubmitLayoutDXR inside SubmitBatchMac.
++  DisplayXRWeaveClient::WeaveSubmitResult sr = displayxr::SubmitBatchMac(
++      reinterpret_cast<uintptr_t>(atlas), wrects, /*input_is_dxgi=*/false,
++      overlay_handle, view_count, tile_columns, tile_rows, content_view_width,
++      content_view_height);
++  if (!sr.ok) {
++    static int s_fail = 0;
++    if (s_fail < 3) {
++      ++s_fail;
++      LOG(ERROR) << "[DisplayXR] mac v6 atlas weave submit failed (views="
++                 << view_count << " grid=" << tile_columns << "x" << tile_rows
++                 << " content=" << content_view_width << "x"
++                 << content_view_height << ")";
++    }
++    return false;
++  }
++
++  // The woven output (one content view) is handed back as an IOSurface*REF* on
++  // the FIRST submit only (0 afterwards; the runtime re-weaves into the same
++  // surface). Adopt it into cached_woven_ and reuse it every frame — Phase B's
++  // BlitWovenToMac reads cached_woven_.
++  if (sr.woven_handle) {
++    cached_woven_.reset(reinterpret_cast<IOSurfaceRef>(sr.woven_handle));
++  }
++  static int s_ok_throttle = 0;
++  if ((s_ok_throttle++ % 120) == 0) {
++    VLOG(1) << "[DisplayXR] mac v6 atlas weave ok: views=" << view_count
++            << " grid=" << tile_columns << "x" << tile_rows
++            << " content=" << content_view_width << "x" << content_view_height
++            << " out=" << sr.width << "x" << sr.height
++            << " overlay=" << (overlay_handle ? "yes" : "no");
++  }
++  return cached_woven_.get() != nullptr;
++}
++
+ bool DisplayXRWeaveGpuMac::TryTakeWovenResult(uint32_t target_id, Result* out) {
+   auto it = results_.find(target_id);
+   if (it == results_.end() || !it->second.have) {
+diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
+index e58097ee4748f..9cca7b6c7c69e 100644
+--- a/components/viz/service/display/skia_renderer.cc
++++ b/components/viz/service/display/skia_renderer.cc
+@@ -3035,6 +3035,16 @@ void SkiaRenderer::ScheduleOverlays() {
+   // vertical scroll clips the aggregator's element rect) — and substitute it
+   // with a woven scratch. Mirrors the GPU-side size-match (which scans all
+   // overlays regardless of type); each overlay is claimed at most once.
++  //
++  // DISABLED (feat/mac-composited-weave): the per-element CALayer overlay
++  // substitution is REPLACED by the single-path composited-surface weave
++  // (SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface, weaving the composited
++  // ROOT render pass in place like Windows). Mac tile promotion is all-or-nothing
++  // (one backdrop-filter anywhere drops every tile -> SBS), so on the real
++  // gallery the tiles never promote to individual overlays — this loop had
++  // nothing to substitute. Left compiled (behind #if 0) but not run;
++  // SubstituteInline3DOverlayMac stays defined for reference.
++#if 0  // DisplayXR: overlay-substitution weave replaced by composited-surface weave
+   if (!inline_3d_rects_.empty()) {
+     auto& overlay_list = current_frame()->overlay_list;
+     std::vector<bool> overlay_used(overlay_list.size(), false);
+@@ -3098,6 +3108,7 @@ void SkiaRenderer::ScheduleOverlays() {
+                                    static_cast<uint32_t>(t));
+     }
+   }
++#endif  // 0 — DisplayXR overlay-substitution disabled (composited-surface weave)
+ #endif  // BUILDFLAG(IS_APPLE)
+ 
+   skia_output_surface_->ScheduleOverlays(
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+index b10e9062bc8ae..b55abd04b58c7 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.cc
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -32,6 +32,23 @@ bool DisplayXRWeaveProvider::SetBatchOverlay(ID3D11Device* device,
+                                              UINT array_slice) {
+   return false;
+ }
++#elif BUILDFLAG(IS_APPLE)
++bool DisplayXRWeaveProvider::SetBatchOverlayMac(IOSurfaceRef atlas) {
++  return false;
++}
++
++// v6 (#774) default: only the mac GPU provider (DisplayXRWeaveGpuMac) assembles
++// and submits an N-view atlas; other providers weave with the legacy path.
++bool DisplayXRWeaveProvider::SubmitAtlasV6Mac(
++    IOSurfaceRef atlas,
++    uint32_t view_count,
++    uint32_t tile_columns,
++    uint32_t tile_rows,
++    uint32_t content_view_width,
++    uint32_t content_view_height,
++    const std::vector<gfx::Rect>& rects) {
++  return false;
++}
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+ void SetDisplayXRWeaveProvider(DisplayXRWeaveProvider* p) {
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index eeaad1b996fb8..f5224a52a275d 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -16,6 +16,7 @@
+ #endif
+ 
+ #include <cstdint>
++#include <vector>
+ 
+ #include "components/viz/service/viz_service_export.h"
+ #include "ui/gfx/geometry/rect.h"
+@@ -113,6 +114,24 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   // so it can't be imported as a Chromium SharedImage directly; copying into a
+   // Chromium-native surface is the bridge. Returns false if no woven output yet.
+   virtual bool BlitWovenToMac(IOSurfaceRef dst, const gfx::Rect& src_rect) = 0;
++
++  // v6 (#774): submit a pre-assembled N-view worst-case atlas as ONE weave,
++  // chaining XrWeaveSubmitLayoutDXR. |atlas| is the IOSurface the caller (Skia)
++  // already filled with |view_count| tiles packed contiguously from the top-left
++  // at |content_view_width|x|content_view_height| in a |tile_columns|x|tile_rows|
++  // grid; |rects| are the element window rects (device px), a scope hint only.
++  // This REPLACES the BeginBatchSync/WeaveCanvasMac packed-input assembly for the
++  // browser inline-3D path (which overflowed Metal's 16384 max texture size when
++  // packing every full-SBS canvas). The woven output is one content view
++  // (content_view_width x content_view_height); read it back via BlitWovenToMac.
++  // Default: false (only the mac GPU provider implements it).
++  virtual bool SubmitAtlasV6Mac(IOSurfaceRef atlas,
++                                uint32_t view_count,
++                                uint32_t tile_columns,
++                                uint32_t tile_rows,
++                                uint32_t content_view_width,
++                                uint32_t content_view_height,
++                                const std::vector<gfx::Rect>& rects);
+ #endif
+ 
+   // If a completed weave result for |target_id| is available and not yet taken,
+@@ -157,6 +176,13 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   virtual bool SetBatchOverlay(ID3D11Device* device,
+                                ID3D11Texture2D* atlas_tex,
+                                UINT array_slice);
++#elif BUILDFLAG(IS_APPLE)
++  // macOS twin of SetBatchOverlay: |atlas| is the window-sized PREMULTIPLIED-
++  // alpha BGRA IOSurface the caller assembled (all 2D overlays flattened in
++  // z-order onto transparency). Staged as the runtime DP's overlay atlas for the
++  // batch submit (composited OVER the woven output); the provider CFRetains it
++  // until the next batch. Returns true if staged. Default: no-op.
++  virtual bool SetBatchOverlayMac(IOSurfaceRef atlas);
+ #endif  // BUILDFLAG(IS_WIN)
+ };
+ 
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index e350aa56c6ce1..534868c984cda 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -115,10 +115,12 @@
+ #include <IOSurface/IOSurface.h>
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstdlib>
+ #include <limits>
+ 
+ #include "components/viz/common/resources/shared_image_format.h"
++#include "components/viz/service/display/overlay_candidate.h"
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+@@ -521,7 +523,7 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+     if (!draw_success) {
+       draw_render_pass_failed_ = true;
+     }
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+     // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model): weave the
+     // composited output's inline-3d sub-rects AFTER the page is painted, before
+     // Flush/Submit. (Graphite-Dawn is chrome's default.)
+@@ -563,7 +565,7 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+                    *scoped_output_device_paint_->GetCanvas());
+     }
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+     // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model): weave the
+     // composited output's inline-3d sub-rects AFTER the page is painted, before
+     // Flush/Submit.
+@@ -758,11 +760,12 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintRenderPass(
+     }
+     if (insert_success) {
+       skia_representation->SetCleared();
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+       // DisplayXR inline-3D (#625, Step B / B4c): under DComp the composited page
+       // lands in the ROOT render-pass backing (this Graphite recording), not the
+       // output-device surface — weave it here so --disable-direct-composition is
+-      // no longer required.
++      // no longer required. On macOS the whole gallery page (tiles included) is
++      // likewise composited into the window-sized ROOT SkSurface via this path.
+       MaybeWeaveRootRenderPass(surface, is_overlay);
+ #endif
+     } else {
+@@ -786,12 +789,12 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintRenderPass(
+     DrawOverdraw(std::move(overdraw_ddl), *surface->getCanvas());
+   }
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+   // DisplayXR inline-3D (#625, Step B / B4c): under DComp (Ganesh backend) the
+   // composited page lands in the ROOT render-pass backing (this DDL), not the
+   // output-device surface — weave it here so --disable-direct-composition is no
+   // longer required. WeaveCompositedSurface flushes the woven draw-back itself;
+-  // the flush below is harmless.
++  // the flush below is harmless. Same on macOS (Ganesh/Metal root SkSurface).
+   MaybeWeaveRootRenderPass(surface, is_overlay);
+ #endif
+ 
+@@ -2452,9 +2455,17 @@ bool SkiaOutputSurfaceImplOnGpu::PresentFrame(OutputSurfaceFrame frame) {
+   }
+ 
+   if (!overlays_.empty()) {
+-#if BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_APPLE) && 0
+     // DisplayXR inline-3D (#625, mac overlay path): weave the inline-3d canvas
+     // overlay(s) before they are presented to CoreAnimation. See header.
++    //
++    // DISABLED (feat/mac-composited-weave): the fragile per-element CALayer
++    // overlay-substitution weave is REPLACED by the single-path composited-
++    // surface weave (MaybeWeaveRootRenderPass -> WeaveCompositedSurface), which
++    // weaves the composited ROOT render pass in place like Windows. Mac tile
++    // promotion is all-or-nothing (one backdrop-filter drops every tile -> SBS),
++    // so this substitution path could never be relied on. The method body is
++    // left compiled but uncalled for reference. See displayxr-runtime notes.
+     MaybeWeaveOverlaysMac();
+ #endif
+     for (auto& each : overlays_) {
+@@ -2715,7 +2726,7 @@ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
+   inline_3d_canvas_layers_ = std::move(canvas_layers);
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+   if (inline_3d_rects_.empty()) {
+@@ -2770,11 +2781,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   if (!provider) {
+     return;
+   }
++#if BUILDFLAG(IS_WIN)
++  // Windows weaves same-device: the canvas copy + keyed-mutex input live on the
++  // Viz GPU-main D3D11 device. macOS routes through IOSurfaces (no device here).
+   Microsoft::WRL::ComPtr<ID3D11Device> device_x =
+       context_state_->GetD3D11Device();
+   if (!device_x) {
+     return;
+   }
++#endif
+   const gfx::Rect window_bounds(size_);
+   if (window_bounds.IsEmpty()) {
+     return;
+@@ -2931,6 +2946,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+               SinglePlaneFormat::kBGRA_8888, rect.size(),
+               gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
+               kPremul_SkAlphaType,
++#if BUILDFLAG(IS_WIN)
+               gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
+                   gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE |
+                   // CPU_READ forces D3DImageBackingFactory: under Graphite-Dawn a
+@@ -2940,6 +2956,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                   // want_dcomp_texture, so the backing stays a plain, overlay-
+                   // exposable ID3D11Texture2D (kD3D11Texture).
+                   gpu::SHARED_IMAGE_USAGE_CPU_READ,
++#elif BUILDFLAG(IS_APPLE)
++              // SCANOUT routes the scratch to IOSurfaceImageBacking, which is BOTH
++              // Skia-writable (Graphite/Metal) AND Overlay-readable
++              // (ProduceOverlayForWeave -> GetIOSurface) — one backing for the
++              // copy-in and the IOSurface handoff to the mac weave client.
++              gpu::SHARED_IMAGE_USAGE_SCANOUT |
++                  gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++                  gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE,
++#endif
+               "DisplayXRScratch");
+           if (!shared_image_factory_->CreateSharedImage(
+                   mailbox, si_info, gpu::kNullSurfaceHandle)) {
+@@ -3137,6 +3162,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         if (!overlay_read) {
+           return fail("overlay BeginScopedReadAccess");
+         }
++#if BUILDFLAG(IS_WIN)
+         std::optional<gl::DCLayerOverlayImage> ov =
+             overlay_read->GetDCLayerOverlayImage();
+         if (!ov || ov->type() != gl::DCLayerOverlayType::kD3D11Texture ||
+@@ -3159,6 +3185,18 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+             device_x.Get(), ov->d3d11_video_texture(),
+             static_cast<UINT>(ov->texture_array_slice()),
+             gfx::Rect(0, 0, rw, rh), rect, static_cast<uint32_t>(t));
++#elif BUILDFLAG(IS_APPLE)
++        // (4) mac: the scratch's backing IOSurface is MTLBlit-copied into the
++        // shared window-sized weave input at |rect| by the provider, then woven
++        // by the batch submit. GetIOSurface owns a retained ref for the duration
++        // of the read access (kept alive across the copy).
++        gfx::ScopedIOSurface ios = overlay_read->GetIOSurface();
++        if (!ios) {
++          return fail("overlay GetIOSurface");
++        }
++        bool submitted = provider->WeaveCanvasMac(
++            ios.get(), gfx::Rect(0, 0, rw, rh), rect, static_cast<uint32_t>(t));
++#endif
+         static bool logged_zc = false;
+         if (submitted && !logged_zc) {
+           logged_zc = true;
+@@ -3218,9 +3256,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       src_stride = stride;
+     }
+ 
++#if BUILDFLAG(IS_WIN)
+     const bool submitted = provider->WeavePixels(
+         device_x.Get(), src_pixels, static_cast<uint32_t>(src_stride), rect,
+         static_cast<uint32_t>(t));
++#elif BUILDFLAG(IS_APPLE)
++    const bool submitted = provider->WeavePixelsMac(
++        src_pixels, static_cast<uint32_t>(src_stride), rect,
++        static_cast<uint32_t>(t));
++#endif
+     if (submitted) {
+       // Submit-time rect for phase (B) draw-back (see the zero-copy path above).
+       displayxr_pending_rect_[t] = rect;
+@@ -3279,6 +3323,13 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // weave submit and land glued to their tiles (no main-thread-rect scroll lag).
+   // Runs before SubmitBatchSync (the overlay rides that submit). Any failure just
+   // skips the overlay this frame; the weave itself is unaffected.
++  //
++  // Windows only for now: the v4/v5 DP-composited overlay atlas + whole-window
++  // firstChunk present is a follow-up on the mac runtime (comp_multi_weave_macos).
++  // The mac composited-surface weave uses the legacy per-rect kSrc draw-back
++  // below, where the 2D chrome outside the woven tile rects is left untouched on
++  // the root SkSurface (browser#18/#22 exclusion already composited it there).
++#if BUILDFLAG(IS_WIN)
+   if (batch && !inline_3d_overlays_.empty()) {
+     auto stage_overlay_atlas = [&]() -> bool {
+       DisplayXRScratchState& atlas = displayxr_overlay_atlas_state_;
+@@ -3445,12 +3496,208 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+               << inline_3d_overlays_.size() << " overlays, DP-composited)";
+     }
+   }
++#endif  // BUILDFLAG(IS_WIN)  (v4 DP-composited overlay atlas)
++
++#if BUILDFLAG(IS_APPLE)
++  // v4 (browser#18/#22) macOS: assemble the isolated 2D overlays into ONE
++  // window-sized PREMUL atlas and stage it via SetBatchOverlayMac; the runtime DP
++  // composites it OVER the woven output (final = woven·(1 − a) + overlay). This
++  // REPLACES the old browser-side kSrcOver draw-back of the overlays, which read
++  // the renderer-owned overlay backings on the GPU thread and lost the mac
++  // Graphite single-writer-XOR-reader race during scroll → dropped overlay →
++  // flicker (#0053). The DP never reads renderer backings.
++  //
++  // #0053 Option B — PERSISTENT atlas. The atlas BUILD below still reads the
++  // renderer backings on this (GPU) thread, so a read can still lose the race.
++  // But we do NOT clear-and-rebuild every frame (that would turn a mid-write read
++  // into a DROP = the same flicker). The atlas is persistent: only overlays whose
++  // read SUCCEEDS are re-drawn; a mid-write overlay keeps last frame's pixels (a
++  // scrim/label barely moves per frame → invisible one-frame-lag). Vacated regions
++  // (an overlay that moved or disappeared) are erased. A FAILED begin-read pins
++  // nothing, so this does NOT reintroduce the renderer :1651 write-fail that the
++  // earlier held-scratch attempt did; the successful reads are FlushSurface+submit
++  // here (short-lived), also off the :1651 path.
++  if (batch && !inline_3d_overlays_.empty()) {
++    auto stage_overlay_atlas_mac = [&]() -> bool {
++      // (1) Ensure the persistent window-sized BGRA8 premul atlas IOSurface
++      // (SCANOUT → IOSurfaceImageBacking: Skia-writable AND Overlay-readable).
++      bool atlas_created_now = false;
++      if (displayxr_overlay_atlas_mailbox_mac_.IsZero() ||
++          displayxr_overlay_atlas_size_mac_ != window_bounds.size()) {
++        if (!displayxr_overlay_atlas_mailbox_mac_.IsZero()) {
++          shared_image_factory_->DestroySharedImage(
++              displayxr_overlay_atlas_mailbox_mac_);
++          displayxr_overlay_atlas_mailbox_mac_ = gpu::Mailbox();
++        }
++        displayxr_overlay_atlas_prev_rects_mac_.clear();
++        gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++        gpu::SharedImageInfo si_info(
++            SinglePlaneFormat::kBGRA_8888, window_bounds.size(),
++            gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++            kPremul_SkAlphaType,
++            gpu::SHARED_IMAGE_USAGE_SCANOUT |
++                gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++                gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE,
++            "DisplayXROverlayAtlasMac");
++        if (!shared_image_factory_->CreateSharedImage(
++                mailbox, si_info, gpu::kNullSurfaceHandle)) {
++          return false;
++        }
++        displayxr_overlay_atlas_mailbox_mac_ = mailbox;
++        displayxr_overlay_atlas_size_mac_ = window_bounds.size();
++        atlas_created_now = true;
++      }
++
++      // (2) Persistent update (Option B). Collect this frame's rects, then update
++      // the atlas in place: erase vacated regions, redraw only readable overlays,
++      // leave last-good for any whose read loses the race.
++      std::vector<gfx::Rect> curr_rects;
++      curr_rects.reserve(inline_3d_overlays_.size());
++      for (const SkiaOutputSurface::Inline3dLayerMailbox& overlay :
++           inline_3d_overlays_) {
++        gfx::Rect r = overlay.rect;
++        r.Intersect(window_bounds);
++        if (!r.IsEmpty() && !overlay.mailbox.IsZero()) {
++          curr_rects.push_back(r);
++        }
++      }
++      {
++        auto atlas_rep = shared_image_representation_factory_->ProduceSkia(
++            displayxr_overlay_atlas_mailbox_mac_, context_state_.get());
++        if (!atlas_rep) {
++          return false;
++        }
++        std::vector<GrBackendSemaphore> abegin, aend;
++        SkSurfaceProps props;
++        auto atlas_write = atlas_rep->BeginScopedWriteAccess(
++            /*final_msaa_count=*/0, props, &abegin, &aend,
++            gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++        if (!atlas_write || !atlas_write->surface()) {
++          return false;
++        }
++        SkSurface* atlas_surface = atlas_write->surface();
++        SkCanvas* ac = atlas_surface->getCanvas();
++        if (!abegin.empty()) {
++          atlas_surface->wait(abegin.size(), abegin.data(),
++                              /*deleteSemaphoresAfterWait=*/false);
++        }
++        // One-time init clear on (re)creation: a fresh SharedImage is UNCLEARED
++        // and the persistent path never full-clears, so without this the non-
++        // overlay regions are garbage that the DP composites over the WHOLE woven
++        // output (→ white/opaque tiles). Clear ALL to transparent once; thereafter
++        // only overlay rects are touched and the rest stays transparent.
++        if (atlas_created_now) {
++          ac->clear(SK_ColorTRANSPARENT);
++        }
++        // Erase VACATED regions: each previous rect MINUS all current rects (an
++        // overlay that moved or disappeared leaves no ghost). A current overlay's
++        // rect is never cleared here (it's in curr_rects), so a mid-write overlay
++        // keeps its last-good pixels.
++        for (const gfx::Rect& prev : displayxr_overlay_atlas_prev_rects_mac_) {
++          ac->save();
++          ac->clipRect(SkRect::MakeXYWH(prev.x(), prev.y(), prev.width(),
++                                        prev.height()),
++                       SkClipOp::kIntersect, /*doAntiAlias=*/false);
++          for (const gfx::Rect& cur : curr_rects) {
++            ac->clipRect(SkRect::MakeXYWH(cur.x(), cur.y(), cur.width(),
++                                          cur.height()),
++                         SkClipOp::kDifference, /*doAntiAlias=*/false);
++          }
++          ac->clear(SK_ColorTRANSPARENT);
++          ac->restore();
++        }
++        // Redraw only the overlays whose backing is readable THIS frame. Padding-
++        // aware source (browser#29-Y): the isolated raster holds the element at
++        // scale 1 in the TOP-LEFT of a padded image; key |src| off the UNCLIPPED
++        // rect and let kStrict clamp keep the padding out.
++        SkPaint over_paint;
++        over_paint.setBlendMode(SkBlendMode::kSrcOver);
++        for (const SkiaOutputSurface::Inline3dLayerMailbox& overlay :
++             inline_3d_overlays_) {
++          gfx::Rect r = overlay.rect;
++          r.Intersect(window_bounds);
++          if (r.IsEmpty() || overlay.mailbox.IsZero()) {
++            continue;
++          }
++          auto overlay_rep = shared_image_representation_factory_->ProduceSkia(
++              overlay.mailbox, context_state_.get());
++          if (!overlay_rep) {
++            continue;  // leave last-good
++          }
++          std::vector<GrBackendSemaphore> obegin, oend;
++          auto overlay_access =
++              overlay_rep->BeginScopedReadAccess(&obegin, &oend);
++          if (!overlay_access) {
++            continue;  // mid-write → leave last-good (no clear, no drop, no pin)
++          }
++          sk_sp<SkImage> overlay_img =
++              overlay_access->CreateSkImage(context_state_.get());
++          if (!overlay_img) {
++            continue;
++          }
++          if (!obegin.empty()) {
++            atlas_surface->wait(obegin.size(), obegin.data(),
++                                /*deleteSemaphoresAfterWait=*/false);
++          }
++          const gfx::Rect full = overlay.rect;
++          const SkRect src = SkRect::MakeXYWH(r.x() - full.x(), r.y() - full.y(),
++                                              r.width(), r.height());
++          const SkRect dst =
++              SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
++          // Clear this overlay's own rect first (so a shrunk/moved overlay leaves
++          // no residue inside it), then draw fresh premul-over transparent.
++          ac->save();
++          ac->clipRect(dst, SkClipOp::kIntersect, /*doAntiAlias=*/false);
++          ac->clear(SK_ColorTRANSPARENT);
++          ac->restore();
++          ac->drawImageRect(overlay_img.get(), src, dst,
++                            SkSamplingOptions(SkFilterMode::kLinear), &over_paint,
++                            SkCanvas::kStrict_SrcRectConstraint);
++        }
++        FlushSurface(atlas_surface, aend, atlas_write.get());
++        if (gr_context()) {
++          gr_context()->submit();
++        }
++        if (graphite_shared_context()) {
++          graphite_shared_context()->submit();
++        }
++      }
++      displayxr_overlay_atlas_prev_rects_mac_ = std::move(curr_rects);
++
++      // (3) Stage the PERSISTENT atlas IOSurface for this batch submit. It holds
++      // last-good content even if every read lost the race this frame, so stage
++      // whenever it exists (SubmitBatchSync composites it over the woven output).
++      auto overlay_rep =
++          shared_image_representation_factory_->ProduceOverlayForWeave(
++              displayxr_overlay_atlas_mailbox_mac_);
++      if (!overlay_rep) {
++        return false;
++      }
++      auto overlay_read = overlay_rep->BeginScopedReadAccess();
++      if (!overlay_read) {
++        return false;
++      }
++      gfx::ScopedIOSurface atlas_ios = overlay_read->GetIOSurface();
++      if (!atlas_ios) {
++        return false;
++      }
++      return provider->SetBatchOverlayMac(atlas_ios.get());
++    };
++    const bool staged = stage_overlay_atlas_mac();
++    static int atlas_log_throttle_mac = 0;
++    if ((atlas_log_throttle_mac++ % 120) == 0) {
++      VLOG(1) << "[DisplayXR] mac weave overlay atlas: staged=" << staged << " ("
++              << inline_3d_overlays_.size() << " overlays, DP-composited)";
++    }
++  }
++#endif  // BUILDFLAG(IS_APPLE)  (v4 DP-composited overlay atlas, persistent)
+ 
+   if (batch) {
+     provider->SubmitBatchSync();
+   }
+ 
+-  // ---- (B) Draw back the accumulated window-sized woven output ----
++#if BUILDFLAG(IS_WIN)
++  // ---- (B) Draw back the accumulated window-sized woven output (Windows) ----
+   // The runtime weaves EVERY submitted sub-rect into ONE window-sized handback
+   // texture and (v5, browser#22) clears the gaps to transparent on the frame's
+   // first chunk, so all inline-3d elements accumulate into a single shared output
+@@ -3458,7 +3705,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // fresh handle arrives only on the first submit / a window-size change; every
+   // later reply carries handle 0), adopt the latest submit's fence, then draw the
+   // WHOLE woven output back over the page in one kSrcOver (below). Runs after (A)
+-  // so the submit read the clean pre-weave page.
++  // so the submit read the clean pre-weave page. (macOS uses the synchronous
++  // draw-back in the #elif branch below — see that block.)
+   uint64_t latest_fence_value = 0;
+   bool got_result = false;
+   for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
+@@ -3521,10 +3769,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+   }
+ 
+-  // One read access on the shared woven; draw each inline-3d rect's region from
+-  // it. The woven output is window-sized and offset-preserving, so sample the
+-  // SAME rect it occupies (device-pixel-exact nearest — critical for the
+-  // interlace lattice). Access + representation stay alive until after the flush.
++  // One read access on the shared woven; draw the whole window-sized woven output
++  // back. Access + representation stay alive until after the flush.
+   auto woven_rep = shared_image_representation_factory_->ProduceSkia(
+       displayxr_shared_woven_mailbox_, context_state_.get());
+   if (!woven_rep) {
+@@ -3544,18 +3790,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                  /*deleteSemaphoresAfterWait=*/false);
+   }
+ 
+-  // v5 whole-window present (browser#22): the runtime now clears its woven
+-  // output to premultiplied transparent on the FIRST chunk of the frame
+-  // (XrWeaveSubmitInfoDXR::firstChunk), so the window-sized handback is "opaque
+-  // woven tiles + DP-composited overlays, on transparent gaps". Draw it ONCE
+-  // over the whole window with kSrcOver (device-pixel-exact NEAREST for the
+-  // interlace lattice): opaque tiles (alpha 1) replace the page, transparent
+-  // gaps (alpha 0) show the page through, premul overlays composite on top. This
+-  // single-sources any 2D chrome that spans tile gaps — killing the per-tile
+-  // header double the old per-rect kSrc draw-back produced (a full-width sticky
+-  // header covered by both the DP composite over tiles AND the raw page in the
+-  // gaps). The runtime's transparent clear also means gaps carry no stale/smear,
+-  // so there is no longer a reason to scope the draw to submit-time rects.
++  // v5 whole-window present (browser#22): the runtime clears its woven output to
++  // premultiplied transparent on the FIRST chunk of the frame, so the window-
++  // sized handback is "opaque woven tiles + DP-composited overlays, on
++  // transparent gaps". Draw it ONCE over the whole window with kSrcOver
++  // (device-pixel-exact NEAREST for the interlace lattice).
+   bool drew_any = false;
+   gfx::Rect woven_rect(0, 0, displayxr_shared_woven_size_.width(),
+                        displayxr_shared_woven_size_.height());
+@@ -3572,12 +3811,6 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     drew_any = true;
+   }
+ 
+-  // 2D overlays (browser#18) are NO LONGER composited here. They are assembled
+-  // into a premultiplied-alpha atlas in Phase A and composited by the runtime DP
+-  // OVER the woven output (v4 XrWeaveSubmitOverlaysDXR / browser#22), so the
+-  // woven handback drawn back above already carries them at their tile-glued
+-  // positions. See the stage_overlay_atlas block before SubmitBatchSync.
+-
+   // Ensure the woven draws land in (and are submitted to) the output surface
+   // before |woven_access| releases — otherwise Ganesh reads the released woven
+   // texture at flush time and the draws show nothing.
+@@ -3592,8 +3825,189 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+   }
+   // woven_access / woven_rep release here, after the submit.
++
++#elif BUILDFLAG(IS_APPLE)
++  // ---- (B) macOS SYNCHRONOUS draw-back (#760) via a Chromium-allocated scratch ----
++  // SubmitBatchSync already blocked until the runtime finished weaving, so the
++  // woven output is in hand NOW (the provider retains it in cached_woven_, set by
++  // SubmitBatchSync; the runtime re-weaves in place into it every frame).
++  //
++  // We CANNOT import the runtime's woven IOSurface into a SharedImage directly:
++  // MoltenVK's vkExportMetalObjectsEXT exports it with pixel-format = 0 (it does
++  // not tag the surface), so CreateSharedImage rejects it ("CreateSharedImage
++  // (woven IOSurface) FAILED", 3381x, drew_any=0 last iteration). Instead — as the
++  // overlay-substitution path already did — MTL-blit the woven pixels into a
++  // Chromium-ALLOCATED, properly-formatted window-sized scratch (BGRA8 SCANOUT
++  // IOSurfaceImageBacking) that imports cleanly, then draw FROM the scratch.
++  //
++  // The woven surface is window-sized (== size_) with all tiles at their WINDOW
++  // positions (shared-woven model), so blit the whole window rect and draw each
++  // inline-3d rect's sub-region back over the composited root at the same rect.
++  const gfx::Size woven_size(size_);
++  const int woven_w = woven_size.width();
++  const int woven_h = woven_size.height();
++  bool blit_ok = false;
++  bool drew_any = false;
++  int rects_drawn = 0;
++  int overlays_drawn = 0;
++  if (woven_w > 0 && woven_h > 0) {
++    // (a) Persistent window-sized BGRA8 SCANOUT scratch — Skia-writable AND
++    // Overlay-readable (ProduceOverlayForWeave -> GetIOSurface). Created once,
++    // recreated on a window-size change. A fresh SharedImage is UNCLEARED, so
++    // Skia-clear it once (EnsureScratchClearedMac) before first read.
++    if (displayxr_shared_woven_mailbox_.IsZero() ||
++        displayxr_shared_woven_size_ != woven_size) {
++      if (!displayxr_shared_woven_mailbox_.IsZero()) {
++        displayxr_cleared_scratch_mac_.erase(displayxr_shared_woven_mailbox_);
++        shared_image_factory_->DestroySharedImage(displayxr_shared_woven_mailbox_);
++        displayxr_shared_woven_mailbox_ = gpu::Mailbox();
++      }
++      gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++      gpu::SharedImageInfo si_info(
++          SinglePlaneFormat::kBGRA_8888, woven_size,
++          gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++          kPremul_SkAlphaType,
++          gpu::SHARED_IMAGE_USAGE_SCANOUT |
++              gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++              gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE,
++          "DisplayXRWovenScratch");
++      if (shared_image_factory_->CreateSharedImage(mailbox, si_info,
++                                                   gpu::kNullSurfaceHandle)) {
++        displayxr_shared_woven_mailbox_ = mailbox;
++        displayxr_shared_woven_size_ = woven_size;
++      } else {
++        LOG(ERROR) << "[DisplayXR] weave draw-back: CreateSharedImage(woven "
++                      "scratch) failed "
++                   << woven_w << "x" << woven_h;
++      }
++    }
++    if (!displayxr_shared_woven_mailbox_.IsZero()) {
++      EnsureScratchClearedMac(displayxr_shared_woven_mailbox_);
++    }
++
++    // (b) MTL-blit the runtime woven pixels (cached_woven_) into the scratch's
++    // IOSurface at (0,0) covering the whole window (positions preserved). The
++    // provider's BlitWovenToMac waits for the blit to complete synchronously.
++    if (!displayxr_shared_woven_mailbox_.IsZero()) {
++      auto overlay_rep =
++          shared_image_representation_factory_->ProduceOverlayForWeave(
++              displayxr_shared_woven_mailbox_);
++      if (overlay_rep) {
++        auto overlay_read = overlay_rep->BeginScopedReadAccess();
++        if (overlay_read) {
++          gfx::ScopedIOSurface scratch_ios = overlay_read->GetIOSurface();
++          if (scratch_ios) {
++            blit_ok = provider->BlitWovenToMac(
++                scratch_ios.get(), gfx::Rect(0, 0, woven_w, woven_h));
++          }
++        }
++      }
++    }
++
++    // (c) Wrap the (freshly-blitted) scratch as an SkImage and draw each tile's
++    // window sub-region back over the composited root.
++    if (blit_ok) {
++      auto woven_rep = shared_image_representation_factory_->ProduceSkia(
++          displayxr_shared_woven_mailbox_, context_state_.get());
++      if (woven_rep) {
++        std::vector<GrBackendSemaphore> wbegin_sem, wend_sem;
++        auto woven_access =
++            woven_rep->BeginScopedReadAccess(&wbegin_sem, &wend_sem);
++        if (woven_access) {
++          sk_sp<SkImage> woven_img =
++              woven_access->CreateSkImage(context_state_.get());
++          if (woven_img) {
++            if (!wbegin_sem.empty()) {
++              output->wait(wbegin_sem.size(), wbegin_sem.data(),
++                           /*deleteSemaphoresAfterWait=*/false);
++            }
++            // Draw each tile's window sub-region back over the composited root at
++            // the SAME window rect (the woven surface is window-sized with tiles
++            // at window positions). kSrc: the woven pixels replace the raw SBS;
++            // the 2D chrome outside these rects is left as the root composited it.
++            for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
++              gfx::Rect rect = inline_3d_rects_[i];
++              rect.Intersect(window_bounds);
++              if (rect.IsEmpty()) {
++                continue;
++              }
++              const SkRect src_dst = SkRect::MakeXYWH(
++                  rect.x(), rect.y(), rect.width(), rect.height());
++              SkPaint paint;
++              paint.setBlendMode(SkBlendMode::kSrc);
++              out_canvas->drawImageRect(
++                  woven_img.get(), src_dst, src_dst,
++                  SkSamplingOptions(SkFilterMode::kNearest), &paint,
++                  SkCanvas::kStrict_SrcRectConstraint);
++              drew_any = true;
++              ++rects_drawn;
++            }
++            // #0053: the browser#18-EXCLUDED 2D overlays (header/title/captions/
++            // plates) are now composited INTO the woven output by the runtime DP
++            // (SetBatchOverlayMac above → premul-over: final = woven·(1 − a) + a),
++            // at their window positions. Draw them back from the WOVEN SCRATCH
++            // (|woven_img|) — NOT the renderer-owned overlay backings, so there is
++            // no GPU-thread read race (the old kSrcOver loop that read those
++            // backings lost the mac Graphite single-writer-XOR-reader race during
++            // scroll → dropped overlay → flicker). Each overlay rect is drawn
++            // kSrcOver: a header over the page blends premul-correctly; a scrim
++            // over a tile (already composited opaque into the woven output)
++            // replaces. On-tile scrims are ALSO inside a tile rect (drawn kSrc
++            // above); the woven-scratch pixels are identical, so the overlap is a
++            // harmless idempotent redraw. IN THE SAME Graphite recording as the
++            // tiles (one flush per frame — see below).
++            SkPaint over_paint;
++            over_paint.setBlendMode(SkBlendMode::kSrcOver);
++            for (const SkiaOutputSurface::Inline3dLayerMailbox& overlay :
++                 inline_3d_overlays_) {
++              gfx::Rect r = overlay.rect;
++              r.Intersect(window_bounds);
++              if (r.IsEmpty()) {
++                continue;
++              }
++              const SkRect rr =
++                  SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
++              out_canvas->drawImageRect(woven_img.get(), rr, rr,
++                                        SkSamplingOptions(SkFilterMode::kNearest),
++                                        &over_paint,
++                                        SkCanvas::kStrict_SrcRectConstraint);
++              ++overlays_drawn;
++            }
++
++            // ONE flush per frame for the whole draw-back (woven tiles + 2D
++            // overlays). out_canvas IS output->getCanvas() (the presented root
++            // render-pass surface FinishPaintRenderPass handed us). Commit before
++            // |woven_access| and the overlay accesses release.
++            if (drew_any || overlays_drawn > 0) {
++              std::vector<GrBackendSemaphore> empty_sem;
++              FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
++              if (gr_context()) {
++                gr_context()->submit();
++              }
++              if (graphite_shared_context()) {
++                graphite_shared_context()->submit();
++              }
++            }
++            // overlay_accesses / overlay_reps release HERE, after flush+submit.
++          } else {
++            LOG(ERROR)
++                << "[DisplayXR] weave draw-back: CreateSkImage(woven) failed";
++          }
++        }
++      }
++    }
++  }
++
++  static bool logged_drawback = false;
++  if ((drew_any || overlays_drawn > 0) && !logged_drawback) {
++    logged_drawback = true;
++    VLOG(1) << "[DisplayXR] mac composited weave: drew back " << rects_drawn
++            << " woven inline-3D rect(s) from a " << woven_w << "x" << woven_h
++            << " scratch + " << overlays_drawn << " excluded 2D overlay(s)";
++  }
++#endif  // BUILDFLAG(IS_WIN) / BUILDFLAG(IS_APPLE)
+ }
+-#endif  // BUILDFLAG(IS_WIN)
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+ 
+ #if BUILDFLAG(IS_APPLE)
+ bool SkiaOutputSurfaceImplOnGpu::EnsureScratchClearedMac(
+@@ -3652,28 +4066,48 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOverlaysMac() {
+     return;
+   }
+ 
+-  // The inline-3d canvas overlays were substituted by SkiaRenderer: each now
+-  // presents a woven scratch (|mailbox|) and carries the original canvas
+-  // render-pass backing in |displayxr_weave_source|. We weave the source (the
+-  // full-resolution flat SBS) and blit the woven anaglyph into the presented
+-  // scratch, so every present path — including the async trackpad-scroll fast
+-  // path — samples the woven surface, never the raw SBS.
++  // v6 (#774) N-view worst-case atlas. Replaces the old assembly that packed
++  // every element's FULL-SBS canvas side-by-side into one input IOSurface — that
++  // overflowed Metal's 16384 max texture width on the gallery (many wide SBS
++  // canvases) and produced SBS tiles + black rows. Now we build a DISPLAY-bounded
++  // N-view atlas: each element is drawn (scaled by the active mode's viewScale)
++  // into every view-tile at its window position, so the atlas is at most the
++  // packed active-mode size and never overflows.
++  //
++  // TARGET MODE hardcoded to sim_display's first 3D mode = Anaglyph:
++  //   viewCount=2, tileColumns=2, tileRows=1, viewScale 0.5 x 0.5 (both axes).
++  // TODO(v6): enumerate via xrEnumerateDisplayRenderingModesDXR + track
++  // XrEventDataRenderingModeChangedDXR::currentModeIndex — do NOT use isActive,
++  // it is stale over IPC. N>2 is blocked on #776 (mode negotiation).
++  constexpr uint32_t kViewCount = 2u;
++  constexpr uint32_t kCols = 2u;
++  constexpr uint32_t kRows = 1u;
++  constexpr float kScaleX = 0.5f;
++  constexpr float kScaleY = 0.5f;
++  const int win_w = window_bounds.width();
++  const int win_h = window_bounds.height();
++  const int content_w = static_cast<int>(std::lround(win_w * kScaleX));
++  const int content_h = static_cast<int>(std::lround(win_h * kScaleY));
++  if (content_w <= 0 || content_h <= 0) {
++    return;
++  }
++  const int packed_w = static_cast<int>(kCols) * content_w;  // = win_w (anaglyph)
++  const int packed_h = static_cast<int>(kRows) * content_h;  // = win_h/2
++
++  // Match the substituted inline-3d canvas overlays: each now presents a woven
++  // scratch (|mailbox|) and carries its original canvas SBS backing
++  // (|displayxr_weave_source|). Recover the element's window rect (device px) via
++  // DisplayRectInTargetSpace — the position the element occupies on the panel,
++  // which the atlas fill scales by viewScale.
+   struct Weave {
+     size_t idx;                       // index into overlays_
+     uint32_t target;                  // inline-3d element index
+-    gfx::ScopedIOSurface source_ios;  // canvas SBS (weave input)
+-    int iw;
+-    int ih;
+-    int px;  // packed x-offset in the batch input (elements side-by-side)
++    gfx::ScopedIOSurface source_ios;  // canvas SBS (cw x ch), weave input
++    int cw;                           // SBS width (cw = 2 * per-eye)
++    int ch;                           // SBS height
++    gfx::Rect win_rect;               // element window rect, device px (y-down)
+   };
+   std::vector<Weave> weaves;
+-  // Pack the elements side-by-side into one batch input (each source at a
+-  // cumulative x-offset), NOT all at origin: overlapping them at (0,0) makes
+-  // every element read the same (last-wins) woven output — the multi-element
+-  // gallery bug. The runtime weaves each rect in place and its output is the
+-  // input size, so each element reads back its own packed sub-region below.
+-  int input_w = 0;  // packed total width (sum of element widths)
+-  int input_h = 0;  // max element height
+   for (size_t i = 0; i < overlays_.size(); ++i) {
+     const auto& o = overlays_[i];
+     if (o.displayxr_weave_source.IsZero() || o.mailbox.IsZero()) {
+@@ -3687,37 +4121,342 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOverlaysMac() {
+     if (!ios) {
+       continue;
+     }
+-    const int iw = static_cast<int>(IOSurfaceGetWidth(ios.get()));
+-    const int ih = static_cast<int>(IOSurfaceGetHeight(ios.get()));
+-    weaves.push_back({i, o.displayxr_weave_target, ios, iw, ih, input_w});
+-    input_w += iw;  // next element packs to the right
+-    input_h = std::max(input_h, ih);
++    const int cw = static_cast<int>(IOSurfaceGetWidth(ios.get()));
++    const int ch = static_cast<int>(IOSurfaceGetHeight(ios.get()));
++    gfx::Rect wr =
++        gfx::ToRoundedRect(OverlayCandidate::DisplayRectInTargetSpace(o));
++    wr.Intersect(window_bounds);
++    if (cw < 2 || ch < 1 || wr.IsEmpty()) {
++      continue;
++    }
++    weaves.push_back({i, o.displayxr_weave_target, ios, cw, ch, wr});
+   }
+   if (weaves.empty()) {
+     return;
+   }
+ 
+-  // Phase A: weave every canvas at full backing resolution (correct 2x1
+-  // un-squeeze), one batched synchronous submit.
+-  provider->BeginBatchSync(gfx::Size(input_w, input_h));
++  // Open the provider batch so the shared 2D-overlay staging path
++  // (SetBatchOverlayMac, which gates on the batch being open) still works. We do
++  // NOT call WeaveCanvasMac — the atlas is Skia-assembled below (drawImageRect
++  // scales; MTLBlit can't) and handed to SubmitAtlasV6Mac directly.
++  provider->BeginBatchSync(window_bounds.size());
++
++  // (A) Ensure the packed N-view atlas SharedImage (IOSurface-backed BGRA8 premul,
++  // SCANOUT → IOSurfaceImageBacking: Skia-writable AND Overlay-readable via
++  // ProduceOverlayForWeave → GetIOSurface). Recreate on a size change.
++  const gfx::Size atlas_size(packed_w, packed_h);
++  if (displayxr_weave_atlas_mailbox_mac_.IsZero() ||
++      displayxr_weave_atlas_size_mac_ != atlas_size) {
++    if (!displayxr_weave_atlas_mailbox_mac_.IsZero()) {
++      shared_image_factory_->DestroySharedImage(
++          displayxr_weave_atlas_mailbox_mac_);
++      displayxr_weave_atlas_mailbox_mac_ = gpu::Mailbox();
++    }
++    gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++    gpu::SharedImageInfo si_info(
++        SinglePlaneFormat::kBGRA_8888, atlas_size, gfx::ColorSpace::CreateSRGB(),
++        kTopLeft_GrSurfaceOrigin, kPremul_SkAlphaType,
++        gpu::SHARED_IMAGE_USAGE_SCANOUT | gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++            gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE,
++        "DisplayXRWeaveAtlasMac");
++    if (!shared_image_factory_->CreateSharedImage(mailbox, si_info,
++                                                  gpu::kNullSurfaceHandle)) {
++      return;
++    }
++    displayxr_weave_atlas_mailbox_mac_ = mailbox;
++    displayxr_weave_atlas_size_mac_ = atlas_size;
++  }
++
++  // (B) Skia-assemble the atlas: clear transparent (dead space must be clean),
++  // then for each element draw its LEFT SBS half into tile 0 (origin (0,0)) and
++  // its RIGHT SBS half into tile 1 (origin (content_w,0)), each at the element's
++  // window rect scaled by viewScale. kSrc = opaque replace over the transparent
++  // clear (disjoint tiles); kStrict clamp keeps the SBS split seam clean.
++  {
++    auto atlas_rep = shared_image_representation_factory_->ProduceSkia(
++        displayxr_weave_atlas_mailbox_mac_, context_state_.get());
++    if (!atlas_rep) {
++      return;
++    }
++    std::vector<GrBackendSemaphore> abegin, aend;
++    SkSurfaceProps props;
++    auto atlas_write = atlas_rep->BeginScopedWriteAccess(
++        /*final_msaa_count=*/0, props, &abegin, &aend,
++        gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++    if (!atlas_write || !atlas_write->surface()) {
++      return;
++    }
++    SkSurface* atlas_surface = atlas_write->surface();
++    if (!abegin.empty()) {
++      atlas_surface->wait(abegin.size(), abegin.data(),
++                          /*deleteSemaphoresAfterWait=*/false);
++    }
++    atlas_surface->getCanvas()->clear(SK_ColorTRANSPARENT);
++    SkPaint tile_paint;
++    tile_paint.setBlendMode(SkBlendMode::kSrc);
++    const SkSamplingOptions sampling(SkFilterMode::kLinear);
++    for (const Weave& w : weaves) {
++      auto src_rep = shared_image_representation_factory_->ProduceSkia(
++          overlays_[w.idx].displayxr_weave_source, context_state_.get());
++      if (!src_rep) {
++        continue;
++      }
++      std::vector<GrBackendSemaphore> sbegin, send;
++      auto src_read = src_rep->BeginScopedReadAccess(&sbegin, &send);
++      if (!src_read) {
++        continue;
++      }
++      sk_sp<SkImage> src_img = src_read->CreateSkImage(context_state_.get());
++      if (!src_img) {
++        continue;
++      }
++      if (!sbegin.empty()) {
++        atlas_surface->wait(sbegin.size(), sbegin.data(),
++                            /*deleteSemaphoresAfterWait=*/false);
++      }
++      const double half = w.cw / 2.0;  // SBS split: left half | right half
++      const float l = w.win_rect.x() * kScaleX;
++      const float t = w.win_rect.y() * kScaleY;
++      const float r = w.win_rect.right() * kScaleX;
++      const float b = w.win_rect.bottom() * kScaleY;
++      // LEFT view → tile 0 at (0,0).
++      atlas_surface->getCanvas()->drawImageRect(
++          src_img.get(),
++          SkRect::MakeLTRB(0.f, 0.f, static_cast<float>(half),
++                           static_cast<float>(w.ch)),
++          SkRect::MakeLTRB(l, t, r, b), sampling, &tile_paint,
++          SkCanvas::kStrict_SrcRectConstraint);
++      // RIGHT view → tile 1 at (content_w,0).
++      atlas_surface->getCanvas()->drawImageRect(
++          src_img.get(),
++          SkRect::MakeLTRB(static_cast<float>(half), 0.f,
++                           static_cast<float>(w.cw), static_cast<float>(w.ch)),
++          SkRect::MakeLTRB(content_w + l, t, content_w + r, b), sampling,
++          &tile_paint, SkCanvas::kStrict_SrcRectConstraint);
++    }
++    FlushSurface(atlas_surface, aend, atlas_write.get());
++    if (gr_context()) {
++      gr_context()->submit();
++    }
++    if (graphite_shared_context()) {
++      graphite_shared_context()->submit();
++    }
++  }
++
++  // v4/v5 (browser#18/#22): assemble this frame's isolated 2D overlays into ONE
++  // window-sized premultiplied-alpha atlas and stage it as the runtime DP's
++  // overlay input, so the DP composites 2D OVER the woven output
++  // (final = woven·(1 − a) + overlay). Backend-neutral Skia assembly identical to
++  // the Windows stage_overlay_atlas (steps 1-2), then a mac-specific IOSurface
++  // export (step 3). Runs before SubmitBatchSync (the overlay rides that submit).
++  // Any failure just skips the overlay this frame; the weave itself is
++  // unaffected. |inline_3d_overlays_| is cross-platform (SetInline3DLayers).
++  if (!inline_3d_overlays_.empty()) {
++    auto stage_overlay_atlas = [&]() -> bool {
++      // (1) Ensure a window-sized BGRA8 premul atlas as an IOSurface-backed
++      // SharedImage (SCANOUT routes it to IOSurfaceImageBacking — Skia-writable
++      // for the composite below AND Overlay-readable via ProduceOverlayForWeave
++      // -> GetIOSurface, like the mac woven scratch). Recreated on a size change.
++      if (displayxr_overlay_atlas_mailbox_mac_.IsZero() ||
++          displayxr_overlay_atlas_size_mac_ != window_bounds.size()) {
++        if (!displayxr_overlay_atlas_mailbox_mac_.IsZero()) {
++          shared_image_factory_->DestroySharedImage(
++              displayxr_overlay_atlas_mailbox_mac_);
++          displayxr_overlay_atlas_mailbox_mac_ = gpu::Mailbox();
++        }
++        gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++        gpu::SharedImageInfo si_info(
++            SinglePlaneFormat::kBGRA_8888, window_bounds.size(),
++            gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++            kPremul_SkAlphaType,
++            gpu::SHARED_IMAGE_USAGE_SCANOUT |
++                gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++                gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE,
++            "DisplayXROverlayAtlasMac");
++        if (!shared_image_factory_->CreateSharedImage(
++                mailbox, si_info, gpu::kNullSurfaceHandle)) {
++          return false;
++        }
++        displayxr_overlay_atlas_mailbox_mac_ = mailbox;
++        displayxr_overlay_atlas_size_mac_ = window_bounds.size();
++      }
++
++      // (2) Composite every isolated overlay kSrcOver into the (cleared) atlas at
++      // its compositor-exact window rect (z-order + overlap + translucency
++      // resolved here). The Skia write (AllowUnclearedAccess::kYes) also marks the
++      // fresh SharedImage cleared, so the ProduceOverlayForWeave read below is
++      // accepted without a separate EnsureScratchClearedMac.
++      int composited = 0;
++      {
++        auto atlas_rep = shared_image_representation_factory_->ProduceSkia(
++            displayxr_overlay_atlas_mailbox_mac_, context_state_.get());
++        if (!atlas_rep) {
++          return false;
++        }
++        std::vector<GrBackendSemaphore> abegin, aend;
++        SkSurfaceProps props;
++        auto atlas_write = atlas_rep->BeginScopedWriteAccess(
++            /*final_msaa_count=*/0, props, &abegin, &aend,
++            gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++        if (!atlas_write || !atlas_write->surface()) {
++          return false;
++        }
++        SkSurface* atlas_surface = atlas_write->surface();
++        if (!abegin.empty()) {
++          atlas_surface->wait(abegin.size(), abegin.data(),
++                              /*deleteSemaphoresAfterWait=*/false);
++        }
++        // Reused across frames: clear last frame's overlays first (transparent =
++        // show the weave through; the premultiplied alpha is the 2D-vs-3D mask).
++        atlas_surface->getCanvas()->clear(SK_ColorTRANSPARENT);
++        SkPaint over_paint;
++        over_paint.setBlendMode(SkBlendMode::kSrcOver);
++        for (const SkiaOutputSurface::Inline3dLayerMailbox& overlay :
++             inline_3d_overlays_) {
++          gfx::Rect r = overlay.rect;
++          r.Intersect(window_bounds);
++          if (r.IsEmpty() || overlay.mailbox.IsZero()) {
++            continue;
++          }
++          auto overlay_rep = shared_image_representation_factory_->ProduceSkia(
++              overlay.mailbox, context_state_.get());
++          if (!overlay_rep) {
++            continue;
++          }
++          std::vector<GrBackendSemaphore> obegin, oend;
++          auto overlay_access =
++              overlay_rep->BeginScopedReadAccess(&obegin, &oend);
++          if (!overlay_access) {
++            continue;
++          }
++          sk_sp<SkImage> overlay_img =
++              overlay_access->CreateSkImage(context_state_.get());
++          if (!overlay_img) {
++            continue;
++          }
++          if (!obegin.empty()) {
++            atlas_surface->wait(obegin.size(), obegin.data(),
++                                /*deleteSemaphoresAfterWait=*/false);
++          }
++          // The isolated-layer raster (overlay_img) is the element's content at
++          // device scale in the TOP-LEFT, plus GPU tile-alignment PADDING (width
++          // rounded up to a multiple of 32, height to 64); the extra texels are
++          // empty. Sample the content region at SCALE 1 keyed off the UNCLIPPED
++          // rect |full| and let kStrict clamp keep the padding out — do NOT scale
++          // the source by img/full (that pulled the padding into |dst| and
++          // vertically squished short overlays; browser#22/#29-Y). r ⊆ full, so
++          // (r − full) is the visible sub-rect and maps 1:1 into |dst|.
++          const gfx::Rect full = overlay.rect;
++          const SkRect src = SkRect::MakeXYWH(r.x() - full.x(), r.y() - full.y(),
++                                              r.width(), r.height());
++          const SkRect dst =
++              SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
++          atlas_surface->getCanvas()->drawImageRect(
++              overlay_img.get(), src, dst,
++              SkSamplingOptions(SkFilterMode::kLinear), &over_paint,
++              SkCanvas::kStrict_SrcRectConstraint);
++          ++composited;
++        }
++        FlushSurface(atlas_surface, aend, atlas_write.get());
++        if (gr_context()) {
++          gr_context()->submit();
++        }
++        if (graphite_shared_context()) {
++          graphite_shared_context()->submit();
++        }
++      }
++      if (composited == 0) {
++        return false;  // nothing landed → weave with no overlay this frame
++      }
++
++      // (3) Export the atlas IOSurface (SCANOUT-gate-free ProduceOverlayForWeave,
++      // as the woven scratch does) and stage it as the provider's overlay input
++      // for this batch submit. SetBatchOverlayMac CFRetains it, so it survives the
++      // scoped read access releasing here.
++      auto overlay_rep =
++          shared_image_representation_factory_->ProduceOverlayForWeave(
++              displayxr_overlay_atlas_mailbox_mac_);
++      if (!overlay_rep) {
++        return false;
++      }
++      auto overlay_read = overlay_rep->BeginScopedReadAccess();
++      if (!overlay_read) {
++        return false;
++      }
++      gfx::ScopedIOSurface atlas_ios = overlay_read->GetIOSurface();
++      if (!atlas_ios) {
++        return false;
++      }
++      return provider->SetBatchOverlayMac(atlas_ios.get());
++    };
++    const bool staged = stage_overlay_atlas();
++    static int atlas_log_throttle = 0;
++    if ((atlas_log_throttle++ % 120) == 0) {
++      VLOG(1) << "[DisplayXR] mac weave overlay atlas: staged=" << staged << " ("
++              << inline_3d_overlays_.size() << " overlays, DP-composited)";
++    }
++  }
++
++  // (D) Export the atlas IOSurface + submit as a v6 N-view atlas weave (chains
++  // XrWeaveSubmitLayoutDXR). |scope_rects| are the element window rects (a scope
++  // hint only under v6). The staged 2D overlay atlas rides this same submit.
++  gfx::ScopedIOSurface atlas_ios;
++  {
++    auto atlas_rep =
++        shared_image_representation_factory_->ProduceOverlayForWeave(
++            displayxr_weave_atlas_mailbox_mac_);
++    auto atlas_read = atlas_rep ? atlas_rep->BeginScopedReadAccess() : nullptr;
++    atlas_ios =
++        atlas_read ? atlas_read->GetIOSurface() : gfx::ScopedIOSurface();
++  }
++  if (!atlas_ios) {
++    return;
++  }
++  std::vector<gfx::Rect> scope_rects;
++  scope_rects.reserve(weaves.size());
+   for (const Weave& w : weaves) {
+-    provider->WeaveCanvasMac(w.source_ios.get(), gfx::Rect(0, 0, w.iw, w.ih),
+-                             gfx::Rect(w.px, 0, w.iw, w.ih), w.target);
++    scope_rects.push_back(w.win_rect);
+   }
+-  const bool submit_ok = provider->SubmitBatchSync();
++  const bool submit_ok = provider->SubmitAtlasV6Mac(
++      atlas_ios.get(), kViewCount, kCols, kRows,
++      static_cast<uint32_t>(content_w), static_cast<uint32_t>(content_h),
++      scope_rects);
+   if (!submit_ok) {
+     return;
+   }
+ 
+-  // Phase B: create/size each target's scratch (SkiaRenderer minted the mailbox
+-  // but couldn't size it — the source's real size only lives in its IOSurface,
+-  // which we read above), then blit the woven output into the scratch IOSurface.
++  // (E) Readback: the woven output is ONE content view (content_w x content_h).
++  // Each element's woven region sits at (x*sx, y*sy, w*sx, h*sy) in that output.
++  // Size each target's substitution scratch to that content-region size and blit
++  // the region into it at origin; SkiaRenderer presents the scratch at the
++  // element's full window rect → CoreAnimation upscales 1/viewScale (2x).
+   for (const Weave& w : weaves) {
+     const gpu::Mailbox scratch = overlays_[w.idx].mailbox;
+     if (scratch.IsZero()) {
+       continue;
+     }
+-    const gfx::Size want(w.iw, w.ih);
++    int cx = static_cast<int>(std::lround(w.win_rect.x() * kScaleX));
++    int cy = static_cast<int>(std::lround(w.win_rect.y() * kScaleY));
++    int cwid = static_cast<int>(std::lround(w.win_rect.width() * kScaleX));
++    int chei = static_cast<int>(std::lround(w.win_rect.height() * kScaleY));
++    if (cx < 0) {
++      cx = 0;
++    }
++    if (cy < 0) {
++      cy = 0;
++    }
++    // Clamp to the content-view output so the MTLBlit source stays in bounds
++    // (rounding can push the far edge 1 px past content_w / content_h).
++    if (cx + cwid > content_w) {
++      cwid = content_w - cx;
++    }
++    if (cy + chei > content_h) {
++      chei = content_h - cy;
++    }
++    if (cwid < 1 || chei < 1) {
++      continue;
++    }
++    const gfx::Size want(cwid, chei);
+     auto it = displayxr_scratch_sizes_mac_.find(scratch);
+     if (it == displayxr_scratch_sizes_mac_.end() || it->second != want) {
+       if (it != displayxr_scratch_sizes_mac_.end()) {
+@@ -3752,7 +4491,7 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOverlaysMac() {
+     if (!dst) {
+       continue;
+     }
+-    provider->BlitWovenToMac(dst.get(), gfx::Rect(w.px, 0, w.iw, w.ih));
++    provider->BlitWovenToMac(dst.get(), gfx::Rect(cx, cy, cwid, chei));
+   }
+ }
+ #endif  // BUILDFLAG(IS_APPLE)
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index fb248ee10291b..c51932aa4741e 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -496,7 +496,7 @@ class SkiaOutputSurfaceImplOnGpu
+   // returns a newly produced one and caches it.
+   gpu::SkiaImageRepresentation* GetSkiaRepresentation(gpu::Mailbox mailbox);
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+   // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model). After the
+   // frame's quads are painted into the output surface and before Flush/Submit,
+   // for each inline_3d_rects_ entry: copy the composited output sub-rect into an
+@@ -692,16 +692,18 @@ class SkiaOutputSurfaceImplOnGpu
+   std::vector<SkiaOutputSurface::Inline3dLayerMailbox> inline_3d_overlays_;
+   std::vector<SkiaOutputSurface::Inline3dLayerMailbox> inline_3d_canvas_layers_;
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
+   // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model) GPU-thread
+   // weave state. Per inline-3d rect (index-keyed), |woven_mailbox| is the
+   // imported woven SharedImage (re-imported on a fresh handle) and |fence| is the
+   // service->caller shared fence GPU-waited before the woven texture is drawn
+-  // back. Owned by shared_image_factory_ and destroyed with
+-  // DestroyAllSharedImages().
++  // back (Windows only; macOS weave is synchronous, no fence). Owned by
++  // shared_image_factory_ and destroyed with DestroyAllSharedImages().
+   struct DisplayXRWovenState {
+     gpu::Mailbox woven_mailbox;
++#if BUILDFLAG(IS_WIN)
+     scoped_refptr<gfx::D3DSharedFence> fence;
++#endif
+   };
+   std::vector<DisplayXRWovenState> displayxr_woven_state_;
+ 
+@@ -725,7 +727,11 @@ class SkiaOutputSurfaceImplOnGpu
+   // runtime DP's overlay atlas (composited OVER the woven output). This replaces
+   // the browser-side kSrcOver draw-back. Reused across frames; recreated on a
+   // window-size change; owned by shared_image_factory_.
++  // (Windows only — the mac composited-surface weave uses the legacy per-rect
++  // draw-back for now; v4/v6 DP-composited overlays on mac are a follow-up.)
++#if BUILDFLAG(IS_WIN)
+   DisplayXRScratchState displayxr_overlay_atlas_state_;
++#endif
+ 
+   // DisplayXR inline-3D (#625, Step B — async per-element weave). The provider
+   // keys a SEPARATE keyed-mutex input per target, so every visible target is
+@@ -749,8 +755,14 @@ class SkiaOutputSurfaceImplOnGpu
+   // only on the first submit / a window-size change) and draw each inline-3d
+   // rect's region from it. |displayxr_shared_woven_fence_| is GPU-waited to the
+   // latest submit's fence value before sampling.
++  // Windows: the imported window-sized woven texture (DXGI). macOS: a Chromium-
++  // allocated window-sized BGRA8 SCANOUT scratch that BlitWovenToMac MTL-blits the
++  // runtime's (untaggable-by-MoltenVK) woven IOSurface into, then draws from — the
++  // runtime surface can't be SharedImage-imported directly (pixel-format 0).
+   gpu::Mailbox displayxr_shared_woven_mailbox_;
++#if BUILDFLAG(IS_WIN)
+   scoped_refptr<gfx::D3DSharedFence> displayxr_shared_woven_fence_;
++#endif
+   gfx::Size displayxr_shared_woven_size_;
+ #endif
+ 
+@@ -770,6 +782,34 @@ class SkiaOutputSurfaceImplOnGpu
+   // the matched overlay's resource_size_in_pixels is often 0x0). Created lazily
+   // in MaybeWeaveOverlaysMac(), recreated if the source size changes.
+   std::map<gpu::Mailbox, gfx::Size> displayxr_scratch_sizes_mac_;
++
++  // DisplayXR inline-3D (browser#18/#22 — v4/v5 DP-composited 2D overlays, mac):
++  // ONE window-sized owned premultiplied-alpha BGRA8 IOSurface-backed SharedImage
++  // into which the frame's isolated 2D overlays are composited kSrcOver, then
++  // ProduceOverlayForWeave yields its IOSurface for the provider's
++  // SetBatchOverlayMac to stage as the runtime DP's overlay atlas (composited OVER
++  // the woven output; final = woven·(1 − a) + overlay). The mac twin of
++  // |displayxr_overlay_atlas_state_|. Reused across frames; recreated on a
++  // window-size change; owned by shared_image_factory_.
++  gpu::Mailbox displayxr_overlay_atlas_mailbox_mac_;
++  gfx::Size displayxr_overlay_atlas_size_mac_;
++  // #0053 Option B — the overlay rects composited into the atlas LAST frame, so
++  // this frame can erase VACATED regions (an overlay that moved/disappeared)
++  // without clearing-and-rebuilding the whole atlas (which would DROP a mid-write
++  // overlay = flicker). The atlas is persistent: mid-write overlays keep last
++  // frame's pixels; only readable ones are redrawn.
++  std::vector<gfx::Rect> displayxr_overlay_atlas_prev_rects_mac_;
++
++  // DisplayXR inline-3D (#774 — v6 N-view worst-case atlas, mac): ONE owned
++  // BGRA8 IOSurface-backed SharedImage sized to the active mode's PACKED region
++  // (tile_columns*content_w x tile_rows*content_h), into which every visible
++  // inline-3D element's per-view halves are drawn (drawImageRect, scaled by the
++  // mode's viewScale) contiguously from the top-left, then ProduceOverlayForWeave
++  // yields its IOSurface for the provider's SubmitAtlasV6Mac. Replaces the old
++  // packed-full-SBS input that overflowed Metal's 16384 max. Reused across frames;
++  // recreated on a size change; owned by shared_image_factory_.
++  gpu::Mailbox displayxr_weave_atlas_mailbox_mac_;
++  gfx::Size displayxr_weave_atlas_size_mac_;
+ #endif  // BUILDFLAG(IS_APPLE)
+ 
+   THREAD_CHECKER(thread_checker_);
+diff --git a/third_party/displayxr/include/openxr/XR_DXR_weave.h b/third_party/displayxr/include/openxr/XR_DXR_weave.h
+index cb3b090caffba..4c0203141bbcf 100644
+--- a/third_party/displayxr/include/openxr/XR_DXR_weave.h
++++ b/third_party/displayxr/include/openxr/XR_DXR_weave.h
+@@ -98,16 +98,25 @@
+  * the end; eyes are returned once per call. A batch is NOT equivalent to N
+  * single-rect submits of the same texture — the layouts differ (see above).
+  *
+- * DP-composited 2D overlays (SPEC_VERSION 4, browser#18). Chain an
+- * XrWeaveSubmitOverlaysDXR onto XrWeaveSubmitInfoDXR::next (alongside
+- * XrWeaveSubmitRectsDXR) carrying one window-sized premultiplied-alpha RGBA
+- * atlas the DP composites OVER the woven output in the same pass
+- * (final = woven·(1 − overlay.a) + overlay), so crisp 2D lands on top of the
+- * interlaced 3D at screen depth. The caller flattens all its 2D overlays into
+- * that one atlas in stacking (z) order before submit — z-order is resolved
+- * caller-side and the wire carries one texture, not N layers. The premultiplied
+- * alpha channel is the 2D-vs-3D mask (alpha 1 = opaque 2D, alpha 0 = show the
+- * weave through). v4 overlays are all at screen depth, "over" the weave.
++ * 2D overlays composited by the DP (SPEC_VERSION 4, browser#18). A present-owner
++ * that paints crisp 2D content OVER the woven 3D (hover plates, badges, chrome)
++ * must NOT composite it itself: at the caller's composite time the woven pixels
++ * do not yet exist, so a 2D layer that samples its backdrop (frosted glass) or
++ * that must track the panel at the interlace phase cannot be done correctly
++ * caller-side. Instead chain an XrWeaveSubmitOverlaysDXR onto
++ * XrWeaveSubmitInfoDXR::next carrying a single window-sized premul-RGBA overlay
++ * atlas; the DP composites it OVER the woven output in the same pass
++ * (final = woven·(1 − overlay.a) + overlay, premul "over" — the overlay's alpha
++ * IS the 2D-vs-3D mask). This reuses the runtime's existing Local2D /
++ * masked-composite leg (XR_DXR_local_3d_zone, ADR-027), which the steady
++ * xrEndFrame path already runs; the weave service previously bypassed it.
++ *
++ * The caller flattens all its 2D overlays into that one atlas in stacking (z)
++ * order before submit, so z-order is resolved caller-side and the wire carries
++ * one texture, not N layers — mirroring set_background_2d and keeping the batch
++ * to two handles (content atlas + overlay atlas) and one submit regardless of
++ * overlay count. Per-overlay depth (2D-under, mid-depth layers) is reserved for
++ * a later version; v4 overlays are all at screen depth, "over" the weave.
+  *
+  * Version history: 1 = initial (pre-rename numbering carried over); 2 =
+  * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
+@@ -134,6 +143,7 @@ extern "C" {
+ #define XR_TYPE_WEAVE_OUTPUT_DXR          ((XrStructureType)1004999191)
+ #define XR_TYPE_WEAVE_SUBMIT_RECTS_DXR    ((XrStructureType)1004999192)
+ #define XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR ((XrStructureType)1004999193)
++#define XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR   ((XrStructureType)1004999194)
+ 
+ //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
+ //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
+@@ -201,6 +211,49 @@ typedef struct XrWeaveSubmitRectsDXR {
+     const XrRect2Di*         rects;     //!< window-relative sub-rects, device px (y-down)
+ } XrWeaveSubmitRectsDXR;
+ 
++/*!
++ * @brief N-view worst-case atlas input layout (spec v6, #774).
++ *
++ * Chain onto XrWeaveSubmitInfoDXR::next. When present it REPLACES the squeezed
++ * per-rect SBS contract of XrWeaveSubmitRectsDXR with the same atlas layout every
++ * other DisplayXR app already uses (ADR-010 worst-case swapchain + ADR-030
++ * crop-before-DP), so the caller becomes an ordinary N-view client:
++ *
++ *  - @c inputTexture is a WORST-CASE-sized atlas — max over every rendering mode
++ *    of (tileColumns * viewScaleX * displayWidth) x (tileRows * viewScaleY *
++ *    displayHeight), spanning both orientations for modes that can rotate. Size it
++ *    from the DISPLAY, not the current window, so window resize / fullscreen never
++ *    reallocates. NOTE: this max is NOT bounded by the display size — a mode with
++ *    viewScaleX 1.0 and tileColumns 2 yields a 2*W x H atlas.
++ *  - Tiles are packed CONTIGUOUSLY from the top-left at (@c contentViewWidth,
++ *    @c contentViewHeight) — tile v sits at ((v % tileColumns) * contentViewWidth,
++ *    (v / tileColumns) * contentViewHeight). The stride is the CONTENT size, not
++ *    atlasWidth / tileColumns. Everything right of / below the packed region is
++ *    dead space the runtime never reads.
++ *  - @c contentViewWidth / @c contentViewHeight are the bound window's client size
++ *    scaled by the ACTIVE mode's viewScaleX / viewScaleY. Each visible element is
++ *    drawn inside tile v at its own window position scaled by the same factors.
++ *
++ * With this chained, XrWeaveSubmitRectsDXR::rects become a scope hint (zone /
++ * wish-mask publication and the caller's own draw-back region) rather than a
++ * layout input, so XR_WEAVE_SUBMIT_MAX_RECTS_DXR no longer bounds how many
++ * elements a frame may contain.
++ *
++ * The runtime hands the atlas to the display processor as-is when it exactly
++ * fills the active mode's atlas (zero-copy), otherwise it crops the packed
++ * region first. Callers that omit this struct keep the spec v3/v4/v5 behaviour
++ * byte-for-byte.
++ */
++typedef struct XrWeaveSubmitLayoutDXR {
++    XrStructureType          type;              //!< XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR
++    const void* XR_MAY_ALIAS next;
++    uint32_t                 viewCount;         //!< active mode view count; must equal tileColumns * tileRows
++    uint32_t                 tileColumns;       //!< active mode atlas grid columns
++    uint32_t                 tileRows;          //!< active mode atlas grid rows
++    uint32_t                 contentViewWidth;  //!< per-tile content width  = windowWidth  * mode viewScaleX
++    uint32_t                 contentViewHeight; //!< per-tile content height = windowHeight * mode viewScaleY
++} XrWeaveSubmitLayoutDXR;
++
+ /*!
+  * @brief DP-composited 2D overlay atlas — crisp 2D painted OVER the weave (spec v4).
+  *
+-- 
+2.50.1 (Apple Git-155)
+
