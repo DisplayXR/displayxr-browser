@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DisplayXR Browser — update feed</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{background:#0a0a0a;color:#e6e6e6;font:15px/1.6 system-ui,sans-serif;margin:0;padding:3rem 1.5rem}
+  main{max-width:38rem;margin:0 auto}
+  h1{font-size:1.35rem;font-weight:600;margin:0 0 1rem}
+  a{color:#3b82f6}
+  code{background:#141414;border:1px solid #262626;border-radius:4px;padding:.1rem .35rem;font-size:.9em}
+  p{color:#a3a3a3}
+</style>
+<main>
+  <h1>DisplayXR Browser — update feed</h1>
+  <p>Machine-readable release feed for the DisplayXR Browser updater:
+     <a href="/feed.json"><code>/feed.json</code></a>.</p>
+  <p>This host is <strong>not</strong> a trust boundary. The updater verifies the SHA-256
+     published in the feed <em>and</em> the Authenticode signature of the downloaded
+     installer before executing anything, so a compromised feed cannot ship code.</p>
+  <p>Source and releases:
+     <a href="https://github.com/DisplayXR/displayxr-browser">github.com/DisplayXR/displayxr-browser</a></p>
+</main>

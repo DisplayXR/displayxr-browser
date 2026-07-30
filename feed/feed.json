@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "channel": "preview",
+  "latest": {
+    "version": "0.1.5",
+    "chromium": "150.0.7871.129",
+    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/preview-150.0.7871.129/DisplayXR-Browser-Preview-Setup-0.1.5.exe",
+    "sha256": "a9f139c8020ff187d2cad15b9521de109d2f4c1546ca2286d526a0e35c91d6f4",
+    "size": 371922808,
+    "released": "2026-07-20T13:53:31Z",
+    "security": false
+  },
+  "minimum": "0.0.0",
+  "rollout": 0
+}
