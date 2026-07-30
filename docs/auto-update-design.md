@@ -116,8 +116,17 @@ in place, per-user vs per-machine install split beyond what the NSIS installer a
 
 ## Open decisions
 
-1. **Feed host** — GitHub Pages (stable URL, easy) vs a fixed Release asset (fewer moving parts, but
-   URL churn per release). Leaning Pages.
+1. ~~**Feed host**~~ — **DECIDED (browser#40): GitHub Pages, served at `updates.displayxr.org`.**
+   Not a bare `github.io` URL: the feed URL is compiled into every shipped browser and can
+   essentially never change, so it must be a name we own — an org rename or a move off GitHub
+   would otherwise strand every installed browser. Pages hosts it; the domain keeps the host
+   swappable. Published from `feed/` by `.github/workflows/pages.yml`.
+
+   *Correction to "Options considered" below:* the fixed-Release-asset option was dismissed here
+   for "URL churn per release", which is wrong — `releases/latest/download/<name>` is a permanent
+   alias GitHub maintains. It fails for a different reason: `releases/latest` resolves to the
+   latest **non-prerelease**, and every browser release so far is a prerelease, so that alias
+   404s today.
 2. **Delivery cadence** — push every `security: true` release, or batch weekly? (§5 option 1.)
 3. **Relaunch aggressiveness** — prompt-only, or force-relaunch after N days on a security release?
 4. **Where the updater lives** — a small separate `.exe` scheduled task (updates even when the
