@@ -38,6 +38,18 @@ VER="$(cat "$CHROMIUM_SRC/chrome/VERSION" | awk -F= '/MAJOR/{a=$2}/MINOR/{b=$2}/
 [ -f "$OUT/$VER.manifest" ] && cp "$OUT/$VER.manifest" "$STAGE/"
 [ -d "$OUT/$VER" ] && cp -r "$OUT/$VER" "$STAGE/" || true
 
+# Default landing page (displayxr-browser: default to the inline-3D samples).
+# Chromium reads `initial_preferences` from NEXT TO chrome.exe to seed a NEW profile,
+# so this ships as data rather than as a 55th source patch — nothing to rebase each
+# milestone, and the user can still change their homepage afterwards. Seeds a new
+# profile ONLY; an existing profile keeps whatever it already has.
+if [ -f "$REPO/branding/initial_preferences" ]; then
+  cp "$REPO/branding/initial_preferences" "$STAGE/initial_preferences"
+  echo "[package] default landing page seeded (branding/initial_preferences)"
+else
+  echo "[package]  (skip missing branding/initial_preferences)"
+fi
+
 echo "[package] version $VER staged. Contents:"
 ls -1 "$STAGE" | sed 's/^/  /'
 echo "[package] done -> $STAGE"
