@@ -1,0 +1,66 @@
+name: pages
+
+# Publishes ONLY `feed/` to GitHub Pages, served at https://updates.displayxr.org
+# (the CNAME file in that directory claims the host).
+#
+# Why a dedicated directory and not the repo root or docs/: `docs/` holds internal
+# design and maintenance notes that have no business on a public site. The site is
+# exactly the update feed plus a one-page explanation of what it is.
+#
+# Why this host at all (browser#40): the feed URL is compiled into every shipped
+# browser and can essentially never change, so it must be a name we own rather than
+# a github.io URL — otherwise an org rename or a move off GitHub strands every
+# installed browser. GitHub Pages is the hosting; the domain is ours.
+#
+# The feed is NOT a trust boundary — the updater verifies SHA-256 + Authenticode
+# before executing anything (docs/auto-update-design.md §3).
+
+on:
+  push:
+    branches: [main]
+    paths: ["feed/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a publish half-done; queue instead. A partially-written feed is worse
+# than a stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail loudly on malformed JSON rather than serving a feed no updater can parse.
+      - name: Validate the feed
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("feed/feed.json"))
+          assert d["schema"] == 1, "unexpected schema version"
+          for k in ("channel", "latest", "minimum", "rollout"):
+              assert k in d, f"missing top-level key: {k}"
+          for k in ("version", "chromium", "url", "sha256", "size", "released", "security"):
+              assert k in d["latest"], f"missing latest.{k}"
+          assert len(d["latest"]["sha256"]) == 64, "sha256 is not 64 hex chars"
+          assert 0 <= d["rollout"] <= 100, "rollout out of range"
+          print(f"feed ok: {d['channel']} {d['latest']['version']} rollout={d['rollout']}")
+          PY
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: feed
+      - id: deploy
+        uses: actions/deploy-pages@v4
