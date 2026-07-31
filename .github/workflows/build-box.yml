@@ -181,6 +181,45 @@ jobs:
           echo "key=$key" >> "$GITHUB_OUTPUT"
           ls -la dist/
 
+      # Turn the raw build output into the SHIPPABLE TREE — on the RUNNER, not the box.
+      #
+      # do_build.ps1 tars out/ wholesale (~543 files: tblgen, code generators, build junk)
+      # rather than the ~25-file run-set scripts/package.sh defines. An installer cut from
+      # that artifact silently OMITS branding/initial_preferences, which is why browser#52's
+      # landing page could never have reached a user. package.sh must define the tree.
+      #
+      # It runs HERE and not on the box because the box has NO bash and no sh — verified by
+      # SSM: git is only a depot_tools shim (C:\depot_tools\git.bat) with no bundled git
+      # bin dir, and a depth-6 search of depot_tools, Program Files and the source trees
+      # finds neither. package.sh is bash, so the runner is the only place it can run.
+      #
+      # package.sh reads a Chromium checkout, so we synthesise the two things it looks at:
+      # out/$OUT_DIR (the artifact) and chrome/VERSION (from the pinned CHROMIUM_TAG in
+      # config.env, which is authoritative — the artifact carries two .manifest files and
+      # cannot disambiguate itself).
+      - name: Stage the shippable tree (package.sh on the runner)
+        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
+        run: |
+          set -euo pipefail
+          source scripts/config.env
+          work="$RUNNER_TEMP/cr"; rm -rf "$work"; mkdir -p "$work/out/$OUT_DIR" "$work/chrome"
+          tar xzf dist/*.tar.gz -C "$RUNNER_TEMP"
+          raw="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'DisplayXR-Browser*' | head -1)"
+          [ -n "$raw" ] || { echo "::error::no unpacked build dir in the artifact"; exit 1; }
+          mv "$raw"/* "$work/out/$OUT_DIR/"
+          # chrome/VERSION in the form package.sh's awk expects.
+          IFS=. read -r a b c d <<< "$CHROMIUM_TAG"
+          { echo "MAJOR=$a"; echo "MINOR=$b"; echo "BUILD=$c"; echo "PATCH=$d"; } > "$work/chrome/VERSION"
+          CHROMIUM_SRC="$work" OUT_DIR="$OUT_DIR" bash scripts/package.sh
+          stage="dist/DisplayXR-Browser"
+          # The regression that started this must turn the build red, not ship quietly.
+          [ -f "$stage/initial_preferences" ] || { echo "::error::initial_preferences missing from the staged tree"; exit 1; }
+          echo "staged $(find "$stage" -type f | wc -l) files"
+          rm -f dist/*.tar.gz
+          tar -czf "dist/dxr_browser_staged.tar.gz" -C dist DisplayXR-Browser
+          rm -rf "$stage"
+          ls -la dist/
+
       - uses: actions/upload-artifact@v4
         if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
         with:

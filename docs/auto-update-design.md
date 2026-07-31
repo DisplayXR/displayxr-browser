@@ -64,8 +64,21 @@ This is the security-critical part and must be conservative:
 
 1. Download the installer to a temp path.
 2. **Verify SHA-256** against the feed value.
-3. **Verify Authenticode**: signature status `Valid` **and** the signer is our cert (subject contains
-   `Leia, Inc.`). This is the same gate the release flow already asserts.
+3. **Verify Authenticode**: signature status `Valid` **and** the signer is one of an
+   **accepted-signer LIST**, not a single hardcoded string.
+
+   > **This must be a set from day one.** The accepted signers are compiled into every shipped
+   > browser and are checked *fail-closed*, which gives them the same never-changeable property as
+   > the feed URL — except that getting them wrong is worse. If the signing identity ever changes
+   > (the vendor-name purge, the neutral-entity spin-out, or simply a cert reissued under a renamed
+   > entity), a single pinned `Leia, Inc.` **bricks auto-update on every installed browser** — and
+   > it bricks it in the one direction we cannot repair remotely, because the repair would itself
+   > have to arrive as an update. Shipping a list costs nothing today and makes an identity change
+   > a routine overlap: add the new signer, ship, wait for the fleet to roll, retire the old one.
+
+   Today the list is `["Leia, Inc."]` — the same value the release flow asserts. Adding to it is a
+   normal change; removing from it is only safe once `minimum` has moved past every build that
+   still trusts the old signer alone.
 4. Only if both pass, run the NSIS installer **silently** (`/S`).
 5. Apply on the next browser restart, Chrome-style ("Relaunch to finish updating"). For a
    `security: true` release, nag harder and relaunch on idle if the user leaves it running for days.
