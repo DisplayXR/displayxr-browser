@@ -39,6 +39,14 @@ on:
         type: boolean
         default: false
 
+# The chain reaches the same single box (build, and the weave gate over SSM), so it takes
+# the same lock. Sharing one group with build-box.yml would deadlock — the reusable
+# workflow inherits the caller's group — so this guards the pipeline as a whole and
+# build-box.yml guards direct dispatches of the build alone.
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
 permissions:
   contents: write   # release.sh creates a GitHub release
   id-token: write   # build-box assumes the AWS role via OIDC
