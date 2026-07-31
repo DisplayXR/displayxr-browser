@@ -23,6 +23,14 @@ on:
         description: "Chromium tag to build (informational; the rebase lane applies the pin)"
         type: string
         default: ""
+      patch_ref:
+        # Which commit of THIS repo supplies patches/. do_rebase.ps1 syncs the series from
+        # git before applying it, so the box can no longer drift from the repo — and a new
+        # patch can be built at all, which it could not before (nothing ever shipped
+        # patches/ to the box; C:\build\patches was populated by hand).
+        description: "Git ref of this repo whose patches/ to apply (blank = the caller's SHA)"
+        type: string
+        default: ""
       job:
         description: "Marker/job name written by do_build.ps1 (C:\\build\\<job>.done)"
         type: string
@@ -43,6 +51,10 @@ on:
     inputs:
       chromium_tag:
         description: "Chromium tag to build (blank = pin)"
+        type: string
+        default: ""
+      patch_ref:
+        description: "Git ref of this repo whose patches/ to apply (blank = this ref's SHA)"
         type: string
         default: ""
       lifecycle_only:
@@ -128,18 +140,23 @@ jobs:
         id: rebase
         env:
           CHROMIUM_TAG: ${{ inputs.chromium_tag }}
+          # Default to the exact commit CI checked out, so the series the box applies is
+          # provably the one in this run rather than whatever was last copied to the box.
+          PATCH_REF: ${{ inputs.patch_ref || github.sha }}
         run: |
           set -euo pipefail
           chmod +x scripts/aws/ssm-run.sh
           # Stage BOTH the canonical rebase script and its driver, then run the driver.
+          # The patch SERIES is not staged here — it is 3.5 MB, well past the RunCommand
+          # payload limit — the box pulls it from this repo at $PATCH_REF instead.
           reb=$(base64 -w0 scripts/aws/do_rebase.ps1)
           drv=$(base64 -w0 scripts/aws/remote-rebase.ps1)
           printf '%s\n' \
             "[IO.File]::WriteAllBytes(\"C:\\build\\do_rebase.ps1\", [Convert]::FromBase64String(\"${reb}\"))" \
             "[IO.File]::WriteAllBytes(\"C:\\build\\remote-rebase.ps1\", [Convert]::FromBase64String(\"${drv}\"))" \
-            "& powershell -NoProfile -ExecutionPolicy Bypass -File C:\\build\\remote-rebase.ps1 -Tag '${CHROMIUM_TAG}' -TimeoutMinutes 60" \
+            "& powershell -NoProfile -ExecutionPolicy Bypass -File C:\\build\\remote-rebase.ps1 -Tag '${CHROMIUM_TAG}' -PatchRef '${PATCH_REF}' -TimeoutMinutes 60" \
             'exit $LASTEXITCODE' \
-          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#36 rebase ${GITHUB_RUN_ID} -> ${CHROMIUM_TAG}" 60
+          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#36 rebase ${GITHUB_RUN_ID} -> ${CHROMIUM_TAG} @ ${PATCH_REF}" 60
 
       # Trigger the build through the `crbuild` scheduled task, NOT by invoking
       # do_build.ps1 directly: RunCommand is SYSTEM, depot_tools needs Administrator.

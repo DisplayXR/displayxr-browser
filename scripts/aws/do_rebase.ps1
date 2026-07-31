@@ -37,6 +37,50 @@ function Fail($m){ Stage "ERROR: $m"; "ERROR: $m" | Out-File $DONE -Encoding asc
 
 Stage "rebase to $TAG starting"
 
+# 0. Sync the canonical patch series from the repo into C:\build\patches.
+#
+#    That directory used to be populated by hand. Nothing in build-box.yml ever shipped
+#    patches/ to the box, so the lane could only ever re-apply whatever series someone had
+#    last copied there: a NEW patch could not be built through CI at all, and the series
+#    the box applied could silently drift from the repo it came from - the same drift #36
+#    called out for the rebase script itself, which is why that script is now versioned
+#    here. Pulling the series over git closes the loop and needs no new AWS permissions
+#    (the repo is public) and no SSM payload (the series is ~3.5 MB, far past the
+#    RunCommand limit, so staging it inline was never an option).
+#
+#    Done BEFORE the tag checkout and gclient sync so a bad ref fails in seconds rather
+#    than after tens of minutes of syncing.
+$PATCH_REF = $env:DXR_PATCH_REF
+if (-not $PATCH_REF) { $PATCH_REF = 'main' }
+$REPO_URL  = 'https://github.com/DisplayXR/displayxr-browser.git'
+$REPO_DIR  = 'C:\build\displayxr-browser'
+$PATCH_DIR = 'C:\build\patches'
+
+if (-not (Test-Path (Join-Path $REPO_DIR '.git'))) {
+    Remove-Item $REPO_DIR -Recurse -Force -ErrorAction SilentlyContinue
+    cmd /c "git clone $REPO_URL $REPO_DIR >> $LOG 2>&1"
+    if ($LASTEXITCODE -ne 0) { Fail "clone $REPO_URL" }
+}
+# Fetch the exact ref asked for - a branch, a tag, or a full SHA. FETCH_HEAD rather than a
+# local branch so a PR branch and main are handled the same way.
+cmd /c "cd /d $REPO_DIR && git fetch --force origin $PATCH_REF >> $LOG 2>&1"
+if ($LASTEXITCODE -ne 0) { Fail "fetch patch ref '$PATCH_REF'" }
+cmd /c "cd /d $REPO_DIR && git checkout -f FETCH_HEAD >> $LOG 2>&1"
+if ($LASTEXITCODE -ne 0) { Fail "checkout patch ref '$PATCH_REF'" }
+
+$srcPatches = @(Get-ChildItem (Join-Path $REPO_DIR 'patches\*.patch') -ErrorAction SilentlyContinue)
+if ($srcPatches.Count -eq 0) { Fail "no patches under $REPO_DIR\patches at '$PATCH_REF'" }
+if (Test-Path $PATCH_DIR) {
+    # Clear first: a series that SHRANK would otherwise leave orphans behind that git am
+    # would still pick up and apply.
+    Remove-Item (Join-Path $PATCH_DIR '*.patch') -Force -ErrorAction SilentlyContinue
+} else {
+    New-Item -ItemType Directory -Path $PATCH_DIR | Out-Null
+}
+Copy-Item (Join-Path $REPO_DIR 'patches\*.patch') $PATCH_DIR -Force
+$patchSha = (cmd /c "cd /d $REPO_DIR && git rev-parse --short HEAD").Trim()
+Stage ("patch series synced from '" + $PATCH_REF + "' (" + $patchSha + "): " + $srcPatches.Count + " patches")
+
 # 1. Discard the working tree. The patch series in patches/ is canonical, so dirty files
 #    are disposable.
 cmd /c "cd /d C:\cr\src && git checkout -- . >> $LOG 2>&1"

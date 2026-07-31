@@ -76,6 +76,23 @@ scripts/sign.sh dist/DisplayXR-Browser    # EV-sign via $DXR_SIGN_REPO (folder-s
 Then the P2 installer + P3 GitHub Release (see the packaging plan). Bump the version-check tag so
 existing installs see the new preview.
 
+## Building on the box (CI lane)
+
+`build-box.yml`'s rebase step drives `do_rebase.ps1` on the AWS box, which **syncs `patches/` from
+this repo** (`git fetch` of `patch_ref`, default the CI commit's SHA) into `C:\build\patches` before
+applying it. So whatever series is committed here is what the box builds — including a series that
+has *grown*, which is the case that used to be impossible: nothing ever shipped `patches/` to the
+box, `C:\build\patches` was populated by hand, and the series is far too large (~3.5 MB) to stage
+inline over SSM RunCommand.
+
+To build a **branch** (e.g. to verify a new patch on hardware), dispatch `build-box.yml` with:
+- `chromium_tag` = the current pin from `scripts/config.env` — the rebase step is skipped when this
+  is blank, and the patch sync lives inside it;
+- `patch_ref` = your branch name or SHA.
+
+The box is **stopped before and after** by the workflow (`if: always()`), so a failed run cannot
+leave the instance billing.
+
 ## Known gotchas
 - **Box kills long builds** (`clang-cl: error … failed due to signal`) — transient; `build.sh` retries.
 - **Kill chrome before rebuilding** (it locks the DLLs / exe). **Never kill `displayxr-service`.**
