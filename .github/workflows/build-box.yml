@@ -186,7 +186,10 @@ jobs:
             '$cands = @("C:\cr\src","C:\src\chromium\src")' \
             '$src = $null' \
             'foreach ($c in $cands) { if (Test-Path "$c\out\Official\chrome.exe") { $src = $c; break } }' \
-            'if (-not $src) { Write-Host "ERROR: no built chrome.exe under: $($cands -join \", \")"; exit 1 }' \
+            '# NB: PowerShell escapes with a backtick, not a backslash — and this line is inside' \
+            '# a SINGLE-quoted bash string, so a \" would reach PS literally and fail to parse.' \
+            '# Keep the message free of nested quotes rather than trying to escape them.' \
+            'if (-not $src) { Write-Host "ERROR: no built chrome.exe under C:\cr\src or C:\src\chromium\src"; exit 1 }' \
             'Write-Host "chromium src = $src"' \
             '$env:CHROMIUM_SRC = $src.Replace("\","/")' \
             '$env:OUT_DIR = "Official"' \
