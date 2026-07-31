@@ -19,6 +19,11 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$Tag,
+  # Git ref of THIS repo whose patches/ the box should apply - branch, tag, or SHA.
+  # Injected as $env:DXR_PATCH_REF the same way $Tag is, because a crbuild-launched task
+  # does not inherit the SSM session's environment. Blank leaves do_rebase.ps1 on its
+  # 'main' default.
+  [string]$PatchRef       = '',
   [string]$TaskName       = 'crbuild',
   [int]   $TimeoutMinutes = 60,
   [string]$BuildDir       = 'C:\build',
@@ -40,13 +45,15 @@ function Show-LogTail {
   }
 }
 
-Write-Output "rebase tag=$Tag task=$TaskName timeout=${TimeoutMinutes}m"
+Write-Output "rebase tag=$Tag patch_ref=$PatchRef task=$TaskName timeout=${TimeoutMinutes}m"
 if (-not (Test-Path $RebaseScript)) { Write-Output "ERROR: no rebase script at $RebaseScript"; exit 2 }
 
 # Stage the rebase script as do_build.ps1 with the tag injected, backing up the build
 # script first so a later build step still has it.
 if (-not (Test-Path $backup)) { Copy-Item $target $backup -Force -ErrorAction SilentlyContinue }
-$body = "`$env:DXR_TARGET_TAG = '$Tag'`r`n" + (Get-Content $RebaseScript -Raw)
+$body = "`$env:DXR_TARGET_TAG = '$Tag'`r`n"
+if ($PatchRef) { $body += "`$env:DXR_PATCH_REF = '$PatchRef'`r`n" }
+$body += (Get-Content $RebaseScript -Raw)
 Set-Content -Path $target -Value $body -Encoding ascii
 Remove-Item $done -ErrorAction SilentlyContinue
 
