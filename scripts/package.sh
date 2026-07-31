@@ -17,6 +17,23 @@ STAGE="$REPO/dist/DisplayXR-Browser"
 echo "[package] staging -> $STAGE"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 
+# The VC++ runtime DLLs and the service/diagnostic binaries above were MISSING from this
+# list until 2026-08, so every staged tree dropped them (caught by the win box diffing an
+# installed 0.1.5 against a staged build: 79 files dropped, ~12 of them not build junk).
+#
+# EVIDENCE NOTE, because the reason matters if this list is ever trimmed again: the report
+# said chrome.exe links the VC++ runtimes and a clean box might fail to launch. That
+# specific mechanism does NOT hold — an import scan of all 14 shipped binaries finds no
+# reference to msvcp140/vcruntime140/vccorlib140 (control: Kernel32.dll IS found the same
+# way), consistent with an official build static-linking the CRT. They are shipped anyway
+# because the asymmetry is stark: ~2 MB versus a browser that cannot start on a machine
+# without the redistributable, and nobody here can test a clean Windows box. Do not remove
+# them on the strength of the import scan alone — verify on a VM with no VC++ redist first.
+#
+# The rest are feature-degradation rather than launch-blocking: notification_helper (native
+# toasts), elevation_service + elevated_tracing_service, eventlog_provider, dbgcore+dbghelp
+# (crash capture — worth having on a preview build precisely because it crashes).
+#
 # Core run-set of an official static Chromium build. (A static build has far fewer DLLs than the
 # component build; the vendored openxr_loader.dll ships alongside for the weave client.)
 # chrome.exe is only a launcher stub even in a static build — the code is chrome.dll (~300-400MB).
@@ -27,7 +44,10 @@ for item in \
   icudtl.dat v8_context_snapshot.bin snapshot_blob.bin \
   vk_swiftshader.dll vk_swiftshader_icd.json vulkan-1.dll libEGL.dll libGLESv2.dll \
   d3dcompiler_47.dll dxcompiler.dll dxil.dll \
-  openxr_loader.dll ; do
+  openxr_loader.dll \
+  msvcp140.dll msvcp140_atomic_wait.dll vcruntime140.dll vcruntime140_1.dll vccorlib140.dll \
+  notification_helper.exe elevation_service.exe elevated_tracing_service.exe \
+  eventlog_provider.dll dbgcore.dll dbghelp.dll ; do
   [ -e "$OUT/$item" ] && cp "$OUT/$item" "$STAGE/" || echo "[package]  (skip missing $item)"
 done
 
