@@ -149,74 +149,6 @@ jobs:
             'exit $LASTEXITCODE' \
           | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#45 CI build ${GITHUB_RUN_ID}" "$TIMEOUT_MIN"
 
-      # Turn the raw build output into the SHIPPABLE TREE before we tar it.
-      #
-      # do_build.ps1 lives only on the box and does not run scripts/package.sh, so the
-      # artifact used to be a ~543-file dump of out/ (tblgen, code generators, build junk)
-      # rather than the ~25-file run-set package.sh defines. Two consequences, both real:
-      # an installer cut from that artifact silently MISSED branding/initial_preferences
-      # (browser#52's landing page), and the repo's own definition of "what we ship" was
-      # not what CI produced. Same box-only-script drift #36 fixed for do_rebase.ps1.
-      #
-      # Rather than edit a script we cannot see from the repo, stage the repo's OWN
-      # package.sh onto the box (the proven pattern from the rebase/build steps) and let
-      # it define the tree. package.sh stays the single source of truth.
-      - name: Stage the shippable tree (repo package.sh on the box)
-        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
-        env:
-          JOB: ${{ inputs.job || 'official18' }}
-        run: |
-          set -euo pipefail
-          chmod +x scripts/aws/ssm-run.sh
-          pkg=$(base64 -w0 scripts/package.sh)
-          cfg=$(base64 -w0 scripts/config.env)
-          pref=$(base64 -w0 branding/initial_preferences)
-          # Layout must mirror the repo: package.sh derives REPO from its own location and
-          # reads ../branding + ./config.env relative to it.
-          printf '%s\n' \
-            '$ErrorActionPreference = "Stop"' \
-            'New-Item -ItemType Directory -Force C:\build\browser-repo\scripts | Out-Null' \
-            'New-Item -ItemType Directory -Force C:\build\browser-repo\branding | Out-Null' \
-            "[IO.File]::WriteAllBytes(\"C:\\build\\browser-repo\\scripts\\package.sh\", [Convert]::FromBase64String(\"${pkg}\"))" \
-            "[IO.File]::WriteAllBytes(\"C:\\build\\browser-repo\\scripts\\config.env\", [Convert]::FromBase64String(\"${cfg}\"))" \
-            "[IO.File]::WriteAllBytes(\"C:\\build\\browser-repo\\branding\\initial_preferences\", [Convert]::FromBase64String(\"${pref}\"))" \
-            '# Discover the checkout rather than trust one hardcoded path: config.env says' \
-            '# C:/src/chromium/src, this workflow comments say C:\cr\src. Whichever holds a' \
-            '# built chrome.exe wins; failing loudly beats staging an empty tree.' \
-            '$cands = @("C:\cr\src","C:\src\chromium\src")' \
-            '$src = $null' \
-            'foreach ($c in $cands) { if (Test-Path "$c\out\Official\chrome.exe") { $src = $c; break } }' \
-            '# NB: PowerShell escapes with a backtick, not a backslash — and this line is inside' \
-            '# a SINGLE-quoted bash string, so a \" would reach PS literally and fail to parse.' \
-            '# Keep the message free of nested quotes rather than trying to escape them.' \
-            'if (-not $src) { Write-Host "ERROR: no built chrome.exe under C:\cr\src or C:\src\chromium\src"; exit 1 }' \
-            'Write-Host "chromium src = $src"' \
-            '$env:CHROMIUM_SRC = $src.Replace("\","/")' \
-            '$env:OUT_DIR = "Official"' \
-            '# bash is NOT on PATH under SSM RunCommand (SYSTEM context). Resolve Git-for-' \
-            '# Windows bash.exe explicitly: depot_tools requires git, so it is always present,' \
-            '# but its bin dir is not in the SYSTEM PATH.' \
-            '$bash = $null' \
-            'if (Get-Command bash -ErrorAction SilentlyContinue) { $bash = "bash" }' \
-            'if (-not $bash) {' \
-            '  $cand = @("C:\Program Files\Git\bin\bash.exe","C:\Program Files\Git\usr\bin\bash.exe","C:\Program Files (x86)\Git\bin\bash.exe")' \
-            '  $g = (Get-Command git -ErrorAction SilentlyContinue)' \
-            '  if ($g) { $root = Split-Path (Split-Path $g.Source -Parent) -Parent; $cand += "$root\bin\bash.exe"; $cand += "$root\usr\bin\bash.exe" }' \
-            '  foreach ($c in $cand) { if (Test-Path $c) { $bash = $c; break } }' \
-            '  if (-not $bash) { Write-Host "ERROR: no bash.exe found. Tried:"; $cand | ForEach-Object { Write-Host "  $_" }; exit 1 }' \
-            '}' \
-            'Write-Host "bash = $bash"' \
-            '& $bash C:/build/browser-repo/scripts/package.sh' \
-            'if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: package.sh failed"; exit 1 }' \
-            '$stage = "C:\build\browser-repo\dist\DisplayXR-Browser"' \
-            'if (-not (Test-Path "$stage\initial_preferences")) { Write-Host "ERROR: initial_preferences missing from the staged tree"; exit 1 }' \
-            '$n = (Get-ChildItem $stage -Recurse -File).Count' \
-            'Write-Host "staged $n files"' \
-            "& tar -czf C:\\build\\dxr_browser_${JOB}.tar.gz -C C:\\build\\browser-repo\\dist DisplayXR-Browser" \
-            'if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: tar failed"; exit 1 }' \
-            '"staged-ok"' \
-          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#52 stage shippable tree ${GITHUB_RUN_ID}" 30
-
       # The box uploads to a RUN-SCOPED key and we download that exact key. The old version
       # took "newest object in the bucket", which picks up another run's artifact whenever
       # two builds overlap.
@@ -247,6 +179,45 @@ jobs:
           key="$ARTIFACT_KEY"
           mkdir -p dist && aws s3 cp "s3://$ARTIFACT_BUCKET/$key" "dist/$(basename "$key")"
           echo "key=$key" >> "$GITHUB_OUTPUT"
+          ls -la dist/
+
+      # Turn the raw build output into the SHIPPABLE TREE — on the RUNNER, not the box.
+      #
+      # do_build.ps1 tars out/ wholesale (~543 files: tblgen, code generators, build junk)
+      # rather than the ~25-file run-set scripts/package.sh defines. An installer cut from
+      # that artifact silently OMITS branding/initial_preferences, which is why browser#52's
+      # landing page could never have reached a user. package.sh must define the tree.
+      #
+      # It runs HERE and not on the box because the box has NO bash and no sh — verified by
+      # SSM: git is only a depot_tools shim (C:\depot_tools\git.bat) with no bundled git
+      # bin dir, and a depth-6 search of depot_tools, Program Files and the source trees
+      # finds neither. package.sh is bash, so the runner is the only place it can run.
+      #
+      # package.sh reads a Chromium checkout, so we synthesise the two things it looks at:
+      # out/$OUT_DIR (the artifact) and chrome/VERSION (from the pinned CHROMIUM_TAG in
+      # config.env, which is authoritative — the artifact carries two .manifest files and
+      # cannot disambiguate itself).
+      - name: Stage the shippable tree (package.sh on the runner)
+        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
+        run: |
+          set -euo pipefail
+          source scripts/config.env
+          work="$RUNNER_TEMP/cr"; rm -rf "$work"; mkdir -p "$work/out/$OUT_DIR" "$work/chrome"
+          tar xzf dist/*.tar.gz -C "$RUNNER_TEMP"
+          raw="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'DisplayXR-Browser*' | head -1)"
+          [ -n "$raw" ] || { echo "::error::no unpacked build dir in the artifact"; exit 1; }
+          mv "$raw"/* "$work/out/$OUT_DIR/"
+          # chrome/VERSION in the form package.sh's awk expects.
+          IFS=. read -r a b c d <<< "$CHROMIUM_TAG"
+          { echo "MAJOR=$a"; echo "MINOR=$b"; echo "BUILD=$c"; echo "PATCH=$d"; } > "$work/chrome/VERSION"
+          CHROMIUM_SRC="$work" OUT_DIR="$OUT_DIR" bash scripts/package.sh
+          stage="dist/DisplayXR-Browser"
+          # The regression that started this must turn the build red, not ship quietly.
+          [ -f "$stage/initial_preferences" ] || { echo "::error::initial_preferences missing from the staged tree"; exit 1; }
+          echo "staged $(find "$stage" -type f | wc -l) files"
+          rm -f dist/*.tar.gz
+          tar -czf "dist/dxr_browser_staged.tar.gz" -C dist DisplayXR-Browser
+          rm -rf "$stage"
           ls -la dist/
 
       - uses: actions/upload-artifact@v4
