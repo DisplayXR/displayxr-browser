@@ -30,9 +30,17 @@ rm -rf "$STAGE"; mkdir -p "$STAGE"
 # without the redistributable, and nobody here can test a clean Windows box. Do not remove
 # them on the strength of the import scan alone — verify on a VM with no VC++ redist first.
 #
-# The rest are feature-degradation rather than launch-blocking: notification_helper (native
-# toasts), elevation_service + elevated_tracing_service, eventlog_provider, dbgcore+dbghelp
-# (crash capture — worth having on a preview build precisely because it crashes).
+# dbghelp.dll is the exception in the other direction: it IS a genuine DELAY-LOAD dependency
+# of chrome.exe (dumpbin -dependents on an installed tree, win box). It would fall back to
+# the System32 copy, but Chromium deliberately ships a newer one for crash symbolization, so
+# it belongs here for a real reason rather than as insurance. dbgcore.dll is its companion.
+#
+# The others are feature-degradation rather than launch-blocking: notification_helper (native
+# toasts), elevation_service + elevated_tracing_service, eventlog_provider.
+#
+# Both scans agree on the VC++ five, by different methods on different trees: an import scan
+# here and dumpbin -dependents on an installed 0.1.5 there. chrome.exe's real imports are
+# just chrome_elf.dll, KERNEL32.dll, ntdll.dll and VERSION.dll.
 #
 # Core run-set of an official static Chromium build. (A static build has far fewer DLLs than the
 # component build; the vendored openxr_loader.dll ships alongside for the weave client.)
