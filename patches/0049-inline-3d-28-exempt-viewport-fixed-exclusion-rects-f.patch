@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 203f41ac9f7d1c94cdfa685a7c194d1f92db95c8 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 19 Jul 2026 22:34:59 +0900
-Subject: [PATCH 49/51] inline-3d(#28): exempt viewport-fixed exclusion rects
+Subject: [PATCH 49/54] inline-3d(#28): exempt viewport-fixed exclusion rects
  from the impl-scroll patch
 
 The sticky gallery header briefly blew up (~2x) over the woven tiles on a fast

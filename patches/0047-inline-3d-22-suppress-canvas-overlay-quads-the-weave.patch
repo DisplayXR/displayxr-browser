@@ -1,8 +1,8 @@
 From 479b2243f3b13ec7195cd71f8018cb5d8d342ddf Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 19 Jul 2026 18:34:44 +0900
-Subject: inline-3d(#22): suppress canvas + overlay quads the weave draw-back
- owns
+Subject: [PATCH 47/54] inline-3d(#22): suppress canvas + overlay quads the
+ weave draw-back owns
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -138,6 +138,3 @@ index 64e41be8633e7..f86420065c9de 100644
      renderer_->DrawFrame(&frame.render_pass_list, device_scale_factor_,
                           current_surface_size, display_color_spaces_,
                           std::move(frame.surface_damage_rect_list_),
--- 
-2.42.0.windows.2
-

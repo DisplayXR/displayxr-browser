@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 2a369649031bbd10cea502b664d3959f17410c65 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 20 Jul 2026 08:48:44 +0900
-Subject: [PATCH 50/51] inline-3d(#30): pre-blend page backdrop under the SBS
+Subject: [PATCH 50/54] inline-3d(#30): pre-blend page backdrop under the SBS
  weave input
 
 A transparent inline-3D canvas (hello-cube: alpha:true + 0-alpha clear +
