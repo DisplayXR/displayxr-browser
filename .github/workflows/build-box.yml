@@ -50,6 +50,23 @@ on:
         type: boolean
         default: true
 
+# ONE build at a time. The box is a single shared instance, so two runs collide in three
+# ways, and the worst is silent: each run's "Stop the build box" is always(), so a second
+# run finishing (or being cancelled) STOPS THE BOX UNDER THE FIRST ONE'S RUNNING BUILD.
+# They also share the C:\build\<job>.done marker — so a run can read the other's completion
+# signal and package a tree it never built — and the same C:\cr\src checkout, which
+# do_rebase.ps1 will reset out from under a live build.
+#
+# cancel-in-progress is deliberately FALSE: a queued run waits its turn. Cancelling a
+# 90-minute Chromium build to start another is never the behaviour we want, and the
+# cancellation would trigger exactly the always() stop-the-box race described above.
+#
+# (The artifact S3 key was already made run-scoped after the "newest object in the bucket"
+# version of this bug. Markers and the source tree were still shared.)
+concurrency:
+  group: build-box
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write # mint the OIDC token we trade for the AWS role
