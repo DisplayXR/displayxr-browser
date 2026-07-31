@@ -193,7 +193,20 @@ jobs:
             'Write-Host "chromium src = $src"' \
             '$env:CHROMIUM_SRC = $src.Replace("\","/")' \
             '$env:OUT_DIR = "Official"' \
-            '& bash C:/build/browser-repo/scripts/package.sh' \
+            '# bash is NOT on PATH under SSM RunCommand (SYSTEM context). Resolve Git-for-' \
+            '# Windows bash.exe explicitly: depot_tools requires git, so it is always present,' \
+            '# but its bin dir is not in the SYSTEM PATH.' \
+            '$bash = $null' \
+            'if (Get-Command bash -ErrorAction SilentlyContinue) { $bash = "bash" }' \
+            'if (-not $bash) {' \
+            '  $cand = @("C:\Program Files\Git\bin\bash.exe","C:\Program Files\Git\usr\bin\bash.exe","C:\Program Files (x86)\Git\bin\bash.exe")' \
+            '  $g = (Get-Command git -ErrorAction SilentlyContinue)' \
+            '  if ($g) { $root = Split-Path (Split-Path $g.Source -Parent) -Parent; $cand += "$root\bin\bash.exe"; $cand += "$root\usr\bin\bash.exe" }' \
+            '  foreach ($c in $cand) { if (Test-Path $c) { $bash = $c; break } }' \
+            '  if (-not $bash) { Write-Host "ERROR: no bash.exe found. Tried:"; $cand | ForEach-Object { Write-Host "  $_" }; exit 1 }' \
+            '}' \
+            'Write-Host "bash = $bash"' \
+            '& $bash C:/build/browser-repo/scripts/package.sh' \
             'if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: package.sh failed"; exit 1 }' \
             '$stage = "C:\build\browser-repo\dist\DisplayXR-Browser"' \
             'if (-not (Test-Path "$stage\initial_preferences")) { Write-Host "ERROR: initial_preferences missing from the staged tree"; exit 1 }' \
