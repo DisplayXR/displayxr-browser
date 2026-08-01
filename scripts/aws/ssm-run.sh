@@ -43,9 +43,39 @@ echo "ssm command: $cmd_id"
 
 deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 + 600 ))
 status=Pending
+# Consecutive poll failures. This used to be `2>/dev/null || echo Pending`, which
+# reported EVERY API failure as the literal status "Pending" — including
+# ExpiredTokenException once the OIDC session aged out at one hour (#62). The
+# result was a run that appeared to sit in "Pending" for 70 minutes and a
+# "gave up waiting (last status: Pending)" verdict that pointed at the SSM agent,
+# when the truth was that we had simply stopped being able to READ the status.
+# Never conflate "cannot query" with "not started".
+poll_errs=0
 while :; do
-  status="$(aws ssm get-command-invocation --command-id "$cmd_id" \
-            --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)"
+  if ! status_out="$(aws ssm get-command-invocation --command-id "$cmd_id" \
+                     --instance-id "$INSTANCE_ID" --query Status --output text 2>&1)"; then
+    poll_errs=$(( poll_errs + 1 ))
+    echo "  [poll] get-command-invocation failed (${poll_errs}): ${status_out}"
+    # Credentials dying mid-run is terminal for this job — every later call,
+    # including "Stop the build box", will fail the same way. Say so once, loudly,
+    # instead of burning the rest of the timeout on calls that cannot succeed.
+    case "$status_out" in
+      *ExpiredToken*|*RequestExpired*|*InvalidClientTokenId*|*credentials*)
+        echo "::error::AWS credentials expired while waiting on SSM command $cmd_id."
+        echo "::error::The command may still be RUNNING on the box — this is a"
+        echo "::error::credential lifetime problem, not a build failure. See #62."
+        status="CredentialsExpired"
+        break ;;
+    esac
+    if [ "$poll_errs" -ge 5 ]; then
+      echo "::error::5 consecutive SSM status queries failed; giving up on $cmd_id"
+      status="PollFailed"
+      break
+    fi
+  else
+    poll_errs=0
+    status="$status_out"
+  fi
   case "$status" in
     Success|Failed|Cancelled|TimedOut|Undeliverable|Terminated) break ;;
   esac

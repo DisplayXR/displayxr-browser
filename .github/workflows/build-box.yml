@@ -154,9 +154,9 @@ jobs:
           printf '%s\n' \
             "[IO.File]::WriteAllBytes(\"C:\\build\\do_rebase.ps1\", [Convert]::FromBase64String(\"${reb}\"))" \
             "[IO.File]::WriteAllBytes(\"C:\\build\\remote-rebase.ps1\", [Convert]::FromBase64String(\"${drv}\"))" \
-            "& powershell -NoProfile -ExecutionPolicy Bypass -File C:\\build\\remote-rebase.ps1 -Tag '${CHROMIUM_TAG}' -PatchRef '${PATCH_REF}' -TimeoutMinutes 60" \
+            "& powershell -NoProfile -ExecutionPolicy Bypass -File C:\\build\\remote-rebase.ps1 -Tag '${CHROMIUM_TAG}' -PatchRef '${PATCH_REF}' -TimeoutMinutes 90" \
             'exit $LASTEXITCODE' \
-          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#36 rebase ${GITHUB_RUN_ID} -> ${CHROMIUM_TAG} @ ${PATCH_REF}" 60
+          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#36 rebase ${GITHUB_RUN_ID} -> ${CHROMIUM_TAG} @ ${PATCH_REF}" 90
 
       # Trigger the build through the `crbuild` scheduled task, NOT by invoking
       # do_build.ps1 directly: RunCommand is SYSTEM, depot_tools needs Administrator.
@@ -262,6 +262,26 @@ jobs:
           retention-days: 7
 
       # ── the load-bearing cleanup ────────────────────────────────────────────────────
+      # Re-assume the role FIRST. The credentials minted at the top of the job last one
+      # hour (the default session duration), while the build step alone allows 180 minutes
+      # — so on any long build the credentials are already dead by the time we get here and
+      # `stop-instances` fails with RequestExpired. `if: always()` does not save you: the
+      # step runs, the API call is refused, and the instance is left RUNNING and billing.
+      # That happened for real (#62) and had to be cleaned up by hand.
+      #
+      # Re-assuming rather than raising role-duration-seconds is deliberate: the duration is
+      # capped by the IAM role's MaxSessionDuration, so raising it needs an IAM change AND
+      # still fails for any run that outlives whatever new cap is chosen. A fresh assume
+      # immediately before the stop is correct for a run of any length. GitHub's OIDC token
+      # endpoint stays available for the whole job, so this mints a new token, not a cached one.
+      - name: Re-assume AWS role for cleanup (credentials may have expired)
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-build-box-stop-${{ github.run_id }}
+
       # always(): a failed build, a cancelled run, or a timeout must still stop the box.
       - name: Stop the build box
         if: always()
@@ -269,5 +289,14 @@ jobs:
           set -uo pipefail
           aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
           aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID" || true
-          aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].State.Name' --output text
+          state=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+                    --query 'Reservations[0].Instances[0].State.Name' --output text)
+          echo "$state"
+          # Fail the step if the box did not actually stop, so a stranded (billing)
+          # instance is loud rather than a green run with a quiet error line in it.
+          case "$state" in
+            stopped|stopping) ;;
+            *) echo "::error::build box is '$state', NOT stopped — it is still billing."
+               echo "::error::Recover with: gh workflow run build-box.yml -f lifecycle_only=true"
+               exit 1 ;;
+          esac
