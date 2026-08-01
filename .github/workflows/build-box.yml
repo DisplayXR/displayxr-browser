@@ -109,6 +109,12 @@ jobs:
           role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-build-box-${{ github.run_id }}
+          # The role permits 7200s; the action defaults to 3600 and we were silently
+          # taking half the window already allowed (#62). Not a substitute for the
+          # mid-wait refresh in ssm-run.sh - a full rebase+build can exceed 2h too -
+          # but it removes the one-hour cliff without any IAM change, which matters
+          # because iam:UpdateRole is denied to the SWE-DEV role we operate under.
+          role-duration-seconds: 7200
 
       - name: Start the build box
         run: |
@@ -285,6 +291,12 @@ jobs:
           role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-build-box-stop-${{ github.run_id }}
+          # The role permits 7200s; the action defaults to 3600 and we were silently
+          # taking half the window already allowed (#62). Not a substitute for the
+          # mid-wait refresh in ssm-run.sh - a full rebase+build can exceed 2h too -
+          # but it removes the one-hour cliff without any IAM change, which matters
+          # because iam:UpdateRole is denied to the SWE-DEV role we operate under.
+          role-duration-seconds: 7200
 
       # always(): a failed build, a cancelled run, or a timeout must still stop the box.
       - name: Stop the build box
