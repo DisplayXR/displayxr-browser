@@ -1,7 +1,7 @@
 From 5cdcf51c516647674e874f3bda8bb872c42aa584 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 17 Jul 2026 23:46:01 -0700
-Subject: [PATCH] inline-3d(#22): DP-composited 2D overlays + coherent
+Subject: [PATCH 46/54] inline-3d(#22): DP-composited 2D overlays + coherent
  whole-window present
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -773,6 +773,3 @@ index 8786abb535f28..cb3b090caffba 100644
  /*!
   * @brief Weaved output handed back to the present-owner.
   *
--- 
-2.42.0.windows.2
-

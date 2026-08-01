@@ -1,8 +1,12 @@
 # Patch series — inline-3D over Chromium `150.0.7871.24`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`150.0.7871.24` (M150). **45 commits, 125 files** (~30 are the vendored OpenXR SDK; the real
-integration surface is ~95 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+`150.0.7871.24` (M150). **54 commits** (~30 files are the vendored OpenXR SDK; the real
+integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patch 0054 makes the panel's hardware 2D/3D element follow the foreground window's active tab
+(browser#55): the browser used only to go *quiet* when a page had no inline-3D content, and the
+element is sticky, so the lens stayed on over flat pages. Needs displayxr-runtime#815 to take
+effect — a weave present-owner cannot reach hardware 2D on runtime v2.2.2.
 Patches 0043–0044 add overlay exclusion (browser#18): 2D overlays composited over the woven 3D
 via isolated composited-layer resources (browser-side; no runtime change). Patch 0045 fixes the
 two overlay/tile scroll bugs (browser#18): the overlay no longer lags the tile on scroll (aggregator

@@ -1,8 +1,8 @@
-From b25017b5277e08f6b753e51fb26b31b1a1a51175 Mon Sep 17 00:00:00 2001
+From 8dc2eff42ecceb10f727c3204144999d2d9de7be Mon Sep 17 00:00:00 2001
 From: DisplayXR Dev <dev@displayxr.local>
 Date: Wed, 22 Jul 2026 17:41:32 +0000
-Subject: [PATCH] inline-3d(#625): mac DP-composited 2D-overlay atlas on the
- composited-surface weave
+Subject: [PATCH 53/54] inline-3d(#625): mac DP-composited 2D-overlay atlas on
+ the composited-surface weave
 
 The mac composited-surface weave now composites the browser#18-excluded 2D
 overlays through the runtime DP overlay-atlas (Windows-parity: final =
@@ -84,7 +84,7 @@ diff --git a/components/displayxr/browser/displayxr_weave_client_mac.mm b/compon
 index d881d78881426..55538a381d92d 100644
 --- a/components/displayxr/browser/displayxr_weave_client_mac.mm
 +++ b/components/displayxr/browser/displayxr_weave_client_mac.mm
-@@ -621,13 +621,47 @@ uint32_t WeaveSpecVersionMac() {
+@@ -621,13 +621,47 @@ std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectMac(
  DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchMac(
      uintptr_t input_handle,
      const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
@@ -133,7 +133,7 @@ index d881d78881426..55538a381d92d 100644
    if (s.weave_spec_version < 3) {
      static bool logged_v2 = false;
      if (!logged_v2) {
-@@ -656,10 +690,48 @@ uint32_t WeaveSpecVersionMac() {
+@@ -656,10 +690,48 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchMac(
      batch.rectCount = static_cast<uint32_t>(n);
      batch.rects = xr_rects;
  
@@ -235,7 +235,7 @@ index 59fc5bd3d2440..3bec0ae8eab1c 100644
  #include "components/displayxr/browser/displayxr_weave_client.h"
  #include "components/displayxr/browser/displayxr_weave_client_mac.h"
  
-@@ -114,9 +115,72 @@
+@@ -114,9 +115,72 @@ void DisplayXRWeaveGpuMac::BeginBatchSync(const gfx::Size& window_size) {
    batch_open_ = true;
    batch_size_ = window_size;
    batch_entries_.clear();
@@ -308,7 +308,7 @@ index 59fc5bd3d2440..3bec0ae8eab1c 100644
  bool DisplayXRWeaveGpuMac::WeaveCanvasMac(IOSurfaceRef canvas_iosurface,
                                            const gfx::Rect& src_rect,
                                            const gfx::Rect& window_rect,
-@@ -224,9 +288,17 @@
+@@ -224,9 +288,17 @@ bool DisplayXRWeaveGpuMac::SubmitBatchSync() {
    // IOSurfaceGetID(). Passing the raw IOSurfaceID makes the runtime deref a small
    // integer -> EXC_BAD_ACCESS. Pass the ref pointer (matches the probe's
    // submit.inputTexture = (void*)input contract).
@@ -327,7 +327,7 @@ index 59fc5bd3d2440..3bec0ae8eab1c 100644
    if (!sr.ok) {
      static int s_fail = 0;
      if (s_fail < 3) {
-@@ -276,6 +348,75 @@
+@@ -276,6 +348,75 @@ bool DisplayXRWeaveGpuMac::SubmitBatchSync() {
    return true;
  }
  
@@ -1799,6 +1799,3 @@ index cb3b090caffba..421e625062507 100644
  /*!
   * @brief DP-composited 2D overlay atlas — crisp 2D painted OVER the weave (spec v4).
   *
--- 
-2.50.1 (Apple Git-155)
-

@@ -1,8 +1,8 @@
-From 253a20fc5d429e38e0b761977f2eff80c119a86c Mon Sep 17 00:00:00 2001
+From 220248bcb0add169b4542f0b9cfd2dafcbecd2b5 Mon Sep 17 00:00:00 2001
 From: David <dfattal@gmail.com>
 Date: Mon, 20 Jul 2026 12:24:45 +0000
-Subject: [PATCH] inline-3d(#625): reconcile macOS runtime-side weave onto
- browser#18/#22
+Subject: [PATCH 52/54] inline-3d(#625): reconcile macOS runtime-side weave
+ onto browser#18/#22
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -2277,6 +2277,3 @@ index 62ecba1d8f867..35b50eb38c862 100644
    // DisplayXR inline-3D (#625, Step B). Identical to ProduceOverlay but WITHOUT
    // the SCANOUT usage enforcement: the overlay representation is the GPU-thread
    // path that exposes a backing's ID3D11Texture2D (via GetDCLayerOverlayImage),
--- 
-2.50.1 (Apple Git-155)
-

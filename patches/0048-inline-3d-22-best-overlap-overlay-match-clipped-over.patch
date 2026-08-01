@@ -1,8 +1,8 @@
 From fae242772ccdf7f6546fb110885b02dffe717f2c Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 19 Jul 2026 18:35:06 +0900
-Subject: inline-3d(#22): best-overlap overlay match, clipped-overlay source
- region, probes
+Subject: [PATCH 48/54] inline-3d(#22): best-overlap overlay match,
+ clipped-overlay source region, probes
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -195,6 +195,3 @@ index 5edc4da1aa2e6..22da0b9cf3092 100644
            const SkRect dst =
                SkRect::MakeXYWH(r.x(), r.y(), r.width(), r.height());
            atlas_surface->getCanvas()->drawImageRect(
--- 
-2.42.0.windows.2
-
