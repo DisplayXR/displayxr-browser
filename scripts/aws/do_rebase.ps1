@@ -32,7 +32,23 @@ $DONE = 'C:\build\rebase.done'
 Remove-Item $DONE -ErrorAction SilentlyContinue
 Remove-Item $LOG  -ErrorAction SilentlyContinue
 
-function Stage($m){ "=== $m ===" | Tee-Object -FilePath $LOG -Append }
+# Stage() must write ASCII, NOT Tee-Object.
+#
+# Tee-Object on Windows PowerShell 5.1 writes UTF-16LE with a BOM, while every
+# `cmd /c "... >> $LOG"` in this script appends plain ANSI. That makes rebase.log
+# a MIXTURE of two encodings, and Get-Content decodes the whole file by the
+# leading BOM - so remote-rebase.ps1's progress line ("last line of the log")
+# came back as mojibake and stopped advancing regardless of real progress.
+#
+# The cost of that was not cosmetic: it is why three consecutive runs could not be
+# diagnosed. We could see that the rebase was slow but not WHERE, and the one line
+# we could see was unreadable. Write-Output for the console, Add-Content -Encoding
+# ascii for the file, so the whole log is single-encoding and tailable.
+function Stage($m){
+  $line = "=== $m ==="
+  Write-Output $line
+  Add-Content -Path $LOG -Value $line -Encoding ascii
+}
 function Fail($m){ Stage "ERROR: $m"; "ERROR: $m" | Out-File $DONE -Encoding ascii; exit 1 }
 
 Stage "rebase to $TAG starting"
@@ -56,30 +72,52 @@ $REPO_URL  = 'https://github.com/DisplayXR/displayxr-browser.git'
 $REPO_DIR  = 'C:\build\displayxr-browser'
 $PATCH_DIR = 'C:\build\patches'
 
-if (-not (Test-Path (Join-Path $REPO_DIR '.git'))) {
-    Remove-Item $REPO_DIR -Recurse -Force -ErrorAction SilentlyContinue
-    cmd /c "git clone $REPO_URL $REPO_DIR >> $LOG 2>&1"
-    if ($LASTEXITCODE -ne 0) { Fail "clone $REPO_URL" }
-}
-# Fetch the exact ref asked for - a branch, a tag, or a full SHA. FETCH_HEAD rather than a
-# local branch so a PR branch and main are handled the same way.
-cmd /c "cd /d $REPO_DIR && git fetch --force origin $PATCH_REF >> $LOG 2>&1"
-if ($LASTEXITCODE -ne 0) { Fail "fetch patch ref '$PATCH_REF'" }
-cmd /c "cd /d $REPO_DIR && git checkout -f FETCH_HEAD >> $LOG 2>&1"
-if ($LASTEXITCODE -ne 0) { Fail "checkout patch ref '$PATCH_REF'" }
+# NO GIT HERE. The first version of this used `git clone` + `git fetch`, and it
+# HUNG - three runs burned their whole budget with rebase.log containing nothing
+# but the "starting" marker while a git process sat there never returning. Under
+# the crbuild scheduled task there is no console, so anything git decides to
+# prompt for (a credential helper popping UI, a host-key question) blocks
+# forever, and a hang is indistinguishable from slow work.
+#
+# A patch series is just files. Fetch them over plain HTTPS as a zip: no
+# credential helper, no interactive anything, an explicit timeout, and a hard
+# failure instead of an infinite wait.
+$ZIP = 'C:\build\patchsrc.zip'
+$EXT = 'C:\build\patchsrc'
+Remove-Item $ZIP -Force -ErrorAction SilentlyContinue
+Remove-Item $EXT -Recurse -Force -ErrorAction SilentlyContinue
 
-$srcPatches = @(Get-ChildItem (Join-Path $REPO_DIR 'patches\*.patch') -ErrorAction SilentlyContinue)
-if ($srcPatches.Count -eq 0) { Fail "no patches under $REPO_DIR\patches at '$PATCH_REF'" }
+# codeload wants refs/heads/<branch> for a branch, but a bare SHA for a commit.
+if ($PATCH_REF -match '^[0-9a-fA-F]{40}$') { $refPath = $PATCH_REF }
+else { $refPath = "refs/heads/$PATCH_REF" }
+$URL = "https://codeload.github.com/DisplayXR/displayxr-browser/zip/$refPath"
+Stage "downloading patch series from $URL"
+try {
+    $ProgressPreference = 'SilentlyContinue'   # progress UI is slow and useless here
+    Invoke-WebRequest -Uri $URL -OutFile $ZIP -UseBasicParsing -TimeoutSec 300
+} catch {
+    Fail ("download failed for ref '" + $PATCH_REF + "': " + $_.Exception.Message)
+}
+if (-not (Test-Path $ZIP)) { Fail "no zip downloaded for ref '$PATCH_REF'" }
+Stage ("downloaded " + [math]::Round((Get-Item $ZIP).Length/1KB) + " KB")
+
+try { Expand-Archive -Path $ZIP -DestinationPath $EXT -Force }
+catch { Fail ("expand failed: " + $_.Exception.Message) }
+
+$srcDir = Get-ChildItem $EXT -Directory | Select-Object -First 1
+if (-not $srcDir) { Fail "zip contained no top-level directory" }
+$srcPatches = @(Get-ChildItem (Join-Path $srcDir.FullName 'patches\*.patch') -ErrorAction SilentlyContinue)
+if ($srcPatches.Count -eq 0) { Fail "no patches under patches/ at '$PATCH_REF'" }
+
 if (Test-Path $PATCH_DIR) {
-    # Clear first: a series that SHRANK would otherwise leave orphans behind that git am
-    # would still pick up and apply.
+    # Clear first: a series that SHRANK would otherwise leave orphans behind that
+    # git am would still pick up and apply.
     Remove-Item (Join-Path $PATCH_DIR '*.patch') -Force -ErrorAction SilentlyContinue
 } else {
     New-Item -ItemType Directory -Path $PATCH_DIR | Out-Null
 }
-Copy-Item (Join-Path $REPO_DIR 'patches\*.patch') $PATCH_DIR -Force
-$patchSha = (cmd /c "cd /d $REPO_DIR && git rev-parse --short HEAD").Trim()
-Stage ("patch series synced from '" + $PATCH_REF + "' (" + $patchSha + "): " + $srcPatches.Count + " patches")
+Copy-Item (Join-Path $srcDir.FullName 'patches\*.patch') $PATCH_DIR -Force
+Stage ("patch series synced from '" + $PATCH_REF + "': " + $srcPatches.Count + " patches")
 
 # 1. Discard the working tree. The patch series in patches/ is canonical, so dirty files
 #    are disposable.
@@ -96,12 +134,15 @@ Stage "checked out $TAG"
 
 # 3. gclient sync to match the tag (run from the .gclient root).
 #
-#    SKIPPED when the deps are already synced for this exact tag. This is the
-#    single biggest cost in the lane: `gclient sync -D --force --reset` re-syncs
-#    Chromium's whole dependency tree from cold on a freshly-booted box, and was
-#    measured taking 90+ MINUTES - longer than the step's entire budget, which is
-#    what made three consecutive runs fail (#62). It was previously unconditional,
-#    so every build paid it whether or not anything had changed.
+#    SKIPPED when the deps are already synced for this exact tag.
+#
+#    NOTE ON THE ORIGINAL JUSTIFICATION: this was added believing gclient sync was
+#    what made three runs time out. It was NOT - those runs never reached this
+#    step at all. They hung in the step-0 patch sync above, which used git and sat
+#    there forever; the log contained only the "starting" marker and the slowness
+#    was misattributed to gclient. Keeping the skip anyway, because re-syncing
+#    deps for a pin that has not moved is genuinely wasted work, but it is an
+#    optimisation, not the fix for #62.
 #
 #    Skipping is safe because the TAG PINS DEPS: a given Chromium tag has one
 #    DEPS file, so if the checkout is already at $TAG and a sync for $TAG has
