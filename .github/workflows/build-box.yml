@@ -87,6 +87,10 @@ env:
   AWS_REGION: us-east-1
   INSTANCE_ID: i-0150c4a09e3852120
   ARTIFACT_BUCKET: displayxr-browser-artifacts
+  # Exposed so ssm-run.sh can re-mint credentials mid-wait when the OIDC session
+  # ages out (#62). A rebase or build outlives the role's 1h MaxSessionDuration,
+  # and losing the ability to READ a healthy command's status must not kill the run.
+  AWS_BUILD_ROLE_ARN: ${{ vars.AWS_BUILD_ROLE_ARN }}
 
 jobs:
   build:
