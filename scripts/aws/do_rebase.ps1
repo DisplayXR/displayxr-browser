@@ -95,11 +95,43 @@ if ($LASTEXITCODE -ne 0) { Fail "checkout $TAG" }
 Stage "checked out $TAG"
 
 # 3. gclient sync to match the tag (run from the .gclient root).
-cmd /c "cd /d C:\cr && gclient sync -D --force --reset --nohooks >> $LOG 2>&1"
-if ($LASTEXITCODE -ne 0) { Fail 'gclient sync' }
-Stage 'gclient sync OK'
-cmd /c "cd /d C:\cr && gclient runhooks >> $LOG 2>&1"
-Stage 'runhooks done'
+#
+#    SKIPPED when the deps are already synced for this exact tag. This is the
+#    single biggest cost in the lane: `gclient sync -D --force --reset` re-syncs
+#    Chromium's whole dependency tree from cold on a freshly-booted box, and was
+#    measured taking 90+ MINUTES - longer than the step's entire budget, which is
+#    what made three consecutive runs fail (#62). It was previously unconditional,
+#    so every build paid it whether or not anything had changed.
+#
+#    Skipping is safe because the TAG PINS DEPS: a given Chromium tag has one
+#    DEPS file, so if the checkout is already at $TAG and a sync for $TAG has
+#    completed before, re-syncing can only reproduce the same tree. What is NOT
+#    safe is trusting a sync that did not finish, so the marker is written only
+#    AFTER gclient exits 0 - an interrupted or failed sync leaves no marker and
+#    the next run does the full sync again.
+#
+#    Overridable with DXR_FORCE_SYNC=1 for the case where the tree is suspected
+#    bad and you want the slow, thorough path back.
+$SYNC_MARKER = 'C:\build\last_synced_tag.txt'
+$syncedTag = ''
+if (Test-Path $SYNC_MARKER) { $syncedTag = (Get-Content $SYNC_MARKER -Raw).Trim() }
+$forceSync = ($env:DXR_FORCE_SYNC -eq '1')
+
+if (-not $forceSync -and $syncedTag -eq $TAG) {
+    Stage "gclient sync SKIPPED - deps already synced for $TAG (set DXR_FORCE_SYNC=1 to force)"
+} else {
+    if ($forceSync) { Stage 'gclient sync forced by DXR_FORCE_SYNC=1' }
+    else { Stage ("gclient sync needed - marker='" + $syncedTag + "' target='" + $TAG + "'") }
+    # Clear the marker first: if we die mid-sync the tree is in an unknown state
+    # and the next run must NOT believe it is synced.
+    Remove-Item $SYNC_MARKER -ErrorAction SilentlyContinue
+    cmd /c "cd /d C:\cr && gclient sync -D --force --reset --nohooks >> $LOG 2>&1"
+    if ($LASTEXITCODE -ne 0) { Fail 'gclient sync' }
+    Stage 'gclient sync OK'
+    cmd /c "cd /d C:\cr && gclient runhooks >> $LOG 2>&1"
+    Stage 'runhooks done'
+    Set-Content -Path $SYNC_MARKER -Value $TAG -Encoding ascii
+}
 
 # 4. Re-apply the inline-3D patch series. THE DRIFT GATE: if `git am` fails the series
 #    needs a manual rebase (#36) and we must NOT proceed to a build.
