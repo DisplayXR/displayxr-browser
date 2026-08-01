@@ -77,7 +77,19 @@ try {
     if ((Get-Date) -gt $deadline) { Write-Output "ERROR: rebase timed out after $TimeoutMinutes min"; Show-LogTail; exit 3 }
     if (((Get-Date) - $lastNote).TotalMinutes -ge 3) {
       $lastNote = Get-Date
-      if (Test-Path $log) { Write-Output ("  [" + (Get-Date -Format HH:mm:ss) + "] " + (Get-Content $log -Tail 1)) }
+      # Report the last STAGE marker, not the last raw line. gclient writes its
+      # progress as one \r-updated blob, so "the last line" is a megabyte of
+      # spinner that never changes and tells you nothing about which step you are
+      # in. The === markers are the actual milestones. Also print the log size, so
+      # a long step still shows visible evidence of progress rather than looking
+      # hung (that ambiguity cost three runs' worth of misdiagnosis).
+      if (Test-Path $log) {
+        $sz = [math]::Round((Get-Item $log).Length / 1KB)
+        $mark = (Select-String -Path $log -Pattern '^=== ' -Encoding ascii |
+                 Select-Object -Last 1).Line
+        if (-not $mark) { $mark = '(no stage marker yet)' }
+        Write-Output ("  [" + (Get-Date -Format HH:mm:ss) + "] ${sz}KB  " + $mark)
+      }
     }
     Start-Sleep -Seconds 20
   }
