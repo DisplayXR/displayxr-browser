@@ -15,3 +15,8 @@ _package/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Local build artifacts pulled from the box (never committed)
+_artifact/
+_staged/
+_signed/

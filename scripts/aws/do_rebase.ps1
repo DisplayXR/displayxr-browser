@@ -190,6 +190,31 @@ if ($LASTEXITCODE -ne 0) {
 }
 Stage 'patch series applied cleanly'
 
+# 5. Apply DisplayXR product branding.
+#
+#    This is what scripts/brand.sh does for a LOCAL build, and the box never did
+#    it: do_build.ps1 (which is not repo-tracked) does not call brand.sh, so every
+#    artifact the lane has ever produced identified itself as
+#
+#        ProductName = Chromium
+#        CompanyName = The Chromium Authors
+#
+#    which misattributes the product and ships under a name that is not ours.
+#    Caught on the first green build, before signing.
+#
+#    It belongs HERE rather than in do_build.ps1 because it is a source-tree
+#    modification exactly like the patch series - and putting it in the tracked
+#    script keeps it from drifting the way the untracked one did. It must come
+#    after the checkout/reset above (which would wipe it) and is independent of
+#    the patches, which never touch this file.
+$brandSrc = Join-Path $srcDir.FullName 'branding/BRANDING'
+$brandDst = 'C:\cr\src\chrome\app\theme\chromium\BRANDING'
+if (-not (Test-Path $brandSrc)) { Fail "no branding/BRANDING in the downloaded series" }
+Copy-Item $brandSrc $brandDst -Force
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $brandDst)) { Fail 'branding copy failed' }
+$prod = (Select-String -Path $brandDst -Pattern '^PRODUCT_FULLNAME=' | Select-Object -First 1).Line
+Stage ("branding applied - " + $prod)
+
 $desc = (cmd /c "cd /d C:\cr\src && git describe --tags").Trim()
 Stage "HEAD = $desc"
 "OK $TAG $desc" | Out-File $DONE -Encoding ascii
