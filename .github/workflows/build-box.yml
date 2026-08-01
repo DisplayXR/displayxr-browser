@@ -164,9 +164,9 @@ jobs:
           printf '%s\n' \
             "[IO.File]::WriteAllBytes(\"C:\\build\\do_rebase.ps1\", [Convert]::FromBase64String(\"${reb}\"))" \
             "[IO.File]::WriteAllBytes(\"C:\\build\\remote-rebase.ps1\", [Convert]::FromBase64String(\"${drv}\"))" \
-            "& powershell -NoProfile -ExecutionPolicy Bypass -File C:\\build\\remote-rebase.ps1 -Tag '${CHROMIUM_TAG}' -PatchRef '${PATCH_REF}' -TimeoutMinutes 90" \
+            "& powershell -NoProfile -ExecutionPolicy Bypass -File C:\\build\\remote-rebase.ps1 -Tag '${CHROMIUM_TAG}' -PatchRef '${PATCH_REF}' -TimeoutMinutes 180" \
             'exit $LASTEXITCODE' \
-          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#36 rebase ${GITHUB_RUN_ID} -> ${CHROMIUM_TAG} @ ${PATCH_REF}" 90
+          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#36 rebase ${GITHUB_RUN_ID} -> ${CHROMIUM_TAG} @ ${PATCH_REF}" 180
 
       # Trigger the build through the `crbuild` scheduled task, NOT by invoking
       # do_build.ps1 directly: RunCommand is SYSTEM, depot_tools needs Administrator.
