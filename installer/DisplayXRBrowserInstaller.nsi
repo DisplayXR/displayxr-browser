@@ -30,6 +30,15 @@
 !ifndef OUTPUT_DIR
 	!define OUTPUT_DIR "."
 !endif
+; Oldest DisplayXR runtime this browser build actually works against (#68). The
+; browser's inline-3D panel control needs displayxr-runtime#815, which shipped in
+; v2.2.3: before it, a weave present-owner could not reach hardware 2D at all, so
+; the browser's request to flatten the panel is a SILENT no-op — the user sees the
+; display stuck in 3D and nothing tells them why. Bump this whenever a browser
+; change starts depending on a newer runtime.
+!ifndef MIN_RUNTIME_VERSION
+	!define MIN_RUNTIME_VERSION "2.2.3"
+!endif
 
 ;--------------------------------
 ; Two-pass signing (same robust recipe as the runtime installer — see
@@ -75,6 +84,8 @@ ShowUninstDetails show
 !include "FileFunc.nsh"
 !include "x64.nsh"
 !include "LogicLib.nsh"
+!include "WordFunc.nsh"
+!insertmacro VersionCompare
 
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
@@ -141,24 +152,84 @@ SectionEnd
 
 ;--------------------------------
 ; Section 2 — chain the DisplayXR runtime + display plug-in (the weave prereqs).
-; If a runtime installer is bundled (RUNTIME_SETUP), run it when the runtime isn't
-; already present; otherwise just note the requirement (the browser still installs
-; and runs 2D). A display plug-in (e.g. Leia) is the vendor's own installer.
+;
+; #68: this used to test only that a runtime was PRESENT, never that it was new
+; enough, so a user on an older runtime installed the browser, was told all was
+; well, and got a browser whose headline fix silently did nothing. The runtime
+; writes its `Version` to the same key as `InstallPath`, so compare it against
+; ${MIN_RUNTIME_VERSION} (VersionCompare from WordFunc.nsh — NSIS has no built-in
+; semver compare) and treat a missing/unparseable Version as TOO OLD, never as
+; fine: a runtime that predates version stamping predates the minimum by
+; definition.
+;
+; If a runtime installer is bundled (RUNTIME_SETUP) it now runs for "missing" AND
+; for "too old" — previously it only ever chained when NO runtime was present, so
+; an out-of-date one was never upgraded. Without a bundled runtime we say so
+; plainly, naming both versions. The browser still installs and runs 2D; a display
+; plug-in (e.g. Leia) is the vendor's own installer.
 Section "DisplayXR runtime (weave prerequisite)" SecRuntime
 	SetRegView 64
 	ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
-	${If} $0 != ""
-		DetailPrint "DisplayXR runtime already installed at $0 — skipping."
+	ReadRegStr $1 HKLM "Software\DisplayXR\Runtime" "Version"
+
+	; $2 = ok | old | none
+	${If} $0 == ""
+		StrCpy $2 "none"
+	${ElseIf} $1 == ""
+		; Installed but unstamped — older than anything we can require.
+		StrCpy $1 "unknown"
+		StrCpy $2 "old"
+	${Else}
+		; $3: 0 = equal, 1 = installed is newer, 2 = required is newer.
+		; An unparseable string compares as 0.0.0, i.e. "old" — the safe way round.
+		${VersionCompare} "$1" "${MIN_RUNTIME_VERSION}" $3
+		${If} $3 == "2"
+			StrCpy $2 "old"
+		${Else}
+			StrCpy $2 "ok"
+		${EndIf}
+	${EndIf}
+
+	${If} $2 == "ok"
+		DetailPrint "DisplayXR runtime $1 at $0 (>= ${MIN_RUNTIME_VERSION}) — skipping."
 	${Else}
 		!ifdef RUNTIME_SETUP
-			DetailPrint "Installing bundled DisplayXR runtime…"
+			${If} $2 == "none"
+				DetailPrint "No DisplayXR runtime found — installing the bundled runtime…"
+			${Else}
+				DetailPrint "DisplayXR runtime $1 is older than the required ${MIN_RUNTIME_VERSION} — upgrading with the bundled runtime…"
+			${EndIf}
 			File "/oname=$PLUGINSDIR\DisplayXRSetup.exe" "${RUNTIME_SETUP}"
 			; /NOSTART: don't hold plug-in DLLs; the runtime installer registers the
 			; Run key + sim-display DP. Silent chain (mirrors the meta-bundle).
-			ExecWait '"$PLUGINSDIR\DisplayXRSetup.exe" /S /NOSTART' $1
-			DetailPrint "  runtime installer exit: $1"
+			ExecWait '"$PLUGINSDIR\DisplayXRSetup.exe" /S /NOSTART' $4
+			DetailPrint "  runtime installer exit: $4"
+			; State what actually landed — a failed chain must not read as success.
+			ReadRegStr $1 HKLM "Software\DisplayXR\Runtime" "Version"
+			${If} $1 == ""
+				StrCpy $1 "none"
+			${EndIf}
+			DetailPrint "  DisplayXR runtime version now: $1"
 		!else
-			DetailPrint "No DisplayXR runtime found and none bundled — 3D weave will be inactive until a runtime + display plug-in are installed."
+			${If} $2 == "none"
+				; No runtime at all — .onInstSuccess's selftest already catches this
+				; and shows the "no 3D display" notice, so a DetailPrint is enough.
+				DetailPrint "No DisplayXR runtime found and none bundled — 3D weave will be inactive until runtime >= ${MIN_RUNTIME_VERSION} + a display plug-in are installed."
+			${Else}
+				; Too old is the case NOTHING else catches: an out-of-date runtime
+				; passes `displayxr-cli selftest` (it has a DP and valid display
+				; info), so the first-run notice stays silent and the user is left
+				; with a browser whose 3D features quietly misbehave. Say it here.
+				DetailPrint "DisplayXR runtime $1 is older than the required ${MIN_RUNTIME_VERSION} — inline-3D display control will not work correctly."
+				; Never modal under /S — a blocking dialog in a silent install hangs
+				; the whole chaining installer with nothing on screen to dismiss.
+				IfSilent +2 0
+				MessageBox MB_ICONEXCLAMATION|MB_OK \
+"DisplayXR runtime $1 is installed, but DisplayXR Browser needs $\r$\n\
+version ${MIN_RUNTIME_VERSION} or newer.$\r$\n$\r$\nThe browser will install and run, but inline-3D pages will \
+not control the display correctly — most visibly, the display can stay in 3D after you leave a 3D \
+page.$\r$\n$\r$\nUpdate the DisplayXR runtime to ${MIN_RUNTIME_VERSION} or newer, then restart the browser."
+			${EndIf}
 		!endif
 	${EndIf}
 SectionEnd
@@ -191,6 +262,9 @@ Function .onInstSuccess
 
 	${If} $3 == ""
 	${OrIf} $4 != "0"
+		; Never modal under /S — see Section 2. This notice predates the guard and
+		; would have hung any silent/chained install of the browser.
+		IfSilent +2 0
 		MessageBox MB_ICONINFORMATION|MB_OK \
 "No DisplayXR 3D display detected.$\r$\n$\r$\nDisplayXR Browser will run as an ordinary browser. On a \
 DisplayXR 3D display with the runtime and a display plug-in installed, inline-3D web pages weave \
