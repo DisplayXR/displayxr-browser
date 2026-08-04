@@ -7,7 +7,11 @@
 # Env:
 #   BUILD_NUM       installer build number (default 0)
 #   RUNTIME_SETUP   abs path to a DisplayXRSetup.exe to chain (optional; else the browser
-#                   just requires an already-installed runtime)
+#                   just requires an already-installed runtime). When set it now covers the
+#                   UPGRADE case too, not only "no runtime at all" (#68).
+#   MIN_RUNTIME_VERSION
+#                   oldest runtime this browser works against (optional; the .nsi carries the
+#                   default). Bump when a browser change starts needing a newer runtime.
 #   SIGN_CMD        runner-local signer (optional; enables Authenticode + signed uninstaller)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,6 +45,7 @@ ARGS=( -DVERSION="$VER" -DBUILD_NUM="${BUILD_NUM:-0}"
        -DSTAGE_DIR="$(w "$STAGE")" -DSOURCE_DIR="$(w "$REPO")" -DOUTPUT_DIR="$(w "$OUT")" )
 [ -f "$REPO/LICENSE" ] && ARGS+=( -DLICENSE_FILE="$(w "$REPO/LICENSE")" )
 [ -n "${RUNTIME_SETUP:-}" ] && ARGS+=( -DRUNTIME_SETUP="$(w "$RUNTIME_SETUP")" )
+[ -n "${MIN_RUNTIME_VERSION:-}" ] && ARGS+=( -DMIN_RUNTIME_VERSION="$MIN_RUNTIME_VERSION" )
 [ -n "${SIGN_CMD:-}" ]      && ARGS+=( -DSIGN_CMD="$SIGN_CMD" )
 
 echo "[installer] makensis ${ARGS[*]}"
