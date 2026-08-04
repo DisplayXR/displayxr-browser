@@ -193,6 +193,30 @@ jobs:
             'exit $LASTEXITCODE' \
           | scripts/aws/ssm-run.sh "$INSTANCE_ID" "browser#45 CI build ${GITHUB_RUN_ID}" "$TIMEOUT_MIN"
 
+      # Re-assume BEFORE the upload, for the same reason the cleanup step below does
+      # (#63/#64) -- that hardening stopped at the stop-the-box step and left this one
+      # exposed. The job's initial credentials last at most the role's 2h
+      # MaxSessionDuration, and the build step alone is allowed 180 minutes, so on any
+      # long build they are already dead by the time the build returns. Run 30933222808
+      # is the proof: the 150->151 milestone bump rebased AND built successfully in
+      # 2h04m, then lost the artifact to
+      #
+      #   ExpiredTokenException ... calling the SendCommand operation
+      #
+      # The build was fine; two hours of it were simply thrown away, and the run reported
+      # `failure` for a credential lifetime rather than anything about the code. The
+      # mid-wait refresh inside ssm-run.sh does not help here: this step calls it fresh
+      # with a 60s timeout, so there is no wait to refresh during -- the credentials are
+      # already expired when send-command is first issued.
+      - name: Re-assume AWS role before the artifact upload (build may have outlived them)
+        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-build-box-upload-${{ github.run_id }}
+          role-duration-seconds: 7200
+
       # The box uploads to a RUN-SCOPED key and we download that exact key. The old version
       # took "newest object in the bucket", which picks up another run's artifact whenever
       # two builds overlap.
