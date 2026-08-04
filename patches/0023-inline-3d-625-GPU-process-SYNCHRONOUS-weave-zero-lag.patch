@@ -828,10 +828,10 @@ index 3a31d22435aff..2c7c4c85c3347 100644
      deps += [ "//components/metal_util" ]
    }
 diff --git a/content/gpu/gpu_main.cc b/content/gpu/gpu_main.cc
-index e7b1bd73f21a3..d74a9581383bf 100644
+index 2b4be734a24e0..f99ecf68ce23d 100644
 --- a/content/gpu/gpu_main.cc
 +++ b/content/gpu/gpu_main.cc
-@@ -104,7 +104,9 @@
+@@ -106,7 +106,9 @@
  #include "base/win/scoped_com_initializer.h"
  #include "base/win/win_util.h"
  #include "base/win/windows_version.h"
@@ -840,8 +840,8 @@ index e7b1bd73f21a3..d74a9581383bf 100644
 +#include "sandbox/policy/switches.h"
  #include "sandbox/policy/win/sandbox_warmup.h"
  #include "sandbox/win/src/sandbox.h"
- #endif
-@@ -130,6 +132,35 @@ namespace content {
+ #include "services/webnn/public/cpp/webnn_sandbox_init.h"
+@@ -133,6 +135,35 @@ namespace content {
  
  namespace {
  
@@ -877,10 +877,10 @@ index e7b1bd73f21a3..d74a9581383bf 100644
  #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
  bool StartSandboxLinux(gpu::GpuWatchdogThread*,
                         const gpu::GPUInfo*,
-@@ -191,6 +222,18 @@ class ContentSandboxHelper : public gpu::GpuSandboxHelper {
+@@ -195,6 +226,18 @@ class ContentSandboxHelper : public gpu::GpuSandboxHelper {
      // On Linux, reading system memory doesn't work through the GPU sandbox.
      // This value is cached, so access it here to populate the cache.
-     base::SysInfo::AmountOfPhysicalMemory();
+     base::SysInfo::AmountOfTotalPhysicalMemory();
 +
 +#if BUILDFLAG(IS_WIN)
 +    // DisplayXR inline-3D (#625, zero-lag sync weave): connect the runtime IPC
