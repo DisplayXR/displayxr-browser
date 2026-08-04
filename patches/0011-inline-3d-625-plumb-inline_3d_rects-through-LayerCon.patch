@@ -156,10 +156,10 @@ index c2f40737c3291..d09799a720422 100644
    // Pushes an update to a single tile in the context's display tree.
    virtual void UpdateDisplayTile(
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 123052d1f4398..7f28122e1fc1a 100644
+index 7b38d60eaa483..8c1cb14babd9e 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2447,12 +2447,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2616,14 +2616,17 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    metadata.capture_bounds = CollectRegionCaptureBounds();
    // DisplayXR inline-3D (#625, Step B / B4b): carry the page's inline-3d canvas
    // rects (window-relative device px) so Viz can weave those output sub-rects.
@@ -171,12 +171,14 @@ index 123052d1f4398..7f28122e1fc1a 100644
 +    metadata.inline_3d_rects = inline_3d_rects_from_client_;
    } else {
      metadata.tracked_element_rects = CollectTrackedElementRects(
-         /*is_for_compositor_frame_metadata=*/true);
+         /*is_for_compositor_frame_metadata=*/true,
+         frame.tracked_element_status ==
+             TrackedElementStatus::kHasTrackedElementsNeedingOcclusion);
 +    metadata.inline_3d_rects = active_tree()->inline_3d_rects();
    }
  
    if (!screenshot_destination_.is_empty()) {
-@@ -2628,7 +2631,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+@@ -2801,7 +2804,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
  
      // Send updates to Viz even for no damage case when TreesInViz is enabled.
      if (settings_.TreesInVizInClientProcess()) {
@@ -186,7 +188,7 @@ index 123052d1f4398..7f28122e1fc1a 100644
      }
  
      active_tree()->ResetAllChangeTracking();
-@@ -2720,7 +2724,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+@@ -2893,7 +2897,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
          compositor_frame.metadata.send_frame_token_to_embedder;
      trees_in_viz_submit_time = UpdateDisplayTree(
          *frame, std::move(compositor_frame.metadata.latency_info),
@@ -196,7 +198,7 @@ index 123052d1f4398..7f28122e1fc1a 100644
  
      layer_tree_frame_sink_->ExportFrameTiming();
    } else {
-@@ -3248,6 +3253,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+@@ -3411,6 +3416,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
      FrameData& frame,
      std::vector<ui::LatencyInfo> latency_info,
      viz::TrackedElementRects tracked_element_rects,
@@ -204,7 +206,7 @@ index 123052d1f4398..7f28122e1fc1a 100644
      bool is_flush) {
    DCHECK(settings_.TreesInVizInClientProcess());
    DCHECK(layer_context_);
-@@ -3258,7 +3264,8 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+@@ -3421,7 +3427,8 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
        *active_tree(), *resource_provider(),
        layer_tree_frame_sink_->shared_image_interface().get(),
        viewport_damage_rect_, !frame.has_no_damage, is_flush,
@@ -214,7 +216,7 @@ index 123052d1f4398..7f28122e1fc1a 100644
  }
  
  void LayerTreeHostImpl::FlushDisplayTree() {
-@@ -3287,7 +3294,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
+@@ -3450,7 +3457,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
    // activation of this specific update and ensures that subsequent metadata
    // (like frame tokens in ACKs) remains consistent.
    ++next_frame_token_;
