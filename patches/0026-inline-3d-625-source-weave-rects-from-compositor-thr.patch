@@ -38,28 +38,48 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  5 files changed, 89 insertions(+), 8 deletions(-)
 
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 80d8cc6dcd2bc..b066a935b15e0 100644
+index 2a89386cc9245..4c00e82a764b7 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2258,7 +2258,17 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
-         viz::TrackedElementRect transformed_rect = rect_data;
-         gfx::Rect visible_layer_rect =
-             layer->draw_properties().visible_layer_rect;
--        visible_layer_rect.Intersect(rect_data.visible_bounds);
-+        // DisplayXR inline-3D (#625): the inline-3d tracked chunk lands on a
-+        // layer with no drawable content (an undecorated canvas's background
-+        // chunk), whose visible_layer_rect is empty — intersecting would zero
-+        // the weave rect. The weave path clips to the window itself, so
-+        // project the raw element rect (matches the legacy unclipped
-+        // getBoundingClientRect semantics).
-+        if (feature == viz::TrackedElementFeature::kInline3dWeave) {
-+          visible_layer_rect = rect_data.visible_bounds;
-+        } else {
-+          visible_layer_rect.Intersect(rect_data.visible_bounds);
-+        }
-         gfx::Rect visible_element_bounds_in_screen_space =
-             MathUtil::ProjectEnclosingClippedRect(layer->ScreenSpaceTransform(),
-                                                   visible_layer_rect);
+@@ -363,13 +363,23 @@ bool IsFixedOrStickyOccluderTransform(int transform_id,
+ gfx::Rect CalculateVisibleBounds(
+     const LayerImpl* layer,
+     const viz::TrackedElementRect& rect_data_in_layer_space,
++    bool use_unclipped_element_bounds,
+     const std::vector<HeuristicFixedOrStickyOccluder>& front_occluders,
+     const TransformTree& transform_tree,
+     int inner_scroll_id,
+     int outer_scroll_id,
+     base::flat_map<int, int>& sticky_or_viewport_scroll_cache) {
+   gfx::Rect visible_layer_rect = layer->draw_properties().visible_layer_rect;
+-  visible_layer_rect.Intersect(rect_data_in_layer_space.visible_bounds);
++  // DisplayXR inline-3D (#625): the inline-3d tracked chunk lands on a layer
++  // with no drawable content (an undecorated canvas's background chunk), whose
++  // visible_layer_rect is empty — intersecting would zero the weave rect. The
++  // weave path clips to the window itself, so project the raw element rect
++  // (matches the legacy unclipped getBoundingClientRect semantics).
++  if (use_unclipped_element_bounds) {
++    visible_layer_rect = rect_data_in_layer_space.visible_bounds;
++  } else {
++    visible_layer_rect.Intersect(rect_data_in_layer_space.visible_bounds);
++  }
+ 
+   // Map tracked element visible bounds to screen space first.
+   gfx::Rect element_screen_rect = MathUtil::ProjectEnclosingClippedRect(
+@@ -2406,9 +2416,10 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
+           // the compositor frame metadata should be transformed to the
+           // coordinate space of the compositor frame.
+           transformed_rect.visible_bounds = CalculateVisibleBounds(
+-              layer, rect_data, front_occluders, transform_tree,
+-              inner_scroll_id, outer_scroll_id,
+-              sticky_or_viewport_scroll_cache);
++              layer, rect_data,
++              feature == viz::TrackedElementFeature::kInline3dWeave,
++              front_occluders, transform_tree, inner_scroll_id,
++              outer_scroll_id, sticky_or_viewport_scroll_cache);
+ 
+           // Set the element data with screen space visible bounds.
+           rects[feature].emplace_back(transformed_rect);
 diff --git a/components/viz/common/surfaces/tracked_element_rects.h b/components/viz/common/surfaces/tracked_element_rects.h
 index a0bad1b359b34..592831f450e5b 100644
 --- a/components/viz/common/surfaces/tracked_element_rects.h
