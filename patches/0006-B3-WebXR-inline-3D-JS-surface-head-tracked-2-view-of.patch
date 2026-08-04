@@ -1103,14 +1103,13 @@ index ce8231f02d134..226fde99134c6 100644
    CHECK(IsRenderingContext2D());
    if (cc_layer_) {
 diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
-index 2b023e1a62915..e98c081b0d08f 100644
+index 759b9d58f00d2..addecdaf395d3 100644
 --- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
 +++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
-@@ -189,6 +189,12 @@ class CORE_EXPORT HTMLCanvasElement final
+@@ -196,6 +196,11 @@ class CORE_EXPORT HTMLCanvasElement final
+     return accessibility_manager_.Get();
+   }
  
-   cc::TextureLayer* GetOrCreateCcLayerForCanvas2DIfNeeded();
-   cc::TextureLayer* GetCanvas2DCcLayerForTesting() { return cc_layer_.get(); }
-+
 +  // DisplayXR inline-3D (#625, Step B / B3). Tag/untag this canvas's compositor
 +  // layer as a weave target so Viz redirects it to the OS-woven (glasses-free
 +  // 3D) texture. Set by the WebXR XRDisplayLayer binding. The tag is re-applied
@@ -1119,7 +1118,7 @@ index 2b023e1a62915..e98c081b0d08f 100644
    void ClearCanvas2DLayerTexture() override;
  
    void SetNeedsPushProperties();
-@@ -433,6 +439,10 @@ class CORE_EXPORT HTMLCanvasElement final
+@@ -454,6 +459,10 @@ class CORE_EXPORT HTMLCanvasElement final
  
    scoped_refptr<cc::TextureLayer> cc_layer_;
  
