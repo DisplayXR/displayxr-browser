@@ -1,0 +1,339 @@
+From 42bb8d660d5bc21520b1964adfbd171330b0ce14 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 7 Aug 2026 23:15:36 -0700
+Subject: [PATCH] inline-3d(#73): map the weave source through the quad's UVs,
+ not the whole image
+
+A tile clipped at the top of the viewport smears a "tail" below the element:
+the clipped-off top reappears at the bottom as a constant-width column.
+
+Measured on hardware with a runtime-side dump of the weave input, the SBS
+atlas and the woven output (one file trigger, three PNGs). The artifact is
+already present in the INPUT the browser packs, so nothing downstream is at
+fault: the runtime's per-rect blits are vertically identity, the assembled
+atlas is clean, and the DP weave is faithful.
+
+Row-width profile of the left SBS half, element clipped 190px at the top:
+
+    band row   content width
+    0 .. 424   69..103, varying     <- the cube
+    432..608   61, CONSTANT         <- one source row replicated downward
+
+Constant width over 176 rows is texture edge-clamp: the computed source rect
+over-reaches the bottom of the source image and Skia repeats the last row.
+The replicated row still holds cube pixels, which is the only reason it is
+visible -- had the source covered the whole element, its last row would be
+the empty area below the cube and nothing would show. Scrolled far up the
+source runs out entirely and the over-reach yields transparency instead, so
+the artifact lives in a band of clip amounts rather than at the extreme,
+which is exactly how it presents.
+
+Cause: attempt_submit sub-regioned a clipped tile as a fraction of the WHOLE
+resource image, i.e. assuming the quad draws its resource with UVs
+(0,0)-(1,1). SurfaceAggregator recorded only quad->rect and dropped the UVs,
+so that assumption was never checked. Record uv_top_left/uv_bottom_right (and
+the quad's visible_rect) alongside the rect, and compose the clip fraction
+with the UV window so the sub-region stays inside the pixels the resource
+actually carries. With identity UVs the expression is unchanged, so the
+unclipped and non-texture paths keep their current behaviour.
+
+Also adds a throttled [DXR73] probe logging rect / quad_rect / quad_visible /
+uv / image dims / computed src, flagging src.bottom past the image edge, so
+the over-reach is visible in a log rather than only in pixels.
+---
+ .../viz/service/display/aggregated_frame.h    |  7 +++
+ components/viz/service/display/display.cc     |  2 +-
+ .../viz/service/display/skia_output_surface.h |  5 ++
+ .../viz/service/display/surface_aggregator.cc | 44 ++++++++++---
+ .../viz/service/display/surface_aggregator.h  | 17 ++++-
+ .../skia_output_surface_impl_on_gpu.cc        | 62 +++++++++++++++----
+ 6 files changed, 112 insertions(+), 25 deletions(-)
+
+diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
+index 58a21f4..60b8d32 100644
+--- a/components/viz/service/display/aggregated_frame.h
++++ b/components/viz/service/display/aggregated_frame.h
+@@ -16,6 +16,7 @@
+ #include "components/viz/service/viz_service_export.h"
+ #include "ui/gfx/delegated_ink_metadata.h"
+ #include "ui/gfx/display_color_spaces.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/latency/latency_info.h"
+ 
+ namespace viz {
+@@ -92,6 +93,12 @@ class VIZ_SERVICE_EXPORT AggregatedFrame {
+   struct Inline3dLayerResource {
+     ResourceId resource_id;
+     gfx::Rect rect;
++    // browser#73: the quad's visible_rect, and the normalized sub-rect of the
++    // RESOURCE that |rect| displays. The weave stage sub-regions a clipped tile
++    // within |uv| — assuming the resource covered the whole tile is what made
++    // the sampler over-reach and edge-clamp into a downward smear.
++    gfx::Rect visible_rect;
++    gfx::RectF uv{0.f, 0.f, 1.f, 1.f};
+   };
+   std::vector<Inline3dLayerResource> inline_3d_overlays;
+   std::vector<Inline3dLayerResource> inline_3d_canvas_resources;
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index a2ffdbe..5b8e152 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -998,7 +998,7 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+             for (const auto& layer : in) {
+               gpu::Mailbox m = resource_provider_->GetMailbox(layer.resource_id);
+               if (!m.IsZero()) {
+-                out.push_back({m, layer.rect});
++                out.push_back({m, layer.rect, layer.visible_rect, layer.uv});
+               }
+             }
+             return out;
+diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
+index 4789f9b..292677c 100644
+--- a/components/viz/service/display/skia_output_surface.h
++++ b/components/viz/service/display/skia_output_surface.h
+@@ -22,6 +22,7 @@
+ #include "gpu/vulkan/buildflags.h"
+ #include "media/gpu/buildflags.h"
+ #include "third_party/skia/include/core/SkRefCnt.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/gpu_fence_handle.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -213,6 +214,10 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
+   struct Inline3dLayerMailbox {
+     gpu::Mailbox mailbox;
+     gfx::Rect rect;
++    // browser#73: see AggregatedFrame::Inline3dLayerResource — |uv| is the
++    // normalized sub-rect of the resource that |rect| shows.
++    gfx::Rect visible_rect;
++    gfx::RectF uv{0.f, 0.f, 1.f, 1.f};
+   };
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): set the page's inline-3d canvas
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 061d430..1e37903 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -1500,9 +1500,30 @@ void SurfaceAggregator::CopyQuadsToPass(
+           gfx::Transform to_root = dest_pass->transform_to_root_target;
+           to_root.PreConcat(
+               dest_quad->shared_quad_state->quad_to_target_transform);
+-          root_resource_quads_.emplace_back(
+-              quad_data.remapped_resource_id,
+-              cc::MathUtil::MapEnclosingClippedRect(to_root, quad->rect));
++          // browser#73: also record HOW the resource maps onto |rect|. A
++          // TextureDrawQuad carries explicit UVs, and the weave stage must
++          // sub-region a clipped tile within THOSE, not within the whole image
++          // — assuming (0,0)-(1,1) is what made the sampler over-reach past the
++          // image bottom and edge-clamp into a smear.
++          gfx::RectF uv(0.f, 0.f, 1.f, 1.f);
++          if (quad->material == DrawQuad::Material::kTextureContent) {
++            // GetNormalizedTexCoords needs the backing size to normalize a quad
++            // whose tex coords are stored in pixels; it returns an empty rect if
++            // it cannot, and we then keep the identity window (today's
++            // behaviour) rather than inventing a mapping.
++            const gfx::RectF n =
++                TextureDrawQuad::MaterialCast(quad)->GetNormalizedTexCoords(
++                    provider_->GetResourceBackedSize(
++                        quad_data.remapped_resource_id));
++            if (!n.IsEmpty()) {
++              uv = n;
++            }
++          }
++          root_resource_quads_.push_back(
++              {quad_data.remapped_resource_id,
++               cc::MathUtil::MapEnclosingClippedRect(to_root, quad->rect),
++               cc::MathUtil::MapEnclosingClippedRect(to_root, quad->visible_rect),
++               uv});
+         }
+       }
+     }
+@@ -2395,9 +2416,9 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   // (browser#18 bug A).
+   auto best_match =
+       [](const gfx::Rect& target,
+-         const std::vector<std::pair<ResourceId, gfx::Rect>>& quads)
+-      -> std::optional<std::pair<ResourceId, gfx::Rect>> {
+-    std::optional<std::pair<ResourceId, gfx::Rect>> found;
++         const std::vector<RootResourceQuad>& quads)
++      -> std::optional<RootResourceQuad> {
++    std::optional<RootResourceQuad> found;
+     // Score = intersection area normalised by the larger of the two rects, in
+     // 1/1000ths. Pick the BEST-overlapping quad, not merely the last one over
+     // the bar (browser#22): because `target` is the main-thread rect trailing
+@@ -2408,7 +2429,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     // header. Ties keep the later (topmost) quad, preserving the old behaviour
+     // when exactly one candidate qualifies — the slow-scroll/steady case.
+     int64_t best_score = -1;
+-    for (const auto& [rid, qr] : quads) {
++    for (const RootResourceQuad& cand : quads) {
++      const gfx::Rect& qr = cand.rect;
+       if (qr.IsEmpty()) {
+         continue;
+       }
+@@ -2432,7 +2454,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       const int64_t score = (ia * 1000) / max_area;
+       if (score >= best_score) {
+         best_score = score;
+-        found = std::make_pair(rid, qr);
++        found = cand;
+       }
+     }
+     if (!found) {
+@@ -2487,7 +2509,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   }
+   for (const gfx::Rect& excl : inline_3d_exclusion_rects_) {
+     if (auto m = best_match(excl, root_resource_quads_)) {
+-      frame.inline_3d_overlays.push_back({m->first, m->second});
++      frame.inline_3d_overlays.push_back(
++          {m->resource_id, m->rect, m->visible_rect, m->uv});
+     } else {
+       // (B) declared but unmatched: does it sit over a 3D canvas region? If so
+       // it is exactly the chrome-over-tile case we care about — report the
+@@ -2510,7 +2533,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   }
+   for (const gfx::Rect& canvas : frame.inline_3d_rects) {
+     if (auto m = best_match(canvas, root_resource_quads_)) {
+-      frame.inline_3d_canvas_resources.push_back({m->first, m->second});
++      frame.inline_3d_canvas_resources.push_back(
++          {m->resource_id, m->rect, m->visible_rect, m->uv});
+     }
+   }
+   if (!frame.inline_3d_overlays.empty() ||
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index 33d722a..46c2eae 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -30,6 +30,7 @@
+ #include "components/viz/service/viz_service_export.h"
+ #include "ui/gfx/delegated_ink_metadata.h"
+ #include "ui/gfx/display_color_spaces.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/overlay_layer_id.h"
+ #include "ui/gfx/overlay_transform.h"
+ 
+@@ -486,7 +487,21 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+   // resources) and inline_3d_rects_ (→ canvas resources). Recorded (not matched
+   // inline) so both lists are complete before matching, independent of
+   // per-surface collection order.
+-  std::vector<std::pair<ResourceId, gfx::Rect>> root_resource_quads_;
++  // DisplayXR (browser#73): a root-pass resource-bearing quad, recorded with the
++  // mapping from its RESOURCE to |rect| rather than just |rect|. |uv| is the
++  // normalized sub-rect of the resource that |rect| displays — (0,0,1,1) for a
++  // quad drawing the whole image, and something else for a TextureDrawQuad with
++  // explicit UVs. The weave stage used to assume the resource always covered the
++  // whole tile; when a tile is clipped that over-reaches past the image and Skia
++  // clamps, replicating the last row downward (the #73 "tail" smear). Carrying
++  // the real UVs is what lets it sub-region a clipped tile correctly.
++  struct RootResourceQuad {
++    ResourceId resource_id;
++    gfx::Rect rect;          // root space, UNCLIPPED quad rect
++    gfx::Rect visible_rect;  // root space, the quad's visible_rect
++    gfx::RectF uv;           // normalized resource sub-rect shown by |rect|
++  };
++  std::vector<RootResourceQuad> root_resource_quads_;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 4d3d0fc..00bf0b5 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2877,17 +2877,17 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // bounds in inline_3d_rects_ — it is the reference for sub-regioning the SBS
+   // when the tile is clipped at a screen edge (browser#18 bug B).
+   auto canvas_mailbox_for =
+-      [&](const gfx::Rect& r) -> std::pair<gpu::Mailbox, gfx::Rect> {
++      [&](const gfx::Rect& r) -> SkiaOutputSurface::Inline3dLayerMailbox {
+     for (const auto& c : inline_3d_canvas_layers_) {
+       gfx::Rect inter = c.rect;
+       inter.Intersect(r);
+       const int64_t ia = static_cast<int64_t>(inter.width()) * inter.height();
+       const int64_t ta = static_cast<int64_t>(r.width()) * r.height();
+       if (ta > 0 && ia * 10 >= ta * 7) {
+-        return {c.mailbox, c.rect};
++        return c;
+       }
+     }
+-    return {gpu::Mailbox(), gfx::Rect()};
++    return SkiaOutputSurface::Inline3dLayerMailbox();
+   };
+ 
+   auto attempt_submit = [&](size_t t) -> bool {
+@@ -2901,9 +2901,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+     const int rw = rect.width();
+     const int rh = rect.height();
+-    const std::pair<gpu::Mailbox, gfx::Rect> clean_sbs = canvas_mailbox_for(rect);
+-    const gpu::Mailbox clean_sbs_mailbox = clean_sbs.first;
+-    const gfx::Rect clean_sbs_rect = clean_sbs.second;  // UNCLIPPED full tile
++    const SkiaOutputSurface::Inline3dLayerMailbox clean_sbs =
++        canvas_mailbox_for(rect);
++    const gpu::Mailbox clean_sbs_mailbox = clean_sbs.mailbox;
++    const gfx::Rect clean_sbs_rect = clean_sbs.rect;  // UNCLIPPED full tile
++    const gfx::RectF clean_sbs_uv = clean_sbs.uv;     // resource sub-rect (#73)
+ 
+     // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the composited
+     // sub-rect on the GPU instead of the readPixels roundtrip: Skia-copy it into
+@@ -3118,17 +3120,51 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           // full image scaled into the shorter scratch, which squishes the tile
+           // vertically at top/bottom (browser#18 bug B). The output-snapshot
+           // fallback is already the clipped region (rw×rh), so its src is full.
+-          SkRect src = SkRect::MakeWH(src_img->width(), src_img->height());
++          //
++          // browser#73: the tile maps onto the resource's UV WINDOW, not onto
++          // the whole image. Assuming (0,0)-(1,1) over-reaches past the image
++          // whenever the quad draws a sub-rect of its resource, and Skia then
++          // edge-clamps — replicating the last sampled row down the rest of the
++          // destination as a constant-width smear ("the tail"). Compose the
++          // clip fraction with the quad's UVs so the sub-region stays inside
++          // the pixels the resource actually carries. With identity UVs this is
++          // exactly the previous expression.
++          const float iw = src_img->width();
++          const float ih = src_img->height();
++          gfx::RectF uvw = clean_sbs_uv;
++          if (uvw.IsEmpty()) {
++            uvw = gfx::RectF(0.f, 0.f, 1.f, 1.f);
++          }
++          const SkRect uv_px =
++              SkRect::MakeXYWH(uvw.x() * iw, uvw.y() * ih, uvw.width() * iw,
++                               uvw.height() * ih);
++          SkRect src = src_from_canvas ? uv_px
++                                       : SkRect::MakeWH(iw, ih);
+           if (src_from_canvas && !clean_sbs_rect.IsEmpty() &&
+               rect != clean_sbs_rect) {
+-            const float iw = src_img->width();
+-            const float ih = src_img->height();
+             const float fw = static_cast<float>(clean_sbs_rect.width());
+             const float fh = static_cast<float>(clean_sbs_rect.height());
+-            src = SkRect::MakeXYWH((rect.x() - clean_sbs_rect.x()) / fw * iw,
+-                                   (rect.y() - clean_sbs_rect.y()) / fh * ih,
+-                                   rect.width() / fw * iw,
+-                                   rect.height() / fh * ih);
++            src = SkRect::MakeXYWH(
++                uv_px.x() + (rect.x() - clean_sbs_rect.x()) / fw * uv_px.width(),
++                uv_px.y() + (rect.y() - clean_sbs_rect.y()) / fh * uv_px.height(),
++                rect.width() / fw * uv_px.width(),
++                rect.height() / fh * uv_px.height());
++          }
++          // #73 PROBE: the four numbers that decide whether the UV window (and
++          // not something else) is what the old code got wrong. Throttled.
++          if (src_from_canvas) {
++            static int s_probe = 0;
++            if ((s_probe++ % 120) == 0) {
++              VLOG(1) << "[DXR73] rect=" << rect.ToString()
++                      << " quad_rect=" << clean_sbs_rect.ToString()
++                      << " quad_visible=" << clean_sbs.visible_rect.ToString()
++                      << " uv=" << clean_sbs_uv.ToString()
++                      << " img=" << src_img->width() << "x" << src_img->height()
++                      << " src=" << src.x() << "," << src.y() << " "
++                      << src.width() << "x" << src.height()
++                      << " src_bottom=" << src.bottom()
++                      << (src.bottom() > ih + 0.5f ? "  OVER-REACH!" : "");
++            }
+           }
+           SkPaint paint;
+           // kSrcOver only when a backdrop was laid down first (browser#30);
+-- 
+2.42.0.windows.2
+
