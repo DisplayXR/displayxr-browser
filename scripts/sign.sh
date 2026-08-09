@@ -41,8 +41,24 @@ present=()
 for f in "${FIRST_PARTY[@]}"; do
   if [ -f "$SRC_DIR/$f" ]; then cp "$SRC_DIR/$f" "$SIGN_DIR/"; present+=("$f"); fi
 done
+# Also pick up a finished installer sitting in SRC_DIR (the documented
+# `scripts/sign.sh dist` post-hoc path, browser#75). NB: post-hoc signing covers
+# the OUTER Setup.exe only — the packed uninstaller can only be signed in-build
+# via SIGN_CMD (the NSIS two-pass), so prefer that for releases.
+for f in "$SRC_DIR"/DisplayXR-Browser-Preview-Setup-*.exe; do
+  [ -f "$f" ] || continue
+  cp "$f" "$SIGN_DIR/"
+  present+=("$(basename "$f")")
+  VERIFY+=("$(basename "$f")")
+done
 if [ ${#present[@]} -eq 0 ]; then
-  echo "[sign] WARN no first-party binaries found in $SRC_DIR — nothing to sign"; exit 0
+  # browser#75: this used to WARN and exit 0 — following the documented signing
+  # step then shipped an UNSIGNED installer while reporting success. Signing may
+  # ship unsigned when the SIGNER is unreachable (policy), but "you pointed me at
+  # a directory with nothing I know how to sign" is caller error and must fail.
+  echo "[sign] ERROR: nothing signable in $SRC_DIR (no first-party binaries, no"
+  echo "[sign]        DisplayXR-Browser-Preview-Setup-*.exe). Wrong directory?"
+  exit 2
 fi
 echo "[sign] first-party set (${#present[@]}): ${present[*]}"
 
