@@ -39,8 +39,18 @@ RUNTIME_SETUP="/abs/DisplayXRSetup-<ver>.exe"   # optional: bundle+chain the run
 SIGN_CMD='<runner-local signer>'                 # optional: sign exe + uninstaller
 installer/build_installer.sh
 ```
-Output: `dist/DisplayXR-Browser-Preview-Setup-<ver>.<build>.exe`. To sign the finished installer via the
-remote provider instead of a local `SIGN_CMD`, run `scripts/sign.sh dist` (folder-sign path).
+Output: `dist/DisplayXR-Browser-Preview-Setup-<ver>.<build>.exe`.
+
+**Signing the installer** — two ways, not equivalent (browser#75):
+- **Preferred (releases): in-build via `SIGN_CMD`** — pass a signer wrapper to `build_installer.sh`
+  (NSIS `!finalize` two-pass), which signs the Setup.exe **and the packed uninstaller**.
+- **Post-hoc: `scripts/sign.sh dist`** — signs the finished Setup.exe in `dist/` via the provider's
+  folder-sign path. The uninstaller inside stays unsigned (it can only be signed in-build).
+
+`sign.sh` now **fails (exit 2) if it finds nothing signable** in the directory it is given — it
+previously exited 0 having signed nothing, so the documented step shipped an unsigned installer
+while reporting success. Signing still never gates publishing when the *signer* is unreachable;
+only pointing it at the wrong directory is a hard error.
 
 ## Verify (per reference_installer_verification)
 Silent install + uninstall and inspect the result:
