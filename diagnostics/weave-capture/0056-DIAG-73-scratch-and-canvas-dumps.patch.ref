@@ -1,0 +1,308 @@
+From 251e4eaab521623de5491fd728c45d9eaa66a987 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sat, 8 Aug 2026 01:16:13 -0700
+Subject: [PATCH] DIAG(#73): dump the scratch after the backdrop and after the
+ canvas draw
+
+The streak region of the weave input is column-constant (280/280 columns
+with vertical std 0.00) -- one source row stretched vertically. The [DXR73]
+probe shows the canvas sub-region sampling is exact in every probed frame,
+so the streaks enter through one of the two images composed into the
+scratch: the backdrop snapshot (browser#30 pre-blend) or the canvas
+resource itself. Dumping the scratch at both points in one captured frame
+attributes them in a single shot, with an unthrottled values line so the
+pixels and the numbers are provably from the same frame.
+
+Armed by %TEMP%\dxr_browser_dump_trigger, consumed on first sight. Raw BMP
+via raw win32 IO (viz/service links no image codec; GPU sandbox blocks
+%TEMP% writes -- run the capture with --no-sandbox).
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 226 +++++++++++++++++-
+ 1 file changed, 216 insertions(+), 10 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 00bf0b5..dd62b83 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -11,6 +11,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/debug/dump_without_crashing.h"
+@@ -2773,6 +2774,88 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+                          /*prefer_zero_copy=*/true);
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++// browser#73 DIAGNOSTIC — armed by %TEMP%\dxr_browser_dump_trigger (consumed
++// by the first scratch composition that sees it, so one touch == one frame).
++// The scratch is dumped TWICE — after the backdrop pre-blend and after the
++// canvas draw — so a streak artifact is attributed to the backdrop snapshot or
++// the canvas resource in a single capture. Raw top-down 32bpp BMP because
++// viz/service links no image codec; raw win32 file IO because base's blocking
++// checks do not apply to it. Diagnostic only, never ships enabled.
++namespace {
++
++bool Dxr73TakeDumpTrigger() {
++  char tmp[MAX_PATH];
++  DWORD n = ::GetEnvironmentVariableA("TEMP", tmp, MAX_PATH);
++  if (n == 0 || n >= MAX_PATH) {
++    return false;
++  }
++  const std::string trig = std::string(tmp) + "\\dxr_browser_dump_trigger";
++  if (::GetFileAttributesA(trig.c_str()) == INVALID_FILE_ATTRIBUTES) {
++    return false;
++  }
++  ::DeleteFileA(trig.c_str());
++  return true;
++}
++
++void Dxr73WriteBmp(const std::string& name,
++                   const void* bgra,
++                   int w,
++                   int h,
++                   size_t row_bytes) {
++  char tmp[MAX_PATH];
++  DWORD n = ::GetEnvironmentVariableA("TEMP", tmp, MAX_PATH);
++  if (n == 0 || n >= MAX_PATH) {
++    return;
++  }
++  const std::string path = std::string(tmp) + "\\" + name + ".bmp";
++#pragma pack(push, 1)
++  struct BmpHdr {
++    uint16_t bfType;
++    uint32_t bfSize;
++    uint16_t r1, r2;
++    uint32_t bfOffBits;
++    uint32_t biSize;
++    int32_t biWidth, biHeight;
++    uint16_t biPlanes, biBitCount;
++    uint32_t biCompression, biSizeImage;
++    int32_t xppm, yppm;
++    uint32_t clrUsed, clrImp;
++  };
++#pragma pack(pop)
++  BmpHdr hd = {};
++  hd.bfType = 0x4D42;
++  hd.bfOffBits = sizeof(BmpHdr);
++  hd.biSize = 40;
++  hd.biWidth = w;
++  hd.biHeight = -h;  // top-down
++  hd.biPlanes = 1;
++  hd.biBitCount = 32;
++  hd.biSizeImage = static_cast<uint32_t>(w) * 4u * static_cast<uint32_t>(h);
++  hd.bfSize = hd.bfOffBits + hd.biSizeImage;
++  HANDLE f = ::CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
++                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++  if (f == INVALID_HANDLE_VALUE) {
++    VLOG(1) << "[DXR73] dump: CreateFileA failed for " << path
++            << " (GPU sandbox? relaunch with --no-sandbox)";
++    return;
++  }
++  DWORD wr = 0;
++  ::WriteFile(f, &hd, sizeof(hd), &wr, nullptr);
++  for (int y = 0; y < h; ++y) {
++    // UNSAFE_TODO: diagnostic-only raw row walk; bounds are w*4 <= row_bytes
++    // rows of a buffer the readback just produced.
++    ::WriteFile(f,
++                UNSAFE_TODO(static_cast<const uint8_t*>(bgra) + y * row_bytes),
++                static_cast<DWORD>(w) * 4u, &wr, nullptr);
++  }
++  ::CloseHandle(f);
++  VLOG(1) << "[DXR73] dumped " << path << " (" << w << "x" << h << ")";
++}
++
++}  // namespace
++#endif  // BUILDFLAG(IS_WIN)
++
+ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                                                         SkCanvas* out_canvas,
+                                                         bool prefer_zero_copy) {
+@@ -2991,6 +3074,46 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+             return fail("BeginScopedWriteAccess(scratch)");
+           }
+           SkSurface* scratch_surface = scratch_write->surface();
++#if BUILDFLAG(IS_WIN)
++          // browser#73 DIAGNOSTIC (see the helpers above WeaveCompositedSurface).
++          const bool dxr73_dump = Dxr73TakeDumpTrigger();
++          auto dxr73_dump_scratch = [&](const char* name) {
++            const SkImageInfo dinfo = SkImageInfo::Make(
++                rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
++                SkColorSpace::MakeSRGB());
++            WeaveReadPixelsContext rctx;
++            std::vector<uint8_t> px;
++            const uint8_t* data = nullptr;
++            size_t stride = 0;
++            if (auto* graphite = context_state_->graphite_shared_context()) {
++              context_state_->FlushGraphiteRecorder();
++              graphite->asyncRescaleAndReadPixelsAndSubmit(
++                  scratch_surface, dinfo, SkIRect::MakeWH(rw, rh),
++                  SkImage::RescaleGamma::kSrc,
++                  SkImage::RescaleMode::kRepeatedLinear,
++                  base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone),
++                  &rctx);
++              if (!rctx.finished || !rctx.async_result ||
++                  rctx.async_result->count() != 1) {
++                VLOG(1) << "[DXR73] dump readback failed for " << name;
++                return;
++              }
++              data = reinterpret_cast<const uint8_t*>(rctx.async_result->data(0));
++              stride = rctx.async_result->rowBytes(0);
++            } else {
++              px.resize(static_cast<size_t>(rw) * 4u * rh);
++              if (!scratch_surface->readPixels(dinfo, px.data(),
++                                               static_cast<size_t>(rw) * 4u, 0,
++                                               0)) {
++                VLOG(1) << "[DXR73] dump readPixels failed for " << name;
++                return;
++              }
++              data = px.data();
++              stride = static_cast<size_t>(rw) * 4u;
++            }
++            Dxr73WriteBmp(name, data, rw, rh, stride);
++          };
++#endif
+           if (!sbegin.empty()) {
+             scratch_surface->wait(sbegin.size(), sbegin.data(),
+                                   /*deleteSemaphoresAfterWait=*/false);
+@@ -3039,6 +3162,57 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           if (!src_img) {
+             return fail("makeImageSnapshot");
+           }
++#if BUILDFLAG(IS_WIN)
++          // browser#73 DIAGNOSTIC: the canvas RESOURCE, isolated — the whole
++          // image drawn kSrc into the scratch and dumped before the backdrop
++          // pass (kSrc, full coverage) overwrites it, so the real composition
++          // is untouched. Squeezed to the scratch size; geometry, not fidelity,
++          // is what this dump answers.
++          if (dxr73_dump && src_from_canvas) {
++            SkPaint dpaint;
++            dpaint.setBlendMode(SkBlendMode::kSrc);
++            scratch_surface->getCanvas()->drawImageRect(
++                src_img.get(),
++                SkRect::MakeWH(src_img->width(), src_img->height()),
++                SkRect::MakeWH(rw, rh), SkSamplingOptions(SkFilterMode::kNearest),
++                &dpaint, SkCanvas::kStrict_SrcRectConstraint);
++            dxr73_dump_scratch("dxr73_canvas");
++            // The EXACT src rect the real draw will use, drawn ADJACENT to the
++            // full-image draw (same instant, same buffer): if the tail shows
++            // here but not above, the 1:1 crop sampling itself manufactures it
++            // (short backing / clamp); if both or neither show it, it is buffer
++            // content vs timing. Uses the same sub-region expression as the
++            // real draw below.
++            {
++              const float xiw = src_img->width();
++              const float xih = src_img->height();
++              gfx::RectF xuv = clean_sbs_uv;
++              if (xuv.IsEmpty()) {
++                xuv = gfx::RectF(0.f, 0.f, 1.f, 1.f);
++              }
++              const SkRect xuv_px =
++                  SkRect::MakeXYWH(xuv.x() * xiw, xuv.y() * xih,
++                                   xuv.width() * xiw, xuv.height() * xih);
++              SkRect xsrc = xuv_px;
++              if (!clean_sbs_rect.IsEmpty() && rect != clean_sbs_rect) {
++                const float xfw = static_cast<float>(clean_sbs_rect.width());
++                const float xfh = static_cast<float>(clean_sbs_rect.height());
++                xsrc = SkRect::MakeXYWH(
++                    xuv_px.x() +
++                        (rect.x() - clean_sbs_rect.x()) / xfw * xuv_px.width(),
++                    xuv_px.y() +
++                        (rect.y() - clean_sbs_rect.y()) / xfh * xuv_px.height(),
++                    rect.width() / xfw * xuv_px.width(),
++                    rect.height() / xfh * xuv_px.height());
++              }
++              scratch_surface->getCanvas()->drawImageRect(
++                  src_img.get(), xsrc, SkRect::MakeWH(rw, rh),
++                  SkSamplingOptions(SkFilterMode::kNearest), &dpaint,
++                  SkCanvas::kStrict_SrcRectConstraint);
++              dxr73_dump_scratch("dxr73_canvasx");
++            }
++          }
++#endif
+ 
+           // browser#30: PRE-BLEND THE PAGE BACKDROP UNDER THE SBS.
+           //
+@@ -3109,6 +3283,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+               // The SBS now composites OVER the backdrop instead of replacing
+               // it (see the kSrcOver selection below).
+               blended_backdrop = true;
++#if BUILDFLAG(IS_WIN)
++              if (dxr73_dump) {
++                dxr73_dump_scratch("dxr73_backdrop");
++              }
++#endif
+             }
+           }
+           // Source rect. The canvas resource is the WHOLE tile's SBS, mapped to
+@@ -3138,17 +3317,26 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           const SkRect uv_px =
+               SkRect::MakeXYWH(uvw.x() * iw, uvw.y() * ih, uvw.width() * iw,
+                                uvw.height() * ih);
+-          SkRect src = src_from_canvas ? uv_px
+-                                       : SkRect::MakeWH(iw, ih);
++          // browser#73 FIX: never sub-region the SOURCE for a clipped tile.
++          // When the element is viewport-clipped, the canvas resource's
++          // PHYSICAL texture can be shorter than the SkImage claims (measured:
++          // the sampler clamps exactly (element_h - rect_h) rows early, so a
++          // source crop walks off the texture and D3D edge-clamp replicates
++          // the boundary row - the "tail" smear). The full-image draw is clean
++          // in every capture, so express the crop on the DESTINATION instead:
++          // draw the whole image at the tile's position relative to the
++          // clipped scratch and let Skia clip to the surface. The mapping is
++          // identical (1:1 vertical, SBS squeeze horizontal, offset by the
++          // clip); the sampling never leaves the image.
++          SkRect src = src_from_canvas ? uv_px : SkRect::MakeWH(iw, ih);
++          SkRect dst = SkRect::MakeWH(rw, rh);
+           if (src_from_canvas && !clean_sbs_rect.IsEmpty() &&
+               rect != clean_sbs_rect) {
+-            const float fw = static_cast<float>(clean_sbs_rect.width());
+-            const float fh = static_cast<float>(clean_sbs_rect.height());
+-            src = SkRect::MakeXYWH(
+-                uv_px.x() + (rect.x() - clean_sbs_rect.x()) / fw * uv_px.width(),
+-                uv_px.y() + (rect.y() - clean_sbs_rect.y()) / fh * uv_px.height(),
+-                rect.width() / fw * uv_px.width(),
+-                rect.height() / fh * uv_px.height());
++            dst = SkRect::MakeXYWH(
++                static_cast<float>(clean_sbs_rect.x() - rect.x()),
++                static_cast<float>(clean_sbs_rect.y() - rect.y()),
++                static_cast<float>(clean_sbs_rect.width()),
++                static_cast<float>(clean_sbs_rect.height()));
+           }
+           // #73 PROBE: the four numbers that decide whether the UV window (and
+           // not something else) is what the old code got wrong. Throttled.
+@@ -3172,9 +3360,27 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           paint.setBlendMode(blended_backdrop ? SkBlendMode::kSrcOver
+                                               : SkBlendMode::kSrc);
+           scratch_surface->getCanvas()->drawImageRect(
+-              src_img.get(), src, SkRect::MakeWH(rw, rh),
++              src_img.get(), src, dst,
+               SkSamplingOptions(SkFilterMode::kNearest), &paint,
+               SkCanvas::kStrict_SrcRectConstraint);
++#if BUILDFLAG(IS_WIN)
++          if (dxr73_dump) {
++            dxr73_dump_scratch("dxr73_scratch");
++            // Unthrottled companion to the [DXR73] probe — the exact values of
++            // THE dumped frame, so the pixels and the numbers can never be from
++            // different frames again.
++            VLOG(1) << "[DXR73-DUMP] rect=" << rect.ToString()
++                    << " quad_rect=" << clean_sbs_rect.ToString()
++                    << " uv=" << clean_sbs_uv.ToString()
++                    << " img=" << src_img->width() << "x" << src_img->height()
++                    << " src=" << src.x() << "," << src.y() << " "
++                    << src.width() << "x" << src.height()
++                    << " dst=" << dst.x() << "," << dst.y() << " "
++                    << dst.width() << "x" << dst.height()
++                    << " from_canvas=" << src_from_canvas
++                    << " blended_backdrop=" << blended_backdrop;
++          }
++#endif
+           FlushSurface(scratch_surface, send, scratch_write.get());
+           if (gr_context()) {
+             gr_context()->submit();
+-- 
+2.42.0.windows.2
+
