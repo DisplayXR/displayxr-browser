@@ -1,4 +1,4 @@
-From d630bd727d8759006a0e2bdce224fd31c1af73a4 Mon Sep 17 00:00:00 2001
+From b16663672d9189d5caed60a68e5c876dfc45232f Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 14 Aug 2026 13:43:48 -0700
 Subject: [PATCH] inline-3d(#83): scroll-shift rects from a measurement-time
@@ -27,6 +27,7 @@ commit keeps the old (rects, base) PAIR. The TreesInViz-in-viz client-copy
 path carries no base and now gets NO shift (an unshifted one-frame-stale rect
 still clears the 70% match gate; a mis-based shift never does).
 ---
+ cc/trees/commit_state.cc                      |  1 +
  cc/trees/commit_state.h                       |  9 +++++
  cc/trees/layer_tree_host.cc                   | 11 +++++-
  cc/trees/layer_tree_host.h                    |  3 +-
@@ -37,8 +38,20 @@ still clears the 70% match gate; a mis-based shift never does).
  .../core/frame/web_frame_widget_impl.h        |  3 +-
  .../blink/renderer/modules/xr/xr_session.cc   | 12 ++++++-
  .../renderer/platform/widget/frame_widget.h   |  7 +++-
- 10 files changed, 85 insertions(+), 20 deletions(-)
+ 11 files changed, 86 insertions(+), 20 deletions(-)
 
+diff --git a/cc/trees/commit_state.cc b/cc/trees/commit_state.cc
+index 22f30c9fab402..e5c719ab5e336 100644
+--- a/cc/trees/commit_state.cc
++++ b/cc/trees/commit_state.cc
+@@ -22,6 +22,7 @@ CommitState::CommitState(const CommitState& prev)
+       inline_3d_rects(prev.inline_3d_rects),
+       inline_3d_exclusion_rects(prev.inline_3d_exclusion_rects),
+       inline_3d_exclusion_fixed_rects(prev.inline_3d_exclusion_fixed_rects),
++      inline_3d_scroll_base(prev.inline_3d_scroll_base),
+       event_listener_properties(prev.event_listener_properties),
+       bottom_controls_shown_ratio(prev.bottom_controls_shown_ratio),
+       device_scale_factor(prev.device_scale_factor),
 diff --git a/cc/trees/commit_state.h b/cc/trees/commit_state.h
 index 8aa2c2a0d8897..1f51c7d004c8b 100644
 --- a/cc/trees/commit_state.h
