@@ -1,7 +1,7 @@
-# Patch series — inline-3D over Chromium `150.0.7871.24`
+# Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`150.0.7871.24` (M150). **54 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **56 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
 Patch 0054 makes the panel's hardware 2D/3D element follow the foreground window's active tab
 (browser#55): the browser used only to go *quiet* when a page had no inline-3D content, and the
@@ -20,6 +20,6 @@ Apply with `git am --3way patches/*.patch` onto a fresh checkout of the tag (or 
 The series is roughly chronological by build phase (B2 browser-process weave client → B2c real-canvas
 weave → B3 JS surface + head-tracked off-axis session → B4 chrome port + CEF sub-rect model → B4c retire
 the launch flags → B4d GPU-resident zero-copy weave → batched submit + scene rig on `XR_DXR_view_rig`).
-The final patch (0040) delay-loads `openxr_loader.dll` so the sandboxed renderer survives in a
+Patch 0040 delay-loads `openxr_loader.dll` so the sandboxed renderer survives in a
 non-component/official build (displayxr-browser#15). On each monthly rebase this series is regenerated
 against the new milestone tag (see [../docs/rebase-runbook.md](../docs/rebase-runbook.md) §4).
