@@ -1,8 +1,14 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **56 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **58 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patches 0057–0058 kill the navigation ghost (browser#87), where the previous page's woven tiles
+repainted over the page you navigated to: 0057 gates the Phase-B draw-back on at least one weave
+submit having succeeded this frame (the shared woven texture is persistent, and the runtime only
+clears its gaps when something is actually submitted), and 0058 clears the inline-3D rect state —
+rects, exclusions, and the browser#83 scroll base — on session end *and* on navigation commit,
+which nothing did before.
 Patch 0054 makes the panel's hardware 2D/3D element follow the foreground window's active tab
 (browser#55): the browser used only to go *quiet* when a page had no inline-3D content, and the
 element is sticky, so the lens stayed on over flat pages. Needs displayxr-runtime#815 to take

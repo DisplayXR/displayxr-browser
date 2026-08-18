@@ -1,0 +1,104 @@
+From 47d530b053d03d8d738797b2259c8d8198717554 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 18 Aug 2026 14:53:33 -0700
+Subject: [PATCH 57/58] inline-3d(#87): gate the Phase-B draw-back on a live
+ weave submit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase (B) of WeaveCompositedSurface blits the shared woven texture back over
+the page. That texture is PERSISTENT across frames (a fresh DXGI handle arrives
+only on the first submit or a window-size change), and the runtime clears its
+gaps to transparent on the frame's FIRST CHUNK — i.e. only when a submit
+actually happens. But Phase (B) ran on the sole condition that this frame had
+>= 1 inline-3d rect and the woven mailbox was non-zero. It never checked that
+anything was woven THIS frame.
+
+So a frame with rects but zero successful submits — the canvas layer resource
+not ready yet, which is exactly the first frames after a same-renderer Back
+navigation — blitted the PREVIOUS page's whole woven texture over the new page.
+That is the navigation ghost (browser#87). DisplayXRWeaveGpu::SubmitBatchSync
+makes it explicit: `if (!had_copies) return false;` — no copies, no submit, no
+re-weave, no clear, stale pixels retained.
+
+The per-target ghost guard patch 0028 added for this class of bug
+(displayxr_drawn_rect_) has been dead since 0046 moved Phase B to one
+whole-window kSrcOver: it is still written at three sites and read at none.
+
+Track liveness instead: |wove_this_frame| is set where a target's submit
+succeeds and ANDed with SubmitBatchSync's (previously discarded) return value,
+so a failed batch RPC counts as "wove nothing" too. When it is false, skip
+Phase (B) entirely and leave the page's own pixels on screen.
+
+The gate is batch-mode only. Async mode deliberately keeps the last woven
+output visible while a submit is in flight — that is its documented
+one-frame-lag contract, and gating it would strobe.
+
+Scoped to the Windows draw-back, which is the whole-window blit that produces
+the ghost. The macOS path draws per-rect from the NEW page's rects and is left
+alone here.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 27 ++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 1fd6aa8b7ffd7..f8ac6aed2ce65 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3312,6 +3312,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   if (batch) {
+     provider->BeginBatchSync(window_bounds.size());
+   }
++  // (browser#87) Liveness of THIS frame's weave. Phase (B) below blits the
++  // shared woven texture, which persists across frames — so it may only run
++  // when this frame actually re-wove something. A frame can carry >= 1 rect and
++  // still submit nothing (a canvas layer resource that is not ready yet: the
++  // first frames after a same-renderer Back navigation, a lost race during
++  // scroll), and SubmitBatchSync then returns early without submitting, so the
++  // runtime neither re-weaves nor runs its v5 first-chunk transparent clear.
++  // Ungated, Phase (B) would blit the PREVIOUS page's whole woven texture over
++  // the new page — the navigation ghost.
++  [[maybe_unused]] bool wove_this_frame = false;
+   for (size_t t = 0; t < inline_3d_rects_.size(); ++t) {
+     gfx::Rect probe = inline_3d_rects_[t];
+     probe.Intersect(window_bounds);
+@@ -3330,6 +3340,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       continue;
+     }
+     const bool submitted = attempt_submit(t);
++    wove_this_frame |= submitted;
+     // Batch mode completes synchronously, so "nothing submitted this frame"
+     // (copy failed) means nothing was woven for this target — clear rather
+     // than redraw a stale region. (Async mode keeps the last woven visible
+@@ -3718,10 +3729,24 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+ #endif  // BUILDFLAG(IS_APPLE)  (v4 DP-composited overlay atlas, persistent)
+ 
+   if (batch) {
+-    provider->SubmitBatchSync();
++    // (browser#87) A batch with zero copied targets — or a failed submit RPC —
++    // leaves the runtime's woven output untouched, so it is NOT live this frame
++    // no matter how many targets copied in.
++    const bool batch_ok = provider->SubmitBatchSync();
++    wove_this_frame = wove_this_frame && batch_ok;
+   }
+ 
+ #if BUILDFLAG(IS_WIN)
++  // (browser#87) Liveness gate: skip the Phase (B) draw-back entirely when this
++  // frame wove nothing, rather than blitting a woven texture that still holds
++  // the previous page's pixels. Batch mode only: the batch weave completes
++  // synchronously inside SubmitBatchSync, so "nothing submitted" there really
++  // means "nothing woven". Async mode deliberately keeps the last woven output
++  // visible while a submit is in flight — that is its one-frame-lag contract.
++  if (batch && !wove_this_frame) {
++    return;
++  }
++
+   // ---- (B) Draw back the accumulated window-sized woven output (Windows) ----
+   // The runtime weaves EVERY submitted sub-rect into ONE window-sized handback
+   // texture and (v5, browser#22) clears the gaps to transparent on the frame's
+-- 
+2.42.0.windows.2
+
