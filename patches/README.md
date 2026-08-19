@@ -1,8 +1,28 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **62 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **63 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patch 0063 opens **Phase 2 (occlusion)**: the page content sitting OVER a woven tile is lifted onto
+its own transparent plane so the display processor can composite it above the weave, instead of the
+page burying the tile. This patch builds the whole mechanism and deliberately connects none of it —
+with `--inline-3d-occlusion` off (the default) nothing runs; with it on one extra transparent surface
+is produced and ignored. Presented pixels are unchanged either way, which is the point: every
+allocation, transform, clear and quad-replay path becomes observable on real hardware a patch before
+it can break anything. The split is computed at DRAW time from the live root `quad_list` — never from
+the aggregation-time quad ordinals, which `Display::RemoveOverdrawQuads()` and
+`OverlayProcessor::ProcessForOverlays()` invalidate before anything is drawn. `QuadList` index 0 is
+the FRONTMOST quad, so for a tile canvas quad at index `k` the OVER set is `[0, k)` and back-to-front
+is descending index; `k` is found by canvas resource id with LAST match winning (the deepest
+occurrence, hence the widest defensible over set), and a tile whose `k` cannot be found keeps
+Phase-1 behaviour and says so in the log. Clip vectors are PER QUAD — a quad above tile A and below
+tile B is clipped against A only. Excluded from the over set, each counted by reason: 3D sorting
+contexts, non-`kSrcOver` blends, ALL `AggregatedRenderPassDrawQuad`s (pixel-moving filters exist, so
+"it only wraps one pass" is false), `RequiresOverlay` quads, any tile's own canvas quad, and
+resources already suppressed from the page draw. The plane is painted before the root pass so the GPU
+task queue is strictly plane-then-page, with `is_overlay=false` keeping the weave guard inert for it.
+The difference clip that would punch the page out of the tiles is fully plumbed but gated off by one
+bool, which is what patch 0064 flips.
 Patch 0062 extends **Phase 1 identity** to exclusion overlays (browser#18/#49). An exclusion is a
 promise that an element's pixels stay 2D, out of the weave — and two channels describe those
 exclusions: the legacy metadata list is COMPLETE (Blink walks the declaration list every frame) but
