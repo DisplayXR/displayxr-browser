@@ -1,4 +1,4 @@
-From c389d844f8e39cf0cfe3ca77e42b591065713ccd Mon Sep 17 00:00:00 2001
+From a27566ef867e8579ac1c77672e947687310104ac Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 18 Aug 2026 17:33:31 -0700
 Subject: [PATCH 59/61] inline-3d(Phase 1): carry layer identity from cc
@@ -57,33 +57,33 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  8 files changed, 99 insertions(+), 10 deletions(-)
 
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index dbdae228d0237..112d0c391f97e 100644
+index f45d7c9f70bdf..7cc72a73fdb2c 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2256,6 +2256,18 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
-         // space of the compositor frame.
+@@ -2411,6 +2411,18 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
+                 need_occlusion);
  
-         viz::TrackedElementRect transformed_rect = rect_data;
-+        // DisplayXR Phase-1 identity (browser#83/#28 lineage): stamp the id of
-+        // the layer this rect rode in on, so Viz can join the rect to the
-+        // SharedQuadState of the quads drawing that same layer instead of
-+        // guessing geometrically. |stable_id_for_shared_quad_state()| is
-+        // per-LayerImpl-INSTANCE and re-established every frame — it is stable
-+        // for the life of the LayerImpl and matches the value LayerImpl writes
-+        // into its SharedQuadState in the same frame, which is exactly the
-+        // window the join needs. It is NOT a persistent identifier: nothing may
-+        // cache it across frames, and consumers key long-lived state by the
-+        // element's TrackedElementId (a real token) instead.
-+        transformed_rect.sqs_layer_id =
-+            static_cast<uint32_t>(layer->stable_id_for_shared_quad_state());
-         gfx::Rect visible_layer_rect =
-             layer->draw_properties().visible_layer_rect;
-         // DisplayXR inline-3D (#625): the inline-3d tracked chunk lands on a
+           viz::TrackedElementRect transformed_rect = rect_data;
++          // DisplayXR Phase-1 identity (browser#83/#28 lineage): stamp the id of
++          // the layer this rect rode in on, so Viz can join the rect to the
++          // SharedQuadState of the quads drawing that same layer instead of
++          // guessing geometrically. |stable_id_for_shared_quad_state()| is
++          // per-LayerImpl-INSTANCE and re-established every frame — it is stable
++          // for the life of the LayerImpl and matches the value LayerImpl writes
++          // into its SharedQuadState in the same frame, which is exactly the
++          // window the join needs. It is NOT a persistent identifier: nothing may
++          // cache it across frames, and consumers key long-lived state by the
++          // element's TrackedElementId (a real token) instead.
++          transformed_rect.sqs_layer_id =
++              static_cast<uint32_t>(layer->stable_id_for_shared_quad_state());
+ 
+           // TODO(http://crbug.com/441532128): Elements that are being added to
+           // the compositor frame metadata should be transformed to the
 diff --git a/components/viz/common/surfaces/tracked_element_rects.cc b/components/viz/common/surfaces/tracked_element_rects.cc
-index ecead35167f16..efe0027993b42 100644
+index a24b78a2d922f..e84b79fcb50d0 100644
 --- a/components/viz/common/surfaces/tracked_element_rects.cc
 +++ b/components/viz/common/surfaces/tracked_element_rects.cc
-@@ -23,7 +23,7 @@ std::string TrackedElementRect::ToString() const {
+@@ -25,7 +25,7 @@ std::string TrackedElementRect::ToString() const {
         frame_token.has_value() ? frame_token->ToString() : "null",
         ", parent_frame_token: ",
         parent_frame_token.has_value() ? parent_frame_token->ToString() : "null",
@@ -93,10 +93,10 @@ index ecead35167f16..efe0027993b42 100644
  
  std::string TrackedElementRectsToString(const TrackedElementRects& bounds) {
 diff --git a/components/viz/common/surfaces/tracked_element_rects.h b/components/viz/common/surfaces/tracked_element_rects.h
-index 592831f450e5b..d6f59a74f65cf 100644
+index 4d1e14adfc736..7941c6040eee9 100644
 --- a/components/viz/common/surfaces/tracked_element_rects.h
 +++ b/components/viz/common/surfaces/tracked_element_rects.h
-@@ -69,6 +69,19 @@ struct VIZ_COMMON_EXPORT TrackedElementRect {
+@@ -78,6 +78,19 @@ struct VIZ_COMMON_EXPORT TrackedElementRect {
    // The local frame token of the parent frame.
    std::optional<blink::LocalFrameToken> parent_frame_token;
  
@@ -117,10 +117,10 @@ index 592831f450e5b..d6f59a74f65cf 100644
                           const TrackedElementRect&) = default;
  
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 496725df0564d..fa15e61ffa02d 100644
+index 1e37903cb3aa3..379d482f7fd74 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
-@@ -904,7 +904,8 @@ void SurfaceAggregator::EmitSurfaceContent(
+@@ -905,7 +905,8 @@ void SurfaceAggregator::EmitSurfaceContent(
    if (resolved_frame.WillDraw()) {
      CollectTrackedElementRects(frame_metadata, combined_transform,
                                 dest_pass->transform_to_root_target,
@@ -130,7 +130,7 @@ index 496725df0564d..fa15e61ffa02d 100644
    }
  
    // If the SurfaceDrawQuad is marked as being reflected and surface contents
-@@ -1518,11 +1519,21 @@ void SurfaceAggregator::CopyQuadsToPass(
+@@ -1519,11 +1520,21 @@ void SurfaceAggregator::CopyQuadsToPass(
                uv = n;
              }
            }
@@ -153,7 +153,7 @@ index 496725df0564d..fa15e61ffa02d 100644
          }
        }
      }
-@@ -1557,7 +1568,8 @@ void SurfaceAggregator::CopyPasses(ResolvedFrameData& resolved_frame) {
+@@ -1558,7 +1569,8 @@ void SurfaceAggregator::CopyPasses(ResolvedFrameData& resolved_frame) {
      CollectTrackedElementRects(
          frame_metadata, surface_transform,
          root_resolved_pass.render_pass().transform_to_root_target,
@@ -163,7 +163,7 @@ index 496725df0564d..fa15e61ffa02d 100644
    }
  
    if (frame_metadata.delegated_ink_metadata) {
-@@ -2694,7 +2706,12 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2695,7 +2707,12 @@ void SurfaceAggregator::CollectTrackedElementRects(
      const CompositorFrameMetadata& frame_metadata,
      const gfx::Transform& target_transform,
      const gfx::Transform& transform_to_root_target,
@@ -221,12 +221,12 @@ index 46c2eae7f121f..45642481cdf1b 100644
    std::vector<RootResourceQuad> root_resource_quads_;
  };
 diff --git a/services/viz/public/cpp/compositing/mojom_traits_unittest.cc b/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
-index 65677786331cc..1273d15a27004 100644
+index a45ecc7b6bfc5..d24949ae5a93d 100644
 --- a/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
 +++ b/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
-@@ -1569,6 +1569,12 @@ TEST_F(StructTraitsTest, TrackedElementRects) {
-       TrackedElementRect(token2, rect2,
+@@ -1571,6 +1571,12 @@ TEST_F(StructTraitsTest, TrackedElementRects) {
                           /*should_add_to_compositor_frame_metadata=*/false,
+                          /*should_exclude_fixed_and_sticky_occlusions=*/false,
                           std::nullopt, std::nullopt)};
 +  // DisplayXR Phase-1 identity: sqs_layer_id is a post-hoc compositor
 +  // annotation (not a constructor argument), so set it directly. Element [1]
@@ -237,10 +237,10 @@ index 65677786331cc..1273d15a27004 100644
  
    TrackedElementRects output;
    mojo::test::SerializeAndDeserialize<mojom::TrackedElementRects>(input,
-@@ -1581,6 +1587,12 @@ TEST_F(StructTraitsTest, TrackedElementRects) {
-                   .should_add_to_compositor_frame_metadata);
-   EXPECT_FALSE(output[TrackedElementFeature::kTrackedElementFeatureMax][1]
+@@ -1587,6 +1593,12 @@ TEST_F(StructTraitsTest, TrackedElementRects) {
                     .should_add_to_compositor_frame_metadata);
+   EXPECT_FALSE(output[TrackedElementFeature::kTrackedElementFeatureMax][1]
+                    .should_exclude_fixed_and_sticky_occlusions);
 +  EXPECT_EQ(output[TrackedElementFeature::kTrackedElementFeatureMax][0]
 +                .sqs_layer_id,
 +            0xABCD1234u);
@@ -250,10 +250,10 @@ index 65677786331cc..1273d15a27004 100644
  }
  
  TEST_F(StructTraitsTest, CopyOutputResult_Texture) {
-@@ -2428,17 +2440,22 @@ auto AnyTrackedElementRect() {
-   return fuzztest::Map(
+@@ -2435,17 +2447,22 @@ auto AnyTrackedElementRect() {
        [](const TrackedElementId& id, const gfx::Rect& bounds,
-          bool add_to_metadata, const std::optional<blink::FrameToken>& token,
+          bool add_to_metadata, bool exclude_occlusion,
+          const std::optional<blink::FrameToken>& token,
 -         const std::optional<base::UnguessableToken>& parent_token) {
 +         const std::optional<base::UnguessableToken>& parent_token,
 +         uint32_t sqs_layer_id) {
@@ -261,16 +261,16 @@ index 65677786331cc..1273d15a27004 100644
          if (parent_token) {
            parent_local_token = blink::LocalFrameToken(*parent_token);
          }
--        return TrackedElementRect(id, bounds, add_to_metadata, token,
--                                  parent_local_token);
-+        TrackedElementRect rect(id, bounds, add_to_metadata, token,
-+                                parent_local_token);
+-        return TrackedElementRect(id, bounds, add_to_metadata,
+-                                  exclude_occlusion, token, parent_local_token);
++        TrackedElementRect rect(id, bounds, add_to_metadata, exclude_occlusion,
++                                token, parent_local_token);
 +        // DisplayXR Phase-1 identity: post-hoc annotation, not a ctor arg.
 +        rect.sqs_layer_id = sqs_layer_id;
 +        return rect;
        },
        AnyTrackedElementId(), AnyRect(), fuzztest::Arbitrary<bool>(),
-       fuzztest::OptionalOf(AnyFrameToken()),
+       fuzztest::Arbitrary<bool>(), fuzztest::OptionalOf(AnyFrameToken()),
 -      fuzztest::OptionalOf(AnyUnguessableToken()));
 +      fuzztest::OptionalOf(AnyUnguessableToken()),
 +      fuzztest::Arbitrary<uint32_t>());
@@ -278,10 +278,10 @@ index 65677786331cc..1273d15a27004 100644
  
  auto AnyTrackedElementRects() {
 diff --git a/services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h b/services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h
-index e8f4a9a7b86d6..6a674820fd3d3 100644
+index a4f3f8160a222..1ae53fa3081c5 100644
 --- a/services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h
 +++ b/services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h
-@@ -46,10 +46,15 @@ struct StructTraits<viz::mojom::TrackedElementRectDataView,
+@@ -51,12 +51,17 @@ struct StructTraits<viz::mojom::TrackedElementRectDataView,
      return data.parent_frame_token;
    }
  
@@ -293,15 +293,17 @@ index e8f4a9a7b86d6..6a674820fd3d3 100644
                     viz::TrackedElementRect* out) {
      out->should_add_to_compositor_frame_metadata =
          data.should_add_to_compositor_frame_metadata();
+     out->should_exclude_fixed_and_sticky_occlusions =
+         data.should_exclude_fixed_and_sticky_occlusions();
 +    out->sqs_layer_id = data.sqs_layer_id();
      if (!data.ReadTrackedElementId(&out->id) ||
          !data.ReadVisibleBounds(&out->visible_bounds) ||
          !data.ReadFrameToken(&out->frame_token) ||
 diff --git a/services/viz/public/mojom/compositing/tracked_element_rects.mojom b/services/viz/public/mojom/compositing/tracked_element_rects.mojom
-index eb23842959f00..5fb636712856f 100644
+index 79e8c7102b6b5..e1f39a96e6930 100644
 --- a/services/viz/public/mojom/compositing/tracked_element_rects.mojom
 +++ b/services/viz/public/mojom/compositing/tracked_element_rects.mojom
-@@ -29,6 +29,12 @@ struct TrackedElementRect {
+@@ -41,6 +41,12 @@ struct TrackedElementRect {
  
    // The local frame token of the parent frame.
    blink.mojom.LocalFrameToken? parent_frame_token;

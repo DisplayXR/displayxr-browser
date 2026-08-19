@@ -1,4 +1,4 @@
-From 3025bda8b96a78c9e9bdeab1bde460eb5186eb3a Mon Sep 17 00:00:00 2001
+From f2397c2be14d9c8f9f21b3470a0cebfca11535fd Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 18 Aug 2026 19:17:43 -0700
 Subject: [PATCH] inline-3d(Phase 1): give exclusion overlays an identity,
@@ -108,10 +108,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  32 files changed, 659 insertions(+), 114 deletions(-)
 
 diff --git a/cc/mojo_embedder/viz_layer_context.cc b/cc/mojo_embedder/viz_layer_context.cc
-index 84bd45002b618..ea9e5f1fbfe2b 100644
+index 7a86a69253989..4aaa09b2414f9 100644
 --- a/cc/mojo_embedder/viz_layer_context.cc
 +++ b/cc/mojo_embedder/viz_layer_context.cc
-@@ -1465,7 +1465,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+@@ -1475,7 +1475,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
      std::vector<ui::LatencyInfo> latency_info,
      viz::TrackedElementRects tracked_element_rects,
      std::vector<gfx::Rect> inline_3d_rects,
@@ -236,10 +236,10 @@ index dc79fda79dde3..498d1eafb09eb 100644
    // Pushes an update to a single tile in the context's display tree.
    virtual void UpdateDisplayTile(
 diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
-index d61616467f2ce..07d2c4bcea515 100644
+index ee84a24889aaf..651c252bf6114 100644
 --- a/cc/trees/layer_tree_host.cc
 +++ b/cc/trees/layer_tree_host.cc
-@@ -1566,8 +1566,8 @@ void LayerTreeHost::SetBrowserControlsParams(
+@@ -1570,8 +1570,8 @@ void LayerTreeHost::SetBrowserControlsParams(
  
  void LayerTreeHost::SetInline3DRects(
      std::vector<gfx::Rect> rects,
@@ -251,7 +251,7 @@ index d61616467f2ce..07d2c4bcea515 100644
    // NOTE (browser#83): scroll_base is deliberately NOT part of the dedup
    // compare. The rects are viewport-relative, so identical rects measured at a
 diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
-index a8ab0208fcf51..16a6b10018924 100644
+index 32d1b1c747718..b4295c357091b 100644
 --- a/cc/trees/layer_tree_host.h
 +++ b/cc/trees/layer_tree_host.h
 @@ -64,6 +64,7 @@
@@ -262,7 +262,7 @@ index a8ab0208fcf51..16a6b10018924 100644
  #include "components/viz/common/surfaces/local_surface_id.h"
  #include "ui/gfx/delegated_ink_metadata.h"
  #include "ui/gfx/geometry/rect.h"
-@@ -592,10 +593,11 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
+@@ -588,10 +589,11 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
    // |exclusion_fixed_rects| (browser#28) are exclusion rects whose element is
    // viewport-fixed; they are exempt from the impl-scroll-delta patch applied to
    // the other two lists.
@@ -279,29 +279,31 @@ index a8ab0208fcf51..16a6b10018924 100644
    void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
    const OverscrollBehavior& overscroll_behavior() const {
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 112d0c391f97e..ae5c7fbb30215 100644
+index 7cc72a73fdb2c..3b5a02d828ed6 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2276,7 +2276,17 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
-         // the weave rect. The weave path clips to the window itself, so
-         // project the raw element rect (matches the legacy unclipped
-         // getBoundingClientRect semantics).
--        if (feature == viz::TrackedElementFeature::kInline3dWeave) {
-+        //
-+        // Phase 1 (browser#18): kInline3dOverlay needs the identical exemption
-+        // for the identical reason. An exclusion is arbitrary page DOM — a
-+        // sticky header, a caption — whose chunk routinely merges into a layer
-+        // that draws nothing itself; intersecting against that layer's empty
-+        // visible_layer_rect zeroes the hole, and a zeroed hole is not a
-+        // no-op: the overlay's pixels then ride into the tile's SBS weave
-+        // input and get woven (browser#22's blown-up header). Same bug 0026
-+        // fixed for canvases.
-+        if (feature == viz::TrackedElementFeature::kInline3dWeave ||
-+            feature == viz::TrackedElementFeature::kInline3dOverlay) {
-           visible_layer_rect = rect_data.visible_bounds;
-         } else {
-           visible_layer_rect.Intersect(rect_data.visible_bounds);
-@@ -2473,7 +2483,7 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2427,9 +2427,19 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
+           // TODO(http://crbug.com/441532128): Elements that are being added to
+           // the compositor frame metadata should be transformed to the
+           // coordinate space of the compositor frame.
++          // Phase 1 (browser#18): kInline3dOverlay needs the identical
++          // unclipped-element-bounds exemption kInline3dWeave gets, for the
++          // identical reason. An exclusion is arbitrary page DOM — a sticky
++          // header, a caption — whose chunk routinely merges into a layer that
++          // draws nothing itself; intersecting against that layer's empty
++          // visible_layer_rect zeroes the hole, and a zeroed hole is not a
++          // no-op: the overlay's pixels then ride into the tile's SBS weave
++          // input and get woven (browser#22's blown-up header). Same bug 0026
++          // fixed for canvases.
+           transformed_rect.visible_bounds = CalculateVisibleBounds(
+               layer, rect_data,
+-              feature == viz::TrackedElementFeature::kInline3dWeave,
++              feature == viz::TrackedElementFeature::kInline3dWeave ||
++                  feature == viz::TrackedElementFeature::kInline3dOverlay,
+               front_occluders, transform_tree, inner_scroll_id,
+               outer_scroll_id, sticky_or_viewport_scroll_cache);
+ 
+@@ -2643,7 +2653,7 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    // so take them from the client-supplied copy (mirrors tracked_element_rects).
    // DisplayXR (browser#28): viewport-fixed exclusion rects are held aside while
    // the scroll-delta patch below runs, then appended verbatim.
@@ -310,7 +312,7 @@ index 112d0c391f97e..ae5c7fbb30215 100644
    // browser#83: the scroll-delta patch below only runs when the rects carry
    // their measurement-time scroll base (the metadata/commit path). The
    // TreesInViz-in-viz client copy has no base, so it gets NO shift — an
-@@ -2550,8 +2560,11 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2722,8 +2732,11 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
            for (gfx::Rect& r : metadata.inline_3d_rects) {
              r.Offset(-dx, -dy);
            }
@@ -324,7 +326,7 @@ index 112d0c391f97e..ae5c7fbb30215 100644
            }
            // NOTE (browser#28): viewport-fixed exclusion rects are deliberately
            // NOT in either list above — see the append below. They do not move
-@@ -2758,7 +2771,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+@@ -2932,7 +2945,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
      // Send updates to Viz even for no damage case when TreesInViz is enabled.
      if (settings_.TreesInVizInClientProcess()) {
        UpdateDisplayTree(*frame, {}, viz::TrackedElementRects(),
@@ -334,7 +336,7 @@ index 112d0c391f97e..ae5c7fbb30215 100644
      }
  
      active_tree()->ResetAllChangeTracking();
-@@ -3381,7 +3395,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+@@ -3545,7 +3559,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
      std::vector<ui::LatencyInfo> latency_info,
      viz::TrackedElementRects tracked_element_rects,
      std::vector<gfx::Rect> inline_3d_rects,
@@ -343,7 +345,7 @@ index 112d0c391f97e..ae5c7fbb30215 100644
      bool is_flush) {
    DCHECK(settings_.TreesInVizInClientProcess());
    DCHECK(layer_context_);
-@@ -3423,7 +3437,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
+@@ -3587,7 +3601,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
    // (like frame tokens in ACKs) remains consistent.
    ++next_frame_token_;
    UpdateDisplayTree(frame, {}, viz::TrackedElementRects(),
@@ -354,7 +356,7 @@ index 112d0c391f97e..ae5c7fbb30215 100644
  
    // A flush update synchronizes state (e.g. tile evictions) to Viz but does not
 diff --git a/cc/trees/layer_tree_host_impl.h b/cc/trees/layer_tree_host_impl.h
-index 53567f86cc604..f4feeb4ce8c02 100644
+index 86ced76995501..2a426699c44b9 100644
 --- a/cc/trees/layer_tree_host_impl.h
 +++ b/cc/trees/layer_tree_host_impl.h
 @@ -69,6 +69,7 @@
@@ -365,7 +367,7 @@ index 53567f86cc604..f4feeb4ce8c02 100644
  #include "components/viz/common/quads/trees_in_viz_timing.h"
  #include "components/viz/common/surfaces/child_local_surface_id_allocator.h"
  #include "components/viz/common/surfaces/local_surface_id.h"
-@@ -425,7 +426,7 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -429,7 +430,7 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
        std::vector<ui::LatencyInfo> latency_info,
        viz::TrackedElementRects tracked_element_rects,
        std::vector<gfx::Rect> inline_3d_rects,
@@ -374,7 +376,7 @@ index 53567f86cc604..f4feeb4ce8c02 100644
        bool is_flush = false);
  
    // Synchronizes the current tree state to Viz without triggering a draw.
-@@ -586,13 +587,13 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -597,13 +598,13 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
    }
  
    void set_inline_3d_exclusion_rects_from_client(
@@ -390,7 +392,7 @@ index 53567f86cc604..f4feeb4ce8c02 100644
      inline_3d_exclusion_fixed_rects_from_client_ =
          std::move(exclusion_fixed_rects);
    }
-@@ -1390,9 +1391,10 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -1405,9 +1406,10 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
    // generated frame metadata in Viz (mirrors tracked_element_rects_from_client_).
    std::vector<gfx::Rect> inline_3d_rects_from_client_;
    // Overlay-exclusion holes (browser#18) riding the same client channel.
@@ -404,7 +406,7 @@ index 53567f86cc604..f4feeb4ce8c02 100644
    // Settings whether we dump generated compositor frame during DrawLayers.
    // They are for debug purposes for TreesInViz and TreeAnimationsInViz.
 diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
-index 4f00ea998f839..f7c925cb62586 100644
+index b738187a98ed9..fd931de3ab976 100644
 --- a/cc/trees/layer_tree_impl.h
 +++ b/cc/trees/layer_tree_impl.h
 @@ -32,6 +32,7 @@
@@ -540,7 +542,7 @@ index d9d16de742989..85aa1963e76e8 100644
   private:
    CompositorFrameMetadata(const CompositorFrameMetadata& other);
 diff --git a/components/viz/common/surfaces/tracked_element_rects.h b/components/viz/common/surfaces/tracked_element_rects.h
-index d6f59a74f65cf..9564cf1530f39 100644
+index 7941c6040eee9..0b3f5e0161e95 100644
 --- a/components/viz/common/surfaces/tracked_element_rects.h
 +++ b/components/viz/common/surfaces/tracked_element_rects.h
 @@ -33,6 +33,17 @@ enum class TrackedElementFeature : int32_t {
@@ -582,10 +584,10 @@ index ad299b9a35156..fb669c505ea98 100644
    std::vector<Inline3dLayerResource> inline_3d_overlays;
    std::vector<Inline3dLayerResource> inline_3d_canvas_resources;
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 33e4cff4c3325..10b2a03a92f7d 100644
+index 328ffdedfb62d..bb6cb5d88ce41 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
-@@ -2212,7 +2212,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2213,7 +2213,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
    root_surface_id_ = surface_id;
    tracked_element_rects_ = {};
    inline_3d_rects_ = {};
@@ -594,7 +596,7 @@ index 33e4cff4c3325..10b2a03a92f7d 100644
    root_resource_quads_ = {};
  
    ResolvedFrameData* resolved_frame = GetResolvedFrame(surface_id);
-@@ -2418,14 +2418,18 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2419,14 +2419,18 @@ AggregatedFrame SurfaceAggregator::Aggregate(
             std::make_tuple(b.rect.y(), b.rect.x(), b.rect.width(),
                             b.rect.height());
    });
@@ -621,7 +623,7 @@ index 33e4cff4c3325..10b2a03a92f7d 100644
    // DisplayXR isolated-layer matching (browser#18): a recorded ROOT resource
    // quad is an isolated overlay/canvas layer iff its root-space rect closely
    // matches an exclusion/canvas rect (both derive from the same element's
-@@ -2577,15 +2581,19 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2578,15 +2582,19 @@ AggregatedFrame SurfaceAggregator::Aggregate(
    {
      static int last_wide_w = 0, last_wide_h = 0, absent_run = 0;
      int widest = 0;
@@ -646,7 +648,7 @@ index 33e4cff4c3325..10b2a03a92f7d 100644
          }
        }
      }
-@@ -2593,9 +2601,10 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2594,9 +2602,10 @@ AggregatedFrame SurfaceAggregator::Aggregate(
        if (absent_run++ % 30 == 0) {
          VLOG(1) << "[DisplayXR] #22 (A) GLOBAL-OVERLAY EXCLUSION MISSING this "
                     "frame: widest excl="
@@ -660,7 +662,7 @@ index 33e4cff4c3325..10b2a03a92f7d 100644
                  << " canvas rects live => chrome paints INTO the canvas layer "
                     "and is fed to the weave as SBS content (blow-up)";
        }
-@@ -2603,31 +2612,154 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2604,31 +2613,154 @@ AggregatedFrame SurfaceAggregator::Aggregate(
        absent_run = 0;
      }
    }
@@ -828,7 +830,7 @@ index 33e4cff4c3325..10b2a03a92f7d 100644
    // Phase-1 identity: match each inline-3d canvas rect to the resource quad
    // that draws it by IDENTITY first, geometry only as a fallback.
    for (const Inline3dTrackedRect& canvas : inline_3d_rects_) {
-@@ -2668,7 +2800,14 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2669,7 +2801,14 @@ AggregatedFrame SurfaceAggregator::Aggregate(
                << root_resource_quads_.size() << " root resource quads)";
      }
    }
@@ -844,7 +846,7 @@ index 33e4cff4c3325..10b2a03a92f7d 100644
  
    return frame;
  }
-@@ -2829,8 +2968,29 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2830,8 +2969,29 @@ void SurfaceAggregator::CollectTrackedElementRects(
    // getBoundingClientRect snapshot patched by an approximate impl-scroll delta
    // and trail during a fling.
    bool has_tracked_inline3d = false;
@@ -874,7 +876,7 @@ index 33e4cff4c3325..10b2a03a92f7d 100644
      if (feature == TrackedElementFeature::kInline3dWeave) {
        // Route into the weave rects; keep these out of the generic map so they
        // don't leak into CopyOutput geometry or the pixel-moving-filter union.
-@@ -2883,19 +3043,63 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2884,19 +3044,63 @@ void SurfaceAggregator::CollectTrackedElementRects(
                                    std::pair<uint32_t, uint32_t>()});
      }
    }
@@ -1103,7 +1105,7 @@ index b3a61647ce67f..a09d688079da1 100644
      return metadata.inline_3d_exclusion_rects;
    }
 diff --git a/services/viz/public/cpp/compositing/mojom_traits_unittest.cc b/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
-index 1273d15a27004..e223b1508f357 100644
+index d24949ae5a93d..4ad0c7aabe202 100644
 --- a/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
 +++ b/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
 @@ -840,6 +840,17 @@ TEST_F(StructTraitsTest, CompositorFrameMetadata) {
@@ -1227,10 +1229,10 @@ index ed4e743b021c5..2a6a78ff885ec 100644
  
  // Drives updates to a GPU-side LayerTreeHostImpl from its corresponding
 diff --git a/third_party/blink/renderer/core/DEPS b/third_party/blink/renderer/core/DEPS
-index f4684efd4b39a..d428ff2448b3a 100644
+index 07c55106e50ba..008705c0eef5e 100644
 --- a/third_party/blink/renderer/core/DEPS
 +++ b/third_party/blink/renderer/core/DEPS
-@@ -71,6 +71,7 @@ include_rules = [
+@@ -73,6 +73,7 @@ include_rules = [
      "+components/performance_manager/public/mojom/web_memory.mojom-blink.h",
      "+components/viz/common/frame_timing_details.h",
      "+components/viz/common/navigation_id.h",
@@ -1239,10 +1241,10 @@ index f4684efd4b39a..d428ff2448b3a 100644
      "+gpu/config/gpu_feature_info.h",
      "-inspector/v8",
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-index e4edbd6eca2e4..2976524148da6 100644
+index 5a07e2afdd694..b3adb7e103bcd 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-@@ -1635,8 +1635,8 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
+@@ -1747,8 +1747,8 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
  
  void WebFrameWidgetImpl::SetInline3DRects(
      const std::vector<gfx::Rect>& rects,
@@ -1253,7 +1255,7 @@ index e4edbd6eca2e4..2976524148da6 100644
      const gfx::PointF& scroll_base) {
    if (!View()->does_composite())
      return;
-@@ -4140,8 +4140,9 @@ void WebFrameWidgetImpl::DidNavigate() {
+@@ -4401,8 +4401,9 @@ void WebFrameWidgetImpl::DidNavigate() {
    // immersive session only), so XRSession::HandleShutdown never runs on this
    // path. Reset the state here, alongside the other per-navigation compositor
    // resets; a new inline-3d session re-reports its rects on its first frame.
@@ -1266,10 +1268,10 @@ index e4edbd6eca2e4..2976524148da6 100644
    // The input handler wants to know about navigation so that it can
    // suppress input until the newly navigated page has a committed frame.
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
-index ba2a22969504d..262db2b36bd19 100644
+index 2f3abbff5f8f7..953d6522e957a 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
-@@ -235,8 +235,8 @@ class CORE_EXPORT WebFrameWidgetImpl
+@@ -244,8 +244,8 @@ class CORE_EXPORT WebFrameWidgetImpl
    // DisplayXR inline-3D (#625, Step B / B4b).
    void SetInline3DRects(
        const std::vector<gfx::Rect>& rects,
@@ -1468,21 +1470,23 @@ index f2bea0dd21d29..047d17dd22607 100644
    Member<Element> target_;
    HeapLinkedHashSet<Member<Element>> excluded_elements_;
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index b6deba276f66d..874f2fd356e59 100644
+index ddbd3c52d8605..7b2add4d04352 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -14,8 +14,10 @@
+@@ -14,10 +14,12 @@
  #include "base/dcheck_is_on.h"
  #include "base/metrics/histogram_macros.h"
  #include "base/numerics/safe_conversions.h"
 +#include "base/token.h"
  #include "base/trace_event/trace_event.h"
  #include "base/types/pass_key.h"
+ #include "build/build_config.h"
+ #include "build/buildflag.h"
 +#include "components/viz/common/quads/compositor_frame_metadata.h"
  #include "device/vr/buildflags/buildflags.h"
  #include "device/vr/public/mojom/hit_test_subscription_id.h"
  #include "services/metrics/public/cpp/ukm_builders.h"
-@@ -2664,6 +2666,22 @@ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
+@@ -2689,6 +2691,22 @@ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
    }
  }
  
@@ -1505,7 +1509,7 @@ index b6deba276f66d..874f2fd356e59 100644
  void XRSession::ReportInline3DRects() {
    // Collect each registered inline-3d canvas's window-relative device-px rect
    // (getBoundingClientRect x device-scale-factor) and hand it to the compositor.
-@@ -2719,7 +2737,12 @@ void XRSession::ReportInline3DRects() {
+@@ -2744,7 +2762,12 @@ void XRSession::ReportInline3DRects() {
    // overlays yield an empty rect and drop out here. Not clipped to the layer
    // rect on purpose — the GPU stage clips against the (scroll-exact,
    // possibly tracked-channel) target rect, not this main-thread one.
@@ -1519,7 +1523,7 @@ index b6deba276f66d..874f2fd356e59 100644
    // browser#28: exclusion rects whose element is VIEWPORT-FIXED go in their own
    // list. Both lists are the same getBoundingClientRect measurement; the split
    // exists purely so cc can skip its impl-scroll-delta patch on these. The
-@@ -2729,7 +2752,17 @@ void XRSession::ReportInline3DRects() {
+@@ -2754,7 +2777,17 @@ void XRSession::ReportInline3DRects() {
    // it there moved the header rect by the whole fling delta, so it missed its
    // quad (or got clipped short at the surface top) and a strip of the header
    // stayed in the tile's SBS weave input and got woven.
@@ -1538,7 +1542,7 @@ index b6deba276f66d..874f2fd356e59 100644
    // A `position: sticky` element is viewport-fixed only while it is actually
    // STUCK; before it reaches its threshold it scrolls with the content and the
    // patch is correct for it. StickyPositionOffset() is non-zero exactly when
-@@ -2769,10 +2802,16 @@ void XRSession::ReportInline3DRects() {
+@@ -2794,10 +2827,16 @@ void XRSession::ReportInline3DRects() {
        if (hole.IsEmpty()) {
          continue;
        }
@@ -1557,7 +1561,7 @@ index b6deba276f66d..874f2fd356e59 100644
        }
      }
    }
-@@ -2810,8 +2849,10 @@ void XRSession::ClearInline3DRects() {
+@@ -2835,8 +2874,10 @@ void XRSession::ClearInline3DRects() {
    }
    // Empty rects, empty exclusions, reset scroll base — LayerTreeHost's
    // SetInline3DRects dedup early-out makes this a no-op if it is already clear.
@@ -1571,7 +1575,7 @@ index b6deba276f66d..874f2fd356e59 100644
  
  void XRSession::ReportInline3DDemand(bool wants_3d) {
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 79631a6fdf0d6..a55eb0ddc222c 100644
+index dc770347c05bc..67d214ee9ab52 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -339,6 +339,15 @@ class XRSession final : public EventTarget,
@@ -1591,7 +1595,7 @@ index 79631a6fdf0d6..a55eb0ddc222c 100644
    // virtualDisplayHeight): the height in metres of the virtual display the
    // scene is authored for. UpdateInline3DViews scales the reported eye poses by
 diff --git a/third_party/blink/renderer/platform/widget/frame_widget.h b/third_party/blink/renderer/platform/widget/frame_widget.h
-index 52b84998d8ea8..dc5691e4d4db4 100644
+index b02c132a1945d..5a6aa44d30a99 100644
 --- a/third_party/blink/renderer/platform/widget/frame_widget.h
 +++ b/third_party/blink/renderer/platform/widget/frame_widget.h
 @@ -14,6 +14,7 @@
@@ -1602,7 +1606,7 @@ index 52b84998d8ea8..dc5691e4d4db4 100644
  #include "mojo/public/mojom/base/text_direction.mojom-blink.h"
  #include "services/viz/public/mojom/compositing/frame_sink_id.mojom-blink.h"
  #include "third_party/blink/public/mojom/input/input_handler.mojom-blink.h"
-@@ -318,8 +319,8 @@ class PLATFORM_EXPORT FrameWidget {
+@@ -320,8 +321,8 @@ class PLATFORM_EXPORT FrameWidget {
    // stale the commit or how long since the last one.
    virtual void SetInline3DRects(
        const std::vector<gfx::Rect>& rects,

@@ -1,4 +1,4 @@
-From b06a77fc2f3b8fdf9fdf72b37a225e03afe1d239 Mon Sep 17 00:00:00 2001
+From c739264fb7c451b7b6a8288aa3aecc81b9406027 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 18 Aug 2026 18:19:31 -0700
 Subject: [PATCH 61/61] inline-3d(Phase 1): key GPU weave state by element
@@ -173,10 +173,10 @@ index f5224a52a275d..df9b56f4cc653 100644
    // frame carrying every visible rect, replacing N serialized ~1 ms sync
    // submits. When BatchMode() is true the caller brackets Phase A with:
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 0cd56032f19e7..0219453633e00 100644
+index e738fc3b94091..934983b164b7e 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2721,19 +2721,43 @@ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
+@@ -2720,19 +2720,43 @@ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
      std::vector<SkiaOutputSurface::Inline3dRect> rects,
      std::vector<SkiaOutputSurface::Inline3dLayerMailbox> overlays,
      std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers) {
@@ -228,7 +228,7 @@ index 0cd56032f19e7..0219453633e00 100644
  void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
    DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
    if (inline_3d_rects_.empty()) {
-@@ -2818,35 +2842,101 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2817,35 +2841,101 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // (A) runs BEFORE (B) so the submit reads the clean pre-weave page, not the
    // woven pixels (B) is about to composite over |output|.
  
@@ -354,7 +354,7 @@ index 0cd56032f19e7..0219453633e00 100644
  
    if (inline_3d_rects_.empty()) {
      return;
-@@ -2884,8 +2974,27 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2883,8 +2973,27 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // rect is the full tile (compositor-exact quad rect), NOT the clipped visible
    // bounds in inline_3d_rects_ — it is the reference for sub-regioning the SBS
    // when the tile is clipped at a screen edge (browser#18 bug B).
@@ -383,7 +383,7 @@ index 0cd56032f19e7..0219453633e00 100644
      for (const auto& c : inline_3d_canvas_layers_) {
        gfx::Rect inter = c.rect;
        inter.Intersect(r);
-@@ -2898,11 +3007,20 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2897,11 +3006,20 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      return SkiaOutputSurface::Inline3dLayerMailbox();
    };
  
@@ -406,7 +406,7 @@ index 0cd56032f19e7..0219453633e00 100644
      rect.Intersect(window_bounds);
      if (rect.IsEmpty()) {
        return false;
-@@ -2910,7 +3028,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2909,7 +3027,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      const int rw = rect.width();
      const int rh = rect.height();
      const SkiaOutputSurface::Inline3dLayerMailbox clean_sbs =
@@ -415,7 +415,7 @@ index 0cd56032f19e7..0219453633e00 100644
      const gpu::Mailbox clean_sbs_mailbox = clean_sbs.mailbox;
      const gfx::Rect clean_sbs_rect = clean_sbs.rect;  // UNCLIPPED full tile
      const gfx::RectF clean_sbs_uv = clean_sbs.uv;     // resource sub-rect (#73)
-@@ -2936,7 +3054,6 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2935,7 +3053,6 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            }
            return false;
          };
@@ -423,7 +423,7 @@ index 0cd56032f19e7..0219453633e00 100644
          // (1) Ensure an owned DISPLAY_READ/WRITE (NON-SCANOUT) D3DImageBacking
          // scratch sized to |rect|. Non-scanout is deliberate: a SCANOUT backing
          // on Windows becomes a DComp visual (want_dcomp_texture in
-@@ -2944,11 +3061,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2943,11 +3060,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          // (kDCompVisualContent); a plain DISPLAY backing keeps a sampleable
          // ID3D11Texture2D, read below via the SCANOUT-gate-free
          // ProduceOverlayForWeave. BGRA8 matches |output|.
@@ -440,7 +440,7 @@ index 0cd56032f19e7..0219453633e00 100644
            }
            gpu::Mailbox mailbox = gpu::Mailbox::Generate();
            gpu::SharedImageInfo si_info(
-@@ -2979,14 +3096,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2978,14 +3095,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                    mailbox, si_info, gpu::kNullSurfaceHandle)) {
              return fail("CreateSharedImage(scratch)");
            }
@@ -458,7 +458,7 @@ index 0cd56032f19e7..0219453633e00 100644
            if (!scratch_rep) {
              return fail("ProduceSkia(scratch)");
            }
-@@ -3186,7 +3303,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3185,7 +3302,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          // raw ID3D11Texture2D.
          auto overlay_rep =
              shared_image_representation_factory_->ProduceOverlayForWeave(
@@ -467,7 +467,7 @@ index 0cd56032f19e7..0219453633e00 100644
          if (!overlay_rep) {
            return fail("ProduceOverlayForWeave(scratch)");
          }
-@@ -3216,7 +3333,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3215,7 +3332,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          bool submitted = provider->WeaveCanvas(
              device_x.Get(), ov->d3d11_video_texture(),
              static_cast<UINT>(ov->texture_array_slice()),
@@ -476,7 +476,7 @@ index 0cd56032f19e7..0219453633e00 100644
  #elif BUILDFLAG(IS_APPLE)
          // (4) mac: the scratch's backing IOSurface is MTLBlit-copied into the
          // shared window-sized weave input at |rect| by the provider, then woven
-@@ -3227,7 +3344,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3226,7 +3343,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            return fail("overlay GetIOSurface");
          }
          bool submitted = provider->WeaveCanvasMac(
@@ -485,7 +485,7 @@ index 0cd56032f19e7..0219453633e00 100644
  #endif
          static bool logged_zc = false;
          if (submitted && !logged_zc) {
-@@ -3241,7 +3358,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3240,7 +3357,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        if (zc) {
          // Remember where this target was submitted so phase (B) draws the woven
          // pixels at the rect the runtime placed them, not a later drifted rect.
@@ -494,7 +494,7 @@ index 0cd56032f19e7..0219453633e00 100644
          return true;
        }
      }
-@@ -3291,15 +3408,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3290,15 +3407,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
  #if BUILDFLAG(IS_WIN)
      const bool submitted = provider->WeavePixels(
          device_x.Get(), src_pixels, static_cast<uint32_t>(src_stride), rect,
@@ -513,7 +513,7 @@ index 0cd56032f19e7..0219453633e00 100644
      }
      return submitted;
    };
-@@ -3330,31 +3446,44 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3329,31 +3445,44 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // the new page — the navigation ghost.
    [[maybe_unused]] bool wove_this_frame = false;
    for (size_t t = 0; t < inline_3d_rects_.size(); ++t) {
@@ -570,7 +570,7 @@ index 0cd56032f19e7..0219453633e00 100644
      }
    }
  
-@@ -3766,17 +3895,21 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3765,17 +3894,21 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // draw-back in the #elif branch below — see that block.)
    uint64_t latest_fence_value = 0;
    bool got_result = false;
@@ -596,7 +596,7 @@ index 0cd56032f19e7..0219453633e00 100644
      if (r.woven_handle) {
        if (!displayxr_shared_woven_mailbox_.IsZero()) {
          shared_image_factory_->DestroySharedImage(displayxr_shared_woven_mailbox_);
-@@ -3983,7 +4116,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3982,7 +4115,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
              // at window positions). kSrc: the woven pixels replace the raw SBS;
              // the 2D chrome outside these rects is left as the root composited it.
              for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
@@ -606,7 +606,7 @@ index 0cd56032f19e7..0219453633e00 100644
                if (rect.IsEmpty()) {
                  continue;
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index cf427868e2ea5..ae8214deabfe0 100644
+index 3c862a3e7bec3..ffa1d9834ffe9 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 @@ -20,6 +20,7 @@
@@ -625,7 +625,7 @@ index cf427868e2ea5..ae8214deabfe0 100644
  class ImageContextImpl;
  class SkiaOutputSurfaceDependency;
  class VulkanContextProvider;
-@@ -497,6 +499,10 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -496,6 +498,10 @@ class SkiaOutputSurfaceImplOnGpu
    gpu::SkiaImageRepresentation* GetSkiaRepresentation(gpu::Mailbox mailbox);
  
  #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
@@ -636,7 +636,7 @@ index cf427868e2ea5..ae8214deabfe0 100644
    // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model). After the
    // frame's quads are painted into the output surface and before Flush/Submit,
    // for each inline_3d_rects_ entry: copy the composited output sub-rect into an
-@@ -526,6 +532,25 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -525,6 +531,25 @@ class SkiaOutputSurfaceImplOnGpu
    void WeaveCompositedSurface(SkSurface* output,
                                SkCanvas* out_canvas,
                                bool prefer_zero_copy);
@@ -662,7 +662,7 @@ index cf427868e2ea5..ae8214deabfe0 100644
  #endif
  
  #if BUILDFLAG(IS_APPLE)
-@@ -683,8 +708,10 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -682,8 +707,10 @@ class SkiaOutputSurfaceImplOnGpu
  
    // DisplayXR inline-3D (#625, Step B / B4b): inline-3d canvas rects for the
    // frame currently being finished (set via SetInline3DRects; consumed by
@@ -675,7 +675,7 @@ index cf427868e2ea5..ae8214deabfe0 100644
  
    // DisplayXR isolated layers (browser#18): overlay layers composited kSrcOver
    // the woven output; canvas layers (clean SBS) used as weave input. Each a
-@@ -693,32 +720,66 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -692,32 +719,66 @@ class SkiaOutputSurfaceImplOnGpu
    std::vector<SkiaOutputSurface::Inline3dLayerMailbox> inline_3d_canvas_layers_;
  
  #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
@@ -763,7 +763,7 @@ index cf427868e2ea5..ae8214deabfe0 100644
  
    // DisplayXR inline-3D (browser#18/#22 — v4 DP-composited 2D overlays): ONE
    // window-sized owned premultiplied-alpha SharedImage into which the frame's
-@@ -736,17 +797,9 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -735,17 +796,9 @@ class SkiaOutputSurfaceImplOnGpu
    // DisplayXR inline-3D (#625, Step B — async per-element weave). The provider
    // keys a SEPARATE keyed-mutex input per target, so every visible target is
    // submitted EVERY frame (concurrently, gated only per-target by

@@ -1,4 +1,4 @@
-From c583e8b421407eb840390f3f680e9ff8b3b7e52e Mon Sep 17 00:00:00 2001
+From e7a28c1fc68c13eebc4b302f569323f3e7dc3d9a Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 18 Aug 2026 18:07:20 -0700
 Subject: [PATCH 60/61] inline-3d(Phase 1): match an inline-3D canvas to its
@@ -129,10 +129,10 @@ index 60b8d32641240..ad299b9a35156 100644
    std::vector<Inline3dLayerResource> inline_3d_overlays;
    std::vector<Inline3dLayerResource> inline_3d_canvas_resources;
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index e85dbaf2b0ed6..f6995c2cb60b0 100644
+index 5b8e152a64dfd..b6f80127a779c 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
-@@ -999,12 +999,20 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -998,12 +998,20 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
              for (const auto& layer : in) {
                gpu::Mailbox m = resource_provider_->GetMailbox(layer.resource_id);
                if (!m.IsZero()) {
@@ -155,7 +155,7 @@ index e85dbaf2b0ed6..f6995c2cb60b0 100644
                                               resolve(frame.inline_3d_overlays),
                                               resolve(frame.inline_3d_canvas_resources));
      }
-@@ -1028,7 +1036,17 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1027,7 +1035,17 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
      // DisplayXR inline-3D weave (mac): the renderer also needs the rects so it
      // can substitute each inline-3d canvas overlay's mailbox with a woven
      // scratch inside ScheduleOverlays (where the overlay lock is recorded).
@@ -216,10 +216,10 @@ index 292677c795b78..6a47d12b955e7 100644
        std::vector<Inline3dLayerMailbox> canvas_layers) {}
  
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index fa15e61ffa02d..33e4cff4c3325 100644
+index 379d482f7fd74..328ffdedfb62d 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
-@@ -2399,12 +2399,25 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2400,12 +2400,25 @@ AggregatedFrame SurfaceAggregator::Aggregate(
    // DisplayXR inline-3D (#625): deterministic order — the weave consumer keys
    // per-target state by vector index, and the tracked-element and legacy paths
    // enumerate in different orders.
@@ -251,7 +251,7 @@ index fa15e61ffa02d..33e4cff4c3325 100644
    // Exclusion holes (browser#18): same deterministic order for stable logging /
    // comparison only — the weave consumer associates them to targets
    // geometrically, never by index.
-@@ -2478,6 +2491,78 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2479,6 +2492,78 @@ AggregatedFrame SurfaceAggregator::Aggregate(
      }
      return found;
    };
@@ -330,7 +330,7 @@ index fa15e61ffa02d..33e4cff4c3325 100644
    // browser#22 DIAGNOSTIC: why does page-global chrome (the sticky header) blow
    // up for a frame or two during a fast scroll? Two candidate mechanisms, and
    // they need different fixes, so distinguish them explicitly:
-@@ -2526,15 +2611,16 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2527,15 +2612,16 @@ AggregatedFrame SurfaceAggregator::Aggregate(
        // (B) declared but unmatched: does it sit over a 3D canvas region? If so
        // it is exactly the chrome-over-tile case we care about — report the
        // overlap so a miss over empty page can be told from a miss over a tile.
@@ -351,7 +351,7 @@ index fa15e61ffa02d..33e4cff4c3325 100644
                      << " overlap=" << ov.ToString();
            }
            break;
-@@ -2542,10 +2628,34 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2543,10 +2629,34 @@ AggregatedFrame SurfaceAggregator::Aggregate(
        }
      }
    }
@@ -389,7 +389,7 @@ index fa15e61ffa02d..33e4cff4c3325 100644
      }
    }
    if (!frame.inline_3d_overlays.empty() ||
-@@ -2708,10 +2818,9 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2709,10 +2819,9 @@ void SurfaceAggregator::CollectTrackedElementRects(
      const gfx::Transform& transform_to_root_target,
      const std::optional<gfx::Rect> root_target_clip_rect,
      // DisplayXR Phase-1 identity: carried here so a tracked rect can keep the
@@ -403,7 +403,7 @@ index fa15e61ffa02d..33e4cff4c3325 100644
    // DisplayXR inline-3D (#625, scroll-sync P3): prefer the compositor-thread
    // tracked-element rects for the weave. cc projects them through the layer's
    // ScreenSpaceTransform at DRAW time (live property trees, current impl
-@@ -2731,9 +2840,13 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2732,9 +2841,13 @@ void SurfaceAggregator::CollectTrackedElementRects(
          if (rect_data.visible_bounds.IsEmpty()) {
            continue;
          }
@@ -420,7 +420,7 @@ index fa15e61ffa02d..33e4cff4c3325 100644
          has_tracked_inline3d = true;
        }
        if (has_tracked_inline3d) {
-@@ -2758,9 +2871,16 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2759,9 +2872,16 @@ void SurfaceAggregator::CollectTrackedElementRects(
    // old path stays a live fallback and nothing regresses.
    if (!has_tracked_inline3d) {
      for (const gfx::Rect& rect : frame_metadata.inline_3d_rects) {
@@ -475,10 +475,10 @@ index 45642481cdf1b..a61f771384092 100644
    // DisplayXR overlay-exclusion rects (browser#18): the on-screen rects of 2D UI
    // over a woven element, transformed to root render pass space. Used to identify
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-index d3965d5809335..bf173903a4666 100644
+index a42ef3fae88d4..62426408dce49 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-@@ -1071,7 +1071,7 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
+@@ -1064,7 +1064,7 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
  #endif
  
  void SkiaOutputSurfaceImpl::SetInline3DRects(
@@ -488,10 +488,10 @@ index d3965d5809335..bf173903a4666 100644
      std::vector<Inline3dLayerMailbox> canvas_layers) {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
-index 969fa01f779fa..ca1d07b8803e7 100644
+index 102154029f475..758ea47416cc0 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
-@@ -178,7 +178,7 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
+@@ -177,7 +177,7 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
    bool SupportsBGRA() const override;
    // DisplayXR inline-3D (#625, Step B / B4b; overlays + canvas res browser#18).
    void SetInline3DRects(
@@ -501,10 +501,10 @@ index 969fa01f779fa..ca1d07b8803e7 100644
        std::vector<Inline3dLayerMailbox> canvas_layers) override;
  
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index f8ac6aed2ce65..0cd56032f19e7 100644
+index 46802114fb799..e738fc3b94091 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2718,10 +2718,17 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+@@ -2717,10 +2717,17 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
  }
  
  void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
@@ -525,10 +525,10 @@ index f8ac6aed2ce65..0cd56032f19e7 100644
    inline_3d_canvas_layers_ = std::move(canvas_layers);
  }
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index c51932aa4741e..cf427868e2ea5 100644
+index fb1d37b1fcaee..3c862a3e7bec3 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -236,7 +236,7 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -235,7 +235,7 @@ class SkiaOutputSurfaceImplOnGpu
    // Inline3dLayerMailbox). Set from the compositor thread (Display, via
    // SkiaOutputSurfaceImpl) before FinishPaintCurrentFrame; read on the GPU thread.
    void SetInline3DRects(
