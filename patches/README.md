@@ -1,8 +1,36 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **63 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **64 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patch 0064 makes **Phase 2 (occlusion)** real: the flag now composites the split. Four things go live
+together, because none of them is correct alone. The difference clip is enabled (the one bool 0063
+left false), so the page raster is punched out of the tile rects; `WeaveCompositedSurface`'s phase (B)
+draws the published over-plane `kSrcOver` over the whole window right after the woven draw-back
+(NEAREST, `kStrict`, inside the existing flush/submit bracket, with risk guard R7's size check
+skipping rather than sampling a stale-sized plane), mirrored in the macOS branch and drawn LAST so it
+wins; the v4 DP-composited overlay atlas is stood down in all three places and `display.cc` stops
+suppressing the exclusion-overlay resources, because those two ARE the Phase-1 occlusion mechanism —
+it can only lift content that DECLARED itself, the split lifts whatever the draw order says is over a
+tile, and running both would composite the declared overlays twice while suppressing them under the
+split would drop them entirely; and the GPU stage reads `--inline-3d-occlusion` itself, cached in the
+`SkiaOutputSurfaceImplOnGpu` constructor exactly as `gpu_main.cc` reads the other inline-3D switches
+(one switch, two readers — one thread punches the page, the other repairs it, so a split verdict would
+be a hole). Nothing is deleted: the legacy path is dormant, not gone, so **both paths ship in one
+binary** and the hardware A/B is a relaunch — `--inline-3d-occlusion` is the split, the default and
+`--disable-inline-3d-occlusion` are Phase 1 byte for byte. What the A/B has to show: an UNDECLARED 2D
+element over a tile rendering as crisp 2D over 3D with ZERO declarations (the whole point), a
+translucent scrim blending once rather than double-darkening, scroll-glued overlays staying glued, and
+the Phase-1 exclusion corpus unchanged-or-better. The per-pixel story inside a tile rect is now exact
+rather than approximate: `output` holds page + under only (the clip removes the over content BEFORE
+phase (A) snapshots it, which makes patch 0050's pre-blend backdrop the true backdrop — its comment now
+says so), the woven draw covers the rect opaquely, and the plane composites 2D-over with the page's own
+alpha. R9 is restated where it lives: the difference clip is the ONLY thing keeping translucent
+above-content out of both the backdrop and the over-plane, and must never be weakened. Partial swap
+needs no change — the composite is whole-window but reads a surface whose undamaged regions carry
+identical pixels, the same contract the woven texture already relies on. Diagnostics: one throttled
+`[DisplayXR] inline-3D occlusion composite:` marker with the plane size and drawn/skipped. Patch 0065
+deletes the dormant legacy path and makes the split the default.
 Patch 0063 opens **Phase 2 (occlusion)**: the page content sitting OVER a woven tile is lifted onto
 its own transparent plane so the display processor can composite it above the weave, instead of the
 page burying the tile. This patch builds the whole mechanism and deliberately connects none of it —
