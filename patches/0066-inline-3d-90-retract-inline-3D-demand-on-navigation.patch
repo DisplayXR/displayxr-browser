@@ -1,0 +1,439 @@
+From 00967706af525bb81df4e6ca6b457c7ef56e909e Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Wed, 19 Aug 2026 11:41:05 -0700
+Subject: [PATCH] inline-3d(#90): retract inline-3D demand on navigation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 3, Stage 0. Two defects left the display-mode policy latched at the
+wrong answer across a navigation. Both are browser-side only; nothing in the
+runtime or the extension wire protocol moves.
+
+C-1 — navigating away from a 3D page left the panel in 3D (the reported bug).
+A document put in the back/forward cache keeps its DisplayXRService pipe, so
+its demand is never retracted, and its RenderFrameHost is kInBackForwardCache
+rather than gone. ComputeWish() already discounted it — IsActive() is false —
+but nothing on a same-tab navigation ever asked: the controller only woke on
+demand events and browser create/close/activate/deactivate/active-tab-change.
+Renderer-side retraction is not available (XRSystem::EnsureDisplayXRService
+returns null once the execution context is destroyed), so the browser has to
+notice by itself.
+
+  Fix: a WebContentsObserver on the active tab of each window, overriding
+  PrimaryPageChanged() to ScheduleApply(). That fires on cross-document
+  commits, bfcache restores and prerender activations, and deliberately not on
+  same-document navigations, which a live inline-3D session is expected to
+  survive. Only active tabs are observed — a background tab cannot change
+  ComputeWish()'s answer — and the set is refreshed from the existing
+  RegisterActiveTabDidChange path, so a tab dragged between windows is picked
+  up by the window it lands in.
+
+C-2 — latent permanent-stuck-2D race, fixed here because C-1's fix makes
+navigation a hot path. On a same-RFH cross-document navigation the new
+document binds a fresh pipe with the SAME GlobalRenderFrameHostId, and the old
+pipe's destructor retraction is unordered against the new pipe's first
+SetInline3DDemand(true). If the retraction lands second it erases the NEW
+document's claim, and since the renderer is edge-triggered
+(inline_3d_demand_sent_) it never re-reports: a 3D page stuck in 2D for the
+life of the document.
+
+  Fix: a generation token. DisplayXRServiceImpl mints instance_id_ from a
+  process-global counter in its constructor, Inline3DDemandCallback carries it,
+  and demanding_frames_ becomes id -> generation. A demand is insert_or_assign
+  (newest claimant wins); a retraction erases only when the stored generation
+  matches the retracting pipe's. A stale retraction is dropped instead of
+  clearing a live claim.
+
+Hardware test plan (Leia SR panel, --enable-inline-3d):
+  1. Load a 3D page, confirm the panel goes 3D; navigate away. Panel returns
+     to 2D within the 300 ms debounce (<=300 ms after commit).
+  2. Press Back so the 3D document is restored from the bfcache. Panel returns
+     to 3D — proves the observer fires on restore, not just on commit, and
+     that the bfcached claim was discounted rather than destroyed.
+  3. Navigate 3D page -> 3D page, same site, x20. Panel stays 3D throughout,
+     with no instance ending stuck in 2D. This is the C-2 proof: same-site
+     keeps the RenderFrameHost, so every hop runs the retraction/report race.
+  4. Regression: two windows, 3D page in each, alternate focus; and a 3D page
+     in a background tab of the foreground window. Policy unchanged.
+
+Compile-checked (clang-cl -fsyntax-only, milestone-150 tree): the two edited
+TUs plus both DisplayXRServiceImpl::Create call sites —
+components/displayxr/browser/displayxr_service_impl.cc,
+chrome/browser/displayxr/displayxr_display_mode_controller.cc,
+chrome/browser/chrome_browser_interface_binders.cc,
+content/shell/browser/shell_content_browser_client.cc. All clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../displayxr_display_mode_controller.cc      | 101 ++++++++++++++++--
+ .../displayxr_display_mode_controller.h       |  61 ++++++++++-
+ .../browser/displayxr_service_impl.cc         |  19 +++-
+ .../browser/displayxr_service_impl.h          |  18 ++++
+ 4 files changed, 186 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/displayxr/displayxr_display_mode_controller.cc b/chrome/browser/displayxr/displayxr_display_mode_controller.cc
+index 7ec51559c10d0..c2843b6d4775f 100644
+--- a/chrome/browser/displayxr/displayxr_display_mode_controller.cc
++++ b/chrome/browser/displayxr/displayxr_display_mode_controller.cc
+@@ -4,7 +4,11 @@
+ 
+ #include "chrome/browser/displayxr/displayxr_display_mode_controller.h"
+ 
++#include <memory>
++#include <utility>
++
+ #include "base/command_line.h"
++#include "base/containers/flat_set.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/time/time.h"
+@@ -42,6 +46,33 @@ content::WebContents* ActiveContents(BrowserWindowInterface* browser) {
+ 
+ }  // namespace
+ 
++DisplayXRDisplayModeController::PageChangeObserver::PageChangeObserver(
++    content::WebContents* contents,
++    DisplayXRDisplayModeController* owner)
++    : content::WebContentsObserver(contents), owner_(owner) {}
++
++DisplayXRDisplayModeController::PageChangeObserver::~PageChangeObserver() =
++    default;
++
++void DisplayXRDisplayModeController::PageChangeObserver::PrimaryPageChanged(
++    content::Page& page) {
++  // browser#90: a new primary page owns this tab now. Whatever the old one
++  // claimed is either gone with it or parked in the back/forward cache with an
++  // inactive RenderFrameHost — either way ComputeWish() will now discount it.
++  // Fires on cross-document commits, bfcache restores and prerender
++  // activations; not on same-document navigations, which a live inline-3D
++  // session is expected to survive.
++  owner_->ScheduleApply();
++}
++
++void DisplayXRDisplayModeController::PageChangeObserver::
++    WebContentsDestroyed() {
++  // Self-erase so the map never holds a key to a freed WebContents. Safe from
++  // inside this notification: the base destructor's RemoveObserver() is exactly
++  // what the observer list permits during iteration.
++  owner_->OnObservedContentsDestroyed(web_contents());
++}
++
+ // static
+ void DisplayXRDisplayModeController::CreateForBrowserProcess() {
+   if (InstancePtr()) {
+@@ -78,11 +109,23 @@ DisplayXRDisplayModeController::~DisplayXRDisplayModeController() = default;
+ 
+ void DisplayXRDisplayModeController::OnFrameDemandChanged(
+     content::GlobalRenderFrameHostId frame_id,
++    uint64_t instance_id,
+     bool wants_3d) {
+   if (wants_3d) {
+-    demanding_frames_.insert(frame_id);
++    // The newest claimant on this frame id wins outright.
++    demanding_frames_.insert_or_assign(frame_id, instance_id);
+   } else {
+-    demanding_frames_.erase(frame_id);
++    // browser#90 (C-2): honour the retraction only if the claim still belongs
++    // to the pipe retracting it. On a same-RFH cross-document navigation the
++    // old pipe's teardown retraction and the new document's first report are
++    // unordered; if the retraction arrives second, erasing here would clear a
++    // claim the new document has already made — and because the renderer is
++    // edge-triggered it would never make it again, stranding a 3D page in 2D
++    // for the life of the document.
++    auto it = demanding_frames_.find(frame_id);
++    if (it != demanding_frames_.end() && it->second == instance_id) {
++      demanding_frames_.erase(it);
++    }
+   }
+   ScheduleApply();
+ }
+@@ -117,8 +160,11 @@ bool DisplayXRDisplayModeController::ComputeWish() const {
+ 
+   // Any live frame of that tab reporting visible 3D content. Frames are held by
+   // id, not pointer, precisely so a dead one resolves to null here instead of
+-  // dangling.
+-  for (const content::GlobalRenderFrameHostId& id : demanding_frames_) {
++  // dangling. IsActive() is what discounts a document sitting in the
++  // back/forward cache — its pipe, and so its claim, outlives the navigation
++  // (browser#90 C-1); PageChangeObserver is what makes sure this runs again
++  // once that happens.
++  for (const auto& [id, instance_id] : demanding_frames_) {
+     content::RenderFrameHost* rfh = content::RenderFrameHost::FromID(id);
+     if (rfh && rfh->IsActive() &&
+         content::WebContents::FromRenderFrameHost(rfh) == foreground_contents) {
+@@ -209,20 +255,59 @@ void DisplayXRDisplayModeController::ForceTwoDForShutdown() {
+   shutting_down_ = true;
+ }
+ 
++void DisplayXRDisplayModeController::RefreshActiveTabObservers() {
++  base::flat_set<content::WebContents*> active;
++  ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
++      [&active](BrowserWindowInterface* browser) {
++        if (content::WebContents* contents = ActiveContents(browser)) {
++          active.insert(contents);
++        }
++        return true;
++      });
++
++  // Stop watching tabs that are no longer the active tab of any window.
++  base::EraseIf(active_tab_observers_, [&active](const auto& entry) {
++    return !active.contains(entry.first);
++  });
++
++  // Start watching the ones that just became active. A tab dragged out into its
++  // own window arrives here as a new entry against the new window, and drops
++  // out of the old one on that window's active-tab change.
++  for (content::WebContents* contents : active) {
++    if (!active_tab_observers_.contains(contents)) {
++      active_tab_observers_.insert_or_assign(
++          contents, std::make_unique<PageChangeObserver>(contents, this));
++    }
++  }
++}
++
++void DisplayXRDisplayModeController::OnObservedContentsDestroyed(
++    content::WebContents* contents) {
++  // Deletes the calling observer. Nothing may touch it after this point.
++  active_tab_observers_.erase(contents);
++}
++
+ void DisplayXRDisplayModeController::OnBrowserCreated(
+     BrowserWindowInterface* browser) {
+   if (!active_tab_subscriptions_.contains(browser)) {
+-    active_tab_subscriptions_[browser] = browser->RegisterActiveTabDidChange(
+-        base::BindRepeating([](DisplayXRDisplayModeController* self,
+-                               BrowserWindowInterface*) { self->ScheduleApply(); },
+-                            base::Unretained(this)));
++    active_tab_subscriptions_[browser] =
++        browser->RegisterActiveTabDidChange(base::BindRepeating(
++            [](DisplayXRDisplayModeController* self, BrowserWindowInterface*) {
++              // browser#90: the active tab changed, so both the wish
++              // and the set of tabs whose navigations matter may have.
++              self->RefreshActiveTabObservers();
++              self->ScheduleApply();
++            },
++            base::Unretained(this)));
+   }
++  RefreshActiveTabObservers();
+   ScheduleApply();
+ }
+ 
+ void DisplayXRDisplayModeController::OnBrowserClosed(
+     BrowserWindowInterface* browser) {
+   active_tab_subscriptions_.erase(browser);
++  RefreshActiveTabObservers();
+   ScheduleApply();
+ }
+ 
+diff --git a/chrome/browser/displayxr/displayxr_display_mode_controller.h b/chrome/browser/displayxr/displayxr_display_mode_controller.h
+index 79cb3d8038f73..cb26b4d5dcf97 100644
+--- a/chrome/browser/displayxr/displayxr_display_mode_controller.h
++++ b/chrome/browser/displayxr/displayxr_display_mode_controller.h
+@@ -33,19 +33,34 @@
+ //     inferring anything from a return code, because the workspace gate is a
+ //     silent XR_SUCCESS no-op.
+ //
++// browser#90: the policy above is only as good as the events that trigger it.
++// The demand set is edge-driven, and a same-tab navigation produces no edge —
++// a document put in the back/forward cache keeps its mojo pipe, and therefore
++// its demand, alive indefinitely. ComputeWish() already filters it out (its
++// RenderFrameHost is no longer IsActive()), but nothing asked. So the
++// controller also watches the active tab of every window for primary-page
++// changes, which is what a cross-document commit, a bfcache restore, and a
++// prerender activation all have in common. Same-document navigations
++// deliberately do NOT fire: a live inline-3D session survives those and keeps
++// reporting.
++//
+ // Browser process, UI thread. Windows-only in practice (the weave client is a
+ // stub elsewhere), but the class itself is platform-neutral.
+ 
++#include <cstdint>
+ #include <map>
+-#include <set>
++#include <memory>
+ 
+ #include "base/callback_list.h"
++#include "base/containers/flat_map.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/timer/timer.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/web_contents_observer.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ 
+ class BrowserWindowInterface;
+@@ -81,13 +96,45 @@ class DisplayXRDisplayModeController : public BrowserCollectionObserver {
+   void OnBrowserDeactivated(BrowserWindowInterface* browser) override;
+ 
+  private:
++  // browser#90: turns "the tab navigated" into "recompute the wish". Attached
++  // to the active tab of each window; see the file comment for why nothing else
++  // reaches the controller on a same-tab navigation.
++  class PageChangeObserver : public content::WebContentsObserver {
++   public:
++    PageChangeObserver(content::WebContents* contents,
++                       DisplayXRDisplayModeController* owner);
++    ~PageChangeObserver() override;
++
++    PageChangeObserver(const PageChangeObserver&) = delete;
++    PageChangeObserver& operator=(const PageChangeObserver&) = delete;
++
++    // content::WebContentsObserver:
++    void PrimaryPageChanged(content::Page& page) override;
++    void WebContentsDestroyed() override;
++
++   private:
++    const raw_ptr<DisplayXRDisplayModeController> owner_;
++  };
++
+   DisplayXRDisplayModeController();
+   ~DisplayXRDisplayModeController() override;
+ 
+   // Renderer said this frame's visible inline-3D content appeared/disappeared.
++  // |instance_id| is the reporting pipe's generation; a retraction from a stale
++  // one is ignored (see DisplayXRServiceImpl::Inline3DDemandCallback).
+   void OnFrameDemandChanged(content::GlobalRenderFrameHostId frame_id,
++                            uint64_t instance_id,
+                             bool wants_3d);
+ 
++  // Bring |active_tab_observers_| in line with the active tabs of the current
++  // windows. Only active tabs are watched: a background tab's navigation cannot
++  // change ComputeWish()'s answer, and a tab that becomes active — including
++  // one dragged into another window — comes through here first.
++  void RefreshActiveTabObservers();
++
++  // A watched tab is going away.
++  void OnObservedContentsDestroyed(content::WebContents* contents);
++
+   // Demand of the active tab of the frontmost window that is actually on screen.
+   bool ComputeWish() const;
+ 
+@@ -106,7 +153,12 @@ class DisplayXRDisplayModeController : public BrowserCollectionObserver {
+   mojom::DisplayXRDisplayMode* GetSink();
+   void OnSinkDisconnected();
+ 
+-  std::set<content::GlobalRenderFrameHostId> demanding_frames_;
++  // Frames claiming visible inline-3D content -> the generation of the pipe
++  // that made the claim. Keyed by id rather than pointer so a dead frame
++  // resolves to null in ComputeWish() instead of dangling; valued by generation
++  // so a retraction that lost the race against the next document is discarded
++  // rather than clearing that document's claim (browser#90 C-2).
++  base::flat_map<content::GlobalRenderFrameHostId, uint64_t> demanding_frames_;
+ 
+   mojo::Remote<mojom::DisplayXRDisplayMode> sink_;
+ 
+@@ -116,6 +168,11 @@ class DisplayXRDisplayModeController : public BrowserCollectionObserver {
+   std::map<BrowserWindowInterface*, base::CallbackListSubscription>
+       active_tab_subscriptions_;
+ 
++  // browser#90: one per currently-active tab. Entries are removed when the tab
++  // stops being active or is destroyed, so the raw keys never dangle.
++  base::flat_map<content::WebContents*, std::unique_ptr<PageChangeObserver>>
++      active_tab_observers_;
++
+   base::ScopedObservation<BrowserCollection, BrowserCollectionObserver>
+       collection_observation_{this};
+ 
+diff --git a/components/displayxr/browser/displayxr_service_impl.cc b/components/displayxr/browser/displayxr_service_impl.cc
+index 259c94632b488..2d5fce0bf5d61 100644
+--- a/components/displayxr/browser/displayxr_service_impl.cc
++++ b/components/displayxr/browser/displayxr_service_impl.cc
+@@ -24,6 +24,15 @@ DisplayXRServiceImpl::Inline3DDemandCallback& DemandCallback() {
+   return *cb;
+ }
+ 
++// browser#90: monotonic pipe generation. Browser-UI-thread only (every
++// DisplayXRServiceImpl is constructed from the frame's interface broker, which
++// runs there), so a plain counter is enough — no atomic needed. Starts at 1 so
++// no live instance ever holds 0.
++uint64_t NextInstanceId() {
++  static uint64_t next = 0;
++  return ++next;
++}
++
+ }  // namespace
+ 
+ // static
+@@ -34,15 +43,19 @@ void DisplayXRServiceImpl::SetInline3DDemandCallback(
+ 
+ DisplayXRServiceImpl::DisplayXRServiceImpl(
+     content::GlobalRenderFrameHostId frame_id)
+-    : frame_id_(frame_id) {}
++    : frame_id_(frame_id), instance_id_(NextInstanceId()) {}
+ 
+ DisplayXRServiceImpl::~DisplayXRServiceImpl() {
+   // browser#55: the pipe is gone — navigation, frame teardown, or a renderer
+   // crash. Whatever this frame last wanted, it cannot want it any more. Retract
+   // it, otherwise a navigation away from a 3D page (the reported bug) would
+   // leave the demand latched at true with no renderer left to clear it.
++  //
++  // browser#90: tagged with |instance_id_| because this retraction races the
++  // NEXT document's first report on a same-RFH navigation — the sink drops it
++  // if that race has already been lost.
+   if (reported_demand_valid_ && reported_demand_ && DemandCallback()) {
+-    DemandCallback().Run(frame_id_, false);
++    DemandCallback().Run(frame_id_, instance_id_, false);
+   }
+ }
+ 
+@@ -61,7 +74,7 @@ void DisplayXRServiceImpl::SetInline3DDemand(bool wants_3d) {
+   reported_demand_ = wants_3d;
+   reported_demand_valid_ = true;
+   if (DemandCallback()) {
+-    DemandCallback().Run(frame_id_, wants_3d);
++    DemandCallback().Run(frame_id_, instance_id_, wants_3d);
+   }
+ }
+ 
+diff --git a/components/displayxr/browser/displayxr_service_impl.h b/components/displayxr/browser/displayxr_service_impl.h
+index 7d558bb3aab9e..0b9d1a2ae2933 100644
+--- a/components/displayxr/browser/displayxr_service_impl.h
++++ b/components/displayxr/browser/displayxr_service_impl.h
+@@ -11,6 +11,8 @@
+ // forbids the weave RPC, so the client lives in the browser). Self-owned;
+ // bound via the frame's BrowserInterfaceBroker, gated on --enable-inline-3d.
+ 
++#include <cstdint>
++
+ #include "base/functional/callback.h"
+ #include "content/public/browser/global_routing_id.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -26,8 +28,19 @@ class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
+   // foreground) and that lives in chrome/browser — a layer components/ must not
+   // depend on. Unset in embedders that have no display-mode policy (content
+   // shell), in which case demand reports are simply dropped.
++  //
++  // browser#90: |instance_id| identifies the PIPE, not the frame. A frame id is
++  // not unique over time — a same-RFH cross-document navigation gives the new
++  // document the very same GlobalRenderFrameHostId — and the old pipe's
++  // teardown retraction is unordered against the new pipe's first report.
++  // Without a generation token a late-arriving retraction erases the NEW
++  // document's demand, and since the renderer is edge-triggered it never
++  // re-reports: a 3D page stuck permanently in 2D. The sink must therefore
++  // honour a retraction only while the instance that made the claim is still
++  // the one holding it.
+   using Inline3DDemandCallback =
+       base::RepeatingCallback<void(content::GlobalRenderFrameHostId frame_id,
++                                   uint64_t instance_id,
+                                    bool wants_3d)>;
+   static void SetInline3DDemandCallback(Inline3DDemandCallback callback);
+ 
+@@ -54,6 +67,11 @@ class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
+   // the ID to a live RenderFrameHost at handling time or drops the report.
+   const content::GlobalRenderFrameHostId frame_id_;
+ 
++  // browser#90: this pipe's generation, from a process-global counter. Unique
++  // for the life of the browser process, so it disambiguates two documents that
++  // share a frame id (see Inline3DDemandCallback).
++  const uint64_t instance_id_;
++
+   // Last value handed to the embedder. The renderer is already edge-triggered;
+   // this makes the browser side idempotent against a renderer that isn't (a
+   // compromised one, or a future one that changes its mind about that).
+-- 
+2.42.0.windows.2
+

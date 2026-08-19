@@ -37,7 +37,7 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 |---|---|
 | Latest preview | [**0.1.8**](https://github.com/DisplayXR/displayxr-browser/releases/tag/preview-0.1.8) — *DisplayXR-Browser-Preview-Setup-0.1.8.exe* |
 | Chromium pin | **151.0.7922.77** (stable) — `scripts/config.env` |
-| Patch series | 56 patches over the pinned tag, ~100 files of real integration surface |
+| Patch series | 66 patches over the pinned tag, ~100 files of real integration surface |
 | Platform | Windows — D3D11 + DirectComposition |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
