@@ -1,8 +1,23 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **61 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **62 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patch 0062 extends **Phase 1 identity** to exclusion overlays (browser#18/#49). An exclusion is a
+promise that an element's pixels stay 2D, out of the weave — and two channels describe those
+exclusions: the legacy metadata list is COMPLETE (Blink walks the declaration list every frame) but
+its geometry trails the impl scroll, while a draw-time tracked rect is EXACT but only best-effort
+present, because arbitrary overlay DOM has no guaranteed paint chunk. 0049 could only CHOOSE between
+them, wholesale per frame, so every exclusion whose element emitted no chunk that frame was silently
+dropped — and its pixels then rode into the tile's SBS weave input and got woven (browser#22's
+blown-up header). Carrying each exclusion's element token end to end lets the aggregator MERGE the
+two instead: it enumerates the complete list and upgrades rows individually by id, so a tracked
+entry's presence can never suppress another row and a row never mixes geometry bases. The
+exclusion→quad join becomes `(namespace, layer id)` equality with best-overlap kept as a logged
+fallback, diagnostics are throttled PER ID (a single global counter is what made the 0049 drop
+invisible), the session de-duplicates an element excluded from several windows, and overlays are
+finally composited in a real stacking order — back-to-front by root-pass quad ordinal, replacing a
+geometric (y,x,w,h) sort that was never a z-order at all.
 Patches 0059–0061 are **Phase 1 identity**: the weave stops guessing which quad draws an inline-3D
 canvas and is told. 0059 carries the cc `LayerImpl` stable id onto every tracked element rect and
 records the matching SharedQuadState id + client namespace on each root resource quad (inert
