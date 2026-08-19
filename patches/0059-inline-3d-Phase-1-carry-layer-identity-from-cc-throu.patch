@@ -1,7 +1,7 @@
 From a27566ef867e8579ac1c77672e947687310104ac Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 18 Aug 2026 17:33:31 -0700
-Subject: [PATCH 59/61] inline-3d(Phase 1): carry layer identity from cc
+Subject: [PATCH 59/62] inline-3d(Phase 1): carry layer identity from cc
  through the aggregator
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -57,7 +57,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  8 files changed, 99 insertions(+), 10 deletions(-)
 
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index f45d7c9f70bdf..7cc72a73fdb2c 100644
+index f45d7c9..7cc72a7 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
 @@ -2411,6 +2411,18 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
@@ -80,7 +80,7 @@ index f45d7c9f70bdf..7cc72a73fdb2c 100644
            // TODO(http://crbug.com/441532128): Elements that are being added to
            // the compositor frame metadata should be transformed to the
 diff --git a/components/viz/common/surfaces/tracked_element_rects.cc b/components/viz/common/surfaces/tracked_element_rects.cc
-index a24b78a2d922f..e84b79fcb50d0 100644
+index a24b78a..e84b79f 100644
 --- a/components/viz/common/surfaces/tracked_element_rects.cc
 +++ b/components/viz/common/surfaces/tracked_element_rects.cc
 @@ -25,7 +25,7 @@ std::string TrackedElementRect::ToString() const {
@@ -93,7 +93,7 @@ index a24b78a2d922f..e84b79fcb50d0 100644
  
  std::string TrackedElementRectsToString(const TrackedElementRects& bounds) {
 diff --git a/components/viz/common/surfaces/tracked_element_rects.h b/components/viz/common/surfaces/tracked_element_rects.h
-index 4d1e14adfc736..7941c6040eee9 100644
+index 4d1e14a..7941c60 100644
 --- a/components/viz/common/surfaces/tracked_element_rects.h
 +++ b/components/viz/common/surfaces/tracked_element_rects.h
 @@ -78,6 +78,19 @@ struct VIZ_COMMON_EXPORT TrackedElementRect {
@@ -117,7 +117,7 @@ index 4d1e14adfc736..7941c6040eee9 100644
                           const TrackedElementRect&) = default;
  
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 1e37903cb3aa3..379d482f7fd74 100644
+index 1e37903..379d482 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
 @@ -905,7 +905,8 @@ void SurfaceAggregator::EmitSurfaceContent(
@@ -178,7 +178,7 @@ index 1e37903cb3aa3..379d482f7fd74 100644
    // tracked-element rects for the weave. cc projects them through the layer's
    // ScreenSpaceTransform at DRAW time (live property trees, current impl
 diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
-index 46c2eae7f121f..45642481cdf1b 100644
+index 46c2eae..4564248 100644
 --- a/components/viz/service/display/surface_aggregator.h
 +++ b/components/viz/service/display/surface_aggregator.h
 @@ -334,11 +334,16 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
@@ -221,7 +221,7 @@ index 46c2eae7f121f..45642481cdf1b 100644
    std::vector<RootResourceQuad> root_resource_quads_;
  };
 diff --git a/services/viz/public/cpp/compositing/mojom_traits_unittest.cc b/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
-index a45ecc7b6bfc5..d24949ae5a93d 100644
+index a45ecc7..d24949a 100644
 --- a/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
 +++ b/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
 @@ -1571,6 +1571,12 @@ TEST_F(StructTraitsTest, TrackedElementRects) {
@@ -278,7 +278,7 @@ index a45ecc7b6bfc5..d24949ae5a93d 100644
  
  auto AnyTrackedElementRects() {
 diff --git a/services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h b/services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h
-index a4f3f8160a222..1ae53fa3081c5 100644
+index a4f3f81..1ae53fa 100644
 --- a/services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h
 +++ b/services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h
 @@ -51,12 +51,17 @@ struct StructTraits<viz::mojom::TrackedElementRectDataView,
@@ -300,7 +300,7 @@ index a4f3f8160a222..1ae53fa3081c5 100644
          !data.ReadVisibleBounds(&out->visible_bounds) ||
          !data.ReadFrameToken(&out->frame_token) ||
 diff --git a/services/viz/public/mojom/compositing/tracked_element_rects.mojom b/services/viz/public/mojom/compositing/tracked_element_rects.mojom
-index 79e8c7102b6b5..e1f39a96e6930 100644
+index 79e8c71..e1f39a9 100644
 --- a/services/viz/public/mojom/compositing/tracked_element_rects.mojom
 +++ b/services/viz/public/mojom/compositing/tracked_element_rects.mojom
 @@ -41,6 +41,12 @@ struct TrackedElementRect {
@@ -316,6 +316,3 @@ index 79e8c7102b6b5..e1f39a96e6930 100644
  };
  
  // TrackedElementRects are used to map a "feature" to the list of tracked
--- 
-2.42.0.windows.2
-
