@@ -1,7 +1,7 @@
-From fdf9f05b15cf9f02c900c564686077d8fc30e13f Mon Sep 17 00:00:00 2001
+From 3a4f86191dc1480b23ad0aab3a0eb2fa9da14660 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 00:46:56 -0700
-Subject: [PATCH] inline-3d(Phase 2): make the flag composite the split
+Subject: [PATCH 64/64] inline-3d(Phase 2): make the flag composite the split
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -78,7 +78,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  7 files changed, 371 insertions(+), 67 deletions(-)
 
 diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
-index 636a828f52737..ee41e26125d72 100644
+index 636a828..ee41e26 100644
 --- a/chrome/app/chrome_main_delegate.cc
 +++ b/chrome/app/chrome_main_delegate.cc
 @@ -1121,11 +1121,13 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
@@ -100,7 +100,7 @@ index 636a828f52737..ee41e26125d72 100644
      // What IS established now is the precedence, so the escape hatch works from
      // this patch on: --disable-inline-3d-occlusion beats an explicit
 diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
-index dc1c64b5c29e4..8fc6ba35ee7c4 100644
+index 01d47e5..57a54dc 100644
 --- a/components/viz/service/display/direct_renderer.h
 +++ b/components/viz/service/display/direct_renderer.h
 @@ -108,9 +108,12 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
@@ -120,10 +120,10 @@ index dc1c64b5c29e4..8fc6ba35ee7c4 100644
  
    void ReallocatedFrameBuffers();
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index 16bbb8439fc0c..2ba3eeead127a 100644
+index 82f52aa..fa18be2 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
-@@ -1024,11 +1024,31 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1023,11 +1023,31 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
      {
        ResourceIdSet suppressed;
        if (!frame.inline_3d_rects.empty()) {
@@ -158,10 +158,10 @@ index 16bbb8439fc0c..2ba3eeead127a 100644
        }
        renderer_->SetInline3dSuppressedResources(std::move(suppressed));
 diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
-index 7687ea3ac2be5..45484bf130bc5 100644
+index 117f738..b3525fe 100644
 --- a/components/viz/service/display/skia_renderer.cc
 +++ b/components/viz/service/display/skia_renderer.cc
-@@ -1507,12 +1507,14 @@ void SkiaRenderer::SetInline3dQuadClips(
+@@ -1581,12 +1581,14 @@ void SkiaRenderer::SetInline3dQuadClips(
    // APPLIED must not change underneath quads already batched. Same reasoning
    // (and same remedy) as the RequiresOverlay fallback in DrawQuadInternal.
    //
@@ -182,7 +182,7 @@ index 7687ea3ac2be5..45484bf130bc5 100644
    const bool clip_is_live = inline3d_difference_clip_enabled_ ||
                              inline3d_clip_in_.has_value() ||
                              clip_in.has_value();
-@@ -1646,9 +1648,11 @@ void SkiaRenderer::PrepareCanvas(
+@@ -1721,9 +1723,11 @@ void SkiaRenderer::PrepareCanvas(
                                SkClipOp::kIntersect, /*doAntiAlias=*/false);
    }
    // |inline3d_clip_out_| punches the page draw out of the tiles the over-plane
@@ -197,7 +197,7 @@ index 7687ea3ac2be5..45484bf130bc5 100644
    if (inline3d_difference_clip_enabled_) {
      for (const gfx::Rect& rect : inline3d_clip_out_) {
        current_canvas_->clipRect(gfx::RectToSkRect(rect), SkClipOp::kDifference,
-@@ -3767,11 +3771,12 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
+@@ -3842,11 +3846,12 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
    // DirectRenderer::ComputeInline3dPlaneSplit — into a separate window-sized
    // transparent plane, and publish its mailbox.
    //
@@ -215,7 +215,7 @@ index 7687ea3ac2be5..45484bf130bc5 100644
    //
    // Gated on there being TILES this frame, not on the over set being non-empty:
    // "tiles present, nothing over them" still has to clear and republish the
-@@ -3916,8 +3921,9 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
+@@ -3991,8 +3996,9 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
  
    inline_3d_over_plane_->painted_rects = tile_rects;
    // Publish AFTER the paint task and BEFORE the root pass is painted — the GPU
@@ -227,7 +227,7 @@ index 7687ea3ac2be5..45484bf130bc5 100644
    skia_output_surface_->SetInline3dOverPlane(inline_3d_over_plane_->mailbox,
                                               size);
  
-@@ -3927,8 +3933,7 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
+@@ -4002,8 +4008,7 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
              << size.ToString() << " tiles=" << tile_rects.size()
              << " over_set=" << inline3d_over_clips_.size() << " draws=" << draws
              << (created_now ? " (allocated)" : "")
@@ -238,10 +238,10 @@ index 7687ea3ac2be5..45484bf130bc5 100644
  }
  
 diff --git a/components/viz/service/display/skia_renderer.h b/components/viz/service/display/skia_renderer.h
-index 3b9c30fc61b44..49e7dd701b37b 100644
+index 5d15843..9bd2f6c 100644
 --- a/components/viz/service/display/skia_renderer.h
 +++ b/components/viz/service/display/skia_renderer.h
-@@ -648,14 +648,21 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
+@@ -652,14 +652,21 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
    absl::InlinedVector<gfx::Rect, 2> inline3d_clip_out_;
    std::optional<gfx::Rect> inline3d_clip_in_;
  
@@ -272,7 +272,7 @@ index 3b9c30fc61b44..49e7dd701b37b 100644
    // Sets the two clips above, flushing any in-progress batch first if they
    // change (a batch is drawn with ONE PrepareCanvas, so a mid-batch clip change
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 8b4d241d107af..5dc7c08b46a15 100644
+index 7fd5544..c6c5931 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -11,6 +11,7 @@
@@ -309,7 +309,7 @@ index 8b4d241d107af..5dc7c08b46a15 100644
    weak_ptr_ = weak_ptr_factory_.GetWeakPtr();
    buffer_presented_callback_ = CreateSafeRepeatingCallback(
        weak_ptr_, std::move(buffer_presented_callback));
-@@ -3204,6 +3224,21 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3203,6 +3223,21 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            // overlays". Hence the gate below on |src_from_canvas| -- that is
            // precisely the case where suppression fired for this tile.
            //
@@ -331,7 +331,7 @@ index 8b4d241d107af..5dc7c08b46a15 100644
            // The backdrop is 2D, so it goes under BOTH eye halves at ZERO
            // DISPARITY (the same screen region in each half), which is what makes
            // it survive the interlace crisp at z = 0. Cost: it is squeezed to
-@@ -3509,8 +3544,20 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3508,8 +3543,20 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // The mac composited-surface weave uses the legacy per-rect kSrc draw-back
    // below, where the 2D chrome outside the woven tile rects is left untouched on
    // the root SkSurface (browser#18/#22 exclusion already composited it there).
@@ -353,7 +353,7 @@ index 8b4d241d107af..5dc7c08b46a15 100644
      auto stage_overlay_atlas = [&]() -> bool {
        DisplayXRScratchState& atlas = displayxr_overlay_atlas_state_;
        // (1) Ensure a window-sized RGBA8 premul atlas (same overlay-exposable
-@@ -3697,7 +3744,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3696,7 +3743,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // nothing, so this does NOT reintroduce the renderer :1651 write-fail that the
    // earlier held-scratch attempt did; the successful reads are FlushSurface+submit
    // here (short-lived), also off the :1651 path.
@@ -367,7 +367,7 @@ index 8b4d241d107af..5dc7c08b46a15 100644
      auto stage_overlay_atlas_mac = [&]() -> bool {
        // (1) Ensure the persistent window-sized BGRA8 premul atlas IOSurface
        // (SCANOUT → IOSurfaceImageBacking: Skia-writable AND Overlay-readable).
-@@ -4009,9 +4061,123 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -4008,9 +4060,123 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      drew_any = true;
    }
  
@@ -492,7 +492,7 @@ index 8b4d241d107af..5dc7c08b46a15 100644
    if (drew_any) {
      std::vector<GrBackendSemaphore> empty_sem;
      FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
-@@ -4022,7 +4188,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -4021,7 +4187,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        graphite_shared_context()->submit();
      }
    }
@@ -502,7 +502,7 @@ index 8b4d241d107af..5dc7c08b46a15 100644
  
  #elif BUILDFLAG(IS_APPLE)
    // ---- (B) macOS SYNCHRONOUS draw-back (#760) via a Chromium-allocated scratch ----
-@@ -4154,29 +4321,107 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -4153,29 +4320,107 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
              // above); the woven-scratch pixels are identical, so the overlap is a
              // harmless idempotent redraw. IN THE SAME Graphite recording as the
              // tiles (one flush per frame — see below).
@@ -627,7 +627,7 @@ index 8b4d241d107af..5dc7c08b46a15 100644
                std::vector<GrBackendSemaphore> empty_sem;
                FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
                if (gr_context()) {
-@@ -4449,7 +4694,15 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOverlaysMac() {
+@@ -4448,7 +4693,15 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOverlaysMac() {
    // export (step 3). Runs before SubmitBatchSync (the overlay rides that submit).
    // Any failure just skips the overlay this frame; the weave itself is
    // unaffected. |inline_3d_overlays_| is cross-platform (SetInline3DLayers).
@@ -645,10 +645,10 @@ index 8b4d241d107af..5dc7c08b46a15 100644
        // (1) Ensure a window-sized BGRA8 premul atlas as an IOSurface-backed
        // SharedImage (SCANOUT routes it to IOSurfaceImageBacking — Skia-writable
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index f71a91d1387aa..942753786b8db 100644
+index e83fbb2..14e2514 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -243,8 +243,9 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -242,8 +242,9 @@ class SkiaOutputSurfaceImplOnGpu
        std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers);
  
    // DisplayXR inline-3D Phase 2 (plane split): record the over-plane painted
@@ -660,7 +660,7 @@ index f71a91d1387aa..942753786b8db 100644
    void SetInline3dOverPlane(gpu::Mailbox mailbox, gfx::Size size);
  
    void SetCapabilitiesForTesting(
-@@ -728,18 +729,31 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -727,18 +728,31 @@ class SkiaOutputSurfaceImplOnGpu
    // RGBA plane SkiaRenderer painted the OVER set into for the frame currently
    // being finished, and its full pixel size. Set via SetInline3dOverPlane on
    // the task immediately before the root pass's FinishPaintRenderPass, so it
@@ -700,6 +700,3 @@ index f71a91d1387aa..942753786b8db 100644
  #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
    // DisplayXR inline-3D (#625, Step B / B4d — GPU-resident weave) scratch
    // SharedImage state. |mailbox| is an owned D3DImageBacking sized to a rect:
--- 
-2.42.0.windows.2
-
