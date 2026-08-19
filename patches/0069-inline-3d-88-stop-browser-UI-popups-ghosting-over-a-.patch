@@ -1,0 +1,1136 @@
+From 608585bd4c0b5681a566dfa4a12c6227d70f3d2e Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Wed, 19 Aug 2026 15:55:08 -0700
+Subject: [PATCH] inline-3d(#88): stop browser-UI popups ghosting over a woven
+ page
+
+Phase 3 Stage 4 item B. The omnibox dropdown, autofill popups and every menu
+are separate OWNED top-level HWNDs that DWM composites ABOVE the browser
+window. They never enter Viz and can never be woven, but the panel underneath
+stays physically 3D -- so their perfectly flat pixels are viewed through a
+lenticular they did not ask for and read soft and ghosted. (menu_host.cc sets
+force_software_compositing on Windows for menus: there is no Viz frame to
+weave, by construction.)
+
+Patch 0067's flat-regions channel cannot fix this, because it rides the weave
+SUBMIT. The failing case is an inline-3D page sitting IDLE -- no damage, no Viz
+frame, no submit at all -- when the user clicks the omnibox: a submit-chained
+wish would never republish and the popup would ghost for as long as it stayed
+open. So this uses XR_DXR_weave v8's other half, the STICKY channel
+xrWeaveSetScreenFlatRegionsDXR, which the runtime applies on the spot (it
+re-rasters and republishes the wish inside the call). Runtime half shipped in
+displayxr-runtime#1065; against a pre-v8 runtime the entry point does not
+resolve and the whole path is inert.
+
+The popups are enumerated GENERICALLY, not by special-casing the three types
+that motivated the bug: aura::EnvObserver::OnHostInitialized is the universal
+"a new top-level HWND exists" edge, and Widget::GetAllOwnedWidgets() on each
+browser window's native view says what those HWNDs actually are -- on Windows
+that walks the HWND OWNER relation, which is the same relation DWM composites
+above the owner, so the enumeration and the visual problem share a definition.
+Each enumerated popup then gets a WidgetObserver for its own moves, shows and
+destruction. Omnibox, autofill, menus, tooltips, bubbles and extension popups
+all fall out of that, including ones nobody has written yet.
+
+Deliberately NOT done: suppressing the weave beneath a popup. Subtracting the
+popup rects from the weave rects, or skipping the draw-back there, would show
+raw unwoven page through a kTranslucent popup's shadow and rounded corners.
+The ghost is a LENS artefact, not a compositing one, so switching the panel's
+3D element off over the region is the whole fix. There is a comment saying so,
+because it looks like an optimization someone will want to make.
+
+  - New DisplayXRPopupOccluderTracker (chrome/browser/displayxr/, sibling to
+    the display-mode controller, Windows-only): enumerate, observe, convert
+    DIP -> absolute physical screen px via ScreenWin against the POPUP's own
+    HWND, coarsen, and push the full set on change. Debounced 16 ms, an order
+    of magnitude tighter than the controller's 300 ms and commented as such:
+    that timer guards a hardware transition of the whole panel, this one moves
+    a lens hint over already-correct pixels and popup open/close has to feel
+    instant.
+  - Transport extends the EXISTING browser->GPU DisplayXRDisplayMode interface
+    with SetPopupOccluders(array<gfx.mojom.Rect>) rather than adding a fifth
+    one, so both messages are ordered on one pipe and the controller stays the
+    single owner of that pipe. GPU end passes straight through to a new
+    DisplayXRWeaveClient::SetScreenFlatRegions, which owns the wire: spec-v8
+    gate, clamp to 8, and idempotence (the runtime's immediate re-raster is a
+    ClearView plus a vtable call under its render_mutex, so a redundant call is
+    not free).
+  - The wish comes from the controller, not a second copy of the foreground
+    policy -- pushed from Apply() BEFORE its early returns, which fire when the
+    panel needs no change and say nothing about whether the latch does.
+
+Leak safety (R7), which is the one failure mode of this that is visible rather
+than merely absent -- a leaked rect is a permanent flat band over live 3D: the
+set is full-every-time and never a delta, recomputed from scratch on every
+event, sent as {} when inline-3D demand goes false, cleared on shutdown, and
+re-asserted after a GPU crash (a fresh session latches nothing, so the tracker
+models the reconnect as an empty latch rather than an unknown one -- which also
+keeps a browser with no popups open from binding the pipe at all). Past the
+8-rect cap the smallest are DROPPED, never merged: a dropped popup keeps
+ghosting, whereas a bounding box would switch the lens off across working 3D
+between two popups. Same bias rule as 0067, and the sort carries a positional
+tie-break so which rect loses does not depend on the allocator.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ chrome/browser/BUILD.gn                       |  20 +-
+ .../displayxr_display_mode_controller.cc      |  58 +++
+ .../displayxr_display_mode_controller.h       |  33 ++
+ .../displayxr_popup_occluder_tracker.cc       | 352 ++++++++++++++++++
+ .../displayxr_popup_occluder_tracker.h        | 169 +++++++++
+ .../browser/displayxr_weave_client.cc         | 116 ++++++
+ .../browser/displayxr_weave_client.h          |  33 +-
+ .../displayxr/common/displayxr_weave.mojom    |  18 +
+ .../gpu/displayxr_display_mode_impl.cc        |  19 +
+ .../gpu/displayxr_display_mode_impl.h         |  11 +
+ 10 files changed, 826 insertions(+), 3 deletions(-)
+ create mode 100644 chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc
+ create mode 100644 chrome/browser/displayxr/displayxr_popup_occluder_tracker.h
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 6ae2aa7577012..5e1a33b283941 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1272,7 +1272,18 @@ source_set("core") {
+   }
+ 
+   if (is_win) {
+-    sources += [ "chrome_browser_main_win.h" ]
++    sources += [
++      "chrome_browser_main_win.h",
++
++      # DisplayXR inline-3D popup occluders (browser#88, Phase 3 item B):
++      # enumerate the visible owned popup HWNDs (omnibox dropdown, autofill,
++      # menus) and latch them as flat regions so the panel's 3D element
++      # switches off underneath them. Windows-only — the DIP -> physical
++      # conversion is display::win::ScreenWin and the consumer is the Windows
++      # weave session.
++      "displayxr/displayxr_popup_occluder_tracker.cc",
++      "displayxr/displayxr_popup_occluder_tracker.h",
++    ]
+     deps += [
+       "//chrome/browser/os_crypt",
+       "//chrome/browser/webnn",
+@@ -1285,6 +1296,13 @@ source_set("core") {
+       "//components/stylus_handwriting/win",
+       "//media/mojo/services",
+       "//sandbox/win:sandbox",
++
++      # browser#88: aura::EnvObserver for "a new top-level HWND exists",
++      # views::Widget::GetAllOwnedWidgets for what those HWNDs are, and
++      # display::win::ScreenWin for DIP -> absolute physical screen px.
++      "//ui/aura",
++      "//ui/display",
++      "//ui/views",
+     ]
+ 
+     if (is_chrome_branded) {
+diff --git a/chrome/browser/displayxr/displayxr_display_mode_controller.cc b/chrome/browser/displayxr/displayxr_display_mode_controller.cc
+index c2843b6d4775f..8c215c50c3581 100644
+--- a/chrome/browser/displayxr/displayxr_display_mode_controller.cc
++++ b/chrome/browser/displayxr/displayxr_display_mode_controller.cc
+@@ -103,6 +103,13 @@ DisplayXRDisplayModeController::DisplayXRDisplayModeController() {
+   DisplayXRServiceImpl::SetInline3DDemandCallback(base::BindRepeating(
+       &DisplayXRDisplayModeController::OnFrameDemandChanged,
+       base::Unretained(this)));
++#if BUILDFLAG(IS_WIN)
++  // browser#88. Constructed eagerly but inert: it observes nothing and sends
++  // nothing until SetInline3DDemand(true) arrives from Apply().
++  popup_tracker_ = std::make_unique<DisplayXRPopupOccluderTracker>(
++      base::BindRepeating(&DisplayXRDisplayModeController::SendPopupOccluders,
++                          base::Unretained(this)));
++#endif
+ }
+ 
+ DisplayXRDisplayModeController::~DisplayXRDisplayModeController() = default;
+@@ -201,6 +208,26 @@ void DisplayXRDisplayModeController::OnSinkDisconnected() {
+   // to whatever process replaces it.
+   applied_valid_ = false;
+   ScheduleApply();
++#if BUILDFLAG(IS_WIN)
++  // browser#88: the popup latch lived on the dead process's weave session, so
++  // the replacement holds nothing. Tell the tracker, or "send only on change"
++  // would keep the now-nonexistent set suppressed for as long as the popups
++  // stay open.
++  if (popup_tracker_) {
++    popup_tracker_->OnSinkReset();
++  }
++#endif
++}
++
++void DisplayXRDisplayModeController::SendPopupOccluders(
++    const std::vector<gfx::Rect>& screen_rects) {
++  if (shutting_down_) {
++    return;
++  }
++  // Same pipe as SetDisplayMode, so the two are ordered against each other.
++  // Advisory and fire-and-forget: there is no reply, and a failure would mean
++  // nothing the browser could act on — the worst case is the pre-v8 ghost.
++  GetSink()->SetPopupOccluders(screen_rects);
+ }
+ 
+ void DisplayXRDisplayModeController::Apply() {
+@@ -208,6 +235,16 @@ void DisplayXRDisplayModeController::Apply() {
+     return;
+   }
+   const bool wish = ComputeWish();
++#if BUILDFLAG(IS_WIN)
++  // browser#88: push the wish to the popup tracker BEFORE the early returns
++  // below. Those return when the panel needs no change, which says nothing
++  // about whether the popup latch does — and on the very first false wish
++  // (|applied_valid_| still unset) the second early return would otherwise hide
++  // the demand edge from the tracker entirely. Idempotent on its side.
++  if (popup_tracker_) {
++    popup_tracker_->SetInline3DDemand(wish);
++  }
++#endif
+   if (applied_valid_ && applied_3d_ == wish) {
+     return;  // transition-driven: nothing to do
+   }
+@@ -239,6 +276,14 @@ void DisplayXRDisplayModeController::ForceTwoDForShutdown() {
+     return;
+   }
+   debounce_.Stop();
++#if BUILDFLAG(IS_WIN)
++  // browser#88: clear the flat latch first, while |shutting_down_| is still
++  // false so SendPopupOccluders will actually run. Same best-effort caveat as
++  // the 2D request below.
++  if (popup_tracker_) {
++    popup_tracker_->Shutdown();
++  }
++#endif
+   // Only if we already have a live pipe. Binding one here would spin up a GPU
+   // process during shutdown to tell it to do nothing — and an unbound sink
+   // means we never asserted 3D in the first place.
+@@ -302,6 +347,7 @@ void DisplayXRDisplayModeController::OnBrowserCreated(
+   }
+   RefreshActiveTabObservers();
+   ScheduleApply();
++  NotifyPopupTrackerOfWindowChange();
+ }
+ 
+ void DisplayXRDisplayModeController::OnBrowserClosed(
+@@ -309,6 +355,18 @@ void DisplayXRDisplayModeController::OnBrowserClosed(
+   active_tab_subscriptions_.erase(browser);
+   RefreshActiveTabObservers();
+   ScheduleApply();
++  NotifyPopupTrackerOfWindowChange();
++}
++
++void DisplayXRDisplayModeController::NotifyPopupTrackerOfWindowChange() {
++#if BUILDFLAG(IS_WIN)
++  // browser#88: the set of windows whose owned popups get enumerated changed.
++  // Window ACTIVATION deliberately does not come through here — a popup is
++  // transient and closing it is what fires, via its own WidgetObserver.
++  if (popup_tracker_) {
++    popup_tracker_->OnBrowserWindowsChanged();
++  }
++#endif
+ }
+ 
+ void DisplayXRDisplayModeController::OnBrowserActivated(
+diff --git a/chrome/browser/displayxr/displayxr_display_mode_controller.h b/chrome/browser/displayxr/displayxr_display_mode_controller.h
+index cb26b4d5dcf97..3f3093f01f93b 100644
+--- a/chrome/browser/displayxr/displayxr_display_mode_controller.h
++++ b/chrome/browser/displayxr/displayxr_display_mode_controller.h
+@@ -44,24 +44,39 @@
+ // deliberately do NOT fire: a live inline-3D session survives those and keeps
+ // reporting.
+ //
++// browser#88: the controller also hosts the popup-occluder tracker (Phase 3
++// item B). Not because the two decisions are the same — one drives the panel's
++// hardware element, the other only names regions that must stay flat — but
++// because the tracker needs exactly the wish this class already computes, and
++// duplicating "does the foreground tab want 3D" is how the two would drift.
++// The controller owns the single mojo pipe both messages ride, so it is also
++// the only place that can re-assert the popup set after a GPU crash.
++//
+ // Browser process, UI thread. Windows-only in practice (the weave client is a
+ // stub elsewhere), but the class itself is platform-neutral.
+ 
+ #include <cstdint>
+ #include <map>
+ #include <memory>
++#include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/containers/flat_map.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/timer/timer.h"
++#include "build/build_config.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "content/public/browser/global_routing_id.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "mojo/public/cpp/bindings/remote.h"
++#include "ui/gfx/geometry/rect.h"
++
++#if BUILDFLAG(IS_WIN)
++#include "chrome/browser/displayxr/displayxr_popup_occluder_tracker.h"
++#endif
+ 
+ class BrowserWindowInterface;
+ class GlobalBrowserCollection;
+@@ -135,6 +150,10 @@ class DisplayXRDisplayModeController : public BrowserCollectionObserver {
+   // A watched tab is going away.
+   void OnObservedContentsDestroyed(content::WebContents* contents);
+ 
++  // browser#88: a window opened or closed, so the popup enumeration's input
++  // set changed. A no-op where the tracker does not exist.
++  void NotifyPopupTrackerOfWindowChange();
++
+   // Demand of the active tab of the frontmost window that is actually on screen.
+   bool ComputeWish() const;
+ 
+@@ -153,6 +172,12 @@ class DisplayXRDisplayModeController : public BrowserCollectionObserver {
+   mojom::DisplayXRDisplayMode* GetSink();
+   void OnSinkDisconnected();
+ 
++  // browser#88: hand the tracker's current occluder set to the GPU process.
++  // Bound as the tracker's sink, so it is only ever called when the set has
++  // actually changed — which is what keeps a browser with no popups open from
++  // binding the pipe at all.
++  void SendPopupOccluders(const std::vector<gfx::Rect>& screen_rects);
++
+   // Frames claiming visible inline-3D content -> the generation of the pipe
+   // that made the claim. Keyed by id rather than pointer so a dead frame
+   // resolves to null in ComputeWish() instead of dangling; valued by generation
+@@ -178,6 +203,14 @@ class DisplayXRDisplayModeController : public BrowserCollectionObserver {
+ 
+   base::OneShotTimer debounce_;
+ 
++#if BUILDFLAG(IS_WIN)
++  // browser#88. Enumerates the visible owned popup HWNDs and latches them as
++  // flat regions on the weave session. Debounced far more tightly than the
++  // display-mode decision above (see its kDebounce) — it moves a lens hint over
++  // already-correct pixels, not the whole panel.
++  std::unique_ptr<DisplayXRPopupOccluderTracker> popup_tracker_;
++#endif
++
+   // Last state handed to the runtime. Unset until the first apply, so the
+   // opening request always goes through.
+   bool applied_3d_ = false;
+diff --git a/chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc b/chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc
+new file mode 100644
+index 0000000000000..d3d8eabad1b29
+--- /dev/null
++++ b/chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc
+@@ -0,0 +1,352 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/displayxr/displayxr_popup_occluder_tracker.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "ui/aura/env.h"
++#include "ui/aura/window_tree_host.h"
++#include "ui/base/base_window.h"
++#include "ui/display/win/screen_win.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/win/hwnd_util.h"
++
++namespace displayxr {
++
++namespace {
++
++// Deliberately an order of magnitude shorter than the display-mode
++// controller's 300 ms. That timer guards a HARDWARE transition of the whole
++// panel, where being wrong costs a visible full-screen flicker, so it waits for
++// the world to settle. This one only moves a lens hint over pixels that are
++// already correct: nothing flickers if it is wrong, and popup open/close has to
++// feel instant — a third of a second of ghosting on every omnibox click is
++// exactly the bug being fixed. One frame's worth of coalescing is enough to
++// collapse the burst of host-init + show + bounds events a single popup emits,
++// which is all this needs to do (risk R8: it also bounds how often the runtime
++// pays for the immediate re-raster).
++constexpr base::TimeDelta kDebounce = base::Milliseconds(16);
++
++// Mirrors XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR (= 8) from XR_DXR_weave spec
++// v8. Not #included: chrome/browser must not depend on the vendored OpenXR
++// headers (they live behind //components/displayxr), so the number is
++// duplicated here and DisplayXRWeaveClient clamps again on its own side — the
++// same split patch 0067 used for the per-submit cap.
++constexpr size_t kMaxScreenFlatRects = 8;
++
++// Reduce |rects| to at most kMaxScreenFlatRects, largest-area-first.
++//
++// Same bias rule as CoarsenInline3dFlatRects() in
++// components/viz/service/display/direct_renderer.cc, and for the same reason:
++// dedupe is lossless (a rect fully inside a kept one adds nothing), but past
++// the cap we DROP rather than merge. A dropped popup keeps ghosting — the
++// pre-v8 status quo — whereas a bounding box around two popups would switch the
++// panel's 3D element off across the live 3D between them, turning a soft edge
++// into a mono regression. Never grow a rect.
++void Coarsen(std::vector<gfx::Rect>* rects) {
++  // Sorting first makes the containment test one-directional: a rect can only
++  // be contained by an EARLIER one, so exact duplicates collapse onto their
++  // first occurrence instead of eliminating each other.
++  //
++  // Area descending, then a positional tie-break. That tie-break is not
++  // cosmetic: the enumeration walks a std::set of Widget POINTERS, so without
++  // it equal-area popups would order by heap address — making both which one is
++  // dropped at the cap and whether the set compares equal to the last one
++  // depend on the allocator.
++  std::sort(rects->begin(), rects->end(),
++            [](const gfx::Rect& a, const gfx::Rect& b) {
++              if (a.size().Area64() != b.size().Area64()) {
++                return a.size().Area64() > b.size().Area64();
++              }
++              if (a.x() != b.x()) {
++                return a.x() < b.x();
++              }
++              if (a.y() != b.y()) {
++                return a.y() < b.y();
++              }
++              return a.width() < b.width();
++            });
++
++  std::vector<gfx::Rect> kept;
++  kept.reserve(std::min(rects->size(), kMaxScreenFlatRects));
++  size_t dropped = 0;
++  for (const gfx::Rect& r : *rects) {
++    if (r.IsEmpty()) {
++      continue;
++    }
++    bool contained = false;
++    for (const gfx::Rect& k : kept) {
++      if (k.Contains(r)) {
++        contained = true;
++        break;
++      }
++    }
++    if (contained) {
++      continue;
++    }
++    if (kept.size() < kMaxScreenFlatRects) {
++      kept.push_back(r);
++    } else {
++      ++dropped;
++    }
++  }
++  if (dropped > 0) {
++    static bool logged = false;
++    if (!logged) {
++      logged = true;
++      VLOG(1) << "[DisplayXR] popup occluders: " << dropped
++              << " past the cap of " << kMaxScreenFlatRects
++              << " — dropping the smallest (those regions keep ghosting)";
++    }
++  }
++  *rects = std::move(kept);
++}
++
++// The views::Widget of |browser|'s top-level window, or null.
++views::Widget* WidgetFor(BrowserWindowInterface* browser) {
++  ui::BaseWindow* window = browser->GetWindow();
++  if (!window) {
++    return nullptr;
++  }
++  gfx::NativeWindow native_window = window->GetNativeWindow();
++  if (!native_window) {
++    return nullptr;
++  }
++  return views::Widget::GetWidgetForNativeWindow(native_window);
++}
++
++}  // namespace
++
++DisplayXRPopupOccluderTracker::DisplayXRPopupOccluderTracker(SinkCallback sink)
++    : sink_(std::move(sink)) {}
++
++DisplayXRPopupOccluderTracker::~DisplayXRPopupOccluderTracker() {
++  StopObservingAllWidgets();
++  if (env_observed_ && aura::Env::HasInstance()) {
++    aura::Env::GetInstance()->RemoveObserver(this);
++  }
++}
++
++void DisplayXRPopupOccluderTracker::SetInline3DDemand(bool demanded) {
++  if (demanded_ == demanded) {
++    return;
++  }
++  demanded_ = demanded;
++  if (demanded_) {
++    // Only start watching once something actually wants 3D. Nothing before that
++    // point can produce a ghost, and this keeps the whole mechanism off in a
++    // browser that never opens an inline-3D page.
++    EnsureEnvObserved();
++  }
++  // Both directions schedule: true starts hinting, false clears the latch
++  // (risk R7 — the runtime holds the set until told otherwise, so "the panel
++  // went flat anyway" is not a reason to leave rects behind).
++  ScheduleRefresh();
++}
++
++void DisplayXRPopupOccluderTracker::OnBrowserWindowsChanged() {
++  ScheduleRefresh();
++}
++
++void DisplayXRPopupOccluderTracker::OnSinkReset() {
++  // A fresh GPU process means a fresh weave session, which latches nothing.
++  // Modelling that as "empty" rather than "unknown" is what stops a
++  // no-popups-open browser from sending a redundant clear through a pipe it
++  // would otherwise never have to bind.
++  latched_.clear();
++  ScheduleRefresh();
++}
++
++void DisplayXRPopupOccluderTracker::Shutdown() {
++  if (shutting_down_) {
++    return;
++  }
++  debounce_.Stop();
++  // Best-effort: the latch dies with the session anyway, but the GPU process
++  // can outlive the browser's teardown by a moment and a stale flat band is the
++  // one failure mode of this feature that is visible rather than merely absent.
++  if (!latched_.empty()) {
++    latched_.clear();
++    sink_.Run(latched_);
++  }
++  StopObservingAllWidgets();
++  shutting_down_ = true;
++}
++
++void DisplayXRPopupOccluderTracker::OnHostInitialized(
++    aura::WindowTreeHost* host) {
++  // A new top-level HWND exists. It is very likely not visible yet and may not
++  // even be parented yet, so do not try to read it here: schedule, and let the
++  // enumeration find it. If it is still not enumerable when the timer lands,
++  // the WidgetObserver attached on the next enumeration covers it, and if it
++  // never becomes an owned widget it was never a popup over the browser.
++  ScheduleRefresh();
++}
++
++void DisplayXRPopupOccluderTracker::OnWidgetBoundsChanged(
++    views::Widget* widget,
++    const gfx::Rect& new_bounds) {
++  ScheduleRefresh();
++}
++
++void DisplayXRPopupOccluderTracker::OnWidgetVisibilityChanged(
++    views::Widget* widget,
++    bool visible) {
++  ScheduleRefresh();
++}
++
++void DisplayXRPopupOccluderTracker::OnWidgetDestroying(views::Widget* widget) {
++  StopObservingWidget(widget);
++  ScheduleRefresh();
++}
++
++void DisplayXRPopupOccluderTracker::ScheduleRefresh() {
++  if (shutting_down_) {
++    return;
++  }
++  debounce_.Start(FROM_HERE, kDebounce,
++                  base::BindOnce(&DisplayXRPopupOccluderTracker::Refresh,
++                                 base::Unretained(this)));
++}
++
++void DisplayXRPopupOccluderTracker::Refresh() {
++  if (shutting_down_) {
++    return;
++  }
++  // Recomputed from scratch every time; nothing is carried forward. That is the
++  // R7 guard: the only way a rect survives is by still being there.
++  std::vector<gfx::Rect> rects =
++      demanded_ ? ComputeOccluders() : std::vector<gfx::Rect>();
++  if (rects == latched_) {
++    return;  // nothing moved; do not make the runtime re-raster for free
++  }
++  latched_ = std::move(rects);
++  sink_.Run(latched_);
++  VLOG(1) << "[DisplayXR] popup occluders: " << latched_.size()
++          << " rect(s) latched";
++}
++
++std::vector<gfx::Rect> DisplayXRPopupOccluderTracker::ComputeOccluders() {
++  std::vector<gfx::Rect> rects;
++  base::flat_set<views::Widget*> seen;
++
++  // Every browser window, not just the frontmost. Two reasons: it avoids a
++  // second copy of the display-mode controller's foreground policy that could
++  // drift from it, and it is strictly MORE correct — a popup belonging to
++  // another browser window that happens to overlap this one really is a flat
++  // HWND over that part of the panel, so flattening there is right. Rects that
++  // do NOT overlap cost nothing: the runtime intersects them with its own bound
++  // window's client area and they clip away (risk R9).
++  ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
++      [this, &rects, &seen](BrowserWindowInterface* browser) {
++        views::Widget* browser_widget = WidgetFor(browser);
++        if (!browser_widget) {
++          return true;
++        }
++        const views::Widget::Widgets owned =
++            views::Widget::GetAllOwnedWidgets(browser_widget->GetNativeView());
++        for (views::Widget* popup : owned) {
++          if (!popup || seen.contains(popup)) {
++            continue;  // owned sets of two windows can legitimately overlap
++          }
++          seen.insert(popup);
++
++          // Only separate TOP-LEVEL widgets. A non-top-level owned widget
++          // shares the browser's compositor, so its pixels DO reach Viz and are
++          // already covered by patch 0067's per-submit flat list — hinting it
++          // again would just spend one of eight wire slots twice.
++          if (!popup->is_top_level()) {
++            continue;
++          }
++          // IsVisible(), not IsVisibleOnScreen(): the strict test is derived
++          // from occlusion tracking and lags, and this hint has to land in the
++          // same frame the popup does. Over-hinting is confined to a popup on a
++          // hidden virtual desktop — where the browser window is not on the
++          // panel either, so there is nothing to flatten wrongly.
++          if (!popup->IsVisible()) {
++            continue;
++          }
++          const gfx::Rect dip = popup->GetWindowBoundsInScreen();
++          if (dip.IsEmpty()) {
++            continue;
++          }
++          // GetWindowBoundsInScreen() is DIP; the runtime wants absolute
++          // PHYSICAL screen px (the XrWeaveWindowGeometryDXR convention). Scale
++          // against the POPUP's own HWND so a popup on a second monitor with a
++          // different DSF converts against that monitor, not the browser's.
++          const HWND popup_hwnd = views::HWNDForWidget(popup);
++          const gfx::Rect screen =
++              display::win::GetScreenWin()->DIPToScreenRect(popup_hwnd, dip);
++          if (screen.IsEmpty()) {
++            continue;
++          }
++          rects.push_back(screen);
++
++          if (!observed_widgets_.contains(popup)) {
++            popup->AddObserver(this);
++            observed_widgets_.insert(popup);
++          }
++        }
++        return true;
++      });
++
++  // Drop observations of popups that are gone or no longer qualify, so the set
++  // does not grow for the life of the process. |seen| is the right filter
++  // rather than |rects|: a widget that still exists but is currently hidden
++  // must stay observed, or its next show would go unnoticed.
++  std::vector<views::Widget*> stale;
++  for (views::Widget* widget : observed_widgets_) {
++    if (!seen.contains(widget)) {
++      stale.push_back(widget);
++    }
++  }
++  for (views::Widget* widget : stale) {
++    StopObservingWidget(widget);
++  }
++
++  Coarsen(&rects);
++  return rects;
++}
++
++void DisplayXRPopupOccluderTracker::EnsureEnvObserved() {
++  if (env_observed_) {
++    return;
++  }
++  // Env is up long before anything can demand inline-3D (a window has to exist
++  // for a page to be in it), but this is not a place to CHECK.
++  if (!aura::Env::HasInstance()) {
++    return;
++  }
++  aura::Env::GetInstance()->AddObserver(this);
++  env_observed_ = true;
++}
++
++void DisplayXRPopupOccluderTracker::StopObservingWidget(
++    views::Widget* widget) {
++  auto it = observed_widgets_.find(widget);
++  if (it == observed_widgets_.end()) {
++    return;
++  }
++  observed_widgets_.erase(it);
++  widget->RemoveObserver(this);
++}
++
++void DisplayXRPopupOccluderTracker::StopObservingAllWidgets() {
++  // Copy first: RemoveObserver must not run while the set is being iterated.
++  std::vector<views::Widget*> widgets(observed_widgets_.begin(),
++                                      observed_widgets_.end());
++  observed_widgets_.clear();
++  for (views::Widget* widget : widgets) {
++    widget->RemoveObserver(this);
++  }
++}
++
++}  // namespace displayxr
+diff --git a/chrome/browser/displayxr/displayxr_popup_occluder_tracker.h b/chrome/browser/displayxr/displayxr_popup_occluder_tracker.h
+new file mode 100644
+index 0000000000000..fbf3072ad75ee
+--- /dev/null
++++ b/chrome/browser/displayxr/displayxr_popup_occluder_tracker.h
+@@ -0,0 +1,169 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_DISPLAYXR_DISPLAYXR_POPUP_OCCLUDER_TRACKER_H_
++#define CHROME_BROWSER_DISPLAYXR_DISPLAYXR_POPUP_OCCLUDER_TRACKER_H_
++
++// DisplayXR inline-3D popup occluders (browser#88, Phase 3 item B).
++//
++// THE PROBLEM. The omnibox dropdown, autofill popups and every menu are not
++// part of the browser's compositor output. Each is a separate OWNED top-level
++// HWND that DWM composites ABOVE the browser window, so its pixels never reach
++// Viz and can never be woven. The panel underneath, however, is still
++// physically 3D — the lens does not know the popup is there — so the popup's
++// perfectly flat pixels are viewed through a lenticular they did not ask for
++// and read soft and ghosted. (If you want the proof that this is structural
++// rather than incidental, see ui/views/controls/menu/menu_host.cc, which sets
++// force_software_compositing = true for menus on Windows: they are drawn by the
++// software compositor into their own HWND and there is no Viz frame to weave.)
++//
++// WHY THIS IS ITS OWN CHANNEL. Patch 0067 already lets the browser name flat
++// regions, but on the weave SUBMIT — so a region is only republished when a Viz
++// frame is produced. The failing case here is precisely the one with no frames:
++// an inline-3D page sitting IDLE (nothing animating, no damage) when the user
++// clicks the omnibox. A submit-chained wish would never republish and the popup
++// would ghost for as long as it stayed open. Hence XR_DXR_weave v8's STICKY
++// channel (xrWeaveSetScreenFlatRegionsDXR), which the runtime applies
++// immediately: it re-rasters and republishes the wish inside the call.
++//
++// WHAT THIS DOES NOT DO. It does NOT suppress weaving beneath a popup — no
++// subtracting popup rects from the weave rects, no skipping the draw-back
++// there. That was considered and rejected: the omnibox and autofill popups are
++// kTranslucent, with shadows and rounded corners, so a hole punched in the
++// woven output would show raw unwoven page through the popup's own translucency
++// instead of the woven content the user expects behind it. The ghost is a LENS
++// artefact, not a compositing one, and switching the panel's 3D element off
++// over the region removes it outright. Do not "optimize" this into a clip.
++//
++// HOW THE SET IS BUILT. Generically, from two hooks — deliberately NOT by
++// special-casing the three popup types, which would go stale the moment anyone
++// adds a fourth:
++//
++//  1. aura::EnvObserver::OnHostInitialized fires for every new desktop-aura
++//     host, i.e. every new top-level HWND. That is the universal "a popup may
++//     have appeared" edge; it is coarser than a views-level parent hook but it
++//     cannot be routed around by an unusual parenting choice.
++//  2. views::Widget::GetAllOwnedWidgets() on each browser window's native view
++//     then enumerates what actually exists. On Windows that walks the HWND
++//     OWNER relationship (DesktopWindowTreeHostWin::GetOwnedWindowTreeHosts),
++//     which is exactly the relationship DWM composites above the owner — so the
++//     enumeration and the visual problem have the same definition.
++//
++// Each enumerated popup gets a views::WidgetObserver so its subsequent moves,
++// shows/hides and destruction drive a recompute without waiting for another
++// host to be created.
++//
++// FULL SET, EVERY TIME. The runtime latch is sticky and wholesale, so a leaked
++// rect is a permanent flat band over live 3D (risk R7). The set is therefore
++// recomputed from scratch on every event, cleared when inline-3D demand goes
++// away, and cleared on teardown. Nothing accumulates.
++//
++// Browser process, UI thread. Windows-only: the coordinate conversion is
++// display::win::ScreenWin and the consumer is the Windows weave session.
++
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/timer/timer.h"
++#include "ui/aura/env_observer.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/widget/widget_observer.h"
++
++namespace aura {
++class WindowTreeHost;
++}  // namespace aura
++
++namespace views {
++class Widget;
++}  // namespace views
++
++namespace displayxr {
++
++class DisplayXRPopupOccluderTracker : public aura::EnvObserver,
++                                     public views::WidgetObserver {
++ public:
++  // Called with the full set of occluder rects in ABSOLUTE PHYSICAL SCREEN px,
++  // largest-area-first, whenever it changes. An empty vector clears the latch.
++  using SinkCallback =
++      base::RepeatingCallback<void(const std::vector<gfx::Rect>&)>;
++
++  explicit DisplayXRPopupOccluderTracker(SinkCallback sink);
++  ~DisplayXRPopupOccluderTracker() override;
++
++  DisplayXRPopupOccluderTracker(const DisplayXRPopupOccluderTracker&) = delete;
++  DisplayXRPopupOccluderTracker& operator=(
++      const DisplayXRPopupOccluderTracker&) = delete;
++
++  // The panel is only 3D when something demands inline-3D, and a flat hint on a
++  // panel that is already flat is noise. Pushed by the display-mode controller
++  // from its own wish rather than recomputed here, so there is exactly one
++  // definition of "the browser wants 3D" in the process. False clears the set.
++  void SetInline3DDemand(bool demanded);
++
++  // Something outside changed the browser's window set (a window opened,
++  // closed, or changed its active tab). Cheap; just schedules a recompute.
++  void OnBrowserWindowsChanged();
++
++  // The GPU process went away and a new one has nothing latched. Forget what we
++  // believe the runtime is holding — modelling the fresh session as "empty
++  // latch" rather than "unknown" is what keeps a browser with no popups open
++  // from sending a pointless clear (and so from binding the pipe at all).
++  void OnSinkReset();
++
++  // Clear the latch and go inert. For browser shutdown.
++  void Shutdown();
++
++  // aura::EnvObserver:
++  void OnHostInitialized(aura::WindowTreeHost* host) override;
++
++  // views::WidgetObserver:
++  void OnWidgetBoundsChanged(views::Widget* widget,
++                             const gfx::Rect& new_bounds) override;
++  void OnWidgetVisibilityChanged(views::Widget* widget, bool visible) override;
++  void OnWidgetDestroying(views::Widget* widget) override;
++
++ private:
++  // (Re)start the coalescing timer. Short on purpose — see kDebounce.
++  void ScheduleRefresh();
++
++  // Recompute, diff against what we last sent, and send if it moved.
++  void Refresh();
++
++  // Every visible owned top-level popup of every browser window, in absolute
++  // physical screen px, coarsened to the wire cap. Also (re)attaches the
++  // per-widget observations as a side effect, since it is the one place that
++  // enumerates.
++  std::vector<gfx::Rect> ComputeOccluders();
++
++  // Attach on first need. aura::Env exists by the time anything demands
++  // inline-3D, and a browser that never shows inline-3D never observes at all.
++  void EnsureEnvObserved();
++
++  void StopObservingWidget(views::Widget* widget);
++  void StopObservingAllWidgets();
++
++  SinkCallback sink_;
++
++  // Popups we currently hold a WidgetObserver on. Entries are removed in
++  // OnWidgetDestroying and when a refresh no longer finds them, so no key ever
++  // dangles.
++  base::flat_set<raw_ptr<views::Widget, CtnExperimental>> observed_widgets_;
++
++  // What the runtime is believed to be holding. Starts EMPTY-and-authoritative
++  // (a fresh session has no latch), which is what makes "send only on change"
++  // silent until there is actually a popup to report.
++  std::vector<gfx::Rect> latched_;
++
++  base::OneShotTimer debounce_;
++
++  bool env_observed_ = false;
++  bool demanded_ = false;
++  bool shutting_down_ = false;
++};
++
++}  // namespace displayxr
++
++#endif  // CHROME_BROWSER_DISPLAYXR_DISPLAYXR_POPUP_OCCLUDER_TRACKER_H_
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index cd20e4968102a..8586359d4e2df 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -85,6 +85,14 @@ struct WeaveClientState {
+   PFN_xrWeaveBindWindowDXR bind_window = nullptr;
+   PFN_xrWeaveSubmitDXR submit = nullptr;
+   PFN_xrWeaveSnapWindowRectDXR snap = nullptr;
++  // browser#88: the STICKY per-region wish channel (spec v8). NULL on a pre-v8
++  // runtime, which makes the whole popup-occluder path inert by construction.
++  PFN_xrWeaveSetScreenFlatRegionsDXR set_screen_flat_regions = nullptr;
++  // Last set we latched, so a recomputed-but-identical set never reaches the
++  // runtime. The runtime applies this one IMMEDIATELY (a ClearView + a vtable
++  // call under its render_mutex), so redundant calls are not free.
++  std::vector<DisplayXRWeaveClient::WeaveRect> latched_screen_flat;
++  bool latched_screen_flat_valid = false;
+   // browser#55: the panel's physical 2D/3D element. |request_display_mode| is
+   // the HARDWARE-only override (XR_DXR_display_info v15) — it does NOT stop the
+   // weave, so it is only ever asked for 2D once submission has already gone
+@@ -406,6 +414,15 @@ void InitializeCore(HWND hwnd) {
+                         reinterpret_cast<PFN_xrVoidFunction*>(&s.submit));
+   xrGetInstanceProcAddr(s.instance, "xrWeaveSnapWindowRectDXR",
+                         reinterpret_cast<PFN_xrVoidFunction*>(&s.snap));
++  // browser#88 (spec v8): the sticky screen-flat latch. Resolved only when the
++  // runtime actually reported v8 — a pre-v8 runtime has no such entry point,
++  // and leaving the PFN null is what makes SetScreenFlatRegions a silent no-op
++  // there rather than something every call site has to remember.
++  if (s.weave_spec_version >= 8) {
++    xrGetInstanceProcAddr(
++        s.instance, "xrWeaveSetScreenFlatRegionsDXR",
++        reinterpret_cast<PFN_xrVoidFunction*>(&s.set_screen_flat_regions));
++  }
+   // browser#55: both entry points are gated on XR_DXR_display_info, which we
+   // only enable when the runtime offers it — so they stay NULL on a runtime
+   // without it and every display-mode call becomes a no-op.
+@@ -1100,6 +1117,92 @@ bool RequestDisplayModeWin(bool three_d) {
+   return true;
+ }
+ 
++// browser#88 (Phase 3 item B): latch the panel regions that must stay flat.
++//
++// This is the STICKY half of the v8 per-region wish, and it exists because the
++// submit-chained half cannot cover browser-UI popups. A popup (omnibox
++// dropdown, autofill, menu) is a separate owned top-level HWND that DWM
++// composites ABOVE the browser: it never enters Viz, so it produces no submit
++// of its own, and the page under it may be perfectly IDLE — no damage, no frame
++// at all — for as long as the popup is open. A wish chained onto a submit would
++// therefore never republish and the popup would ghost the whole time it is up.
++// The runtime applies this call on the spot instead.
++//
++// Coordinates are ABSOLUTE PHYSICAL SCREEN px (the XrWeaveWindowGeometryDXR
++// convention); the runtime intersects them with its own bound window's client
++// area, so a rect from another browser window clips away to nothing rather than
++// being an error.
++void SetScreenFlatRegionsWin(
++    const std::vector<DisplayXRWeaveClient::WeaveRect>& screen_rects) {
++  WeaveClientState& s = State();
++  if (s.session == XR_NULL_HANDLE || !s.set_screen_flat_regions) {
++    return;  // dormant / init racing / pre-v8 runtime: inert by construction
++  }
++
++  // Clamp by dropping the TAIL. The producer hands rects largest-area-first
++  // (see DisplayXRPopupOccluderTracker), so the tail is the smallest popups;
++  // dropping one leaves its area 3D, i.e. the pre-v8 ghost. Merging the
++  // overflow into a bounding box would instead switch the lens off over working
++  // 3D, which is a mono regression. Never merge.
++  const size_t n = std::min<size_t>(screen_rects.size(),
++                                    XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR);
++  if (screen_rects.size() > n) {
++    static bool logged_cap = false;
++    if (!logged_cap) {
++      logged_cap = true;
++      VLOG(1) << "[DisplayXR] SetScreenFlatRegions: " << screen_rects.size()
++              << " rects exceed the cap "
++              << XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR
++              << " — dropping the smallest (those regions stay 3D)";
++    }
++  }
++
++  // Idempotence matters here in a way it does not for a per-frame chain: the
++  // runtime re-rasters and republishes the wish inside this call, under its
++  // render_mutex. Compare the clamped set we would actually send.
++  const bool same =
++      s.latched_screen_flat_valid && s.latched_screen_flat.size() == n &&
++      std::equal(s.latched_screen_flat.begin(), s.latched_screen_flat.end(),
++                 screen_rects.begin(),
++                 [](const DisplayXRWeaveClient::WeaveRect& a,
++                    const DisplayXRWeaveClient::WeaveRect& b) {
++                   return a.x == b.x && a.y == b.y && a.w == b.w &&
++                          a.h == b.h;
++                 });
++  if (same) {
++    return;
++  }
++
++  XrRect2Di xr_rects[XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR];
++  for (size_t i = 0; i < n; ++i) {
++    const DisplayXRWeaveClient::WeaveRect& r = screen_rects[i];
++    XrRect2Di& xr = UNSAFE_TODO(xr_rects[i]);
++    xr.offset.x = r.x;
++    xr.offset.y = r.y;
++    xr.extent.width = r.w;
++    xr.extent.height = r.h;
++  }
++
++  const XrResult r = s.set_screen_flat_regions(
++      s.session, static_cast<uint32_t>(n), n > 0 ? xr_rects : nullptr);
++  if (XR_FAILED(r)) {
++    static int s_fail = 0;
++    if (s_fail < 3) {
++      ++s_fail;
++      LOG(ERROR) << "[DisplayXR] xrWeaveSetScreenFlatRegionsDXR(n=" << n
++                 << ") failed: " << r;
++    }
++    // Deliberately do NOT record the set as latched: the runtime is holding
++    // whatever it held before, and pretending otherwise would suppress the
++    // retry that a later recompute (including the clearing one) represents.
++    return;
++  }
++
++  s.latched_screen_flat.assign(screen_rects.begin(), screen_rects.begin() + n);
++  s.latched_screen_flat_valid = true;
++  VLOG(1) << "[DisplayXR] screen-flat latch: " << n << " rect(s)";
++}
++
+ // #625 phase-snap (CEF parity): poll the bound window's client-area screen
+ // origin; when it changes (the user dragged/repositioned the browser window),
+ // drive xrWeaveSnapWindowRectDXR so the DP re-locks the interlace lattice to the
+@@ -1346,6 +1449,19 @@ bool DisplayXRWeaveClient::RequestDisplayMode(bool three_d) {
+ #endif
+ }
+ 
++// static
++void DisplayXRWeaveClient::SetScreenFlatRegions(
++    const std::vector<WeaveRect>& screen_rects) {
++#if BUILDFLAG(IS_WIN)
++  SetScreenFlatRegionsWin(screen_rects);
++#else
++  // No sticky wish plumbing on the mac weave path (and no weave at all
++  // elsewhere). Ignoring an advisory hint is conformant: the panel is simply 3D
++  // where the caller asked for flat, which is what ships today.
++  (void)screen_rects;
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::PreSandboxInitializeForGpuProcess() {
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index f4f6d0e8582d1..418b7a0b49e2c 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -82,8 +82,10 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+                                   uintptr_t overlay_handle = 0,
+                                   bool overlay_is_dxgi = false);
+ 
+-  // One window-relative device-pixel rect for SubmitBatch. Kept OpenXR- and
+-  // gfx-free so this header stays includable from chromium_code TUs.
++  // A plain integer box. Kept OpenXR- and gfx-free so this header stays
++  // includable from chromium_code TUs. The COORDINATE SPACE is not a property
++  // of the struct — each API below states its own (SubmitBatch: window-relative
++  // device px; SetScreenFlatRegions: absolute physical screen px).
+   struct WeaveRect {
+     int32_t x = 0;
+     int32_t y = 0;
+@@ -199,6 +201,33 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   // IsDisplayModeRequestable() is false. Returns true if the panel is now in the
+   // requested state. Browser process; Windows-only, a stub elsewhere.
+   static bool RequestDisplayMode(bool three_d);
++
++  // browser#88 (Phase 3 item B): latch the panel regions that must stay
++  // physically FLAT regardless of what any frame submits
++  // (xrWeaveSetScreenFlatRegionsDXR, XR_DXR_weave spec v8).
++  //
++  // |screen_rects| is ABSOLUTE PHYSICAL SCREEN px — NOT the window-relative
++  // space SubmitBatch's rects and flat_rects use. The runtime rebases against
++  // its own bound window and clips, so a rect naming panel area outside that
++  // window costs nothing.
++  //
++  // STICKY and WHOLESALE: the runtime holds this set until the next call, so
++  // every call must pass the FULL set, and an empty vector is the only way to
++  // clear it. A leaked non-empty set is a permanent flat band over live 3D —
++  // callers must clear when their reason for hinting goes away.
++  //
++  // Applied IMMEDIATELY (the runtime re-rasters and republishes the wish on the
++  // spot, no submit required) — which is the whole point of this channel over
++  // the submit-chained one: it works while the page is IDLE and producing no
++  // frames at all.
++  //
++  // Clamped to XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR by dropping the TAIL, so
++  // producers should hand rects largest-area-first; a dropped rect leaves its
++  // area 3D (pre-v8 ghosting), whereas merging into a bounding box would switch
++  // the lens off over working 3D. Never merge. ADVISORY: the hardware element
++  // moves, the woven pixels do not. A no-op on a runtime reporting weave spec
++  // < 8, and Windows-only (a stub elsewhere).
++  static void SetScreenFlatRegions(const std::vector<WeaveRect>& screen_rects);
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
+index 43fd44061909f..102fe5827e425 100644
+--- a/components/displayxr/common/displayxr_weave.mojom
++++ b/components/displayxr/common/displayxr_weave.mojom
+@@ -83,4 +83,22 @@ interface DisplayXRDisplayMode {
+   // no-op when the runtime is absent or a workspace controller owns display
+   // policy (checked GPU-side, where the session is).
+   SetDisplayMode(bool three_d);
++
++  // browser#88 (Phase 3 item B). Absolute PHYSICAL screen px of every visible
++  // owned popup HWND (omnibox dropdown, autofill, menus, tooltips, bubbles).
++  // DWM composites these ABOVE the browser window and they never enter Viz, so
++  // the runtime cannot see them: the panel stays physically 3D underneath and
++  // their flat pixels read soft and ghosted through the lens. Subtracted from
++  // the hardware wish (XR_DXR_weave v8's STICKY channel,
++  // xrWeaveSetScreenFlatRegionsDXR), which is why this rides its own message
++  // rather than the weave submit — the failing case is an IDLE inline-3D page
++  // (no damage, no Viz frame, no submit) when the user clicks the omnibox, and
++  // a submit-chained wish would never republish.
++  //
++  // FULL SET every time, not a delta; empty = no popups (clears the latch).
++  // Screen px, not window-relative: the runtime rebases against its own bound
++  // HWND, which also makes rects belonging to a DIFFERENT browser window clip
++  // to nothing for free. Advisory — it moves the panel's 3D element only and
++  // never gates, masks or reorders content.
++  SetPopupOccluders(array<gfx.mojom.Rect> screen_rects);
+ };
+diff --git a/components/displayxr/gpu/displayxr_display_mode_impl.cc b/components/displayxr/gpu/displayxr_display_mode_impl.cc
+index 8fbdd6af1bd49..68bd4bbadbfab 100644
+--- a/components/displayxr/gpu/displayxr_display_mode_impl.cc
++++ b/components/displayxr/gpu/displayxr_display_mode_impl.cc
+@@ -31,4 +31,23 @@ void DisplayXRDisplayModeImpl::SetDisplayMode(bool three_d) {
+   DisplayXRWeaveClient::RequestDisplayMode(three_d);
+ }
+ 
++void DisplayXRDisplayModeImpl::SetPopupOccluders(
++    const std::vector<gfx::Rect>& screen_rects) {
++  // browser#88. Straight pass-through to the v8 sticky wish channel: the
++  // browser owns the policy (which HWNDs, when, debounced) and the client owns
++  // the wire (spec gate, cap, idempotence). Nothing here can usefully refuse —
++  // a pre-v8 runtime leaves the entry point null and the call evaporates.
++  //
++  // gfx::Rect -> WeaveRect the same way the per-frame flat list is converted in
++  // displayxr_weave_gpu.cc, so the client header stays gfx-free. The ORDER is
++  // load-bearing (largest-area-first; the client clamps by dropping the tail),
++  // so it is preserved verbatim.
++  std::vector<DisplayXRWeaveClient::WeaveRect> rects;
++  rects.reserve(screen_rects.size());
++  for (const gfx::Rect& r : screen_rects) {
++    rects.push_back({r.x(), r.y(), r.width(), r.height()});
++  }
++  DisplayXRWeaveClient::SetScreenFlatRegions(rects);
++}
++
+ }  // namespace displayxr
+diff --git a/components/displayxr/gpu/displayxr_display_mode_impl.h b/components/displayxr/gpu/displayxr_display_mode_impl.h
+index 33fd0cc38b6b1..8be63853304ff 100644
+--- a/components/displayxr/gpu/displayxr_display_mode_impl.h
++++ b/components/displayxr/gpu/displayxr_display_mode_impl.h
+@@ -13,9 +13,18 @@
+ // per-client and the vendor unions lens hints across clients, so a request made
+ // on the browser process's own (snap/query-only) session would not clear the
+ // hint the weaving session set.
++//
++// browser#88 adds SetPopupOccluders on the same interface for exactly the same
++// reason: the popup rects become a STICKY per-region wish
++// (xrWeaveSetScreenFlatRegionsDXR) on the weaving session, and only the browser
++// can enumerate the popup HWNDs. Sharing one interface also keeps the two
++// messages ordered against each other on a single pipe.
++
++#include <vector>
+ 
+ #include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "ui/gfx/geometry/rect.h"
+ 
+ namespace displayxr {
+ 
+@@ -32,6 +41,8 @@ class DisplayXRDisplayModeImpl : public mojom::DisplayXRDisplayMode {
+ 
+   // mojom::DisplayXRDisplayMode:
+   void SetDisplayMode(bool three_d) override;
++  void SetPopupOccluders(
++      const std::vector<gfx::Rect>& screen_rects) override;
+ };
+ 
+ }  // namespace displayxr
+-- 
+2.42.0.windows.2
+

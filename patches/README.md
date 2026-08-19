@@ -1,8 +1,50 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **68 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **69 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patch 0069 stops **browser-UI popups ghosting** (browser#88, Phase 3 Stage 4 item B). The omnibox
+dropdown, the autofill popups and every menu are separate OWNED top-level HWNDs that DWM composites
+ABOVE the browser window: they never enter Viz and can never be woven, yet the panel underneath stays
+physically 3D, so their perfectly flat pixels are viewed through a lenticular they did not ask for and
+read soft and ghosted. (`ui/views/controls/menu/menu_host.cc` sets `force_software_compositing = true`
+on Windows for menus — there is no Viz frame to weave, by construction.) 0067's flat-regions channel
+cannot reach this case because it rides the weave SUBMIT: the failing scenario is an inline-3D page
+sitting IDLE — no damage, no Viz frame, no submit at all — when the user clicks the omnibox, so a
+submit-chained wish would never republish and the popup would ghost for as long as it stayed open.
+This therefore uses v8's OTHER half, the STICKY `xrWeaveSetScreenFlatRegionsDXR`, which the runtime
+applies on the spot (it re-rasters and republishes the wish inside the call, no submit needed). The
+popups are enumerated GENERICALLY rather than by special-casing the three types that motivated the
+bug: `aura::EnvObserver::OnHostInitialized` is the universal "a new top-level HWND exists" edge and
+`views::Widget::GetAllOwnedWidgets()` on each browser window's native view says what those HWNDs
+actually are — on Windows that walks the HWND OWNER relation, which is *the same relation DWM
+composites above the owner*, so the enumeration and the visual problem share one definition; each
+enumerated popup then carries a `WidgetObserver` for its own moves, shows and destruction. Tooltips,
+bubbles, extension popups and anything future fall out for free. What is deliberately NOT done is
+suppressing the weave beneath a popup: subtracting those rects from the weave rects, or skipping the
+draw-back there, would show raw unwoven page through a `kTranslucent` popup's shadow and rounded
+corners — the ghost is a LENS artefact, not a compositing one, so switching the panel's 3D element off
+over the region *is* the whole fix, and there is a comment saying so because it looks like an
+optimization someone will want to make. Transport extends the EXISTING browser→GPU
+`DisplayXRDisplayMode` interface with `SetPopupOccluders` rather than adding a fifth, keeping both
+messages ordered on one pipe and the display-mode controller the single owner of it; the browser owns
+policy (which HWNDs, when, debounced **16 ms** — an order of magnitude tighter than the controller's
+300 ms, because that timer guards a hardware transition of the whole panel while this one only moves a
+lens hint over already-correct pixels and popup open/close has to feel instant) and the weave client
+owns the wire (spec-v8 gate, clamp to 8, idempotence — the runtime's immediate re-raster is a
+`ClearView` plus a vtable call under its `render_mutex`, so a redundant call is not free). The wish
+comes from the controller rather than a second copy of the foreground policy, pushed from `Apply()`
+BEFORE its early returns, which fire when the panel needs no change and say nothing about whether the
+latch does. Leak safety is the one failure mode here that is visible rather than merely absent — a
+leaked rect is a permanent flat band over live 3D — so the set is full-every-time and never a delta,
+recomputed from scratch on every event, sent as `{}` when inline-3D demand goes false, cleared on
+shutdown, and re-asserted after a GPU crash (a fresh session latches nothing, so the reconnect is
+modelled as an EMPTY latch rather than an unknown one, which also keeps a browser with no popups open
+from binding the pipe at all). Past the 8-rect cap the smallest are DROPPED, never merged — a dropped
+popup keeps ghosting, whereas a bounding box would switch the lens off across the working 3D between
+two popups — the same bias rule as 0067, with a positional tie-break added so which rect loses does
+not depend on the allocator. Windows only, and against a pre-v8 runtime the entry point does not
+resolve and the entire path is inert.
 Patch 0068 is **D′ — frosted glass** (browser#88, Phase 3 Stage 3), and it closes the worst cell of the
 occlusion matrix. An excluded render pass carrying a BACKDROP FILTER over a woven tile used to lose
 outright: it cannot join the Phase-2 over-plane (a backdrop filter samples a backdrop that plane does
