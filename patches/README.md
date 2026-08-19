@@ -1,8 +1,92 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **65 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **68 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patch 0068 is **D′ — frosted glass** (browser#88, Phase 3 Stage 3), and it closes the worst cell of the
+occlusion matrix. An excluded render pass carrying a BACKDROP FILTER over a woven tile used to lose
+outright: it cannot join the Phase-2 over-plane (a backdrop filter samples a backdrop that plane does
+not have) and it cannot stay under the weave (the woven tile is drawn back opaquely), so a frosted card
+over an inline-3D element simply disappeared behind it. D′ is one decision with three coupled effects,
+all driven from a single recording in the split pass: the woven draw-back is CLIPPED OUT of the
+element's rect (`SkClipOp::kDifference`, so `output`'s own crisp page-drawn glass shows through); the
+same rect JOINS 0067's flat list, so a capable panel switches its 3D element off there and the region
+does not ghost either; and what is lost is DEPTH BEHIND IT, because the page drew that blur against the
+flat page backdrop — at page-draw time the woven pixels did not exist. That is strictly better than
+both alternatives (element invisible, or element smeared through the interlace lattice), and it is why
+the wish's usual "never flatten working 3D" guard does not apply to these rects: the clip already
+removed the 3D from under them. The two halves must therefore never be separated — a frosted rect in
+the flat list that was NOT punched out of the draw-back would switch the lens off over live woven
+pixels — and they cannot be, because both come from the same draw-time pass (risk guard R12) and
+travel on the same GPU task. Two details are load-bearing. The clip uses the quad's OWN
+mapped+clipped rect, not the influence rect the split already had (they differ only for an RPDQ, whose
+rect is expanded by `GetExpandedRectForPixelMovingFilters`): punching out a blur's REACH would leave a
+halo where the weave is gone and the page has nothing to show. And the clip is NOT anti-aliased — an
+AA edge would blend woven and page pixels in a one-pixel seam, and blending into woven pixels breaks
+the interlace lattice, the same reason the draw itself samples NEAREST. The frosted rects are not
+capped (the wire cap bounds the wish only; dropping a clip would resurrect the vanishing-element bug)
+but they ARE counted in the flat list's `raw/sent/dropped` accounting, and the plane-split marker
+gains `frosted=N`. Frame-scoped and single-use like the flat list, and drained before phase (B)'s early
+returns: a stale flat rect only ghosts, a stale CLIP punches raw page through a live weave. Windows
+only — the macOS synchronous draw-back still draws the whole window, so frosted elements keep their
+pre-Stage-3 behaviour there.
+Patch 0067 is the **browser half of the per-region hardware wish** (browser#88, Phase 3 Stage 2); the
+runtime half shipped as `XR_DXR_weave` spec **v8** (displayxr-runtime#1065). Until v8 the weave path
+drove the panel's physical 3D element all-or-nothing: one woven element held the WHOLE panel behind
+the lens, so the flat 2D around and over it was viewed through a lenticular it did not want — the
+ghosting the browser ships today. v8 lets the caller name the flat regions and the runtime derives
+`wish = union(submitted weave rects) − union(flat rects)`, publishing it to the display processor,
+which switches its 3D element per region where the hardware can (ADR-027 Decision 5). The flat list
+comes from nowhere new: the Phase-2 draw-order split already knows which page quads were lifted OVER a
+tile, so `ComputeInline3dPlaneSplit` now emits, from the SAME admissions that fill
+`inline3d_over_clips_`, the intersection of each admitted quad's rect with the tile it covers — one
+pass, two lists, no second coordinate derivation to drift. Two rules are the whole patch. **Opaque
+only** (a tightening over the design sketch): the over set admits translucent `kSrcOver` content too —
+a scrim, a fade, a rounded-corner mask — and there the woven 3D still shows THROUGH the 2D, so calling
+it flat would switch the lens off over working 3D content, the one failure this feature must never
+cause; the producer gates on `DrawQuad::ShouldDrawWithBlending()`, which covers every way a quad can
+be non-opaque over the tile, and a translucent quad simply leaves its area 3D. **Drop, never merge**:
+over the wire cap of 16 (`XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR`) the list is reduced by
+strict-containment dedupe (lossless) then largest-area-first truncation, DISCARDING the smallest —
+bounding-box merging is never done, not even for rects that look adjacent, because a flat rect that
+GREW flattens working 3D (a mono regression) whereas a MISSING one leaves that area 3D (the
+already-shipped ghosting), and the plane-split marker now reports
+`flat{raw/sent/dropped/translucent}` so a drop is visible rather than silent. The list rides
+`SetInline3dOverPlane` — the same GPU task as the plane it describes, so the atomicity the wish depends
+on is the FIFO queue's, not a second sync — is DRAINED at the batch (single use, so an error path that
+skips a publish cannot re-send a stale wish against a later frame's rects), and reaches the runtime
+through a new `DisplayXRWeaveProvider::SetBatchWish`, deliberately NOT `SetBatchOverlay`: that channel
+is reserved for handing the DP an over-plane to composite and it moves PIXELS, whereas this one moves
+only the hardware element. The client chains `XrWeaveSubmitFlatRegionsDXR` on the LAST batch chunk (the
+v4 overlay precedent — one whole-window statement, landing once after every rect has woven), spliced
+ahead of whatever is already chained so it composes with the overlay chain rather than replacing it,
+and gated on the runtime's reported `weave_spec_version >= 8`. The gate is deliberate even though a
+pre-v8 runtime would skip an unknown chained struct anyway: the browser does not get to assume every
+shipped runtime walks unknown chains politely, so the gate makes the pre-v8 wire byte-IDENTICAL rather
+than merely probably-ignored. Empty list, pre-v8 runtime, macOS, or a DP with no per-region capability
+all reduce to exactly today's behaviour — the wish is advisory in the ADR-027 Decision 6 / ADR-030
+sense: it moves the hardware element and nothing else, and the woven pixels are bit-identical with and
+without it. The vendored `XR_DXR_weave.h` is re-synced from the runtime canonical at spec v8; v7 and v8
+are purely ADDITIVE over the v6 copy it replaced (verified: no existing `XrStructureType` value, struct
+layout or entry point changed), so `Local modifications: none` stays true.
+Patch 0066 is **Phase 3 Stage 0** (browser#90): two defects that left the display-mode policy latched
+at the wrong answer across a navigation, both browser-side only — nothing in the runtime or the
+extension wire protocol moves. C-1, the reported bug: navigating away from a 3D page left the panel in
+3D, because a document in the back/forward cache keeps its `DisplayXRService` pipe (so its demand is
+never retracted) and renderer-side retraction is not even available once the execution context is
+destroyed. `ComputeWish()` already discounted it, but nothing on a same-tab navigation ever asked — the
+controller woke only on demand events and browser create/close/activate/deactivate/active-tab-change.
+The fix is a `WebContentsObserver` on each window's active tab overriding `PrimaryPageChanged()` to
+`ScheduleApply()`: it fires on cross-document commits, bfcache restores and prerender activations, and
+deliberately not on same-document navigations, which a live inline-3D session is expected to survive.
+C-2 is a latent permanent-stuck-2D race, fixed here because C-1's fix makes navigation a hot path: on
+a same-RFH cross-document navigation the new document binds a fresh pipe with the SAME
+`GlobalRenderFrameHostId`, and the old pipe's destructor retraction is unordered against the new pipe's
+first `SetInline3DDemand(true)` — if the retraction lands second it erases the NEW document's claim,
+and since the renderer is edge-triggered it never re-reports. A generation token fixes it:
+`DisplayXRServiceImpl` mints an `instance_id_` from a process-global counter, `demanding_frames_`
+becomes id → generation, a demand is newest-claimant-wins, and a retraction erases only when the
+stored generation matches — a stale retraction is dropped instead of clearing a live claim.
 Patch 0065 makes the split the DEFAULT and deletes the mechanism it replaced. The 0064 A/B passed on
 real hardware — per-pixel occlusion of content that declared nothing, the DP overlay atlas confirmed
 dormant, translucent chrome over the weave verified by eye — so `chrome_main_delegate.cc` now appends
