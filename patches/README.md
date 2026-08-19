@@ -1,8 +1,42 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **64 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **65 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+Patch 0065 makes the split the DEFAULT and deletes the mechanism it replaced. The 0064 A/B passed on
+real hardware — per-pixel occlusion of content that declared nothing, the DP overlay atlas confirmed
+dormant, translucent chrome over the weave verified by eye — so `chrome_main_delegate.cc` now appends
+`--inline-3d-occlusion` by default alongside `enable-inline-3d` and `inline-3d-sync-weave`, and
+`--disable-inline-3d-occlusion` stays the escape hatch that beats an explicit opt-in. Pages get the
+capability as a STATIC readonly `XRDisplayLayer.occlusionByDrawOrder` — static because it mirrors a
+process-wide switch, is readable before any layer exists, and living on the interface object rather
+than the prototype sidesteps Blink's illegal-invocation trap; it reads the RENDERER's own command
+line, which is the same switch the GPU process's split runs under (one switch, three readers). With
+that in place `excludeElement()`/`unexcludeElement()` become validate-and-no-op: arguments are still
+checked, `composite:"under"` still throws `NotSupportedError` because 2D UNDER the weave is a
+different pipeline and still unimplemented, and one throttled console warning per layer points the
+author at `occlusionByDrawOrder`. Nothing is recorded — there is no consumer left, so keeping the set
+would be a lie about what happens. Then the declared model goes, end to end: the `kInline3dOverlay`
+tracked-element feature; `Inline3dExclusion` and its two rect lists on the frame metadata, with the
+mojom struct, typemaps, traits and test; the cc plumbing behind them (`commit_state`,
+`layer_tree_host`, `layer_tree_impl`, `layer_tree_host_impl`, `layer_context` and its three
+implementations, `frame_widget`, `web_frame_widget_impl`) — taking care that 0049's viewport-fixed
+split and 0056's scroll base each lose only their exclusion-typed half, because the canvas metadata
+channel still needs the scroll shift; the aggregator's two-pass exclusion merge, the
+exclusion→quad join with its `ID_JOIN_MISS`/`GEOM_FALLBACK`/`PROMOTION_LOST`/`UNCOMPOSITABLE`/
+`EXCL_ABSENT` markers and per-id throttle, the overlay z-sort and the `quad_ordinal` that existed only
+to feed it; `AggregatedFrame::inline_3d_overlays`; `display.cc`'s overlay resolve and
+overlay-resource suppression; and in the GPU stage the Windows overlay atlas, both mac atlases, their
+four members and the mac legacy overlay draw-back loop. Two keeps are deliberate: `best_match` stays
+because the canvas ID-MATCH FALLBACK still calls it (a live dependency, not exclusion residue), and
+the provider's `SetBatchOverlay`/`SetBatchOverlayMac` virtuals stay caller-less with a comment saying
+why — that is the channel for handing the DP an over-plane to composite itself (Phase 3), the
+runtime-side v4 contract is shipped, and keeping the binding costs nothing. What the kill switch means
+changes with this patch and is worth stating plainly: with the atlas deleted,
+`--disable-inline-3d-occlusion` turns off the plane split and leaves NO occlusion at all rather than
+falling back to Phase 1, so undeclared 2D over a tile is woven again. That is intended — the switch
+guards against plane-split bugs, not against needing a Phase-1 revert, which is now a revert of this
+patch.
 Patch 0064 makes **Phase 2 (occlusion)** real: the flag now composites the split. Four things go live
 together, because none of them is correct alone. The difference clip is enabled (the one bool 0063
 left false), so the page raster is punched out of the tile rects; `WeaveCompositedSurface`'s phase (B)
