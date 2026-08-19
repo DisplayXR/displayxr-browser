@@ -1,0 +1,745 @@
+From f7e12697b828ef25a48ebb27906851f5a610f3d2 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 18 Aug 2026 18:07:20 -0700
+Subject: [PATCH 60/62] inline-3d(Phase 1): match an inline-3D canvas to its
+ quad by identity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Builds the canvas half of the identity join on top of the plumbing patch,
+and fixes the reason it could never have worked before.
+
+THE JOIN DID NOT EXIST NATURALLY. A kInline3dWeave tracked rect rides the
+element's BACKGROUND paint chunk — ReplacedPainter forces one onto an
+otherwise undecorated canvas for exactly that purpose — and that chunk
+merges into the enclosing PictureLayer. The canvas PIXELS, meanwhile, are
+a ForeignLayer from HTMLCanvasElement::ContentsCcLayer(), which
+PendingLayer::RequiresOwnLayer() always keeps separate. Two LayerImpls,
+two stable ids. LayerTreeHostImpl already says as much out loud, in the
+comment about the inline-3d chunk landing on "a layer with no drawable
+content".
+
+So HTMLCanvasPainter now registers the rect directly on the ForeignLayer
+(layer-local, cc projects it through the layer's ScreenSpaceTransform at
+draw time), and ReplacedPainter stops forcing the background item for a
+canvas whose ONLY tracked feature is kInline3dWeave — the branch stays
+for region capture and the other features. Emitting both copies would
+hand the same token two different layer ids every frame.
+
+The aggregator then:
+  - carries {rect, element token, sqs_layer_id, namespace} per weave rect
+    instead of a bare rect, on both channels (the legacy metadata channel
+    supplies zeroes, which is the documented "no identity" case);
+  - sorts ID-FIRST. The old (y,x,w,h) order was stable only while nothing
+    moved: two tiles crossing during a scroll swapped indices, and the
+    index-keyed GPU state followed the wrong tile for a frame. Geometry
+    stays as the tiebreak so legacy rects keep today's order;
+  - tries an exact (namespace, layer id) match before the geometric
+    best_match, which is kept verbatim as the fallback. When the exact
+    join cannot be used it logs a throttled "inline-3D ID-MATCH FALLBACK"
+    with a reason string, because the two reasons — nothing stamped vs
+    stamped-but-unclaimed — need different follow-ups;
+  - collapses duplicate ids. Reachable on an ordinary page: a canvas that
+    also has a background colour, a touch-action region, or a wheel
+    handler still records its background chunk, so both copies ship. The
+    collapse keeps the one whose layer id actually names a root quad. It
+    is deliberately not a DCHECK — this must degrade, not crash.
+
+The token then rides the whole way to the GPU: AggregatedFrame's weave
+rects and canvas resources, SkiaOutputSurface::Inline3dRect and
+Inline3dLayerMailbox. Nothing keys off it yet — the GPU stage still
+tracks targets positionally and projects the identity away — that is the
+next patch. DirectRenderer (the mac overlay-substitution path) only ever
+wanted geometry, so Display projects at the call site rather than churn
+its interface.
+
+Token persistence across close(): close() must still clear the element's
+registration, or a dormant tile would keep emitting weave rects. But the
+SDK re-creates an XRDisplayLayer for the same canvas on every lazy
+re-activation, and a fresh random token each time would orphan the
+GPU-side per-target state on every scroll. Rather than cache the token
+(Element is not Supplementable, and a static weak map or a new core
+rare-data field are both heavier than the problem), XRDisplayLayer now
+DERIVES it: a per-renderer-process random high word, minted once, plus
+the element's DOMNodeId as the low word. Stable for the element's
+lifetime, unique across the several renderers one Viz Display aggregates,
+and structurally correct — there is no cache to miss or outlive the
+element.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../viz/service/display/aggregated_frame.h    |  20 ++-
+ components/viz/service/display/display.cc     |  24 ++-
+ .../viz/service/display/skia_output_surface.h |  16 +-
+ .../viz/service/display/surface_aggregator.cc | 166 +++++++++++++++---
+ .../viz/service/display/surface_aggregator.h  |  16 +-
+ .../skia_output_surface_impl.cc               |   2 +-
+ .../skia_output_surface_impl.h                |   2 +-
+ .../skia_output_surface_impl_on_gpu.cc        |  11 +-
+ .../skia_output_surface_impl_on_gpu.h         |   2 +-
+ .../core/paint/html_canvas_painter.cc         |  36 ++++
+ .../renderer/core/paint/replaced_painter.cc   |  35 +++-
+ .../renderer/modules/xr/xr_display_layer.cc   |  50 +++++-
+ 12 files changed, 344 insertions(+), 36 deletions(-)
+
+diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
+index 60b8d32..ad299b9 100644
+--- a/components/viz/service/display/aggregated_frame.h
++++ b/components/viz/service/display/aggregated_frame.h
+@@ -10,6 +10,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "base/token.h"
+ #include "components/viz/common/quads/aggregated_render_pass.h"
+ #include "components/viz/common/resources/resource_id.h"
+ #include "components/viz/common/surfaces/tracked_element_rects.h"
+@@ -74,7 +75,18 @@ class VIZ_SERVICE_EXPORT AggregatedFrame {
+   // DisplayXR inline-3D (#625, Step B / B4b): the page's inline-3d canvas rects,
+   // aggregated and transformed to the root render pass space, for the post-paint
+   // output weave loop.
+-  std::vector<gfx::Rect> inline_3d_rects;
++  //
++  // Phase-1 identity: |id| is the element's TrackedElementId. The GPU stage
++  // keys its per-target weave state (woven mailbox, scratch image, provider
++  // slot, in-flight submit) by this token instead of by vector index, so a
++  // target keeps its state when tiles are added, removed, or reordered.
++  // Zero on the legacy main-thread metadata channel, which has no identity —
++  // those targets fall back to positional behaviour.
++  struct Inline3dTrackedRect {
++    gfx::Rect rect;
++    base::Token id;
++  };
++  std::vector<Inline3dTrackedRect> inline_3d_rects;
+ 
+   // DisplayXR overlay-exclusion rects (browser#18): the on-screen rects of 2D UI
+   // painted over a woven element, aggregated + transformed to root render pass
+@@ -99,6 +111,12 @@ class VIZ_SERVICE_EXPORT AggregatedFrame {
+     // the sampler over-reach and edge-clamp into a downward smear.
+     gfx::Rect visible_rect;
+     gfx::RectF uv{0.f, 0.f, 1.f, 1.f};
++    // Phase-1 identity: the TrackedElementId of the inline-3d element this
++    // resource belongs to, so the GPU stage can key state by identity rather
++    // than by position. Set on canvas resources; zero on overlays, which have
++    // no tracked element of their own (they are matched geometrically to an
++    // exclusion rect).
++    base::Token id;
+   };
+   std::vector<Inline3dLayerResource> inline_3d_overlays;
+   std::vector<Inline3dLayerResource> inline_3d_canvas_resources;
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index 5b8e152..b6f8012 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -998,12 +998,20 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+             for (const auto& layer : in) {
+               gpu::Mailbox m = resource_provider_->GetMailbox(layer.resource_id);
+               if (!m.IsZero()) {
+-                out.push_back({m, layer.rect, layer.visible_rect, layer.uv});
++                out.push_back(
++                    {m, layer.rect, layer.visible_rect, layer.uv, layer.id});
+               }
+             }
+             return out;
+           };
+-      skia_output_surface_->SetInline3DRects(frame.inline_3d_rects,
++      // Phase-1 identity: the GPU stage keys its per-target weave state by the
++      // element token, so carry {rect, id} rather than bare rects.
++      std::vector<SkiaOutputSurface::Inline3dRect> weave_rects;
++      weave_rects.reserve(frame.inline_3d_rects.size());
++      for (const auto& r : frame.inline_3d_rects) {
++        weave_rects.push_back({r.rect, r.id});
++      }
++      skia_output_surface_->SetInline3DRects(std::move(weave_rects),
+                                              resolve(frame.inline_3d_overlays),
+                                              resolve(frame.inline_3d_canvas_resources));
+     }
+@@ -1027,7 +1035,17 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+     // DisplayXR inline-3D weave (mac): the renderer also needs the rects so it
+     // can substitute each inline-3d canvas overlay's mailbox with a woven
+     // scratch inside ScheduleOverlays (where the overlay lock is recorded).
+-    renderer_->SetInline3DRects(frame.inline_3d_rects);
++    // The mac renderer path only ever needed the geometry (it substitutes an
++    // overlay's mailbox by rect inside ScheduleOverlays), so project away the
++    // identity here rather than churn DirectRenderer's interface.
++    {
++      std::vector<gfx::Rect> renderer_rects;
++      renderer_rects.reserve(frame.inline_3d_rects.size());
++      for (const auto& r : frame.inline_3d_rects) {
++        renderer_rects.push_back(r.rect);
++      }
++      renderer_->SetInline3DRects(renderer_rects);
++    }
+     renderer_->DrawFrame(&frame.render_pass_list, device_scale_factor_,
+                          current_surface_size, display_color_spaces_,
+                          std::move(frame.surface_damage_rect_list_),
+diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
+index 292677c..6a47d12 100644
+--- a/components/viz/service/display/skia_output_surface.h
++++ b/components/viz/service/display/skia_output_surface.h
+@@ -10,6 +10,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/token.h"
+ #include "build/build_config.h"
+ #include "components/viz/common/quads/aggregated_render_pass.h"
+ #include "components/viz/common/resources/resource_id.h"
+@@ -218,6 +219,19 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
+     // normalized sub-rect of the resource that |rect| shows.
+     gfx::Rect visible_rect;
+     gfx::RectF uv{0.f, 0.f, 1.f, 1.f};
++    // Phase-1 identity: the TrackedElementId of the inline-3d element this
++    // resource belongs to (zero for overlays and for the legacy channel), so
++    // the GPU stage can pair a canvas resource with its target by name rather
++    // than by overlap.
++    base::Token id;
++  };
++
++  // DisplayXR inline-3D: one weave target — where to weave, and WHICH element
++  // it is. The GPU stage keys per-target state by |id|; a zero id means the
++  // legacy channel supplied this rect and there is no identity to key by.
++  struct Inline3dRect {
++    gfx::Rect rect;
++    base::Token id;
+   };
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): set the page's inline-3d canvas
+@@ -228,7 +242,7 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
+   // layer is a resolved SharedImage mailbox + root-space rect. Consumed by the
+   // GPU-thread post-paint output weave loop. Default no-op off Skia/Windows.
+   virtual void SetInline3DRects(
+-      std::vector<gfx::Rect> rects,
++      std::vector<Inline3dRect> rects,
+       std::vector<Inline3dLayerMailbox> overlays,
+       std::vector<Inline3dLayerMailbox> canvas_layers) {}
+ 
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 379d482..328ffde 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2400,12 +2400,25 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   // DisplayXR inline-3D (#625): deterministic order — the weave consumer keys
+   // per-target state by vector index, and the tracked-element and legacy paths
+   // enumerate in different orders.
+-  std::ranges::sort(
+-      inline_3d_rects_, [](const gfx::Rect& a, const gfx::Rect& b) {
+-        return std::make_tuple(a.y(), a.x(), a.width(), a.height()) <
+-               std::make_tuple(b.y(), b.x(), b.width(), b.height());
+-      });
+-  frame.inline_3d_rects = std::move(inline_3d_rects_);
++  //
++  // Phase-1 identity: order by ID FIRST. The old (y,x,w,h) order was stable
++  // only while nothing moved: two tiles crossing in the scroll direction swap
++  // their indices, and the index-keyed GPU state (woven mailbox, scratch
++  // image, provider slot, in-flight submit) then followed the wrong tile for a
++  // frame. Identity does not flip. The geometric comparison stays as the
++  // tiebreak so legacy (zero-id) rects keep exactly today's order. Ordering
++  // still matters even once the GPU keys by token: the provider's batch
++  // contract puts the frame's fresh woven/fence handles on the FIRST entry.
++  std::ranges::sort(inline_3d_rects_, [](const Inline3dTrackedRect& a,
++                                         const Inline3dTrackedRect& b) {
++    if (a.id != b.id) {
++      return a.id < b.id;
++    }
++    return std::make_tuple(a.rect.y(), a.rect.x(), a.rect.width(),
++                           a.rect.height()) <
++           std::make_tuple(b.rect.y(), b.rect.x(), b.rect.width(),
++                           b.rect.height());
++  });
+   // Exclusion holes (browser#18): same deterministic order for stable logging /
+   // comparison only — the weave consumer associates them to targets
+   // geometrically, never by index.
+@@ -2479,6 +2492,78 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     }
+     return found;
+   };
++  // DisplayXR Phase-1 identity: the EXACT join, tried before best_match above.
++  // A tracked rect was collected FROM a cc::LayerImpl, and that same LayerImpl
++  // stamped its stable id into the SharedQuadState of every quad it emitted;
++  // the aggregator then namespaced both by client. So equality on
++  // (namespace, layer id) names the quads that draw this element's pixels —
++  // no overlap score, no scroll-lag sensitivity, no ambiguity between
++  // co-located quads. Returns nullopt when the rect carries no identity
++  // (legacy channel) or when nothing in the root pass claims it.
++  auto id_match = [](const Inline3dTrackedRect& target,
++                     const std::vector<RootResourceQuad>& quads)
++      -> std::optional<RootResourceQuad> {
++    if (target.sqs_layer_id == 0) {
++      return std::nullopt;
++    }
++    std::optional<RootResourceQuad> found;
++    for (const RootResourceQuad& cand : quads) {
++      if (cand.sqs_layer_id == target.sqs_layer_id &&
++          cand.layer_namespace_id == target.layer_namespace_id) {
++        // LAST match wins, matching best_match's tie policy: one layer can
++        // emit several quads and the later one is the topmost.
++        found = cand;
++      }
++    }
++    return found;
++  };
++  // Phase-1 identity, risk L2 — DUPLICATE ID. One element can emit more than
++  // one tracked rect in a frame: HTMLCanvasPainter registers the rect on the
++  // canvas's ForeignLayer, and a canvas that ALSO records a background paint
++  // chunk (it has a background colour, a touch-action region, or a wheel
++  // handler) emits a second copy that merges into the enclosing PictureLayer.
++  // Same token, different layer ids — and the GPU keys per-target state by
++  // token, so it cannot hold both. Collapse them, keeping the copy whose layer
++  // id actually names a root resource quad, i.e. the layer holding the pixels.
++  // The id-primary sort above has already made duplicates adjacent.
++  {
++    std::vector<Inline3dTrackedRect> deduped;
++    deduped.reserve(inline_3d_rects_.size());
++    for (const Inline3dTrackedRect& r : inline_3d_rects_) {
++      if (!r.id.is_zero() && !deduped.empty() && deduped.back().id == r.id) {
++        // Deliberately NOT a DCHECK: this is reachable on a perfectly ordinary
++        // page (any inline-3d canvas with a background colour), so it must
++        // degrade, not crash. Prefer the copy that id-matches a root resource
++        // quad; failing that, prefer one that carries an identity at all.
++        const uint32_t incumbent_layer_id = deduped.back().sqs_layer_id;
++        const bool incumbent_matches =
++            id_match(deduped.back(), root_resource_quads_).has_value();
++        const bool new_matches = id_match(r, root_resource_quads_).has_value();
++        if ((new_matches && !incumbent_matches) ||
++            (new_matches == incumbent_matches && incumbent_layer_id == 0 &&
++             r.sqs_layer_id != 0)) {
++          deduped.back() = r;
++        }
++        static int dup_dbg = 0;
++        if ((dup_dbg++ % 60) == 0) {
++          VLOG(1) << "[DisplayXR] inline-3D ID-MATCH FALLBACK: reason="
++                     "duplicate id id="
++                  << r.id.ToString() << " layer_ids=" << incumbent_layer_id
++                  << "/" << r.sqs_layer_id
++                  << " kept=" << deduped.back().sqs_layer_id;
++        }
++        continue;
++      }
++      deduped.push_back(r);
++    }
++    inline_3d_rects_ = std::move(deduped);
++  }
++  // Hand the frame the {rect, id} pairs. |inline_3d_rects_| itself stays alive
++  // for the identity join below, which needs the layer half of the key too.
++  frame.inline_3d_rects.reserve(inline_3d_rects_.size());
++  for (const Inline3dTrackedRect& r : inline_3d_rects_) {
++    frame.inline_3d_rects.push_back({r.rect, r.id});
++  }
+   // browser#22 DIAGNOSTIC: why does page-global chrome (the sticky header) blow
+   // up for a frame or two during a fast scroll? Two candidate mechanisms, and
+   // they need different fixes, so distinguish them explicitly:
+@@ -2527,15 +2612,16 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       // (B) declared but unmatched: does it sit over a 3D canvas region? If so
+       // it is exactly the chrome-over-tile case we care about — report the
+       // overlap so a miss over empty page can be told from a miss over a tile.
+-      for (const gfx::Rect& canvas : frame.inline_3d_rects) {
+-        if (excl.Intersects(canvas)) {
++      for (const AggregatedFrame::Inline3dTrackedRect& canvas :
++           frame.inline_3d_rects) {
++        if (excl.Intersects(canvas.rect)) {
+           static int b_dbg = 0;
+           if (b_dbg++ % 30 == 0) {
+             gfx::Rect ov = excl;
+-            ov.Intersect(canvas);
++            ov.Intersect(canvas.rect);
+             VLOG(1) << "[DisplayXR] #22 (B) declared overlay UNMATCHED over a 3D "
+                        "canvas: excl="
+-                    << excl.ToString() << " canvas=" << canvas.ToString()
++                    << excl.ToString() << " canvas=" << canvas.rect.ToString()
+                     << " overlap=" << ov.ToString();
+           }
+           break;
+@@ -2543,10 +2629,34 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       }
+     }
+   }
+-  for (const gfx::Rect& canvas : frame.inline_3d_rects) {
+-    if (auto m = best_match(canvas, root_resource_quads_)) {
++  // Phase-1 identity: match each inline-3d canvas rect to the resource quad
++  // that draws it by IDENTITY first, geometry only as a fallback.
++  for (const Inline3dTrackedRect& canvas : inline_3d_rects_) {
++    std::optional<RootResourceQuad> m = id_match(canvas, root_resource_quads_);
++    if (!m) {
++      // Log WHY the exact join could not be used — the two reasons need
++      // different follow-ups, and telling them apart from a log is the whole
++      // value of the marker. Throttled: a persistent fallback would otherwise
++      // spam at frame rate.
++      const char* reason =
++          canvas.sqs_layer_id == 0
++              ? "no layer_id stamped (legacy/TreesInViz channel or pre-Phase-1 "
++                "renderer)"
++              : "layer_id stamped but no root quad carries it (canvas quad "
++                "occluded, in a child pass, or resource not ready)";
++      static int fallback_dbg = 0;
++      if ((fallback_dbg++ % 60) == 0) {
++        VLOG(1) << "[DisplayXR] inline-3D ID-MATCH FALLBACK: reason=" << reason
++                << " id=" << canvas.id.ToString()
++                << " layer_id=" << canvas.sqs_layer_id
++                << " target=" << canvas.rect.ToString() << " among "
++                << root_resource_quads_.size() << " root quads";
++      }
++      m = best_match(canvas.rect, root_resource_quads_);
++    }
++    if (m) {
+       frame.inline_3d_canvas_resources.push_back(
+-          {m->resource_id, m->rect, m->visible_rect, m->uv});
++          {m->resource_id, m->rect, m->visible_rect, m->uv, canvas.id});
+     }
+   }
+   if (!frame.inline_3d_overlays.empty() ||
+@@ -2709,10 +2819,9 @@ void SurfaceAggregator::CollectTrackedElementRects(
+     const gfx::Transform& transform_to_root_target,
+     const std::optional<gfx::Rect> root_target_clip_rect,
+     // DisplayXR Phase-1 identity: carried here so a tracked rect can keep the
+-    // namespace half of its (namespace, sqs_layer_id) join key. Consumed by the
+-    // canvas identity join and the exclusion join built on top of this patch.
+-    [[maybe_unused]] const std::pair<uint32_t, uint32_t>&
+-        client_namespace_id) {
++    // namespace half of its (namespace, sqs_layer_id) join key — a layer id is
++    // only unique within one client.
++    const std::pair<uint32_t, uint32_t>& client_namespace_id) {
+   // DisplayXR inline-3D (#625, scroll-sync P3): prefer the compositor-thread
+   // tracked-element rects for the weave. cc projects them through the layer's
+   // ScreenSpaceTransform at DRAW time (live property trees, current impl
+@@ -2732,9 +2841,13 @@ void SurfaceAggregator::CollectTrackedElementRects(
+         if (rect_data.visible_bounds.IsEmpty()) {
+           continue;
+         }
+-        inline_3d_rects_.push_back(TransformRectToDestRootTargetSpace(
+-            rect_data.visible_bounds, target_transform,
+-            transform_to_root_target, root_target_clip_rect));
++        // Phase-1 identity: carry the element's token and the (namespace,
++        // layer id) join key alongside the geometry.
++        inline_3d_rects_.push_back(
++            {TransformRectToDestRootTargetSpace(
++                 rect_data.visible_bounds, target_transform,
++                 transform_to_root_target, root_target_clip_rect),
++             rect_data.id, rect_data.sqs_layer_id, client_namespace_id});
+         has_tracked_inline3d = true;
+       }
+       if (has_tracked_inline3d) {
+@@ -2759,9 +2872,16 @@ void SurfaceAggregator::CollectTrackedElementRects(
+   // old path stays a live fallback and nothing regresses.
+   if (!has_tracked_inline3d) {
+     for (const gfx::Rect& rect : frame_metadata.inline_3d_rects) {
+-      inline_3d_rects_.push_back(TransformRectToDestRootTargetSpace(
+-          rect, target_transform, transform_to_root_target,
+-          root_target_clip_rect));
++      // Phase-1 identity: the legacy main-thread channel carries no element
++      // token and no layer id. Zeroes here are the documented "no identity"
++      // signal — the consumer falls back to geometric matching and to
++      // positional per-target state, i.e. exactly today's behaviour.
++      inline_3d_rects_.push_back({TransformRectToDestRootTargetSpace(
++                                      rect, target_transform,
++                                      transform_to_root_target,
++                                      root_target_clip_rect),
++                                  base::Token(), /*sqs_layer_id=*/0u,
++                                  std::pair<uint32_t, uint32_t>()});
+     }
+   }
+   // DisplayXR overlay-exclusion rects (browser#18): unconditional — exclusions
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index 4564248..a61f771 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -17,6 +17,7 @@
+ #include "base/containers/flat_set.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/rand_util.h"
++#include "base/token.h"
+ #include "base/time/time.h"
+ #include "components/viz/common/quads/compositor_render_pass.h"
+ #include "components/viz/common/quads/draw_quad.h"
+@@ -479,7 +480,20 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): inline-3d canvas rects from all
+   // surfaces, transformed to the root render pass space.
+-  std::vector<gfx::Rect> inline_3d_rects_;
++  //
++  // Phase-1 identity: each rect now carries WHO it is. |id| is the element's
++  // TrackedElementId — a real token, stable for the element's lifetime, which
++  // is what the GPU stage keys its per-target weave state by. |sqs_layer_id| +
++  // |layer_namespace_id| are the within-frame join key against
++  // RootResourceQuad, replacing the geometric best-overlap guess. Both are
++  // zero on the legacy main-thread metadata channel.
++  struct Inline3dTrackedRect {
++    gfx::Rect rect;
++    base::Token id;
++    uint32_t sqs_layer_id = 0;
++    std::pair<uint32_t, uint32_t> layer_namespace_id;
++  };
++  std::vector<Inline3dTrackedRect> inline_3d_rects_;
+ 
+   // DisplayXR overlay-exclusion rects (browser#18): the on-screen rects of 2D UI
+   // over a woven element, transformed to root render pass space. Used to identify
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+index a42ef3f..6242640 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+@@ -1064,7 +1064,7 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
+ #endif
+ 
+ void SkiaOutputSurfaceImpl::SetInline3DRects(
+-    std::vector<gfx::Rect> rects,
++    std::vector<Inline3dRect> rects,
+     std::vector<Inline3dLayerMailbox> overlays,
+     std::vector<Inline3dLayerMailbox> canvas_layers) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
+index 1021540..758ea47 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
+@@ -177,7 +177,7 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
+   bool SupportsBGRA() const override;
+   // DisplayXR inline-3D (#625, Step B / B4b; overlays + canvas res browser#18).
+   void SetInline3DRects(
+-      std::vector<gfx::Rect> rects,
++      std::vector<Inline3dRect> rects,
+       std::vector<Inline3dLayerMailbox> overlays,
+       std::vector<Inline3dLayerMailbox> canvas_layers) override;
+ 
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 4680211..e738fc3 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2717,10 +2717,17 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+ }
+ 
+ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
+-    std::vector<gfx::Rect> rects,
++    std::vector<SkiaOutputSurface::Inline3dRect> rects,
+     std::vector<SkiaOutputSurface::Inline3dLayerMailbox> overlays,
+     std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers) {
+-  inline_3d_rects_ = std::move(rects);
++  // The identity carried on each rect is consumed by the follow-up patch that
++  // re-keys the per-target weave state by token; this stage still tracks
++  // targets positionally, so project to geometry here.
++  inline_3d_rects_.clear();
++  inline_3d_rects_.reserve(rects.size());
++  for (const auto& r : rects) {
++    inline_3d_rects_.push_back(r.rect);
++  }
+   inline_3d_overlays_ = std::move(overlays);
+   inline_3d_canvas_layers_ = std::move(canvas_layers);
+ }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index fb1d37b..3c862a3 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -235,7 +235,7 @@ class SkiaOutputSurfaceImplOnGpu
+   // Inline3dLayerMailbox). Set from the compositor thread (Display, via
+   // SkiaOutputSurfaceImpl) before FinishPaintCurrentFrame; read on the GPU thread.
+   void SetInline3DRects(
+-      std::vector<gfx::Rect> rects,
++      std::vector<SkiaOutputSurface::Inline3dRect> rects,
+       std::vector<SkiaOutputSurface::Inline3dLayerMailbox> overlays,
+       std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers);
+ 
+diff --git a/third_party/blink/renderer/core/paint/html_canvas_painter.cc b/third_party/blink/renderer/core/paint/html_canvas_painter.cc
+index 66dfceb..22b3d70 100644
+--- a/third_party/blink/renderer/core/paint/html_canvas_painter.cc
++++ b/third_party/blink/renderer/core/paint/html_canvas_painter.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "third_party/blink/renderer/core/paint/html_canvas_painter.h"
+ 
++#include <utility>
++
++#include "cc/layers/layer.h"
++#include "components/viz/common/surfaces/tracked_element_rects.h"
+ #include "third_party/blink/renderer/core/css/properties/longhands.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+ #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
+@@ -68,6 +72,38 @@ void HTMLCanvasPainter::PaintReplaced(const PaintInfo& paint_info,
+       layer->SetBounds(pixel_snapped_rect.size());
+       layer->SetIsDrawable(true);
+       layer->SetHitTestable(true);
++      // DisplayXR Phase-1 identity: put the inline-3D weave's tracked rect on
++      // the layer that actually carries the canvas PIXELS.
++      //
++      // Without this the identity join cannot be made at all. A
++      // kInline3dWeave TrackedElementSubRect rides the element's BACKGROUND
++      // paint chunk (ReplacedPainter forces one to exist for exactly this
++      // purpose), and that chunk merges into the enclosing PictureLayer —
++      // whereas the canvas pixels are this ForeignLayer, which
++      // PendingLayer::RequiresOwnLayer() always keeps separate. Two
++      // LayerImpls, two stable ids: the id cc stamps onto the tracked rect
++      // could never equal the one in the SharedQuadState of the quad that
++      // draws the canvas. Registering the rect HERE puts both on one layer,
++      // and the join becomes exact.
++      //
++      // The rect is layer-LOCAL (origin 0,0, the layer's size): cc projects
++      // it through the layer's ScreenSpaceTransform at draw time, which is
++      // what makes it scroll-current.
++      viz::TrackedElementRects tracked_rects;
++      if (const TrackedElementSubRect* sub_rect =
++              canvas->GetTrackedElementSubRect(
++                  viz::TrackedElementFeature::kInline3dWeave)) {
++        tracked_rects[viz::TrackedElementFeature::kInline3dWeave].emplace_back(
++            sub_rect->id.value(), gfx::Rect(pixel_snapped_rect.size()),
++            sub_rect->should_add_to_compositor_frame_metadata,
++            sub_rect->should_exclude_fixed_and_sticky_occlusions,
++            sub_rect->frame_token, sub_rect->parent_frame_token);
++      }
++      // Set unconditionally: an EMPTY map is how a CLOSED XRDisplayLayer stops
++      // the flow, and a dormant tile must stop emitting weave rects. Costs
++      // nothing on ordinary canvases — Layer::SetTrackedElementRects early-outs
++      // when the layer has no rare inputs and the new map is empty.
++      layer->SetTrackedElementRects(std::move(tracked_rects));
+       RecordForeignLayer(context, layout_html_canvas_,
+                          DisplayItem::kForeignLayerCanvas, layer,
+                          pixel_snapped_rect.origin());
+diff --git a/third_party/blink/renderer/core/paint/replaced_painter.cc b/third_party/blink/renderer/core/paint/replaced_painter.cc
+index a3f6af3..f0e781b 100644
+--- a/third_party/blink/renderer/core/paint/replaced_painter.cc
++++ b/third_party/blink/renderer/core/paint/replaced_painter.cc
+@@ -7,6 +7,7 @@
+ #include <optional>
+ 
+ #include "base/metrics/histogram_macros.h"
++#include "components/viz/common/surfaces/tracked_element_rects.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/highlight/highlight_style_utils.h"
+@@ -105,6 +106,35 @@ ScopedReplacedContentPaintState::ScopedReplacedContentPaintState(
+   }
+ }
+ 
++// DisplayXR Phase-1 identity: true iff |element| is tracked by some feature
++// OTHER than the inline-3D weave.
++//
++// A tracked element needs its background display item recorded because the
++// resulting paint CHUNK is what carries the tracked rect into cc. That is
++// still true for region capture and the other tracking features. It is no
++// longer true for kInline3dWeave: HTMLCanvasPainter now registers that rect
++// directly on the canvas's ForeignLayer (where the pixels are), which is the
++// whole point — the chunk-borne copy landed on a different LayerImpl and made
++// the identity join impossible. Keeping it would emit the SAME element twice
++// with two different layer ids, and the duplicate-id guard downstream would
++// have to arbitrate every frame.
++//
++// Note this only removes the FORCED background item on an otherwise
++// undecorated canvas; a canvas with a real background, a touch-action region,
++// or a wheel handler still paints one through the earlier conditions.
++bool HasNonInline3dTrackedElementSubRect(const Element& element) {
++  const TrackedElementSubRects* sub_rects = element.GetTrackedElementSubRects();
++  if (!sub_rects) {
++    return false;
++  }
++  for (const auto& [feature, sub_rect] : *sub_rects) {
++    if (feature != viz::TrackedElementFeature::kInline3dWeave) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ }  // anonymous namespace
+ 
+ bool ReplacedPainter::ShouldPaintBoxDecorationBackground(
+@@ -142,8 +172,11 @@ void ReplacedPainter::Paint(const PaintInfo& paint_info) {
+       // Tracked elements need the background display item recorded even on an
+       // undecorated canvas, same as region capture: the paint chunk is what
+       // carries the tracked-element rect (DisplayXR inline-3D, #625).
++      // kInline3dWeave is the exception — see
++      // HasNonInline3dTrackedElementSubRect(); its rect now rides the canvas's
++      // own ForeignLayer instead.
+       if (element && (element->GetRegionCaptureCropId() ||
+-                      element->GetTrackedElementSubRects())) {
++                      HasNonInline3dTrackedElementSubRect(*element))) {
+         should_paint_background = true;
+       }
+     }
+diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+index 68d7838..4499e6a 100644
+--- a/third_party/blink/renderer/modules/xr/xr_display_layer.cc
++++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
+@@ -4,10 +4,12 @@
+ 
+ #include "third_party/blink/renderer/modules/xr/xr_display_layer.h"
+ 
++#include "base/rand_util.h"
+ #include "base/token.h"
+ #include "components/viz/common/surfaces/tracked_element_rects.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_exclusion_init.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_display_layer_init.h"
++#include "third_party/blink/renderer/core/dom/dom_node_ids.h"
+ #include "third_party/blink/renderer/core/dom/element.h"
+ #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
+ #include "third_party/blink/renderer/modules/xr/xr_session.h"
+@@ -17,6 +19,44 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++// DisplayXR Phase-1 identity: the kInline3dWeave TrackedElementId for a given
++// canvas element — STABLE for the element's lifetime, across any number of
++// XRDisplayLayer create/close cycles.
++//
++// Why it must be stable: close() clears the element's kInline3dWeave
++// registration (a dormant tile must stop emitting weave rects), but the SDK's
++// lazy activation destroys and re-creates an XRDisplayLayer for the SAME
++// canvas as it scrolls in and out of the rootMargin. Minting a fresh random
++// token on each re-activation would orphan the GPU-side per-target state on
++// every scroll: the old token's slot would sit out its 30-frame grace and then
++// be pruned, while the new token allocated a cold slot — exactly the churn the
++// token-keyed map exists to avoid.
++//
++// Rather than CACHE the token (which needs somewhere to live: Element is not
++// Supplementable, and a static weak map or a new core rare-data field are both
++// heavier than the problem), derive it. The derivation is:
++//
++//   high = a per-renderer-process random word, minted once
++//   low  = the element's DOMNodeId
++//
++// DOMNodeIds are stable for a node's lifetime and never reused within a
++// process, so the same canvas always yields the same token and two canvases
++// never collide. The random high word is what keeps it unique GLOBALLY: one
++// Viz Display aggregates several renderer processes, whose DOMNodeId sequences
++// all start at 1, and two pages' tokens colliding in the GPU target map would
++// cross-wire their weaves. Deriving rather than caching also means the
++// stability is structural — there is no cache to miss, invalidate, or outlive
++// the element.
++base::Token Inline3dWeaveTokenForElement(Element& element) {
++  static const uint64_t kProcessSalt = base::RandUint64();
++  return base::Token(kProcessSalt,
++                     static_cast<uint64_t>(DOMNodeIds::IdForNode(&element)));
++}
++
++}  // namespace
++
+ // static
+ XRDisplayLayer* XRDisplayLayer::Create(XRSession* session,
+                                        Element* target,
+@@ -59,12 +99,15 @@ XRDisplayLayer::XRDisplayLayer(XRSession* session,
+     // transform baked in). The Viz weave path prefers this rect over the
+     // main-thread getBoundingClientRect report above, which trails impl-thread
+     // scrolls by ~1 frame (#625 scroll-lag).
++    // Phase-1 identity: the id is DERIVED from the element, not minted fresh,
++    // so a re-created layer for the same canvas re-uses the token the GPU
++    // target map is already keyed by. See Inline3dWeaveTokenForElement().
+     if (!target_->GetTrackedElementSubRect(
+             viz::TrackedElementFeature::kInline3dWeave)) {
+       target_->SetTrackedElementSubRect(
+           viz::TrackedElementFeature::kInline3dWeave,
+           TrackedElementSubRect(
+-              TrackedElementId(base::Token::CreateRandom()),
++              TrackedElementId(Inline3dWeaveTokenForElement(*target_)),
+               /*should_add_to_compositor_frame_metadata=*/true));
+     }
+   }
+@@ -130,6 +173,11 @@ void XRDisplayLayer::close() {
+   if (session_) {
+     session_->UnregisterDisplayLayer(this);
+   }
++  // The registration must go: a dormant tile has to stop emitting weave rects,
++  // or the browser would keep weaving a closed layer. The TOKEN, however, is
++  // derived from the element (Inline3dWeaveTokenForElement) rather than stored
++  // here, so re-activating this canvas re-registers with the SAME id and the
++  // GPU-side per-target state it is keyed by survives the round trip.
+   if (target_ && target_->GetTrackedElementSubRect(
+                      viz::TrackedElementFeature::kInline3dWeave)) {
+     target_->ClearTrackedElementSubRect(
