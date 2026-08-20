@@ -22,6 +22,11 @@
 #
 # FAIL-SAFE: any error, empty input, or unknown state exits HOLD (2), never PASS.
 #
+# NOT a substitute for scripts/verify-series.sh (browser#106): this gate classifies risk from
+# upstream diffs and never actually applies the series, so it cannot detect internal series drift
+# (a patch's pre-image no longer matching what earlier patches produce). Run verify-series.sh at
+# capture time (rebase-runbook.md §4); run this gate at rebase-decision time.
+#
 # Usage:
 #   scripts/weave-gate.sh --old 150.0.7871.24 --new 150.0.7871.129 [--src C:/cr/src]
 #   scripts/weave-gate.sh --old X --new Y --changed-file <precomputed-list>   # for tests/CI

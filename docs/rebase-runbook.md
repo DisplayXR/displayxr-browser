@@ -38,13 +38,43 @@ git am --3way patches/*.patch
 ```bash
 git format-patch --binary --no-signature -o "$REPO/patches" "$CHROMIUM_TAG"..displayxr-inline-3d
 ```
-Re-verify the series reproduces the branch exactly (working-tree-safe — uses a throwaway index):
+Verify the capture with `scripts/verify-series.sh` (run it from `$CHROMIUM_SRC`, or pass `--src`;
+it reads `$CHROMIUM_TAG` from `scripts/config.env` by default):
 ```bash
-export GIT_INDEX_FILE=/tmp/verifyidx; git read-tree "$CHROMIUM_TAG"
-for p in "$REPO"/patches/*.patch; do git apply --cached --binary "$p" || { echo "FAIL $p"; break; }; done
-[ "$(git write-tree)" = "$(git rev-parse displayxr-inline-3d^{tree})" ] && echo "series OK"
-unset GIT_INDEX_FILE
+"$REPO"/scripts/verify-series.sh --tag "$CHROMIUM_TAG" --branch displayxr-inline-3d
 ```
+It runs **two independent checks — both must pass**, not just the first:
+
+1. **Reproduction** (the original working-tree-safe check, now scripted): the series applied via
+   `git apply --cached --binary` onto a throwaway index seeded from `$CHROMIUM_TAG` must produce
+   `displayxr-inline-3d`'s tree exactly. This catches a bad `format-patch` capture (dropped,
+   reordered, or truncated patch) — but **nothing else**, and per browser#106 it is easy to never
+   actually run: it's a manual copy/paste block, not a CI-enforced step, which is exactly how a
+   drifted series (below) shipped without anyone noticing.
+
+2. **Fresh-clone apply gate** (browser#106, new): the series applied with a **plain**
+   `git am --keep-non-patch --no-3way` onto a `git worktree` of `$CHROMIUM_TAG` must *also*
+   produce that same tree. This is the check that matters, because it reproduces what a genuine
+   fresh clone sees. `--3way` (used for the *rebase* itself in step 3, and by `do_rebase.ps1` on
+   the build box) is fine for resolving real conflicts, but on a conflict it will silently
+   reconstruct a fake ancestor from whatever blob the patch's SHA1 line names *if that blob
+   happens to be present in the local object DB* — e.g. because this checkout has built
+   `displayxr-inline-3d` before, or because the fork branch's own history is right there. That
+   content-merges the patch against history a fresh clone doesn't have, masking internal series
+   drift (a later patch's declared pre-image no longer matches what the earlier patches in the
+   series actually produce). Plain `am` has no such fallback — it applies textually, so a worktree
+   of the tag reproduces fresh-clone behavior exactly (cross-checked against a true fresh clone in
+   browser#106: plain `am` failed identically there). This is what bit us at patch 0022: 0022's
+   3-line context predated an assignment path patches 0001–0021 had already added, `--3way` on the
+   fork's own box quietly content-merged it using history only that box had, and every fresh clone
+   — a new contributor, a new build box, the Android-port builder — hit a hard apply failure.
+
+**The tell:** if you ever see `sha1 information is lacking or useless` from this gate, the gate
+did not run as designed — that error is `--3way` telling you it just built a fake ancestor from
+local history to paper over a conflict. It means investigate immediately, don't retry with
+`--3way` and move on. The gate's own failure mode instead reads `patch failed: <file>:<line>` /
+`patch does not apply` — that's the real, unmasked signal that the series has drifted; recapture
+from the fork branch tip (steps 1-4 above) rather than hand-splicing the offending patch.
 
 ## 5. Build (official static)
 ```bash
