@@ -37,7 +37,7 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 |---|---|
 | Latest preview | [**0.1.11**](https://github.com/DisplayXR/displayxr-browser/releases/latest) — occlusion by draw order |
 | Chromium pin | **151.0.7922.77** (stable) — `scripts/config.env` |
-| Patch series | 73 patches over the pinned tag, ~100 files of real integration surface |
+| Patch series | 74 patches over the pinned tag, ~100 files of real integration surface |
 | Platform | Windows — D3D11 + DirectComposition |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
@@ -109,6 +109,30 @@ flat from its own resource, per tile rather than only when the whole frame misse
 step of this mechanism was silent — including a lookup whose failure was logged nowhere at all — the
 whole path is now counted at error level: grep `[DisplayXR] weave tile skipped`, `canvas resolve
 dropped`, `ZERO copies this frame`, and `inline-3D recovery draw`.
+
+The fifth and last way is the only one that is not a logic error: **under heavy GPU load the browser
+sometimes simply cannot read a tile's canvas in time.** With the four fixes above running on real
+hardware, a page carrying two 3D elements — one a model, one a model plus a gaussian splat — showed the
+light element rock steady and the heavy one blinking, at a rate that tracked how much work its producer
+was doing. That is the signature of a lost race, not of anything being broken: to build the weave input
+the compositor has to take read access to the canvas the page is still drawing into, and the heavier the
+producer, the more often it is still holding that canvas when the compositor asks. Every safety net
+built above then failed for the *same* reason a few microseconds later — the flat repaint of last
+resort opens the very same resource — so the tile fell all the way through to the empty hole and the
+counters, being shared, could not say which step had lost. Three changes. The compositor **asks twice**
+before giving up, which usually wins because the producer has let go by the second ask. When the failure
+happens *after* the tile's pixels have been assembled but before they reach the hardware weave path, it
+now **reads them back from the tile's own copy** instead of from the page — that copy is hole-free by
+construction, so the "never sample a holed page" rule has nothing to refuse. And when a tile really
+cannot be produced at all, it is **no longer blanked: it keeps the frame it already had.** The weave
+input is one window-sized surface that is never cleared, so a tile that cannot be redrawn this frame
+simply is not overwritten, and re-submitting its unchanged rectangle re-weaves the pixels already
+sitting there. A tile whose producer is starved for a long stretch therefore looks *slowed*, not black,
+and only ever at its own rectangle: the moment it moves, the licence to keep it lapses. That also
+retires the worst symptom in the whole report — when every tile declined there was no submit at all, and
+the weave went quiet for seconds with nothing in either log; a kept tile still submits, so the pipeline
+never stops. Every failure candidate on this path is now counted separately and **per tile**, which is
+what makes "the heavy one fails and the light one does not" a measurement rather than an impression.
 
 The design and rationale live in the runtime repo:
 [`webxr-support.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-support.md)

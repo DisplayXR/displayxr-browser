@@ -1,0 +1,1061 @@
+From 627b2d0beb16d09d62f7215a48dbf9072642f15e Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Wed, 19 Aug 2026 23:46:13 -0700
+Subject: [PATCH] inline-3d(web#12): read back the clean canvas, and keep the
+ tile you cannot copy
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The last layer of the dark blink, and the first one that is not a logic error:
+under GPU load the weave input's production simply FAILS, per tile, and every
+leg 0070-0073 built to catch that failure was failing for the same reason a few
+microseconds later. Live telemetry from the fix-stack build on hardware, model
+sample under load: 301+ "CPU readback would sample the suppression hole" skips;
+"inline-3D recovery draw: n=0 missing=2" on those same frames; "batch weave:
+ZERO copies this frame — no submit issued". Meanwhile resolve-dropped = 0,
+id-miss = 0, NO-resource = 0. Resolution and matching are healthy. The break is
+strictly between "we hold a clean canvas mailbox" and "its pixels are in the
+weave input".
+
+David, watching the same page: of the sample's two tiles, the one showing a
+glTF alone is STABLE and the one showing a glTF plus a gaussian splat BLINKS.
+Per-tile failure rate tracks producer weight. That is not what a broken resource
+looks like; it is what a LOST RACE looks like — the heavy producer holds its own
+access to the canvas SharedImage longer per frame, so our ProduceSkia /
+BeginScopedReadAccess loses far more often on that tile.
+
+WHY THE ZERO-COPY LEG FAILS, AND WHY WE COULD NOT TELL. Every step of that leg —
+scratch creation, scratch ProduceSkia, scratch write access, the CANVAS open,
+the output snapshot, ProduceOverlayForWeave, the overlay read access, the
+overlay type, the WeaveCanvas copy — shared ONE `static bool logged_fail` at
+VLOG(1). After the first failure in the process's life, at a verbosity nobody
+runs, the whole leg was mute; a capture could say the fallback was being reached
+301 times and not say why. Each candidate now has its OWN counter on 0073's
+discipline (LOG(ERROR), first 3 then 1-in-300), a distinct reason string, and
+the TILE'S IDENTITY (id + rect) in the line — without which the per-tile
+correlation above is unmeasurable. The canvas open in particular is split into
+its three separate causes, ProduceSkia vs BeginScopedReadAccess vs
+CreateSkImage, because "contended" and "gone" are different bugs. The recovery
+draw's `missing=N` gains the same breakdown, which is what will confirm on the
+next capture that its n=0 has always been the identical contention: it opens the
+same resource with the same three calls.
+
+PART 1 — READ BACK FROM THE CLEAN CANVAS, NOT THE PAGE. The CPU-readback leg
+sources only from |output|, which since browser#22 is the suppression hole, so
+0073 (rightly) gated it shut — leaving the fallback with nothing to sample. But
+by the time the zero-copy leg reaches its GPU handoff, the SCRATCH already holds
+the finished weave input: the clean canvas SBS, through the quad's UV window,
+over the page backdrop, composed from the RESOURCE and never from a page
+snapshot. It is hole-free by construction, so 0073's gate does not apply to it.
+Every post-compose failure now reads the scratch back and WeavePixels it instead
+of falling through — the same pixels the zero-copy leg would have handed over,
+taking the slow road. It also un-breaks the branch where the backing exposes no
+raw D3D11 texture, which used to be a permanent one-way trip to the gated
+|output| readback for the entire process.
+
+PART 2 — KEEP-PREVIOUS, AND A RETRY IN FRONT OF IT. (a) The canvas open retries
+ONCE in-frame; a second ask usually wins because the producer has released by
+then, and the win is counted so the contention theory stays measurable. (b) When
+both attempts lose, the tile stops going dark. The batch weave input is ONE
+window-sized texture, written per target at the target's own window position,
+and NEVER cleared between frames (the property 0073 discovered while explaining
+byte-identical blink captures). So a tile that cannot be copied does not have to
+be overwritten: leaving it alone leaves last frame's correct stereo pixels at
+the same rect, and re-submitting the rect re-weaves them. New provider entry
+point BatchKeepPrevious stages that entry without a copy, guarded on
+RECT-UNCHANGED-SINCE-THE-LAST-COPY from the provider's own bookkeeping — the
+provider is the only party that knows when the shared texture is reallocated, so
+it is the only correct home for the fact (GPU-side DisplayXRTargetState would
+have had to mirror a lifetime it cannot observe). At a moved rect it refuses and
+we decay to exactly the pre-0074 behaviour. The record is dropped per target by
+PruneTarget/PruneTargets (slots are recycled) and wholesale when the shared
+texture is reallocated.
+
+Nothing expires a kept tile. Sustained load on one heavy producer means a LONG
+consecutive run of failures on that tile, and every frame of it re-reads the
+same unchanged record and re-weaves the same pixels; only a real copy, a rect
+change, a resize or a retirement moves it. Visually that is a slowed — in the
+limit, frozen — turntable on the splat tile while its neighbour runs normally,
+which is the correct trade against a black hole. The kept tile is also marked
+submitted so the per-tile recovery draw does not paint a MONO left eye over
+correctly kept STEREO pixels.
+
+AND THE CLASS THIS CLOSES. When every tile declined, no entry was staged, so
+SubmitBatchSync issued no submit at all: the runtime never re-wove, never ran
+its first-chunk clear, and 0057's liveness gate then (correctly) skipped the
+draw-back — the multi-second silent window that reads from outside as "the weave
+is frozen". With keep-previous, a rect-stable tile always stages an entry, so
+the batch stays non-empty and the submit keeps going out. Reaching that state
+now requires EVERY tile to be both uncopyable AND unkeepable, i.e. the first
+frames or a frame where the rects just moved. The ZERO-copies line survives as
+the discriminator and now also prints how many tiles were keepable, so if it is
+still frequent the log says which of the two it was.
+
+Validated per-TU with clang-cl -fsyntax-only (all three TUs clean; the check
+demonstrably bites — it caught two real -Wunsafe-buffer-usage errors in a first
+draft, and a static_assert tripwire fails as expected), formatted on changed
+line ranges only, and apply-checked against a clean 151 tree with
+0070+0071+0072+0073 in front of it.
+
+Refs: DisplayXR/displayxr-web#12
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 100 +++-
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  17 +
+ .../displayxr_weave_provider.cc               |   9 +
+ .../displayxr_weave_provider.h                |  33 ++
+ .../skia_output_surface_impl_on_gpu.cc        | 508 +++++++++++++++---
+ 5 files changed, 593 insertions(+), 74 deletions(-)
+
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index d239344dd6c1a..7605c01cbc4d2 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -527,11 +527,21 @@ bool DisplayXRWeaveGpu::EnsureBatchInputAndAcquire(ID3D11Device* device,
+     }
+     return false;
+   }
++  // (web#12) |batch_last_copied_| describes pixels living in a SPECIFIC
++  // texture. EnsureInput silently reallocates on a size, format or device
++  // change, and the new texture's contents are undefined — so a keep-previous
++  // decision taken against the old bookkeeping would re-weave garbage rather
++  // than last frame's tile. Notice the swap by identity (the only thing that
++  // cannot lie about it) and forget everything.
++  ID3D11Texture2D* const before = shared_input_.input_tex.Get();
+   if (!EnsureInput(shared_input_, device,
+                    format, static_cast<uint32_t>(batch_size_.width()),
+                    static_cast<uint32_t>(batch_size_.height()))) {
+     return false;
+   }
++  if (shared_input_.input_tex.Get() != before) {
++    batch_last_copied_.clear();
++  }
+   if (!batch_mutex_held_) {
+     if (shared_input_.input_mutex->AcquireSync(0, 1000) != S_OK) {
+       LOG(ERROR) << "[DisplayXR] batch weave: AcquireSync(0) failed";
+@@ -596,6 +606,11 @@ bool DisplayXRWeaveGpu::BatchCopyCanvas(ID3D11Device* device,
+                                   /*DstSubresource=*/0, dst_x, dst_y,
+                                   /*DstZ=*/0, canvas_tex, array_slice, &box);
+   batch_entries_.push_back({target_id, window_rect});
++  // (web#12) This target's pixels now live at |window_rect| in the current
++  // shared texture — the fact BatchKeepPrevious needs on a later frame whose
++  // copy fails. Recorded on the UNCLAMPED |window_rect| (what the submit and
++  // the keep-previous guard both speak), not the clamped D3D11_BOX.
++  batch_last_copied_[target_id] = window_rect;
+   return true;
+ }
+ 
+@@ -654,6 +669,62 @@ bool DisplayXRWeaveGpu::BatchCopyPixels(ID3D11Device* device,
+                                   /*DstSubresource=*/0, dst_x, dst_y,
+                                   /*DstZ=*/0, in.upload_tex.Get(), 0, &box);
+   batch_entries_.push_back({target_id, window_rect});
++  batch_last_copied_[target_id] = window_rect;  // (web#12) see BatchCopyCanvas
++  return true;
++}
++
++// (web#12) Stage a submit entry for a target that could NOT be copied this
++// frame, relying on the pixels its last successful copy left in the shared
++// input. See the header for why that is sound; the guards here are what make it
++// safe in the cases where it is not.
++bool DisplayXRWeaveGpu::BatchKeepPrevious(const gfx::Rect& window_rect,
++                                          uint32_t target_id) {
++  if (!batch_open_ || window_rect.IsEmpty() || !device_) {
++    return false;
++  }
++  // (a) This exact target must have written this EXACT rect. A moved tile's old
++  // pixels are at the old position; weaving them at the new one would drag a
++  // copy of the element behind the scroll. Rect-unchanged is the whole licence.
++  auto it = batch_last_copied_.find(target_id);
++  if (it == batch_last_copied_.end() || it->second != window_rect) {
++    return false;
++  }
++  // (b) The texture those pixels are in must still be the one we will submit,
++  // at the size this frame's batch was opened for. |batch_last_copied_| is
++  // cleared on reallocation, so this is belt-and-braces against a resize that
++  // has not yet reached EnsureInput — and it also guarantees the
++  // EnsureBatchInputAndAcquire below cannot itself trigger the reallocation.
++  if (!shared_input_.input_tex ||
++      shared_input_.input_w != static_cast<uint32_t>(batch_size_.width()) ||
++      shared_input_.input_h != static_cast<uint32_t>(batch_size_.height())) {
++    return false;
++  }
++  // (c) Acquire the shared input's keyed mutex even though we write nothing.
++  // Two reasons, both load-bearing: SubmitBatchSync only submits when the mutex
++  // was held (had_copies), and the service acquires the input on the other side
++  // of a matching release — a submit whose input was never acquired/released
++  // this frame is not a handoff the runtime's keyed-mutex protocol accepts. The
++  // format is the input's own, so EnsureInput takes its already-sized early
++  // return and nothing is recreated.
++  if (!EnsureBatchInputAndAcquire(device_.Get(), shared_input_.input_format)) {
++    return false;
++  }
++  batch_entries_.push_back({target_id, window_rect});
++  // NOT updated: |batch_last_copied_| already names this rect, and a keep is
++  // not a copy. Leaving it untouched is what lets a tile be kept for an
++  // unbounded RUN of failing frames (the heavy-producer case: a splat canvas
++  // whose read access is lost frame after frame) — every frame re-reads the
++  // same true fact and re-weaves the same pixels. Nothing here expires, decays
++  // or invalidates it; only a real copy, a rect change, or a texture
++  // reallocation moves it.
++  static int s_keep = 0;
++  const int n = s_keep++;
++  if (n < 3 || (n % 300) == 0) {
++    LOG(ERROR)
++        << "[DisplayXR] batch weave: keeping PREVIOUS content for target "
++        << target_id << " at " << window_rect.ToString()
++        << " (copy failed this frame; keeps=" << (n + 1) << ")";
++  }
+   return true;
+ }
+ 
+@@ -678,15 +749,26 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+     // frozen" with not one line in either log. It was completely silent. It is
+     // now the discriminator for that window: when every target declines (a
+     // canvas resource that will not open, a readback that returns nothing, or —
+-    // since this patch — every tile refusing to weave the page's suppression
+-    // hole) this is the line that says so. First 3, then 1-in-300, matching the
++    // since 0073 — every tile refusing to weave the page's suppression hole)
++    // this is the line that says so. First 3, then 1-in-300, matching the
+     // submit-failure counter below.
++    //
++    // (web#12, 0074) This should now be RARE rather than the steady state under
++    // load. A tile whose copy fails at a rect it has copied before is kept
++    // (BatchKeepPrevious) instead of declining, which stages an entry — so the
++    // batch stays non-empty, the submit still goes out, the runtime still runs
++    // its first-chunk clear and re-weaves every kept rect, and the whole
++    // "multi-second silent no-submit window" class needs EVERY tile to be both
++    // uncopyable AND unkeepable (first frames, or a rect that just moved). If
++    // this line is still frequent after 0074, that is the fact to report: it
++    // means the failures are landing on frames where the rects are moving.
+     static int s_empty = 0;
+     const int n = s_empty++;
+     if (n < 3 || (n % 300) == 0) {
+       LOG(ERROR) << "[DisplayXR] batch weave: ZERO copies this frame — no "
+                     "submit issued (acquired_input="
+                  << had_mutex << " entries=" << batch_entries_.size()
++                 << " keepable=" << batch_last_copied_.size()
+                  << " empties=" << (n + 1) << ")";
+     }
+     return false;
+@@ -873,6 +955,15 @@ void DisplayXRWeaveGpu::PruneTargets(size_t count) {
+       ++it;
+     }
+   }
++  // (web#12) Same rule as PruneTarget: a retired id's keep-previous record must
++  // not be inherited by whoever takes the id next.
++  for (auto it = batch_last_copied_.begin(); it != batch_last_copied_.end();) {
++    if (it->first >= count) {
++      it = batch_last_copied_.erase(it);
++    } else {
++      ++it;
++    }
++  }
+ }
+ 
+ void DisplayXRWeaveGpu::PruneTarget(uint32_t target_id) {
+@@ -892,6 +983,11 @@ void DisplayXRWeaveGpu::PruneTarget(uint32_t target_id) {
+     ResetInput(input_it->second);
+     inputs_.erase(input_it);
+   }
++  // (web#12) Slots are recycled, so a retiring target's keep-previous record
++  // must die with it: inherited by the next element admitted to this slot it
++  // would authorise weaving the OLD element's pixels at a rect the new one
++  // happens to share. Same reasoning as the result handles and the input above.
++  batch_last_copied_.erase(target_id);
+ }
+ 
+ // static
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index 1e664023660ca..a6b9568b13193 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -73,6 +73,12 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   bool BatchMode() const override;
+   void BeginBatchSync(const gfx::Size& window_size) override;
+   bool SubmitBatchSync() override;
++  // (web#12) Re-submit a target's rect without copying, so the runtime
++  // re-weaves the pixels the last successful copy left in the shared input.
++  // Honoured only when |batch_last_copied_| says this exact target wrote this
++  // exact rect into the CURRENT shared texture.
++  bool BatchKeepPrevious(const gfx::Rect& window_rect,
++                         uint32_t target_id) override;
+   bool SetBatchOverlay(ID3D11Device* device,
+                        ID3D11Texture2D* atlas_tex,
+                        UINT array_slice) override;
+@@ -199,6 +205,17 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   gfx::Size batch_size_;           // window client size this batch frame
+   std::vector<BatchEntry> batch_entries_;
+ 
++  // (web#12) Where each target's pixels were last SUCCESSFULLY copied into
++  // |shared_input_|, in window-relative device px. Survives across frames (the
++  // shared input is never cleared), which is exactly what makes
++  // BatchKeepPrevious sound; dropped for a target by PruneTarget (its slot may
++  // be reused by an unrelated element) and cleared WHOLESALE whenever
++  // |shared_input_.input_tex| is reallocated, because the pixels it describes
++  // died with the old texture. Not merged into |inputs_| deliberately: in batch
++  // mode a WeaveInput's shared texture is unused, and this must be keyed to the
++  // SHARED input's lifetime.
++  base::flat_map<uint32_t, gfx::Rect> batch_last_copied_;
++
+   // v4 DP-composited 2D overlay atlas (browser#18/#22): a second window-sized
+   // legacy-DXGI keyed-mutex input holding the caller's premultiplied-alpha RGBA
+   // overlay atlas, staged by SetBatchOverlay and submitted alongside
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+index 48588ed8cd913..b2049f39cce29 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.cc
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -26,6 +26,15 @@ bool DisplayXRWeaveProvider::SubmitBatchSync() {
+   return false;
+ }
+ 
++// (web#12) Keep-previous default: refuse. A provider with no shared, never-
++// cleared window-sized input has nothing to keep, and answering "yes" would
++// tell the caller a tile was woven when nothing was. The caller treats false
++// exactly as it treated a failed copy before this existed.
++bool DisplayXRWeaveProvider::BatchKeepPrevious(const gfx::Rect& window_rect,
++                                               uint32_t target_id) {
++  return false;
++}
++
+ // Per-region hardware wish (spec v8, browser#88) default: accept and ignore.
+ // This is the whole macOS story too — the mac provider's weave path publishes no
+ // wish yet, and because the wish is ADVISORY (hardware element only, never
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index 5670e5ec9db9f..30783e9f17043 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -170,6 +170,39 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   virtual void BeginBatchSync(const gfx::Size& window_size);
+   virtual bool SubmitBatchSync();
+ 
++  // (web#12) KEEP-PREVIOUS: submit |target_id| at |window_rect| WITHOUT copying
++  // anything into the shared input, so the runtime re-weaves the pixels already
++  // sitting there from the last frame that did copy.
++  //
++  // This is only sound because of a property of the batch model that the rest
++  // of this interface never had to name: the shared input is window-sized,
++  // every target writes it AT ITS OWN WINDOW POSITION, and it is NEVER cleared
++  // between frames.
++  // So after a successful copy the input holds that tile's SBS at exactly the
++  // window rect the runtime will weave from — indefinitely, until something
++  // overwrites it or the texture is reallocated. A tile whose copy fails this
++  // frame therefore does not have to become a hole: not overwriting it leaves
++  // last frame's correct stereo pixels in place, and re-submitting the same
++  // rect re-weaves them.
++  //
++  // The caller must only ask for this when the tile's rect is UNCHANGED since
++  // its last successful copy — at a different rect the input holds someone
++  // else's pixels (or nothing) there. The implementation enforces the same
++  // guard from its own bookkeeping and returns false if it cannot honour it (no
++  // prior copy, rect moved, input reallocated by a resize/format/device change,
++  // batch not open), in which case the caller is exactly as it was before this
++  // existed.
++  //
++  // Returns true if an entry was staged, i.e. the tile counts as woven this
++  // frame: the batch still submits, the liveness gate still passes, and phase
++  // (B) still draws the tile back. That is the whole point — the failure mode
++  // this replaces is "every tile declines → zero entries → no submit at all →
++  // the runtime's woven output is never refreshed and the suppressed tiles show
++  // as holes". Default: false (non-batch providers have no shared input to
++  // keep).
++  virtual bool BatchKeepPrevious(const gfx::Rect& window_rect,
++                                 uint32_t target_id);
++
+   // Per-region hardware wish (XR_DXR_weave spec v8, browser#88 Phase 3 Stage 2).
+   // Set ONCE per batch frame, between BeginBatchSync and SubmitBatchSync, with
+   // this frame's FLAT rects: the sub-areas of the submitted weave rects whose
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index bcbe82f400ca4..b1de20ea94f9f 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3134,6 +3134,55 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     const gfx::Rect clean_sbs_rect = clean_sbs.rect;  // UNCLIPPED full tile
+     const gfx::RectF clean_sbs_uv = clean_sbs.uv;     // resource sub-rect (#73)
+ 
++    // ---- (web#12, 0074 — PART 2) KEEP THIS TILE'S PREVIOUS CONTENT ----
++    //
++    // The last resort, reached from every point below at which this tile can no
++    // longer produce pixels this frame. 0073 taught the weave to REFUSE bad
++    // sources; refusing is right, but a refusal with nothing behind it is still
++    // a dark tile, and the field logs are that fact stated in numbers: 301+
++    // "CPU readback would sample the suppression hole" skips against a recovery
++    // draw that also produced nothing (n=0 missing=2).
++    //
++    // There is, however, something behind it. The batch weave input is ONE
++    // window-sized texture, written per target at the target's own window
++    // position, and never cleared between frames — so this tile's last
++    // successful copy is still sitting there, at this rect, correct and stereo.
++    // A tile that cannot be copied this frame does not have to be overwritten;
++    // it can simply be re-submitted, and the runtime re-weaves what is already
++    // in the input. The visual result when the tile is static is
++    // indistinguishable from success; when it is animating it is one frame (or,
++    // under a long failure run, several frames) stale — a slowed animation
++    // rather than a black hole. That is the right trade in both directions.
++    //
++    // GUARD: rect-unchanged-since-the-last-copy, enforced inside the provider
++    // from its own bookkeeping (it is the only party that knows when the shared
++    // texture is reallocated, so it is the only correct home for that fact). At
++    // a moved rect the input holds someone else's pixels there, and keeping
++    // would drag a copy of the element behind the scroll — so the provider says
++    // no and this decays to exactly the pre-0074 behaviour.
++    //
++    // Nothing expires the kept content. A heavy producer whose canvas resource
++    // stays contended for a long RUN of frames is kept every one of them, from
++    // the same unchanged record; only a real copy, a rect change, a resize or a
++    // target retirement moves it.
++    auto keep_previous = [&]() -> bool {
++      if (!provider->BatchMode() ||
++          !provider->BatchKeepPrevious(rect, st.slot)) {
++        return false;
++      }
++      // Submit-time rect for phase (B), same as a real submit: the woven output
++      // will hold this tile at this rect.
++      st.pending_rect = rect;
++      // Count as submitted for the per-tile recovery draw. Its mono repaint is
++      // a rescue from BLACK; painting it over a correctly kept STEREO tile
++      // would be a downgrade — the same "never repaint a tile that has good
++      // pixels" rule the 0073 canvas_was_submitted() check exists to enforce.
++      if (!clean_sbs_mailbox.IsZero()) {
++        submitted_canvas_mailboxes.push_back(clean_sbs_mailbox);
++      }
++      return true;
++    };
++
+     // ---- (web#12) NEVER WEAVE THE HOLE ----
+     //
+     // |inline_3d_canvas_layers_| is now EXACTLY the set display.cc suppressed
+@@ -3169,7 +3218,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                    << " layers=" << inline_3d_canvas_layers_.size()
+                    << " skips=" << (n + 1) << ")";
+       }
+-      return false;
++      return keep_previous();
+     }
+ 
+     // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the
+@@ -3181,15 +3230,30 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // write access. Any step failing falls through to the CPU readback below.
+     if (prefer_zero_copy) {
+       bool zc = [&]() -> bool {
+-        // If any step fails we fall back to the WeavePixels CPU readback (still
+-        // correct), logging the first reason once at VLOG(1) so a future
+-        // regression is diagnosable without spamming default chrome.
+-        static bool logged_fail = false;
+-        auto fail = [&](const char* why) -> bool {
+-          if (!logged_fail) {
+-            logged_fail = true;
+-            VLOG(1) << "[DisplayXR] B4d zero-copy fell back to WeavePixels: "
+-                    << why;
++        // (web#12, 0074) THE INSTRUMENTATION THIS PATH NEVER HAD.
++        //
++        // Every step below could fail, and all of them shared ONE `static bool
++        // logged_fail` at VLOG(1) — so after the first failure in the process's
++        // life, at a verbosity nobody runs, this whole leg was mute. That is
++        // why the field capture could say "the CPU-readback leg is being
++        // reached 301 times" and not say WHY: the answer was in a line that had
++        // already been suppressed and would not have been printed anyway.
++        //
++        // Now: 0073's discipline (LOG(ERROR), first 3 then 1-in-300), a
++        // DISTINCT COUNTER PER REASON so the ratios are readable rather than
++        // just the total, and PER-TILE identity in the line. The last part is
++        // not cosmetic — the field observation that motivates this patch is
++        // that two tiles on one page fail at very different rates (the heavier
++        // producer far more often), which is measurable only if the line says
++        // which tile it is. |id| is the element's identity, |rect| its window
++        // position; either alone distinguishes the tiles on the model sample.
++        auto fail = [&](const char* why, int* counter) -> bool {
++          const int n = (*counter)++;
++          if (n < 3 || (n % 300) == 0) {
++            LOG(ERROR) << "[DisplayXR] weave zero-copy failed: " << why
++                       << " (id=" << inline_3d_rects_[t].id.ToString()
++                       << " rect=" << rect.ToString() << " fails=" << (n + 1)
++                       << ")";
+           }
+           return false;
+         };
+@@ -3233,18 +3297,25 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+               "DisplayXRScratch");
+           if (!shared_image_factory_->CreateSharedImage(
+                   mailbox, si_info, gpu::kNullSurfaceHandle)) {
+-            return fail("CreateSharedImage(scratch)");
++            static int c_mk_scratch = 0;
++            return fail("CreateSharedImage(scratch)", &c_mk_scratch);
+           }
+           st.scratch_mailbox = mailbox;
+           st.scratch_size = rect.size();
+         }
+ 
++        // (web#12, 0074) Did the scratch end up holding CLEAN pixels — the
++        // canvas resource rather than a snapshot of a possibly-holed |output|?
++        // Hoisted out of the compose block below because part 1's CPU fallback,
++        // which lives after it, is legal only when this is true.
++        bool scratch_is_clean = false;
+         // (2) GPU Skia-copy the composited sub-rect into the scratch surface.
+         {
+           auto scratch_rep = shared_image_representation_factory_->ProduceSkia(
+               st.scratch_mailbox, context_state_.get());
+           if (!scratch_rep) {
+-            return fail("ProduceSkia(scratch)");
++            static int c_ps_scratch = 0;
++            return fail("ProduceSkia(scratch)", &c_ps_scratch);
+           }
+           std::vector<GrBackendSemaphore> sbegin, send;
+           SkSurfaceProps props;
+@@ -3252,7 +3323,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+               /*final_msaa_count=*/0, props, &sbegin, &send,
+               gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
+           if (!scratch_write || !scratch_write->surface()) {
+-            return fail("BeginScopedWriteAccess(scratch)");
++            static int c_wa_scratch = 0;
++            return fail("BeginScopedWriteAccess(scratch)", &c_wa_scratch);
+           }
+           SkSurface* scratch_surface = scratch_write->surface();
+           if (!sbegin.empty()) {
+@@ -3277,21 +3349,68 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           // beneath the SBS (browser#30) -- the SBS must then composite OVER it
+           // rather than replace it.
+           bool blended_backdrop = false;
++          // (web#12, 0074) WHICH step of the canvas open failed. Three separate
++          // causes were collapsed into one silent `if` — and this open is the
++          // prime suspect for the whole dark-tile-under-load report, so it is
++          // the one place where "we could not use the resource" is not a good
++          // enough answer. 0 = ProduceSkia, 1 = BeginScopedReadAccess,
++          // 2 = CreateSkImage.
++          int canvas_fail_step = -1;
+           if (!clean_sbs_mailbox.IsZero()) {
+-            canvas_rep = shared_image_representation_factory_->ProduceSkia(
+-                clean_sbs_mailbox, context_state_.get());
+-            if (canvas_rep) {
++            // RETRY ONCE, in-frame.
++            //
++            // Field evidence (web#12, two tiles on one page): the failure rate
++            // tracks the PRODUCER'S WEIGHT — the tile whose canvas is driven by
++            // the heavy producer fails constantly while its light neighbour is
++            // stable. That is the signature of a lost race for read access, not
++            // of a broken or missing resource: the producer is still holding
++            // its own access to the SharedImage when we ask, and by the time we
++            // ask again it usually is not. So ask again.
++            //
++            // Two attempts, not a loop and not a wait: this is the compositor's
++            // critical path, a genuinely unavailable resource must not be paid
++            // for repeatedly, and part 2 (keep-previous) already covers the
++            // case where both attempts lose. Each attempt re-does the WHOLE
++            // open — a representation whose read access was refused is not
++            // reusable.
++            for (int attempt = 0; attempt < 2 && !src_img; ++attempt) {
++              canvas_fail_step = -1;
+               std::vector<GrBackendSemaphore> cbegin, cend;
+-              canvas_access =
+-                  canvas_rep->BeginScopedReadAccess(&cbegin, &cend);
+-              if (canvas_access) {
+-                src_img = canvas_access->CreateSkImage(context_state_.get());
+-                if (src_img) {
+-                  src_from_canvas = true;
+-                  if (!cbegin.empty()) {
+-                    scratch_surface->wait(cbegin.size(), cbegin.data(),
+-                                          /*deleteSemaphoresAfterWait=*/false);
+-                  }
++              canvas_rep = shared_image_representation_factory_->ProduceSkia(
++                  clean_sbs_mailbox, context_state_.get());
++              if (!canvas_rep) {
++                canvas_fail_step = 0;
++                continue;
++              }
++              canvas_access = canvas_rep->BeginScopedReadAccess(&cbegin, &cend);
++              if (!canvas_access) {
++                canvas_fail_step = 1;
++                canvas_rep.reset();
++                continue;
++              }
++              src_img = canvas_access->CreateSkImage(context_state_.get());
++              if (!src_img) {
++                canvas_fail_step = 2;
++                canvas_access.reset();
++                canvas_rep.reset();
++                continue;
++              }
++              src_from_canvas = true;
++              if (!cbegin.empty()) {
++                scratch_surface->wait(cbegin.size(), cbegin.data(),
++                                      /*deleteSemaphoresAfterWait=*/false);
++              }
++              if (attempt > 0) {
++                // The direct measurement of the contention theory: how often
++                // the second attempt rescues a frame the first would have lost.
++                static int c_retry_won = 0;
++                const int n = c_retry_won++;
++                if (n < 3 || (n % 300) == 0) {
++                  LOG(ERROR)
++                      << "[DisplayXR] weave: clean canvas opened on RETRY"
++                      << " (id=" << inline_3d_rects_[t].id.ToString()
++                      << " rect=" << rect.ToString() << " wins=" << (n + 1)
++                      << ")";
+                 }
+               }
+             }
+@@ -3300,20 +3419,43 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           // the quads display.cc removed from the page raster — and we failed
+           // to open it (ProduceSkia / BeginScopedReadAccess / CreateSkImage).
+           // The output snapshot below is therefore guaranteed to be the hole,
+-          // and weaving it would report success while presenting black. Refuse:
+-          // fail() drops to the CPU-readback fallback, whose own web#12 gate
+-          // (it reads the same |output|) then declines the tile properly.
++          // and weaving it would report success while presenting black. Refuse.
++          //
++          // (0074) Note what fail() now leads to, and what it deliberately does
++          // NOT lead to. It cannot use part 1's clean-scratch readback: there
++          // is nothing clean IN the scratch — this failure is precisely "we
++          // never got the canvas pixels", so the composed source does not
++          // exist. It drops to the CPU-readback leg, whose 0073 gate still
++          // refuses |output|, and lands on part 2 (keep-previous). That is the
++          // exact path the field capture walks 301 times a sample, and part 2
++          // is what it now finds at the end of it instead of a dark tile.
+           if (!src_img && !clean_sbs_mailbox.IsZero()) {
+-            return fail(
+-                "clean canvas resource unusable — refusing to weave the "
+-                "suppression hole");
++            // (web#12, 0074) Three counters, one per cause, so a capture
++            // answers "the read access is contended" vs "the representation is
++            // gone" vs "the image will not build" instead of only "it did not
++            // open". Named rather than an indexed array: a runtime index into a
++            // C array is an unsafe-buffer error in this TU, and three names
++            // read better in a log grep anyway.
++            static int c_canvas_produce = 0;
++            static int c_canvas_read_access = 0;
++            static int c_canvas_mk_image = 0;
++            switch (canvas_fail_step) {
++              case 1:
++                return fail("BeginScopedReadAccess(canvas)",
++                            &c_canvas_read_access);
++              case 2:
++                return fail("CreateSkImage(canvas)", &c_canvas_mk_image);
++              default:
++                return fail("ProduceSkia(canvas)", &c_canvas_produce);
++            }
+           }
+           if (!src_img) {
+             src_img = output->makeImageSnapshot(
+                 SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
+           }
+           if (!src_img) {
+-            return fail("makeImageSnapshot");
++            static int c_snapshot = 0;
++            return fail("makeImageSnapshot(output)", &c_snapshot);
+           }
+ 
+           // browser#30: PRE-BLEND THE PAGE BACKDROP UNDER THE SBS.
+@@ -3462,34 +3604,157 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           if (graphite_shared_context()) {
+             graphite_shared_context()->submit();
+           }
++          // (web#12) Clean iff the SBS came from the canvas resource, OR
++          // nothing was suppressed this frame at all (the legacy
++          // no-canvas-resource channel and the GL output-device path), in which
++          // case the |output| snapshot IS the page's own quad and there is no
++          // hole to speak of. Exactly the same two-case question 0073's gates
++          // ask.
++          scratch_is_clean =
++              src_from_canvas || inline_3d_canvas_layers_.empty();
+           // scratch_write / scratch_rep release here; content is submitted.
+         }
+ 
++        // ---- (web#12, 0074 — PART 1) CPU READBACK FROM THE CLEAN CANVAS ----
++        //
++        // The scratch now holds this tile's finished weave input: the clean
++        // canvas SBS, mapped through the quad's UV window, over the page
++        // backdrop. It was composed from the canvas RESOURCE, never from a
++        // snapshot of the suppressed page — so it is hole-free BY CONSTRUCTION,
++        // and 0073's gate (which exists solely because the old fallback sourced
++        // from |output|) simply does not apply to it.
++        //
++        // That is the missing leg the field logs describe. Every GPU-handoff
++        // failure below used to drop straight to the |output| CPU readback,
++        // which 0073 then had to refuse — "attempt_submit reached the
++        // CPU-READBACK leg constantly and the fallback had nothing safe to
++        // sample". It has something safe to sample now, and it is the same
++        // pixels the zero-copy leg would have handed over, merely taking the
++        // slow road: readback + WeavePixels instead of ProduceOverlay +
++        // WeaveCanvas. The weave input receives byte-identical content.
++        //
++        // Read access is taken as WRITE access deliberately: it is the only
++        // representation accessor that yields an SkSurface*, and the readback
++        // machinery (Ganesh SkSurface::readPixels, Graphite
++        // asyncRescaleAndReadPixelsAndSubmit) is written against SkSurface. The
++        // scratch is owned solely by this target, so writing-to-read is not a
++        // hazard with anyone.
++        auto cpu_weave_from_scratch = [&]() -> bool {
++          if (!scratch_is_clean || st.scratch_mailbox.IsZero()) {
++            return false;
++          }
++          auto rb_rep = shared_image_representation_factory_->ProduceSkia(
++              st.scratch_mailbox, context_state_.get());
++          if (!rb_rep) {
++            static int c_rb_ps = 0;
++            return fail("ProduceSkia(scratch readback)", &c_rb_ps);
++          }
++          std::vector<GrBackendSemaphore> rb_begin, rb_end;
++          SkSurfaceProps rb_props;
++          auto rb_access = rb_rep->BeginScopedWriteAccess(
++              /*final_msaa_count=*/0, rb_props, &rb_begin, &rb_end,
++              gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++          if (!rb_access || !rb_access->surface()) {
++            static int c_rb_wa = 0;
++            return fail("BeginScopedWriteAccess(scratch readback)", &c_rb_wa);
++          }
++          SkSurface* rb_surface = rb_access->surface();
++          if (!rb_begin.empty()) {
++            rb_surface->wait(rb_begin.size(), rb_begin.data(),
++                             /*deleteSemaphoresAfterWait=*/false);
++          }
++          const SkImageInfo rb_info =
++              SkImageInfo::Make(rw, rh, kBGRA_8888_SkColorType,
++                                kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
++          const uint8_t* rb_pixels = nullptr;
++          size_t rb_stride = 0;
++          std::vector<uint8_t> rb_ganesh;  // owns the Ganesh sync-read pixels
++          WeaveReadPixelsContext rb_ctx;   // owns the Graphite async result
++          if (auto* graphite = context_state_->graphite_shared_context()) {
++            context_state_->FlushGraphiteRecorder();
++            graphite->asyncRescaleAndReadPixelsAndSubmit(
++                rb_surface, rb_info, SkIRect::MakeWH(rw, rh),
++                SkImage::RescaleGamma::kSrc,
++                SkImage::RescaleMode::kRepeatedLinear,
++                base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone),
++                &rb_ctx);
++            if (!rb_ctx.finished || !rb_ctx.async_result ||
++                rb_ctx.async_result->count() != 1) {
++              static int c_rb_graphite = 0;
++              return fail("graphite readback(scratch)", &c_rb_graphite);
++            }
++            rb_pixels =
++                reinterpret_cast<const uint8_t*>(rb_ctx.async_result->data(0));
++            rb_stride = rb_ctx.async_result->rowBytes(0);
++          } else {
++            const size_t row = static_cast<size_t>(rw) * 4;
++            rb_ganesh.resize(row * rh);
++            // Whole scratch, origin (0,0): the scratch IS the tile, so unlike
++            // the |output| readback there is no sub-rect offset to apply.
++            if (!rb_surface->readPixels(rb_info, rb_ganesh.data(), row, 0, 0)) {
++              static int c_rb_ganesh = 0;
++              return fail("readPixels(scratch)", &c_rb_ganesh);
++            }
++            rb_pixels = rb_ganesh.data();
++            rb_stride = row;
++          }
++#if BUILDFLAG(IS_WIN)
++          const bool ok = provider->WeavePixels(
++              device_x.Get(), rb_pixels, static_cast<uint32_t>(rb_stride), rect,
++              st.slot);
++#elif BUILDFLAG(IS_APPLE)
++          const bool ok = provider->WeavePixelsMac(
++              rb_pixels, static_cast<uint32_t>(rb_stride), rect, st.slot);
++#endif
++          if (ok) {
++            static int c_rb_ok = 0;
++            const int n = c_rb_ok++;
++            if (n < 3 || (n % 300) == 0) {
++              LOG(ERROR) << "[DisplayXR] weave: CPU readback FROM THE CLEAN "
++                            "SCRATCH carried this tile (id="
++                         << inline_3d_rects_[t].id.ToString()
++                         << " rect=" << rect.ToString() << " uses=" << (n + 1)
++                         << ")";
++            }
++          }
++          return ok;
++        };
++
++        // Every failure from here on is a GPU-HANDOFF failure: the pixels are
++        // composed and correct, only the route to the weave input is broken. So
++        // count the reason and take part 1's road rather than returning false
++        // into the |output| readback 0073 has to gate away.
++        auto handoff_failed = [&](const char* why, int* counter) -> bool {
++          fail(why, counter);
++          return cpu_weave_from_scratch();
++        };
++
+         // (3) ProduceOverlayForWeave the scratch (SCANOUT-gate-free) to get its
+         // raw ID3D11Texture2D.
+         auto overlay_rep =
+             shared_image_representation_factory_->ProduceOverlayForWeave(
+                 st.scratch_mailbox);
+         if (!overlay_rep) {
+-          return fail("ProduceOverlayForWeave(scratch)");
++          static int c_ov_rep = 0;
++          return handoff_failed("ProduceOverlayForWeave(scratch)", &c_ov_rep);
+         }
+         auto overlay_read = overlay_rep->BeginScopedReadAccess();
+         if (!overlay_read) {
+-          return fail("overlay BeginScopedReadAccess");
++          static int c_ov_read = 0;
++          return handoff_failed("overlay BeginScopedReadAccess", &c_ov_read);
+         }
+ #if BUILDFLAG(IS_WIN)
+         std::optional<gl::DCLayerOverlayImage> ov =
+             overlay_read->GetDCLayerOverlayImage();
+         if (!ov || ov->type() != gl::DCLayerOverlayType::kD3D11Texture ||
+             !ov->d3d11_video_texture()) {
+-          if (!logged_fail) {
+-            logged_fail = true;
+-            VLOG(1) << "[DisplayXR] B4d zero-copy fell back to WeavePixels: "
+-                       "overlay not kD3D11Texture (has_value="
+-                    << ov.has_value() << " type="
+-                    << (ov ? static_cast<int>(ov->type()) : -1) << ")";
+-          }
+-          return false;  // not a raw texture -> caller falls back to readback
++          // Not transient (a backing either exposes a raw texture or it never
++          // will), but counted on the same discipline as the rest so a capture
++          // can rule it out — and routed through part 1, which is the whole
++          // point: this branch used to be a permanent one-way trip to the
++          // |output| readback for the entire process.
++          static int c_ov_type = 0;
++          return handoff_failed("overlay not kD3D11Texture", &c_ov_type);
+         }
+ 
+         // (4) GPU-resident weave: CopySubresourceRegion scratch -> keyed-mutex
+@@ -3507,7 +3772,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         // of the read access (kept alive across the copy).
+         gfx::ScopedIOSurface ios = overlay_read->GetIOSurface();
+         if (!ios) {
+-          return fail("overlay GetIOSurface");
++          static int c_ov_ios = 0;
++          return handoff_failed("overlay GetIOSurface", &c_ov_ios);
+         }
+         bool submitted = provider->WeaveCanvasMac(
+             ios.get(), gfx::Rect(0, 0, rw, rh), rect, st.slot);
+@@ -3519,7 +3785,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                      "readback) "
+                   << rw << "x" << rh;
+         }
+-        return submitted;
++        if (!submitted) {
++          // The last handoff step, and the last one that used to be silent: the
++          // copy into the keyed-mutex weave input was refused (mutex
++          // contention, a mid-frame format change, a destination clamp). Same
++          // treatment.
++          static int c_weave_canvas = 0;
++          return handoff_failed("WeaveCanvas(copy into weave input)",
++                                &c_weave_canvas);
++        }
++        return true;
+       }();
+       if (zc) {
+         // Remember where this target was submitted so phase (B) draws the woven
+@@ -3532,11 +3807,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       }
+     }
+ 
+-    // CPU-readback fallback (GL output device, or a failed zero-copy step): read
+-    // the composited sub-rect back to CPU (BGRA8) and upload it into the weave
+-    // input. Ganesh has a synchronous SkSurface::readPixels; Graphite has no sync
+-    // readback, so it uses the blocking-async path. This reads the clean pre-
+-    // weave page (phase (A) runs before the woven draw-back in (B)).
++    // CPU-readback fallback (GL output device, or a failed zero-copy step):
++    // read the composited sub-rect back to CPU (BGRA8) and upload it into the
++    // weave input. Ganesh has a synchronous SkSurface::readPixels; Graphite has
++    // no sync readback, so it uses the blocking-async path. This reads the
++    // clean page as it stands before the weave (phase (A) runs before the woven
++    // draw-back in (B)).
+     //
+     // ---- (web#12) …and "the clean pre-weave page" is exactly what it stopped
+     // being when browser#22 landed suppression. This path sources ONLY from
+@@ -3551,17 +3827,29 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // If it did not (an empty layer list — the legacy no-canvas-resource
+     // channel, and the GL output-device path), this readback is still the
+     // correct weave source and is untouched.
++    //
++    // (web#12, 0074) Two changes, both from the field capture where this line
++    // fired 301+ times in one sample:
++    //   * the tile's IDENTITY joins the line. Per-tile failure rate is the
++    //     measurement that separates "the weave is broken" from "one heavy
++    //     producer is holding its canvas", and the rect alone was already
++    //     enough to tell the sample's two tiles apart — so say which.
++    //   * the refusal is no longer the end of the road. On the DComp path the
++    //     clean-scratch readback above has already had its turn, so arriving
++    //     here means the tile could not be composed at all; part 2 then keeps
++    //     its previous content rather than letting it go dark.
+     if (!inline_3d_canvas_layers_.empty()) {
+       static int s_cpu_hole = 0;
+       const int n = s_cpu_hole++;
+       if (n < 3 || (n % 300) == 0) {
+         LOG(ERROR) << "[DisplayXR] weave tile skipped: CPU readback would "
+-                      "sample the suppression hole (rect="
+-                   << rect.ToString()
++                      "sample the suppression hole (id="
++                   << inline_3d_rects_[t].id.ToString()
++                   << " rect=" << rect.ToString()
+                    << " layers=" << inline_3d_canvas_layers_.size()
+                    << " skips=" << (n + 1) << ")";
+       }
+-      return false;
++      return keep_previous();
+     }
+     const SkImageInfo info = SkImageInfo::Make(
+         rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+@@ -3583,7 +3871,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone), &read_ctx);
+       if (!read_ctx.finished || !read_ctx.async_result ||
+           read_ctx.async_result->count() != 1) {
+-        return false;
++        static int c_out_graphite = 0;
++        const int n = c_out_graphite++;
++        if (n < 3 || (n % 300) == 0) {
++          LOG(ERROR) << "[DisplayXR] weave: graphite readback(output) returned "
++                        "nothing (id="
++                     << inline_3d_rects_[t].id.ToString()
++                     << " rect=" << rect.ToString() << " fails=" << (n + 1)
++                     << ")";
++        }
++        return keep_previous();
+       }
+       src_pixels =
+           reinterpret_cast<const uint8_t*>(read_ctx.async_result->data(0));
+@@ -3594,7 +3891,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       ganesh_pixels.resize(stride * rh);
+       if (!output->readPixels(info, ganesh_pixels.data(), stride, rect.x(),
+                               rect.y())) {
+-        return false;
++        static int c_out_ganesh = 0;
++        const int n = c_out_ganesh++;
++        if (n < 3 || (n % 300) == 0) {
++          LOG(ERROR) << "[DisplayXR] weave: readPixels(output) failed (id="
++                     << inline_3d_rects_[t].id.ToString()
++                     << " rect=" << rect.ToString() << " fails=" << (n + 1)
++                     << ")";
++        }
++        return keep_previous();
+       }
+       src_pixels = ganesh_pixels.data();
+       src_stride = stride;
+@@ -3611,8 +3916,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     if (submitted) {
+       // Submit-time rect for phase (B) draw-back (see the zero-copy path above).
+       st.pending_rect = rect;
++      return true;
+     }
+-    return submitted;
++    // (web#12, 0074) The very last exit. Everything that could produce pixels
++    // for this tile has now failed; keep what it had rather than let the
++    // caller clear its rects and hand it to the recovery draw.
++    return keep_previous();
+   };
+ 
+   // Submit EVERY visible target this frame. Each target keys its own keyed-mutex
+@@ -3789,6 +4098,13 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     rec_accesses.reserve(inline_3d_canvas_layers_.size());
+     int rec_drawn = 0;
+     int rec_missing = 0;
++    // (web#12, 0074) Why the missing ones were missing, per step, frame-scoped
++    // and reported on the throttled line below. Named rather than an indexed
++    // array (a runtime index into a C array is an unsafe-buffer error here).
++    int rec_fail_no_mailbox = 0;
++    int rec_fail_produce = 0;
++    int rec_fail_read_access = 0;
++    int rec_fail_mk_image = 0;
+     for (const auto& c : inline_3d_canvas_layers_) {
+       // Clipped to nothing by the window: there is no hole on screen to fill.
+       // Not counted as missing — nothing was lost.
+@@ -3810,29 +4126,69 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       // is now belt-and-braces rather than the load-bearing case it was.
+       if (c.mailbox.IsZero()) {
+         ++rec_missing;
++        ++rec_fail_no_mailbox;
+         continue;
+       }
+-      auto rep = shared_image_representation_factory_->ProduceSkia(
+-          c.mailbox, context_state_.get());
+-      if (!rep) {
+-        ++rec_missing;
+-        continue;
+-      }
+-      std::vector<GrBackendSemaphore> rbegin_sem, rend_sem;
+-      auto access = rep->BeginScopedReadAccess(&rbegin_sem, &rend_sem);
+-      if (!access) {
+-        ++rec_missing;
+-        continue;
++      // (web#12, 0074) THE RECOVERY OPENS THE SAME RESOURCE THE WEAVE JUST
++      // FAILED TO OPEN. That is why the field capture reads "recovery draw: n=0
++      // missing=2" on exactly the frames the weave declined: this loop's
++      // ProduceSkia / BeginScopedReadAccess / CreateSkImage are the same three
++      // calls, against the same contended canvas SharedImage, a few
++      // microseconds later — so the "safety net" was failing for the identical
++      // reason and the tile fell all the way through to the raw suppression
++      // hole.
++      //
++      // Two changes, mirroring the weave leg: retry ONCE (the producer's write
++      // access is usually released by the second ask), and count WHICH of the
++      // three steps lost so "missing=N" stops being a number with no cause
++      // attached. Keep-previous is what makes those failures survivable; this
++      // is what makes them explicable.
++      std::unique_ptr<gpu::SkiaImageRepresentation> rep;
++      std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess> access;
++      sk_sp<SkImage> img;
++      int rec_step = -1;
++      for (int attempt = 0; attempt < 2 && !img; ++attempt) {
++        rec_step = -1;
++        std::vector<GrBackendSemaphore> rbegin_sem, rend_sem;
++        rep = shared_image_representation_factory_->ProduceSkia(
++            c.mailbox, context_state_.get());
++        if (!rep) {
++          rec_step = 1;
++          continue;
++        }
++        access = rep->BeginScopedReadAccess(&rbegin_sem, &rend_sem);
++        if (!access) {
++          rec_step = 2;
++          rep.reset();
++          continue;
++        }
++        img = access->CreateSkImage(context_state_.get());
++        if (!img) {
++          rec_step = 3;
++          access.reset();
++          rep.reset();
++          continue;
++        }
++        if (!rbegin_sem.empty()) {
++          output->wait(rbegin_sem.size(), rbegin_sem.data(),
++                       /*deleteSemaphoresAfterWait=*/false);
++        }
+       }
+-      sk_sp<SkImage> img = access->CreateSkImage(context_state_.get());
+       if (!img) {
+         ++rec_missing;
++        switch (rec_step) {
++          case 2:
++            ++rec_fail_read_access;
++            break;
++          case 3:
++            ++rec_fail_mk_image;
++            break;
++          default:
++            ++rec_fail_produce;
++            break;
++        }
+         continue;
+       }
+-      if (!rbegin_sem.empty()) {
+-        output->wait(rbegin_sem.size(), rbegin_sem.data(),
+-                     /*deleteSemaphoresAfterWait=*/false);
+-      }
+       // LEFT EYE = the left half of the quad's EXISTING UV WINDOW, not of the
+       // whole texture (browser#73): |uv| is the normalized sub-rect of the
+       // resource that |rect| displays, and for an atlased or partially-mapped
+@@ -3898,6 +4254,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         LOG(ERROR) << "[DisplayXR] inline-3D recovery draw: n=" << rec_drawn
+                    << " missing=" << rec_missing
+                    << (only_unsubmitted ? " (per-tile)" : " (whole-frame)")
++                   // (web#12, 0074) The cause breakdown. "missing=2" with
++                   // no_mailbox=0 produce=0 read_access=2 says the canvas
++                   // resources are THERE and CONTENDED, which is a completely
++                   // different bug from "the resources are gone".
++                   << " [no_mailbox=" << rec_fail_no_mailbox
++                   << " produce=" << rec_fail_produce
++                   << " read_access=" << rec_fail_read_access
++                   << " mk_image=" << rec_fail_mk_image << "]"
+                    << " events=" << (n + 1);
+       }
+     }
+-- 
+2.42.0.windows.2
+
