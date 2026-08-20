@@ -1,7 +1,7 @@
-From a106b5c9b3420677d0a5a2def2962b2c8b06e36b Mon Sep 17 00:00:00 2001
+From f606533cf404539ec08907f126ec75393e55dff4 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 16:37:32 -0700
-Subject: [PATCH 30/54] inline-3d(#625): restore the renderer's eye feed in
+Subject: [PATCH 30/71] inline-3d(#625): restore the renderer's eye feed in
  sync-weave mode + scope views to the scene element
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -385,10 +385,10 @@ index beb940adf1e35..d31221a579661 100644
    // Register the target canvas with the session; each frame the session reports
    // its window-relative rect to the compositor (XRSession::ReportInline3DRects),
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 20d3bfc7ee879..1c0afb7437ae0 100644
+index 6087962c7223a..56befb5bcdddb 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2534,13 +2534,52 @@ void XRSession::UpdateInlineView() {
+@@ -2559,13 +2559,52 @@ void XRSession::UpdateInlineView() {
        render_state_->depthFar());
  }
  
@@ -442,7 +442,7 @@ index 20d3bfc7ee879..1c0afb7437ae0 100644
  }
  
  void XRSession::OnInline3DState(const Vector<float>& eyes,
-@@ -2557,6 +2596,12 @@ void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
+@@ -2582,6 +2621,12 @@ void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
  
  void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
    display_layers_.erase(layer);
@@ -455,7 +455,7 @@ index 20d3bfc7ee879..1c0afb7437ae0 100644
  }
  
  void XRSession::ReportInline3DRects() {
-@@ -2988,6 +3033,7 @@ void XRSession::OnTransferComplete(const Vector<device::LayerId>& layer_ids) {
+@@ -3013,6 +3058,7 @@ void XRSession::OnTransferComplete(const Vector<device::LayerId>& layer_ids) {
  void XRSession::Trace(Visitor* visitor) const {
    visitor->Trace(xr_);
    visitor->Trace(display_layers_);
@@ -464,7 +464,7 @@ index 20d3bfc7ee879..1c0afb7437ae0 100644
    visitor->Trace(world_light_probe_);
    visitor->Trace(pending_render_state_);
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 93f04bc9f5049..15a59de609beb 100644
+index 07289f1b2015b..3acdd35d683b5 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -343,11 +343,14 @@ class XRSession final : public EventTarget,

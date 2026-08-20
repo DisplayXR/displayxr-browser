@@ -1,7 +1,7 @@
-From 30d79469d04756760b6617f3ecddf059851ef220 Mon Sep 17 00:00:00 2001
+From c8a484a010066c53bb034588f9ff23b822a49c17 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 23 Jun 2026 14:27:49 -0400
-Subject: [PATCH 01/54] [displayxr inline-3d #625 B2a] browser-process weave
+Subject: [PATCH 01/71] [displayxr inline-3d #625 B2a] browser-process weave
  client + vendored OpenXR
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -94,7 +94,7 @@ browser<->GPU Mojo bridge land in B2b/B2c.
  create mode 100644 third_party/displayxr/lib/openxr_loader.lib
 
 diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
-index 1ab8f3cac2e00..56c06e604af60 100644
+index 05ec8ec8bcaea..c9f837694769b 100644
 --- a/content/shell/BUILD.gn
 +++ b/content/shell/BUILD.gn
 @@ -174,6 +174,22 @@ inspector_protocol_generate("protocol_sources") {
@@ -351,7 +351,7 @@ index 0000000000000..a7ad6a18fe629
 +
 +#endif  // CONTENT_SHELL_BROWSER_DISPLAYXR_WEAVE_CLIENT_H_
 diff --git a/content/shell/browser/shell_browser_main_parts.cc b/content/shell/browser/shell_browser_main_parts.cc
-index 76ba15e7f865d..25c70f474ed55 100644
+index b07dc0fdfc759..72794720a449c 100644
 --- a/content/shell/browser/shell_browser_main_parts.cc
 +++ b/content/shell/browser/shell_browser_main_parts.cc
 @@ -31,6 +31,7 @@

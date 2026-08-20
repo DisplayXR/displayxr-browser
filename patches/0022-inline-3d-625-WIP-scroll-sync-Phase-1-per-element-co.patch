@@ -1,7 +1,7 @@
-From d3913acf6947dc06dba64aa242e3046900516e11 Mon Sep 17 00:00:00 2001
+From 49b356d2a870c70ce02216005ff3c61d8ebdb392 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 23:34:35 -0700
-Subject: [PATCH 22/54] inline-3d(#625): WIP scroll-sync Phase 1 (per-element
+Subject: [PATCH 22/71] inline-3d(#625): WIP scroll-sync Phase 1 (per-element
  concurrent submit) + Phase 2 (impl-side scroll-fresh rects)
 
 Phase 1: DisplayXRWeaveGpu keeps a per-target keyed-mutex input pool (flat_map
@@ -27,11 +27,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  6 files changed, 255 insertions(+), 126 deletions(-)
 
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 7f28122e1fc1a..80d8cc6dcd2bc 100644
+index 8c1cb14babd9e..2a89386cc9245 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2457,6 +2457,49 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
-         /*is_for_compositor_frame_metadata=*/true);
+@@ -2628,6 +2628,49 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
+             TrackedElementStatus::kHasTrackedElementsNeedingOcclusion);
      metadata.inline_3d_rects = active_tree()->inline_3d_rects();
    }
 +  // DisplayXR inline-3D (#625, Step B / Phase 2 — scroll-sync): the rects above
@@ -545,10 +545,10 @@ index 3f60859165eb9..f9e706e7c44d0 100644
    // B2c.2: fire an async weave from the REAL canvas texture. |device| is the Viz
    // GPU-main D3D11 device (== the canvas SharedImage's device, so the copy is
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index d8135ec351725..d147be01db680 100644
+index 52eff2dd79b78..4ef9134e2a31b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2787,6 +2787,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2786,6 +2786,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      }
    }
    displayxr_woven_state_.resize(inline_3d_rects_.size());
@@ -558,7 +558,7 @@ index d8135ec351725..d147be01db680 100644
  
    // Same prune for the B4d GPU-resident weave scratch SharedImages.
    if (displayxr_scratch_state_.size() > inline_3d_rects_.size()) {
-@@ -2984,6 +2987,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2983,6 +2986,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          return submitted;
        }();
        if (zc) {
@@ -568,7 +568,7 @@ index d8135ec351725..d147be01db680 100644
          return true;
        }
      }
-@@ -3030,28 +3036,31 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3029,28 +3035,31 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        src_stride = stride;
      }
  
@@ -619,7 +619,7 @@ index d8135ec351725..d147be01db680 100644
    }
  
    // ---- (B) Draw back the accumulated window-sized woven output ----
-@@ -3070,6 +3079,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3069,6 +3078,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        continue;
      }
      got_result = true;
@@ -631,7 +631,7 @@ index d8135ec351725..d147be01db680 100644
      if (r.woven_handle) {
        if (!displayxr_shared_woven_mailbox_.IsZero()) {
          shared_image_factory_->DestroySharedImage(displayxr_shared_woven_mailbox_);
-@@ -3144,7 +3158,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3143,7 +3157,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
  
    bool drew_any = false;
    for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
@@ -645,10 +645,10 @@ index d8135ec351725..d147be01db680 100644
      if (rect.IsEmpty()) {
        continue;
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 3efb289c0eba4..ee19656343f75 100644
+index 8ec26add4bdb5..476466e6ae437 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -687,11 +687,20 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -686,11 +686,20 @@ class SkiaOutputSurfaceImplOnGpu
    };
    std::vector<DisplayXRScratchState> displayxr_scratch_state_;
  

@@ -1,7 +1,7 @@
-From fc4635553e2efb8ac66676fe8680e00d1a48b936 Mon Sep 17 00:00:00 2001
+From c5a192cf819f5224381ca90a43ab5f147b99c935 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 17:33:09 -0700
-Subject: [PATCH 33/54] inline-3d(#625): fix device-px vs logical-px mismatch
+Subject: [PATCH 33/71] inline-3d(#625): fix device-px vs logical-px mismatch
  in the element geometry
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -32,10 +32,10 @@ the centre offset AND the m2v scene scale.
  2 files changed, 35 insertions(+), 7 deletions(-)
 
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index db718f01ace91..4c0f82473417d 100644
+index b5ea1c3c17dbd..3c2053c0ba114 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2579,6 +2579,17 @@ void XRSession::RequestInline3DState() {
+@@ -2604,6 +2604,17 @@ void XRSession::RequestInline3DState() {
        scene_rect, BindOnce(&XRSession::OnInline3DState, WrapWeakPersistent(this)));
  }
  
@@ -53,7 +53,7 @@ index db718f01ace91..4c0f82473417d 100644
  // The scene layer's canvas rect in window-relative device px — the same basis
  // ReportInline3DRects uses for the weave rects, so the views and the woven
  // output describe the same element.
-@@ -2699,20 +2710,34 @@ void XRSession::UpdateInline3DViews() {
+@@ -2724,20 +2735,34 @@ void XRSession::UpdateInline3DViews() {
    const float near_depth = static_cast<float>(render_state_->depthNear());
    const float far_depth = static_cast<float>(render_state_->depthFar());
  
@@ -94,7 +94,7 @@ index db718f01ace91..4c0f82473417d 100644
  
    // Scene-scale (display-rig m2v, XR_DXR_view_rig's virtualDisplayHeight): the
    // off-axis frustum ANGLES are physically correct and m2v-invariant (scaling
-@@ -2723,7 +2748,7 @@ void XRSession::UpdateInline3DViews() {
+@@ -2748,7 +2773,7 @@ void XRSession::UpdateInline3DViews() {
    // with no app-side scaling. Matches display3d_view.c: eye_scaled = eye*m2v,
    // projection built from physical dims (buildKooimaProjection cancels m2v with
    // perspectiveFactor=1). 0 = disabled -> m2v 1 -> physical-scale scene.
@@ -104,7 +104,7 @@ index db718f01ace91..4c0f82473417d 100644
                          ? (inline_3d_virtual_display_height_ / elem_phys_h)
                          : 1.f;
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 15a59de609beb..5dfe03744553f 100644
+index 3acdd35d683b5..83342d9a89392 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -498,6 +498,9 @@ class XRSession final : public EventTarget,

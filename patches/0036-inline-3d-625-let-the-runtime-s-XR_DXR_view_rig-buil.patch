@@ -1,7 +1,7 @@
-From 18157e460572217174c8f4f1c173779dd50772d8 Mon Sep 17 00:00:00 2001
+From 8b80980cee417cbabb1138ad558de20f317a9208 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 19:17:30 -0700
-Subject: [PATCH 36/54] inline-3d(#625): let the runtime's XR_DXR_view_rig
+Subject: [PATCH 36/71] inline-3d(#625): let the runtime's XR_DXR_view_rig
  build the off-axis views
 
 The three.js scene rig has never been right: the cube renders far too large,
@@ -609,10 +609,10 @@ index 49dc581f959dc..d9a8324f297a7 100644
 +      => (array<DisplayXRView> views);
  };
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 27b1f8c66f8f9..2f3d77e502979 100644
+index e3253673f5441..7a2af2c427a53 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -75,6 +75,7 @@
+@@ -77,6 +77,7 @@
  #include "third_party/blink/renderer/platform/bindings/v8_throw_exception.h"
  #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
  #include "ui/gfx/geometry/point3_f.h"
@@ -620,7 +620,7 @@ index 27b1f8c66f8f9..2f3d77e502979 100644
  #include "ui/gfx/geometry/transform.h"
  
  #if BUILDFLAG(ENABLE_VR)
-@@ -2513,15 +2514,15 @@ void XRSession::UpdateInlineView() {
+@@ -2538,15 +2539,15 @@ void XRSession::UpdateInlineView() {
        static int s_gate_log = 0;
        if (s_gate_log < 20) {
          ++s_gate_log;
@@ -641,7 +641,7 @@ index 27b1f8c66f8f9..2f3d77e502979 100644
          output_height_ > 0) {
        UpdateInline3DViews();
        return;
-@@ -2575,19 +2576,9 @@ void XRSession::RequestInline3DState() {
+@@ -2600,19 +2601,9 @@ void XRSession::RequestInline3DState() {
    // empty rect means "no scene layer": the browser falls back to the submitted
    // rect (single-window pages).
    gfx::Rect scene_rect = Inline3DSceneWindowRect();
@@ -664,7 +664,7 @@ index 27b1f8c66f8f9..2f3d77e502979 100644
  }
  
  // The scene layer's canvas rect in window-relative device px — the same basis
-@@ -2617,12 +2608,9 @@ gfx::Rect XRSession::Inline3DSceneWindowRect() const {
+@@ -2642,12 +2633,9 @@ gfx::Rect XRSession::Inline3DSceneWindowRect() const {
    return gfx::ToRoundedRect(css_rect);
  }
  
@@ -680,7 +680,7 @@ index 27b1f8c66f8f9..2f3d77e502979 100644
  }
  
  void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
-@@ -2686,12 +2674,24 @@ void XRSession::ReportInline3DRects() {
+@@ -2711,12 +2699,24 @@ void XRSession::ReportInline3DRects() {
    widget->SetInline3DRects(rects);
  }
  
@@ -711,7 +711,7 @@ index 27b1f8c66f8f9..2f3d77e502979 100644
  void XRSession::UpdateInline3DViews() {
    const int w = output_width_;
    const int h = output_height_;
-@@ -2706,99 +2706,42 @@ void XRSession::UpdateInline3DViews() {
+@@ -2731,99 +2731,42 @@ void XRSession::UpdateInline3DViews() {
          gfx::Rect(half_w, 0, w - half_w, h), graphics_api_));
    }
  
@@ -834,7 +834,7 @@ index 27b1f8c66f8f9..2f3d77e502979 100644
    }
  }
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 5dfe03744553f..1c37b8baa581c 100644
+index 83342d9a89392..51acf353ac49b 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -498,12 +498,7 @@ class XRSession final : public EventTarget,

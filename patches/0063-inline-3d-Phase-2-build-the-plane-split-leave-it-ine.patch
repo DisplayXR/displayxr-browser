@@ -1,7 +1,7 @@
-From a097adcb4b91f1b605ec6065ac1b6890d6487615 Mon Sep 17 00:00:00 2001
+From c1a6bcc4e5a05cf79fdc0747342238f9c7adb733 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 00:00:55 -0700
-Subject: [PATCH 63/64] inline-3d(Phase 2): build the plane split, leave it
+Subject: [PATCH 63/71] inline-3d(Phase 2): build the plane split, leave it
  inert
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -78,7 +78,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  14 files changed, 691 insertions(+), 1 deletion(-)
 
 diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
-index 6da4594..636a828 100644
+index 6da459441d53c..636a828f52737 100644
 --- a/chrome/app/chrome_main_delegate.cc
 +++ b/chrome/app/chrome_main_delegate.cc
 @@ -1117,6 +1117,25 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
@@ -108,7 +108,7 @@ index 6da4594..636a828 100644
  #endif  // BUILDFLAG(IS_WIN)
  
 diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
-index 29cff70..adb1778 100644
+index 29cff701fc978..adb1778477cb1 100644
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
 @@ -2860,6 +2860,15 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
@@ -128,7 +128,7 @@ index 29cff70..adb1778 100644
      // The weave input is an NT-shared keyed-mutex D3D11 texture the DisplayXR
      // service creates on the runtime's adapter — the high-performance discrete
 diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
-index fb669c5..4db03d6 100644
+index fb669c505ea98..4db03d6e91cfe 100644
 --- a/components/viz/service/display/aggregated_frame.h
 +++ b/components/viz/service/display/aggregated_frame.h
 @@ -8,6 +8,7 @@
@@ -157,7 +157,7 @@ index fb669c5..4db03d6 100644
    std::vector<Inline3dTrackedRect> inline_3d_rects;
  
 diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
-index 7b52870..900e547 100644
+index 7b5287084e268..900e547637868 100644
 --- a/components/viz/service/display/direct_renderer.cc
 +++ b/components/viz/service/display/direct_renderer.cc
 @@ -8,16 +8,20 @@
@@ -391,7 +391,7 @@ index 7b52870..900e547 100644
                                      const gfx::Rect& render_pass_scissor) {
    // DisplayXR inline-3D (browser#22 B): the weave output drawn back
 diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
-index 0e3771b..01d47e5 100644
+index 0e3771bb3b406..01d47e50b22c7 100644
 --- a/components/viz/service/display/direct_renderer.h
 +++ b/components/viz/service/display/direct_renderer.h
 @@ -15,6 +15,7 @@
@@ -502,7 +502,7 @@ index 0e3771b..01d47e5 100644
    bool disable_color_checks_for_testing_ = false;
  
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index b6f8012..82f52aa 100644
+index b6f80127a779c..82f52aac74a1d 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
 @@ -1046,6 +1046,44 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
@@ -551,7 +551,7 @@ index b6f8012..82f52aa 100644
                           current_surface_size, display_color_spaces_,
                           std::move(frame.surface_damage_rect_list_),
 diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
-index 6a47d12..3916541 100644
+index 6a47d12b955e7..3916541cffb7d 100644
 --- a/components/viz/service/display/skia_output_surface.h
 +++ b/components/viz/service/display/skia_output_surface.h
 @@ -246,6 +246,17 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
@@ -573,7 +573,7 @@ index 6a47d12..3916541 100644
      BUILDFLAG(USE_V4L2_CODEC)
    virtual void DetileOverlay(gpu::Mailbox input,
 diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
-index fa1c0e7..117f738 100644
+index fa1c0e761d726..117f73876d7c7 100644
 --- a/components/viz/service/display/skia_renderer.cc
 +++ b/components/viz/service/display/skia_renderer.cc
 @@ -1501,6 +1501,13 @@ void SkiaRenderer::BeginDrawingRenderPass(
@@ -852,7 +852,7 @@ index fa1c0e7..117f738 100644
      const AggregatedRenderPassList& render_passes_in_draw_order,
      const base::flat_map<AggregatedRenderPassId, RenderPassRequirements>&
 diff --git a/components/viz/service/display/skia_renderer.h b/components/viz/service/display/skia_renderer.h
-index 420fe3d..5d15843 100644
+index 420fe3d030d7b..5d15843aa4c8d 100644
 --- a/components/viz/service/display/skia_renderer.h
 +++ b/components/viz/service/display/skia_renderer.h
 @@ -25,6 +25,7 @@
@@ -930,7 +930,7 @@ index 420fe3d..5d15843 100644
  
    // Returns true if we need to push a color conversion layer to correctly draw
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index bb6cb5d..98fb5c6 100644
+index bb6cb5d88ce41..98fb5c649c12f 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
 @@ -2566,7 +2566,11 @@ AggregatedFrame SurfaceAggregator::Aggregate(
@@ -947,7 +947,7 @@ index bb6cb5d..98fb5c6 100644
    // browser#22 DIAGNOSTIC: why does page-global chrome (the sticky header) blow
    // up for a frame or two during a fast scroll? Two candidate mechanisms, and
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-index 6242640..9e9ff07 100644
+index 62426408dce49..9e9ff0757fb23 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
 @@ -1082,6 +1082,23 @@ void SkiaOutputSurfaceImpl::SetInline3DRects(
@@ -975,7 +975,7 @@ index 6242640..9e9ff07 100644
      gfx::SurfaceOrigin output_surface_origin) {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
-index 758ea47..d6a0cc6 100644
+index 758ea47416cc0..d6a0cc6a4d5aa 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
 @@ -180,6 +180,8 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
@@ -988,7 +988,7 @@ index 758ea47..d6a0cc6 100644
    // ExternalUseClient implementation:
    gpu::SyncToken ReleaseImageContexts(
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 934983b..7fd5544 100644
+index 934983b164b7e..7fd5544fe64ab 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -2725,6 +2725,14 @@ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
@@ -1007,7 +1007,7 @@ index 934983b..7fd5544 100644
  // static
  base::Token SkiaOutputSurfaceImplOnGpu::DisplayXRTargetKey(
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index ffa1d98..e83fbb2 100644
+index ffa1d9834ffe9..e83fbb275487b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 @@ -241,6 +241,11 @@ class SkiaOutputSurfaceImplOnGpu

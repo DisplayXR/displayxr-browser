@@ -1,7 +1,7 @@
-From 6578f2719c16fe359f40e191f99796038ecfe1e0 Mon Sep 17 00:00:00 2001
+From 044e43d8feb75379c1e7ed2a22835ad9ce4174a3 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 9 Jul 2026 01:28:53 -0700
-Subject: [PATCH 11/54] =?UTF-8?q?inline-3d(#625):=20plumb=20inline=5F3d=5F?=
+Subject: [PATCH 11/71] =?UTF-8?q?inline-3d(#625):=20plumb=20inline=5F3d=5F?=
  =?UTF-8?q?rects=20through=20LayerContext=20=E2=80=94=20retire=20--disable?=
  =?UTF-8?q?-features=3DTreesInViz?=
 MIME-Version: 1.0
@@ -50,10 +50,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  12 files changed, 47 insertions(+), 14 deletions(-)
 
 diff --git a/cc/mojo_embedder/viz_layer_context.cc b/cc/mojo_embedder/viz_layer_context.cc
-index 4588ca238230a..3a7bcf768eed7 100644
+index ef4d47f49d46e..edd159a7a9e67 100644
 --- a/cc/mojo_embedder/viz_layer_context.cc
 +++ b/cc/mojo_embedder/viz_layer_context.cc
-@@ -1463,7 +1463,8 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+@@ -1473,7 +1473,8 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
      bool frame_has_damage,
      bool is_flush,
      std::vector<ui::LatencyInfo> latency_info,
@@ -63,7 +63,7 @@ index 4588ca238230a..3a7bcf768eed7 100644
    TRACE_EVENT0("viz", "VizLayerContext::UpdateDisplayTreeFrom");
  
    auto& property_trees = *tree.property_trees();
-@@ -1497,6 +1498,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+@@ -1507,6 +1508,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
  
    update->latency_info = std::move(latency_info);
    update->tracked_element_rects = std::move(tracked_element_rects);
@@ -227,10 +227,10 @@ index 7b38d60eaa483..8c1cb14babd9e 100644
    // A flush update synchronizes state (e.g. tile evictions) to Viz but does not
    // result in a frame draw. We reset internal damage tracking and tree change
 diff --git a/cc/trees/layer_tree_host_impl.h b/cc/trees/layer_tree_host_impl.h
-index 716c6cbd8ca88..aac12746cdb29 100644
+index da308c924b6e2..2f6154a449e05 100644
 --- a/cc/trees/layer_tree_host_impl.h
 +++ b/cc/trees/layer_tree_host_impl.h
-@@ -424,6 +424,7 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -428,6 +428,7 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
        FrameData& frame,
        std::vector<ui::LatencyInfo> latency_info,
        viz::TrackedElementRects tracked_element_rects,
@@ -238,7 +238,7 @@ index 716c6cbd8ca88..aac12746cdb29 100644
        bool is_flush = false);
  
    // Synchronizes the current tree state to Viz without triggering a draw.
-@@ -579,6 +580,10 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -590,6 +591,10 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
      return tracked_element_rects_from_client_;
    }
  
@@ -249,7 +249,7 @@ index 716c6cbd8ca88..aac12746cdb29 100644
    // Buffers `callback` until a relevant presentation feedback arrives, at which
    // point the callback will be posted to run on the main thread. A presentation
    // feedback is considered relevant if the frame's token is greater than or
-@@ -1367,6 +1372,11 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -1382,6 +1387,11 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
    // client so that they can be added to generated frame metadata in Viz.
    viz::TrackedElementRects tracked_element_rects_from_client_;
  
@@ -262,10 +262,10 @@ index 716c6cbd8ca88..aac12746cdb29 100644
    // They are for debug purposes for TreesInViz and TreeAnimationsInViz.
    bool dump_compositor_frame_ = false;
 diff --git a/components/viz/service/layers/layer_context_impl.cc b/components/viz/service/layers/layer_context_impl.cc
-index 5347f77a90f80..9820a5a255d43 100644
+index fa9dbe06577cc..8973d8c170f07 100644
 --- a/components/viz/service/layers/layer_context_impl.cc
 +++ b/components/viz/service/layers/layer_context_impl.cc
-@@ -2029,6 +2029,9 @@ base::expected<void, std::string> LayerContextImpl::DoUpdateDisplayTree(
+@@ -2165,6 +2165,9 @@ base::expected<void, std::string> LayerContextImpl::DoUpdateDisplayTree(
    host_impl_->set_tracked_element_rects_from_client(
        std::move(update->tracked_element_rects));
  

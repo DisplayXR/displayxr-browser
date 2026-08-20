@@ -1,7 +1,7 @@
-From 656af477c0d3c4a1b327fcde010da4b9f0489c64 Mon Sep 17 00:00:00 2001
+From dcd5f6b725880515c06d7537e6055b84045f58e7 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sat, 27 Jun 2026 17:18:17 -0500
-Subject: [PATCH 05/54] B2c.2: weave the REAL canvas texture (replace synthetic
+Subject: [PATCH 05/71] B2c.2: weave the REAL canvas texture (replace synthetic
  SBS input)
 
 #625 Step B. Replaces the B2c.1 synthetic test-pattern input with the
@@ -90,10 +90,10 @@ index 10b7b4d7ff188..c06e73f853b22 100644
  
  // Register / fetch the process-global provider (GPU process, GPU main thread).
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index d2d8eda177072..d3cd80a76e06d 100644
+index 581e4bf1e2e3e..6ec8957dcd46c 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2689,13 +2689,42 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+@@ -2688,13 +2688,42 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
    static bool s_logged_target = false;
    if (!s_logged_target) {
      s_logged_target = true;
@@ -509,7 +509,7 @@ index efa9b5af0509b..5b25867dac708 100644
      const Mailbox& mailbox,
      MemoryTypeTracker* tracker) {
 diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.h b/gpu/command_buffer/service/shared_image/shared_image_manager.h
-index f871108f5afeb..40fd5bfea6163 100644
+index 66f83b95d49df..0d5c29bd24320 100644
 --- a/gpu/command_buffer/service/shared_image/shared_image_manager.h
 +++ b/gpu/command_buffer/service/shared_image/shared_image_manager.h
 @@ -117,6 +117,17 @@ class GPU_GLES2_EXPORT SharedImageManager

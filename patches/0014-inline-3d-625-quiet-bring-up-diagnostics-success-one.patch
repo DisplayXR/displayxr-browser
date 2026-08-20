@@ -1,7 +1,7 @@
-From d28d0dd29f9732d29cd8b551591c8aa7d31335d3 Mon Sep 17 00:00:00 2001
+From dce9d2bf791c0986ca2d926e46d8ed9b5ca97619 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 9 Jul 2026 14:22:12 -0700
-Subject: [PATCH 14/54] =?UTF-8?q?inline-3d(#625):=20quiet=20bring-up=20dia?=
+Subject: [PATCH 14/71] =?UTF-8?q?inline-3d(#625):=20quiet=20bring-up=20dia?=
  =?UTF-8?q?gnostics=20=E2=80=94=20success=20one-shots=20LOG(ERROR)=20->=20?=
  =?UTF-8?q?VLOG(1)?=
 MIME-Version: 1.0
@@ -140,10 +140,10 @@ index ba6dc285e1ed6..214919d4b3c0b 100644
  
    const uint32_t w = static_cast<uint32_t>(window_rect.width());
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 30239ccafe5e8..93e3a629589f1 100644
+index 23bfd3d756071..3068d778f5e1b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2727,9 +2727,9 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+@@ -2726,9 +2726,9 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
    static bool logged = false;
    if (!logged) {
      logged = true;

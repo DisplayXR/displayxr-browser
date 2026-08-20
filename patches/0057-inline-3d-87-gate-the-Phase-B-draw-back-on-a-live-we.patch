@@ -1,7 +1,7 @@
-From 47d530b053d03d8d738797b2259c8d8198717554 Mon Sep 17 00:00:00 2001
+From 1327f9fddc27f4149d30ac55e5623855e8790133 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 18 Aug 2026 14:53:33 -0700
-Subject: [PATCH 57/58] inline-3d(#87): gate the Phase-B draw-back on a live
+Subject: [PATCH 57/71] inline-3d(#87): gate the Phase-B draw-back on a live
  weave submit
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -45,10 +45,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  1 file changed, 26 insertions(+), 1 deletion(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 1fd6aa8b7ffd7..f8ac6aed2ce65 100644
+index 00c5779639c87..46802114fb799 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3312,6 +3312,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3311,6 +3311,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    if (batch) {
      provider->BeginBatchSync(window_bounds.size());
    }
@@ -65,7 +65,7 @@ index 1fd6aa8b7ffd7..f8ac6aed2ce65 100644
    for (size_t t = 0; t < inline_3d_rects_.size(); ++t) {
      gfx::Rect probe = inline_3d_rects_[t];
      probe.Intersect(window_bounds);
-@@ -3330,6 +3340,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3329,6 +3339,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        continue;
      }
      const bool submitted = attempt_submit(t);
@@ -73,7 +73,7 @@ index 1fd6aa8b7ffd7..f8ac6aed2ce65 100644
      // Batch mode completes synchronously, so "nothing submitted this frame"
      // (copy failed) means nothing was woven for this target — clear rather
      // than redraw a stale region. (Async mode keeps the last woven visible
-@@ -3718,10 +3729,24 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3717,10 +3728,24 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
  #endif  // BUILDFLAG(IS_APPLE)  (v4 DP-composited overlay atlas, persistent)
  
    if (batch) {
@@ -99,6 +99,3 @@ index 1fd6aa8b7ffd7..f8ac6aed2ce65 100644
    // ---- (B) Draw back the accumulated window-sized woven output (Windows) ----
    // The runtime weaves EVERY submitted sub-rect into ONE window-sized handback
    // texture and (v5, browser#22) clears the gaps to transparent on the frame's
--- 
-2.42.0.windows.2
-

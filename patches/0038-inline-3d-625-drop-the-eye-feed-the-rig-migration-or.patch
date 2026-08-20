@@ -1,7 +1,7 @@
-From 9b5813c3dd3a27e7963eb455f095a400449d4396 Mon Sep 17 00:00:00 2001
+From d0a355b4f0c042fd0b6682c485170052507d5160 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 22:46:41 -0700
-Subject: [PATCH 38/54] inline-3d(#625): drop the eye feed the rig migration
+Subject: [PATCH 38/71] inline-3d(#625): drop the eye feed the rig migration
  orphaned, and the diags
 
 Once the renderer stopped rebuilding Kooima and started consuming the runtime's
@@ -501,10 +501,10 @@ index d9a8324f297a7..fde37693d527e 100644
    // |element_window_rect| is the element's WINDOW-CLIENT-relative device-px
    // rect — the same rect the weave submits, which is what the runtime's zone
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 760c700a37891..069d36dfe271d 100644
+index 305f140d866bb..a510ebf5255b5 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2509,17 +2509,6 @@ void XRSession::UpdateInlineView() {
+@@ -2534,17 +2534,6 @@ void XRSession::UpdateInlineView() {
    // negative control: no service -> stays mono, inert).
    if (is_inline_3d_) {
      RequestInline3DState();
@@ -522,7 +522,7 @@ index 760c700a37891..069d36dfe271d 100644
      // The runtime answered with render-ready views => 3D. Empty means it
      // couldn't (no rig/zones, session not live, pose untracked) => stay mono.
      if (inline_3d_views_.size() >= 2u && output_width_ > 0 &&
-@@ -2722,20 +2711,6 @@ void XRSession::UpdateInline3DViews() {
+@@ -2747,20 +2736,6 @@ void XRSession::UpdateInline3DViews() {
    const float near_depth = static_cast<float>(render_state_->depthNear());
    const float far_depth = static_cast<float>(render_state_->depthFar());
  

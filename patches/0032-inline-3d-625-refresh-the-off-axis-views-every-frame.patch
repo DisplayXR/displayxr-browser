@@ -1,7 +1,7 @@
-From 93569f42ebb00ebea634cdf33d666810ea9b458d Mon Sep 17 00:00:00 2001
+From 0a2878bba89664c5385f4601b1c97dfcb4d44948 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 17:16:31 -0700
-Subject: [PATCH 32/54] inline-3d(#625): refresh the off-axis views every frame
+Subject: [PATCH 32/71] inline-3d(#625): refresh the off-axis views every frame
  (the real mono-fallback cause)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -37,10 +37,10 @@ path at all.
  1 file changed, 12 insertions(+)
 
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 08eeaf98d6c0e..db718f01ace91 100644
+index 0aebca04dfade..b5ea1c3c17dbd 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2247,6 +2247,18 @@ void XRSession::OnFrame(double timestamp,
+@@ -2263,6 +2263,18 @@ void XRSession::OnFrame(double timestamp,
        if (visibility_state_ == XRVisibilityState::HIDDEN) {
          return;
        }

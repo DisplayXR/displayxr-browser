@@ -1,7 +1,7 @@
-From 131fc35763fab61e3a44aceea40363a7e2f9eccc Mon Sep 17 00:00:00 2001
+From 4520e21f95e78d6476da8834c804249a7a45eb45 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sat, 8 Aug 2026 18:08:57 -0700
-Subject: [PATCH] inline-3d(#73): express a clipped tile's crop on the
+Subject: [PATCH 55/71] inline-3d(#73): express a clipped tile's crop on the
  destination, not the source
 
 A tile clipped at the top of the viewport smeared a "tail" below the
@@ -56,7 +56,7 @@ correct, top- and bottom-clip, pics/videos unaffected.
  6 files changed, 113 insertions(+), 37 deletions(-)
 
 diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
-index 58a21f4..60b8d32 100644
+index 58a21f4d91b88..60b8d32641240 100644
 --- a/components/viz/service/display/aggregated_frame.h
 +++ b/components/viz/service/display/aggregated_frame.h
 @@ -16,6 +16,7 @@
@@ -81,7 +81,7 @@ index 58a21f4..60b8d32 100644
    std::vector<Inline3dLayerResource> inline_3d_overlays;
    std::vector<Inline3dLayerResource> inline_3d_canvas_resources;
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index a2ffdbe..5b8e152 100644
+index a2ffdbe1c72b1..5b8e152a64dfd 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
 @@ -998,7 +998,7 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
@@ -94,7 +94,7 @@ index a2ffdbe..5b8e152 100644
              }
              return out;
 diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
-index 4789f9b..292677c 100644
+index 4789f9b212bae..292677c795b78 100644
 --- a/components/viz/service/display/skia_output_surface.h
 +++ b/components/viz/service/display/skia_output_surface.h
 @@ -22,6 +22,7 @@
@@ -117,7 +117,7 @@ index 4789f9b..292677c 100644
  
    // DisplayXR inline-3D (#625, Step B / B4b): set the page's inline-3d canvas
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 061d430..1e37903 100644
+index 061d43063d8e2..1e37903cb3aa3 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
 @@ -1500,9 +1500,30 @@ void SurfaceAggregator::CopyQuadsToPass(
@@ -207,7 +207,7 @@ index 061d430..1e37903 100644
    }
    if (!frame.inline_3d_overlays.empty() ||
 diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
-index 33d722a..46c2eae 100644
+index 33d722accb2ed..46c2eae7f121f 100644
 --- a/components/viz/service/display/surface_aggregator.h
 +++ b/components/viz/service/display/surface_aggregator.h
 @@ -30,6 +30,7 @@
@@ -242,7 +242,7 @@ index 33d722a..46c2eae 100644
  
  }  // namespace viz
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 4d3d0fc..00c5779 100644
+index 4d3d0fc06ad29..00c5779639c87 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -2877,17 +2877,17 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
@@ -358,6 +358,3 @@ index 4d3d0fc..00c5779 100644
                SkSamplingOptions(SkFilterMode::kNearest), &paint,
                SkCanvas::kStrict_SrcRectConstraint);
            FlushSurface(scratch_surface, send, scratch_write.get());
--- 
-2.42.0.windows.2
-

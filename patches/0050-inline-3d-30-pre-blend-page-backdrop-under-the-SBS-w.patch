@@ -1,7 +1,7 @@
-From 2a369649031bbd10cea502b664d3959f17410c65 Mon Sep 17 00:00:00 2001
+From 5865cc34125950539bc1497c0edd7cf7ccf70030 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 20 Jul 2026 08:48:44 +0900
-Subject: [PATCH 50/54] inline-3d(#30): pre-blend page backdrop under the SBS
+Subject: [PATCH 50/71] inline-3d(#30): pre-blend page backdrop under the SBS
  weave input
 
 A transparent inline-3D canvas (hello-cube: alpha:true + 0-alpha clear +
@@ -40,10 +40,10 @@ from the other side.
  1 file changed, 80 insertions(+), 1 deletion(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 22da0b9cf3092..79265d9318de0 100644
+index 9f0094de0bbd5..be5422a9fba05 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2966,6 +2966,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2965,6 +2965,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                canvas_access;
            sk_sp<SkImage> src_img;
            bool src_from_canvas = false;
@@ -54,7 +54,7 @@ index 22da0b9cf3092..79265d9318de0 100644
            if (!clean_sbs_mailbox.IsZero()) {
              canvas_rep = shared_image_representation_factory_->ProduceSkia(
                  clean_sbs_mailbox, context_state_.get());
-@@ -2992,6 +2996,78 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2991,6 +2995,78 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            if (!src_img) {
              return fail("makeImageSnapshot");
            }
@@ -133,7 +133,7 @@ index 22da0b9cf3092..79265d9318de0 100644
            // Source rect. The canvas resource is the WHOLE tile's SBS, mapped to
            // the canvas layer's UNCLIPPED rect |clean_sbs_rect| (NOT
            // inline_3d_rects_[t], which is the already-clipped visible bounds —
-@@ -3014,7 +3090,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3013,7 +3089,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                                     rect.height() / fh * ih);
            }
            SkPaint paint;

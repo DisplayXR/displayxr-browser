@@ -1,7 +1,7 @@
-From 3283a46b5cbed62ffe7a00305090a911b25a9639 Mon Sep 17 00:00:00 2001
+From cbdacb2980c193c5f0523561ccf6d826ab31c887 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 09:30:13 -0700
-Subject: [PATCH 28/54] displayxr: clear draw-back rects for off-window /
+Subject: [PATCH 28/71] displayxr: clear draw-back rects for off-window /
  unsubmitted weave targets
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -21,10 +21,10 @@ woven; async keeps its one-frame-lag contract untouched).
  1 file changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 3b750a23e820c..7a5c4dddcee8f 100644
+index 4e0e05b269ce3..ffa2d5ccccf2b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3065,12 +3065,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3064,12 +3064,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      gfx::Rect probe = inline_3d_rects_[t];
      probe.Intersect(window_bounds);
      if (probe.IsEmpty()) {

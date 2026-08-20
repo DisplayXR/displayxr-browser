@@ -1,7 +1,7 @@
-From 5f6144911381ad7c76c30229841e8ad2529c6150 Mon Sep 17 00:00:00 2001
+From 56c070a3bba7e6765824315c5d3c1d7919c1d4a8 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 20 Jul 2026 10:29:30 +0900
-Subject: [PATCH 51/54] inline-3d: fix vertical squish of 2D overlays (raster
+Subject: [PATCH 51/71] inline-3d: fix vertical squish of 2D overlays (raster
  padding sampled as content)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -36,10 +36,10 @@ all round. David: "FIXED".
  1 file changed, 20 insertions(+), 11 deletions(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 79265d9318de0..cd0bd9016cfc8 100644
+index be5422a9fba05..02cb7f7f60783 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3358,17 +3358,26 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3357,17 +3357,26 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            // fix bug B applied to the canvas path: key off the unclipped rect and
            // take the matching fraction of the source.
            const gfx::Rect full = overlay.rect;

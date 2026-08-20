@@ -1,7 +1,7 @@
-From 55caa1c8e16f4a6036d164c6c4c82ad3a155dccc Mon Sep 17 00:00:00 2001
+From d336bc2e77eb5db2669244d45bcd29a67172ddd3 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 22:55:59 -0700
-Subject: [PATCH 39/54] inline-3d(#625): keep rendering while the page is
+Subject: [PATCH 39/71] inline-3d(#625): keep rendering while the page is
  visible but unfocused
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -33,10 +33,10 @@ tabs.
  1 file changed, 16 insertions(+), 1 deletion(-)
 
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 069d36dfe271d..35c0b29efce4c 100644
+index a510ebf5255b5..ad468463184bd 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -1754,7 +1754,22 @@ void XRSession::UpdateVisibilityState() {
+@@ -1770,7 +1770,22 @@ void XRSession::UpdateVisibilityState() {
    // because while the runtime reports us as focused the content owned by the
    // session should be focued, which is owned by the document. For inline, we
    // can and must rely on frame focus.

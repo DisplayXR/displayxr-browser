@@ -1,7 +1,7 @@
-From d278a7c2609dd71b866232ce7a98df2cfd22ac26 Mon Sep 17 00:00:00 2001
+From acd3bc0e646900c5f0bce6193afa3c412cd590d9 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 18:20:52 -0700
-Subject: [PATCH 35/54] =?UTF-8?q?inline-3d(#625):=20revert=20the=20deviceP?=
+Subject: [PATCH 35/71] =?UTF-8?q?inline-3d(#625):=20revert=20the=20deviceP?=
  =?UTF-8?q?ixelRatio=20normalisation=20=E2=80=94=20units=20were=20already?=
  =?UTF-8?q?=20device=20px?=
 MIME-Version: 1.0
@@ -37,10 +37,10 @@ element rather than per bound window.
  1 file changed, 9 insertions(+), 13 deletions(-)
 
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 5dec6ad41cd76..27b1f8c66f8f9 100644
+index f34c1bc9bfafe..e3253673f5441 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2715,20 +2715,16 @@ void XRSession::UpdateInline3DViews() {
+@@ -2740,20 +2740,16 @@ void XRSession::UpdateInline3DViews() {
                              ? di.display_height_m / di.display_height_px
                              : 0.f;
  
@@ -69,7 +69,7 @@ index 5dec6ad41cd76..27b1f8c66f8f9 100644
    // TEMP DIAG (#625): which units actually arrive, and what geometry we derive.
    {
      static int s_geo_log = 0;
-@@ -2736,7 +2732,7 @@ void XRSession::UpdateInline3DViews() {
+@@ -2761,7 +2757,7 @@ void XRSession::UpdateInline3DViews() {
        ++s_geo_log;
        const gfx::Rect& raw = di.element_display_rect;
        VLOG(1) << "[DisplayXR] inline3d geom: raw_er=" << raw.x() << "," << raw.y()

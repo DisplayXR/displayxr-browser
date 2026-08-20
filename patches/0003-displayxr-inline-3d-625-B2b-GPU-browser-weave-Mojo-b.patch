@@ -1,7 +1,7 @@
-From df37631fec067596f2e7033c83703fb67962c79b Mon Sep 17 00:00:00 2001
+From 1969af828b30753de1fc15bbe5b92522f55ea600 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 26 Jun 2026 01:22:26 -0500
-Subject: [PATCH 03/54] [displayxr inline-3d #625 B2b] GPU<->browser weave Mojo
+Subject: [PATCH 03/71] [displayxr inline-3d #625 B2b] GPU<->browser weave Mojo
  bridge
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -40,7 +40,7 @@ trip end to end.
  create mode 100644 content/shell/common/displayxr_weave.mojom
 
 diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
-index f2423637d1d5e..0d86b8bb1ed44 100644
+index f8205ebf5de88..3dcdce6154c12 100644
 --- a/content/shell/BUILD.gn
 +++ b/content/shell/BUILD.gn
 @@ -200,6 +200,8 @@ static_library("content_shell_lib") {
@@ -60,7 +60,7 @@ index f2423637d1d5e..0d86b8bb1ed44 100644
      ":protocol_sources",
      ":resources",
      ":rust_test_mojom",
-@@ -1183,6 +1186,13 @@ mojom("shell_controller_mojom") {
+@@ -1199,6 +1202,13 @@ mojom("shell_controller_mojom") {
    public_deps = [ "//mojo/public/mojom/base" ]
  }
  

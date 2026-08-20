@@ -1,7 +1,7 @@
-From 00967706af525bb81df4e6ca6b457c7ef56e909e Mon Sep 17 00:00:00 2001
+From 2298d8329256819c0367557cd29364bc5412223b Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 11:41:05 -0700
-Subject: [PATCH] inline-3d(#90): retract inline-3D demand on navigation
+Subject: [PATCH 66/71] inline-3d(#90): retract inline-3D demand on navigation
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -434,6 +434,3 @@ index 7d558bb3aab9e..0b9d1a2ae2933 100644
    // Last value handed to the embedder. The renderer is already edge-triggered;
    // this makes the browser side idempotent against a renderer that isn't (a
    // compromised one, or a future one that changes its mind about that).
--- 
-2.42.0.windows.2
-

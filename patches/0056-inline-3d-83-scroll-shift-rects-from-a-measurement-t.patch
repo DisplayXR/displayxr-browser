@@ -1,8 +1,8 @@
-From b16663672d9189d5caed60a68e5c876dfc45232f Mon Sep 17 00:00:00 2001
+From ab3fe01661cc8f2ed49c338f7f4e650e220f842e Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 14 Aug 2026 13:43:48 -0700
-Subject: [PATCH] inline-3d(#83): scroll-shift rects from a measurement-time
- base, not SyncedScrollOffset::Delta
+Subject: [PATCH 56/71] inline-3d(#83): scroll-shift rects from a
+ measurement-time base, not SyncedScrollOffset::Delta
 
 The Phase2 scroll-sync patch (0022) shifts the metadata inline-3d rect lists
 by the viewport's impl scroll delta so the weave tracks pixels during a
@@ -80,10 +80,10 @@ index 8aa2c2a0d8897..1f51c7d004c8b 100644
        event_listener_properties = {EventListenerProperties::kNone};
    float bottom_controls_shown_ratio = 0.f;
 diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
-index 87c43460a91b0..d61616467f2ce 100644
+index cd3621a2ed0a7..ee84a24889aaf 100644
 --- a/cc/trees/layer_tree_host.cc
 +++ b/cc/trees/layer_tree_host.cc
-@@ -1567,7 +1567,15 @@ void LayerTreeHost::SetBrowserControlsParams(
+@@ -1571,7 +1571,15 @@ void LayerTreeHost::SetBrowserControlsParams(
  void LayerTreeHost::SetInline3DRects(
      std::vector<gfx::Rect> rects,
      std::vector<gfx::Rect> exclusion_rects,
@@ -100,7 +100,7 @@ index 87c43460a91b0..d61616467f2ce 100644
    if (pending_commit_state()->inline_3d_rects == rects &&
        pending_commit_state()->inline_3d_exclusion_rects == exclusion_rects &&
        pending_commit_state()->inline_3d_exclusion_fixed_rects ==
-@@ -1579,6 +1587,7 @@ void LayerTreeHost::SetInline3DRects(
+@@ -1583,6 +1591,7 @@ void LayerTreeHost::SetInline3DRects(
        std::move(exclusion_rects);
    pending_commit_state()->inline_3d_exclusion_fixed_rects =
        std::move(exclusion_fixed_rects);
@@ -109,10 +109,10 @@ index 87c43460a91b0..d61616467f2ce 100644
  }
  
 diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
-index 12cc1cfcd1590..a8ab0208fcf51 100644
+index 23b35a0c8fb67..32d1b1c747718 100644
 --- a/cc/trees/layer_tree_host.h
 +++ b/cc/trees/layer_tree_host.h
-@@ -594,7 +594,8 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
+@@ -590,7 +590,8 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
    // the other two lists.
    void SetInline3DRects(std::vector<gfx::Rect> rects,
                          std::vector<gfx::Rect> exclusion_rects,
@@ -123,10 +123,10 @@ index 12cc1cfcd1590..a8ab0208fcf51 100644
    void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
    const OverscrollBehavior& overscroll_behavior() const {
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 2c5fdfae88100..dbdae228d0237 100644
+index 663375700510f..f45d7c9f70bdf 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2462,6 +2462,13 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2632,6 +2632,13 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    // DisplayXR (browser#28): viewport-fixed exclusion rects are held aside while
    // the scroll-delta patch below runs, then appended verbatim.
    std::vector<gfx::Rect> inline_3d_exclusion_fixed_rects;
@@ -140,7 +140,7 @@ index 2c5fdfae88100..dbdae228d0237 100644
    if (settings().trees_in_viz_in_viz_process) {
      metadata.tracked_element_rects = tracked_element_rects_from_client_;
      metadata.inline_3d_rects = inline_3d_rects_from_client_;
-@@ -2484,6 +2491,7 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2656,6 +2663,7 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
          active_tree()->inline_3d_exclusion_rects();
      inline_3d_exclusion_fixed_rects =
          active_tree()->inline_3d_exclusion_fixed_rects();
@@ -148,7 +148,7 @@ index 2c5fdfae88100..dbdae228d0237 100644
    }
    // DisplayXR inline-3D (#625, Step B / Phase 2 — scroll-sync): the rects above
    // are getBoundingClientRect measured on the Blink main thread at the COMMITTED
-@@ -2494,8 +2502,9 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2666,8 +2674,9 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    // offset − committed base) so the weave rect tracks the pixels presented THIS
    // frame. Handles the dominant case (content scrolling with the root viewport);
    // nested-scroller content is a follow-up.
@@ -160,7 +160,7 @@ index 2c5fdfae88100..dbdae228d0237 100644
      const ScrollNode* viewport_scroll = OuterViewportScrollNode();
      if (!viewport_scroll) {
        viewport_scroll = InnerViewportScrollNode();
-@@ -2503,12 +2512,21 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2675,12 +2684,21 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
      if (viewport_scroll && viewport_scroll->element_id) {
        const ScrollTree& scroll_tree =
            active_tree_->property_trees()->scroll_tree();
@@ -189,10 +189,10 @@ index 2c5fdfae88100..dbdae228d0237 100644
          const int dx = base::ClampRound(delta.x() * dsf);
          const int dy = base::ClampRound(delta.y() * dsf);
 diff --git a/cc/trees/layer_tree_impl.cc b/cc/trees/layer_tree_impl.cc
-index 696cd96bdce6d..1d143cff8bf90 100644
+index 6a317fa7dfa20..ac780b42ef2b2 100644
 --- a/cc/trees/layer_tree_impl.cc
 +++ b/cc/trees/layer_tree_impl.cc
-@@ -887,7 +887,8 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
+@@ -893,7 +893,8 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
    SetBrowserControlsParams(commit_state.browser_controls_params);
    SetInline3DRects(commit_state.inline_3d_rects,
                     commit_state.inline_3d_exclusion_rects,
@@ -202,7 +202,7 @@ index 696cd96bdce6d..1d143cff8bf90 100644
    set_overscroll_behavior(commit_state.overscroll_behavior);
    PushBrowserControlsFromMainThread(commit_state.top_controls_shown_ratio,
                                      commit_state.bottom_controls_shown_ratio);
-@@ -1015,7 +1016,8 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
+@@ -1021,7 +1022,8 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
  
    target_tree->SetBrowserControlsParams(browser_controls_params_);
    target_tree->SetInline3DRects(inline_3d_rects_, inline_3d_exclusion_rects_,
@@ -213,7 +213,7 @@ index 696cd96bdce6d..1d143cff8bf90 100644
  
    target_tree->set_overscroll_behavior(overscroll_behavior_);
 diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
-index d9f3199b9d7dc..4f00ea998f839 100644
+index f3db67e8ac0b7..b738187a98ed9 100644
 --- a/cc/trees/layer_tree_impl.h
 +++ b/cc/trees/layer_tree_impl.h
 @@ -675,10 +675,12 @@ class CC_EXPORT LayerTreeImpl {
@@ -254,10 +254,10 @@ index d9f3199b9d7dc..4f00ea998f839 100644
    std::vector<gfx::Rect> inline_3d_exclusion_rects_;
    std::vector<gfx::Rect> inline_3d_exclusion_fixed_rects_;
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-index 3e3974cd84ddc..0810a621efb5c 100644
+index 188068565cdf9..9474ff506be24 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-@@ -1636,11 +1636,12 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
+@@ -1748,11 +1748,12 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
  void WebFrameWidgetImpl::SetInline3DRects(
      const std::vector<gfx::Rect>& rects,
      const std::vector<gfx::Rect>& exclusion_rects,
@@ -274,10 +274,10 @@ index 3e3974cd84ddc..0810a621efb5c 100644
  
  void WebFrameWidgetImpl::SetPrefersReducedMotion(bool prefers_reduced_motion) {
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
-index a01e5db7cd54a..ba2a22969504d 100644
+index 603b46006bd2e..2f3abbff5f8f7 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
-@@ -236,7 +236,8 @@ class CORE_EXPORT WebFrameWidgetImpl
+@@ -245,7 +245,8 @@ class CORE_EXPORT WebFrameWidgetImpl
    void SetInline3DRects(
        const std::vector<gfx::Rect>& rects,
        const std::vector<gfx::Rect>& exclusion_rects,
@@ -288,10 +288,10 @@ index a01e5db7cd54a..ba2a22969504d 100644
    void RequestAnimationAfterDelay(const base::TimeDelta&, bool urgent) final;
    void RequestAnimationAfterDelay(cc::BeginMainFrameReason,
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 180aa4372a670..88835cc0b8a84 100644
+index 32a58cc1c95ac..9edea59607c78 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2767,7 +2767,17 @@ void XRSession::ReportInline3DRects() {
+@@ -2792,7 +2792,17 @@ void XRSession::ReportInline3DRects() {
        }
      }
    }
@@ -311,10 +311,10 @@ index 180aa4372a670..88835cc0b8a84 100644
  }
  
 diff --git a/third_party/blink/renderer/platform/widget/frame_widget.h b/third_party/blink/renderer/platform/widget/frame_widget.h
-index 2201230b40831..52b84998d8ea8 100644
+index 738d4384cd2dc..b02c132a1945d 100644
 --- a/third_party/blink/renderer/platform/widget/frame_widget.h
 +++ b/third_party/blink/renderer/platform/widget/frame_widget.h
-@@ -312,10 +312,15 @@ class PLATFORM_EXPORT FrameWidget {
+@@ -314,10 +314,15 @@ class PLATFORM_EXPORT FrameWidget {
    // is viewport-fixed (position:fixed, or a currently-stuck position:sticky).
    // They are exempt from the impl-scroll-delta patch cc applies to the other
    // lists, because a viewport-fixed element does not move with the scroll.
@@ -331,6 +331,3 @@ index 2201230b40831..52b84998d8ea8 100644
  
    // Get and set the configuration for the debugging overlay managed by the
    // underlying LayerTreeHost. This may return null if the widget does not
--- 
-2.42.0.windows.2
-

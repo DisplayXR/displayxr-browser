@@ -1,7 +1,7 @@
-From f7e12697b828ef25a48ebb27906851f5a610f3d2 Mon Sep 17 00:00:00 2001
+From c96ba62b2d60123c9827e587a74bcc1a5f4883d9 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 18 Aug 2026 18:07:20 -0700
-Subject: [PATCH 60/62] inline-3d(Phase 1): match an inline-3D canvas to its
+Subject: [PATCH 60/71] inline-3d(Phase 1): match an inline-3D canvas to its
  quad by identity
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -84,7 +84,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  12 files changed, 344 insertions(+), 36 deletions(-)
 
 diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
-index 60b8d32..ad299b9 100644
+index 60b8d32641240..ad299b9a35156 100644
 --- a/components/viz/service/display/aggregated_frame.h
 +++ b/components/viz/service/display/aggregated_frame.h
 @@ -10,6 +10,7 @@
@@ -129,7 +129,7 @@ index 60b8d32..ad299b9 100644
    std::vector<Inline3dLayerResource> inline_3d_overlays;
    std::vector<Inline3dLayerResource> inline_3d_canvas_resources;
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index 5b8e152..b6f8012 100644
+index 5b8e152a64dfd..b6f80127a779c 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
 @@ -998,12 +998,20 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
@@ -175,7 +175,7 @@ index 5b8e152..b6f8012 100644
                           current_surface_size, display_color_spaces_,
                           std::move(frame.surface_damage_rect_list_),
 diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
-index 292677c..6a47d12 100644
+index 292677c795b78..6a47d12b955e7 100644
 --- a/components/viz/service/display/skia_output_surface.h
 +++ b/components/viz/service/display/skia_output_surface.h
 @@ -10,6 +10,7 @@
@@ -216,7 +216,7 @@ index 292677c..6a47d12 100644
        std::vector<Inline3dLayerMailbox> canvas_layers) {}
  
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 379d482..328ffde 100644
+index 379d482f7fd74..328ffdedfb62d 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
 @@ -2400,12 +2400,25 @@ AggregatedFrame SurfaceAggregator::Aggregate(
@@ -441,7 +441,7 @@ index 379d482..328ffde 100644
    }
    // DisplayXR overlay-exclusion rects (browser#18): unconditional — exclusions
 diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
-index 4564248..a61f771 100644
+index 45642481cdf1b..a61f771384092 100644
 --- a/components/viz/service/display/surface_aggregator.h
 +++ b/components/viz/service/display/surface_aggregator.h
 @@ -17,6 +17,7 @@
@@ -475,7 +475,7 @@ index 4564248..a61f771 100644
    // DisplayXR overlay-exclusion rects (browser#18): the on-screen rects of 2D UI
    // over a woven element, transformed to root render pass space. Used to identify
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-index a42ef3f..6242640 100644
+index a42ef3fae88d4..62426408dce49 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
 @@ -1064,7 +1064,7 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
@@ -488,7 +488,7 @@ index a42ef3f..6242640 100644
      std::vector<Inline3dLayerMailbox> canvas_layers) {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
-index 1021540..758ea47 100644
+index 102154029f475..758ea47416cc0 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
 @@ -177,7 +177,7 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
@@ -501,7 +501,7 @@ index 1021540..758ea47 100644
        std::vector<Inline3dLayerMailbox> canvas_layers) override;
  
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 4680211..e738fc3 100644
+index 46802114fb799..e738fc3b94091 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -2717,10 +2717,17 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
@@ -525,7 +525,7 @@ index 4680211..e738fc3 100644
    inline_3d_canvas_layers_ = std::move(canvas_layers);
  }
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index fb1d37b..3c862a3 100644
+index fb1d37b1fcaee..3c862a3e7bec3 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 @@ -235,7 +235,7 @@ class SkiaOutputSurfaceImplOnGpu
@@ -538,7 +538,7 @@ index fb1d37b..3c862a3 100644
        std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers);
  
 diff --git a/third_party/blink/renderer/core/paint/html_canvas_painter.cc b/third_party/blink/renderer/core/paint/html_canvas_painter.cc
-index 66dfceb..22b3d70 100644
+index 66dfceb9753d1..22b3d70d354f1 100644
 --- a/third_party/blink/renderer/core/paint/html_canvas_painter.cc
 +++ b/third_party/blink/renderer/core/paint/html_canvas_painter.cc
 @@ -4,6 +4,10 @@
@@ -592,7 +592,7 @@ index 66dfceb..22b3d70 100644
                           DisplayItem::kForeignLayerCanvas, layer,
                           pixel_snapped_rect.origin());
 diff --git a/third_party/blink/renderer/core/paint/replaced_painter.cc b/third_party/blink/renderer/core/paint/replaced_painter.cc
-index a3f6af3..f0e781b 100644
+index a3f6af3d4bb57..f0e781bc330fc 100644
 --- a/third_party/blink/renderer/core/paint/replaced_painter.cc
 +++ b/third_party/blink/renderer/core/paint/replaced_painter.cc
 @@ -7,6 +7,7 @@
@@ -653,7 +653,7 @@ index a3f6af3..f0e781b 100644
        }
      }
 diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
-index 68d7838..4499e6a 100644
+index 68d7838abc955..4499e6a32fb27 100644
 --- a/third_party/blink/renderer/modules/xr/xr_display_layer.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
 @@ -4,10 +4,12 @@

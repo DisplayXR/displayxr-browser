@@ -1,7 +1,7 @@
-From 2d5c8c86f621005e59b2f920d5f635d44a3ded35 Mon Sep 17 00:00:00 2001
+From 97e8743194b3f74699ca841a5e7fa329e45b0c86 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sat, 1 Aug 2026 00:45:25 +0800
-Subject: [PATCH 54/54] inline-3d(#55): follow the foreground tab's demand with
+Subject: [PATCH 54/71] inline-3d(#55): follow the foreground tab's demand with
  the panel's 2D/3D element
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -93,10 +93,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  create mode 100644 components/displayxr/gpu/displayxr_display_mode_impl.h
 
 diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
-index 29bdd8e0cf74c..6ae2aa7577012 100644
+index d80284bb2cd01..40af24a7ed70c 100644
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
-@@ -624,6 +624,13 @@ source_set("core") {
+@@ -846,6 +846,13 @@ source_set("core") {
      "chrome_content_browser_client_receiver_bindings.cc",
      "chrome_resource_bundle_helper.cc",
      "chrome_resource_bundle_helper.h",
@@ -111,10 +111,10 @@ index 29bdd8e0cf74c..6ae2aa7577012 100644
      "file_select_helper.cc",
      "font_family_cache.cc",
 diff --git a/chrome/browser/chrome_browser_interface_binders.cc b/chrome/browser/chrome_browser_interface_binders.cc
-index 4108113c99312..e50a591c715dc 100644
+index f703fca88d019..ebb64a42ec70b 100644
 --- a/chrome/browser/chrome_browser_interface_binders.cc
 +++ b/chrome/browser/chrome_browser_interface_binders.cc
-@@ -450,7 +450,12 @@ void BindDisplayXRService(
+@@ -456,7 +456,12 @@ void BindDisplayXRService(
    if (!base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
      return;
    }
@@ -129,10 +129,10 @@ index 4108113c99312..e50a591c715dc 100644
  
  }  // namespace
 diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
-index 240e0f9c397d9..5e9c43ca179f3 100644
+index 161ede5ee5a7f..cdd8c375d77e7 100644
 --- a/chrome/browser/chrome_browser_main.cc
 +++ b/chrome/browser/chrome_browser_main.cc
-@@ -98,6 +98,7 @@
+@@ -97,6 +97,7 @@
  #include "components/device_event_log/device_event_log.h"
  #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR1
  // DisplayXR inline-3D (#625, Step B / B4): browser-process weave client.
@@ -140,7 +140,7 @@ index 240e0f9c397d9..5e9c43ca179f3 100644
  #include "components/displayxr/browser/displayxr_weave_client.h"
  #endif
  #include "components/embedder_support/origin_trials/component_updater_utils.h"
-@@ -1709,6 +1710,12 @@ void ChromeBrowserMainParts::PostBrowserStart() {
+@@ -1717,6 +1718,12 @@ void ChromeBrowserMainParts::PostBrowserStart() {
          base::BindOnce(
              &displayxr::DisplayXRWeaveClient::MaybeInitializeFromCommandLine),
          base::Seconds(2));
@@ -153,7 +153,7 @@ index 240e0f9c397d9..5e9c43ca179f3 100644
    }
  #endif
  }
-@@ -2178,6 +2185,17 @@ void ChromeBrowserMainParts::PostMainMessageLoopRun() {
+@@ -2187,6 +2194,17 @@ void ChromeBrowserMainParts::PostMainMessageLoopRun() {
    // Android specific MessageLoop
    NOTREACHED();
  #else
@@ -1152,7 +1152,7 @@ index fde37693d527e..d1102319cd776 100644
 +  SetInline3DDemand(bool wants_3d);
  };
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index bdce2d264c4a2..180aa4372a670 100644
+index d9af1fbc81e65..32a58cc1c95ac 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
 @@ -13,6 +13,7 @@
@@ -1162,8 +1162,8 @@ index bdce2d264c4a2..180aa4372a670 100644
 +#include "base/numerics/safe_conversions.h"
  #include "base/trace_event/trace_event.h"
  #include "base/types/pass_key.h"
- #include "device/vr/buildflags/buildflags.h"
-@@ -1629,6 +1630,14 @@ void XRSession::HandleShutdown() {
+ #include "build/build_config.h"
+@@ -1645,6 +1646,14 @@ void XRSession::HandleShutdown() {
    DCHECK(ended_);
    waiting_for_shutdown_ = false;
  
@@ -1178,7 +1178,7 @@ index bdce2d264c4a2..180aa4372a670 100644
    if (xr_->IsContextDestroyed()) {
      // If this is being called due to the context being destroyed,
      // it's illegal to run JavaScript code, so we cannot emit an
-@@ -2681,6 +2690,16 @@ void XRSession::ReportInline3DRects() {
+@@ -2706,6 +2715,16 @@ void XRSession::ReportInline3DRects() {
      css_rect.Scale(static_cast<float>(dsf));
      return gfx::ToRoundedRect(css_rect);
    };
@@ -1195,7 +1195,7 @@ index bdce2d264c4a2..180aa4372a670 100644
    std::vector<gfx::Rect> rects;
    rects.reserve(display_layers_.size());
    // Overlay-exclusion rects (browser#18): 2D UI the page declared as painted
-@@ -2729,6 +2748,9 @@ void XRSession::ReportInline3DRects() {
+@@ -2754,6 +2773,9 @@ void XRSession::ReportInline3DRects() {
      gfx::Rect device_rect = device_rect_of(target);
      if (!device_rect.IsEmpty()) {
        rects.push_back(device_rect);
@@ -1205,7 +1205,7 @@ index bdce2d264c4a2..180aa4372a670 100644
      }
      for (const auto& excluded : layer->excluded_elements()) {
        if (!excluded->isConnected()) {
-@@ -2746,6 +2768,26 @@ void XRSession::ReportInline3DRects() {
+@@ -2771,6 +2793,26 @@ void XRSession::ReportInline3DRects() {
      }
    }
    widget->SetInline3DRects(rects, exclusion_rects, exclusion_fixed_rects);
@@ -1233,7 +1233,7 @@ index bdce2d264c4a2..180aa4372a670 100644
  
  // DisplayXR inline-3D (#625): install the two off-axis eye views the RUNTIME
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 1c37b8baa581c..90f42538dda0d 100644
+index 51acf353ac49b..c8cc19fab507d 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -358,6 +358,14 @@ class XRSession final : public EventTarget,

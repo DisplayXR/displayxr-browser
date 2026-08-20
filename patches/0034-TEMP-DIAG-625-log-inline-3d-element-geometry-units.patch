@@ -1,7 +1,7 @@
-From 05cac5611eb0e8aefaa0b9b0f4a33a2cf5d3acc1 Mon Sep 17 00:00:00 2001
+From 42ad5b29cc6180656b2453962f99571871b1545f Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 17:42:36 -0700
-Subject: [PATCH 34/54] TEMP DIAG (#625): log inline-3d element geometry units
+Subject: [PATCH 34/71] TEMP DIAG (#625): log inline-3d element geometry units
 
 Which units element_display_rect actually arrives in (device vs logical px),
 the dsf, the normalised rect, the display px, and the derived element height
@@ -13,10 +13,10 @@ units. Drop with the other diag.
  1 file changed, 16 insertions(+)
 
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 4c0f82473417d..5dec6ad41cd76 100644
+index 3c2053c0ba114..f34c1bc9bfafe 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2729,6 +2729,22 @@ void XRSession::UpdateInline3DViews() {
+@@ -2754,6 +2754,22 @@ void XRSession::UpdateInline3DViews() {
    if (dsf > 0.0) {
      er_f.Scale(static_cast<float>(1.0 / dsf));
    }

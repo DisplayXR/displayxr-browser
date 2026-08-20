@@ -1,7 +1,7 @@
-From 7db14cade79869c23b41bcbac7a8a2d506a845ca Mon Sep 17 00:00:00 2001
+From 0fc2f81ba85a5df5f004952b51658b9bdb58ca87 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 9 Jul 2026 01:54:59 -0700
-Subject: [PATCH 12/54] =?UTF-8?q?inline-3d(#625):=20Graphite-compatible=20?=
+Subject: [PATCH 12/71] =?UTF-8?q?inline-3d(#625):=20Graphite-compatible=20?=
  =?UTF-8?q?weave=20readback=20=E2=80=94=20retire=20--disable-features=3DSk?=
  =?UTF-8?q?iaGraphite?=
 MIME-Version: 1.0
@@ -39,10 +39,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  1 file changed, 55 insertions(+), 7 deletions(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 1c8286eb2a5f0..6580ff09cf02b 100644
+index 17bbfecd893d4..93c60a3f15349 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2731,6 +2731,24 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2730,6 +2730,24 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
    // (D) Per rect: weave the composited sub-rect and draw the woven result back
    // over the output. Serialized (the provider reuses one keyed-mutex input +
    // one woven output), mirroring the CEF host's per-element loop.
@@ -67,7 +67,7 @@ index 1c8286eb2a5f0..6580ff09cf02b 100644
    bool drew_any = false;
    // The woven SkImages must stay backed until the output is flushed + submitted
    // (Ganesh records the draw and reads the texture at flush time). Hold the
-@@ -2746,21 +2764,51 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2745,21 +2763,51 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
      }
  
      // Read the composited sub-rect back to CPU (BGRA8), then upload it into the

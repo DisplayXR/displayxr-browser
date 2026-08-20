@@ -1,7 +1,7 @@
-From 228f3ec8494f66b83df5f9da7311cf6ad62cd549 Mon Sep 17 00:00:00 2001
+From 6b4c39fc948cfb0b7f14b609cf5ca3fde0d9f4cb Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 13 Jul 2026 21:31:31 -0700
-Subject: [PATCH 26/54] inline-3d(#625): source weave rects from
+Subject: [PATCH 26/71] inline-3d(#625): source weave rects from
  compositor-thread tracked-element rects
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -30,15 +30,15 @@ Hardware-validated: zero-lag scroll tracking on a fast fling (Leia,
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
- cc/trees/layer_tree_host_impl.cc              | 12 +++-
+ cc/trees/layer_tree_host_impl.cc              | 19 +++++--
  .../common/surfaces/tracked_element_rects.h   |  4 ++
  .../viz/service/display/surface_aggregator.cc | 55 +++++++++++++++++--
  .../renderer/core/paint/replaced_painter.cc   |  6 +-
  .../renderer/modules/xr/xr_display_layer.cc   | 20 +++++++
- 5 files changed, 89 insertions(+), 8 deletions(-)
+ 5 files changed, 93 insertions(+), 11 deletions(-)
 
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 2a89386cc9245..4c00e82a764b7 100644
+index 2a89386cc9245..2b3fadbf73c47 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
 @@ -363,13 +363,23 @@ bool IsFixedOrStickyOccluderTransform(int transform_id,
@@ -81,7 +81,7 @@ index 2a89386cc9245..4c00e82a764b7 100644
            // Set the element data with screen space visible bounds.
            rects[feature].emplace_back(transformed_rect);
 diff --git a/components/viz/common/surfaces/tracked_element_rects.h b/components/viz/common/surfaces/tracked_element_rects.h
-index a0bad1b359b34..592831f450e5b 100644
+index a7a7bd0ac6916..4d1e14adfc736 100644
 --- a/components/viz/common/surfaces/tracked_element_rects.h
 +++ b/components/viz/common/surfaces/tracked_element_rects.h
 @@ -29,6 +29,10 @@ using TrackedElementId = base::Token;
@@ -96,7 +96,7 @@ index a0bad1b359b34..592831f450e5b 100644
    kTrackedElementFeatureMax = kTrackedElementFeatureEnd + 2,
  };
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index e68dc4659288d..1f1bd1dee1cc0 100644
+index 53f8b34cae4b0..fc346178abdac 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
 @@ -8,6 +8,7 @@
@@ -107,7 +107,7 @@ index e68dc4659288d..1f1bd1dee1cc0 100644
  #include <utility>
  #include <vector>
  
-@@ -2340,6 +2341,14 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2341,6 +2342,14 @@ AggregatedFrame SurfaceAggregator::Aggregate(
      frame_annotator_->AnnotateAggregatedFrame(&frame);
  
    frame.tracked_element_rects = std::move(tracked_element_rects_);
@@ -122,7 +122,7 @@ index e68dc4659288d..1f1bd1dee1cc0 100644
    frame.inline_3d_rects = std::move(inline_3d_rects_);
  
    return frame;
-@@ -2489,8 +2498,39 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2490,8 +2499,39 @@ void SurfaceAggregator::CollectTrackedElementRects(
      const gfx::Transform& target_transform,
      const gfx::Transform& transform_to_root_target,
      const std::optional<gfx::Rect> root_target_clip_rect) {
@@ -162,7 +162,7 @@ index e68dc4659288d..1f1bd1dee1cc0 100644
      for (const auto& rect_data : tracked_elements) {
        TrackedElementRect transformed_rect_data = rect_data;
        transformed_rect_data.visible_bounds = TransformRectToDestRootTargetSpace(
-@@ -2499,12 +2539,15 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2500,12 +2540,15 @@ void SurfaceAggregator::CollectTrackedElementRects(
        tracked_element_rects_[feature].push_back(transformed_rect_data);
      }
    }
