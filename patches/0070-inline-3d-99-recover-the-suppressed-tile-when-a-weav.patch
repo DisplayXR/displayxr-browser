@@ -1,0 +1,258 @@
+From 01c98c60e4df28ef9c25d7861965fbc4e39dbf53 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Wed, 19 Aug 2026 18:03:30 -0700
+Subject: [PATCH] inline-3d(#99): recover the suppressed tile when a weave
+ submit misses
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A frame with inline-3D rects suppresses every canvas resource from the page
+raster on the compositor thread (display.cc), and it does so before the weave
+outcome can be known — the weave happens later, on the GPU thread. Patch 0057
+then, correctly, refuses the phase (B) draw-back on a frame that wove nothing.
+So that frame draws the tile from neither side: the quad was withheld AND the
+woven texture was not blitted, and the tile shows the root pass's backdrop.
+That is browser#99's black flicker. Patch 0047 predicted it in its own commit
+message — "if a frame ever has inline-3D rects but the weave does not land,
+this blanks rather than glitches" — and 0057 did not cause it: the stale
+texture it rightly stopped blitting had been accidentally masking it.
+
+Fill the hole on the GPU thread, where the miss is discovered. Immediately
+before the liveness gate's return, draw each suppressed canvas resource
+directly into the output surface at its tile rect — MONO, the left eye of the
+side-by-side stretched across the whole tile. Everything needed is already in
+hand: |inline_3d_canvas_layers_| is exactly the set display.cc suppressed, each
+entry carrying the resolved mailbox, the unclipped tile rect and the quad's UV
+window. Mono is the same flat fallback the SDK itself shows when 3D is
+unavailable, and it is the only honest choice of the three: black is the bug,
+and a naive full-UV draw would show the raw SBS squeezed to half width.
+
+The details that matter:
+
+- The left half is taken from the quad's EXISTING uv window, not from the whole
+  texture (browser#73). For an atlased or partially-mapped resource those are
+  different rectangles, and halving the texture samples another tile's pixels.
+- The clip stays on the DESTINATION, the same browser#73 rule the weave input
+  follows: a viewport-clipped WebGL canvas resource's physical texture can be
+  shorter than the SkImage claims, so a source crop edge-clamps into a downward
+  smear. Draw the unclipped tile rect and let Skia clip it.
+- LINEAR sampling, unlike phase (B)'s device-pixel-exact NEAREST: this is a 2x
+  horizontal magnification of an eye half, not a 1:1 interlace-lattice blit.
+- The early-return path did NO flush of its own — phase (B)'s bracket sits
+  below the return and is never reached — so the recovery frame brings its own
+  FlushSurface + submit, and holds every representation and read access in
+  vectors until after it. That is the 0064 lesson (an access released before
+  the submit draws nothing), scaled from two objects to N tiles.
+- Tiles clipped to empty by the window are skipped: no hole on screen, nothing
+  lost. Tiles with nothing in hand stay black and are counted — note that
+  display.cc's resolve() already DROPS a layer whose ResourceId has no mailbox
+  while still suppressing it, so that class cannot reach this loop at all.
+
+The block is unreachable when the frame wove, so it costs nothing in the steady
+state. Batch mode only, like the gate it precedes: async mode keeps the last
+woven output visible by contract and has no hole to fill. The gate is also the
+single exit for the SubmitBatchSync RPC failure (batch_ok folds into
+wove_this_frame just above it), so one site covers both miss classes. No
+runtime change, no mojom change, no aggregator change.
+
+One throttled VLOG(1) reports n= repaired / missing= not — browser#99's triage
+plan asked for exactly that number, the direct measurement of how often we
+punch a hole.
+
+Also make the batch-submit-failure LOG(ERROR) throttled rather than capped at
+three occurrences EVER, and append the running total. That line is the direct
+signal for this failure mode, and it went permanently quiet after the first few
+— making exactly the long flickering sessions #99 reports undiagnosable. First
+three, then 1-in-300 (~5 s at 60 fps); the text up to the count is unchanged so
+existing greps keep matching.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../displayxr/gpu/displayxr_weave_gpu.cc      |  17 ++-
+ .../skia_output_surface_impl_on_gpu.cc        | 138 ++++++++++++++++++
+ 2 files changed, 152 insertions(+), 3 deletions(-)
+
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index fc1caa6fd1db1..a5665b2f0e329 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -693,11 +693,22 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+       /*input_is_dxgi=*/true, overlay_handle, /*overlay_is_dxgi=*/true, flat);
+   const base::TimeDelta dt = base::TimeTicks::Now() - t0;
+   if (!sr.ok) {
++    // (browser#99) THROTTLED, not capped-at-3-ever. This line is the direct
++    // signal for the black-flicker mechanism — a failed submit is what trips
++    // the liveness gate and (pre-#99) punched the suppression hole — so a
++    // session that starts flickering ten minutes in must still leave a trace.
++    // The old `s_fail < 3` went permanently quiet after the first few and made
++    // exactly the long sessions that matter undiagnosable (#99's triage note).
++    // First 3 (a startup failure is never throttled away), then 1-in-300
++    // (~5 s at 60 fps). Text shape is deliberately unchanged up to the count,
++    // so existing greps for "[DisplayXR] batch weave submit failed (n=" keep
++    // matching; the running total is appended because #99 asked for the cap to
++    // become a counter.
+     static int s_fail = 0;
+-    if (s_fail < 3) {
+-      ++s_fail;
++    const int n = s_fail++;
++    if (n < 3 || (n % 300) == 0) {
+       LOG(ERROR) << "[DisplayXR] batch weave submit failed (n=" << rects.size()
+-                 << ")";
++                 << " fails=" << (n + 1) << ")";
+     }
+     return false;
+   }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 01926790756ec..43b8034bb98fa 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3589,7 +3589,145 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // means "nothing woven". Async mode deliberately keeps the last woven output
+   // visible while a submit is in flight — that is its one-frame-lag contract.
+   if (batch && !wove_this_frame) {
++    // ---- (B') RECOVERY DRAW (browser#99): degrade to mono, never to black ----
++    //
++    // The gate above is correct — a stale woven texture must not be blitted —
++    // but returning bare leaves a HOLE, and that hole is browser#99's black
++    // flicker. The two halves of the mechanism are decided in different places
++    // and neither can see the other:
++    //   1. Display::DrawAndSwap suppressed every canvas resource from the page
++    //      raster (display.cc, keyed only on "this frame has rects"), on the
++    //      COMPOSITOR thread, before the weave outcome is knowable.
++    //   2. this early return then skips phase (B), the draw-back that was
++    //      supposed to put those pixels back.
++    // Net: the tile is drawn by nobody and shows the root pass's backdrop —
++    // black. Patch 0047 predicted this exact asymmetry in its own commit
++    // message ("if a frame ever has inline-3D rects but the weave does not
++    // land, this blanks rather than glitches"); 0057 made it visible by
++    // (rightly) refusing the stale blit that used to mask it.
++    //
++    // So paint the tiles ourselves this frame. Everything needed is already in
++    // hand: |inline_3d_canvas_layers_| is exactly the set display.cc
++    // suppressed, each entry carrying the resolved mailbox, the unclipped tile
++    // rect and the quad's UV window. We draw MONO — the left eye of the
++    // side-by-side, stretched across the whole tile. That is the same flat
++    // fallback the SDK itself shows when 3D is unavailable, and it is the only
++    // honest choice of the three: black is the bug, and a naive full-UV draw
++    // would show the raw SBS horizontally squeezed to half width.
++    //
++    // This block is unreachable on a healthy frame — |wove_this_frame| true
++    // skips it outright — so it costs nothing in the steady state. Batch mode
++    // only, like the gate: async mode keeps the last woven output visible by
++    // contract, so it has no hole to fill.
++    //
++    // The representations and read accesses must outlive the flush+submit
++    // below (the 0064 lesson — Ganesh reads the texture at flush time, so an
++    // access released before the submit draws nothing), hence the vectors:
++    // they are the same idiom as |woven_access| / |over_access| in phase (B),
++    // scaled to N tiles.
++    std::vector<std::unique_ptr<gpu::SkiaImageRepresentation>> rec_reps;
++    std::vector<std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>>
++        rec_accesses;
++    rec_reps.reserve(inline_3d_canvas_layers_.size());
++    rec_accesses.reserve(inline_3d_canvas_layers_.size());
++    int rec_drawn = 0;
++    int rec_missing = 0;
++    for (const auto& c : inline_3d_canvas_layers_) {
++      // Clipped to nothing by the window: there is no hole on screen to fill.
++      // Not counted as missing — nothing was lost.
++      gfx::Rect on_screen = c.rect;
++      on_screen.Intersect(window_bounds);
++      if (on_screen.IsEmpty()) {
++        continue;
++      }
++      // Nothing in hand -> this tile stays black; count it so the log below
++      // separates "we repaired it" from "we could not". Note display.cc's
++      // resolve() already DROPS layers whose ResourceId has no mailbox while
++      // still suppressing them, so that class never reaches this loop and
++      // cannot be counted here; this guard covers the rest.
++      if (c.mailbox.IsZero()) {
++        ++rec_missing;
++        continue;
++      }
++      auto rep = shared_image_representation_factory_->ProduceSkia(
++          c.mailbox, context_state_.get());
++      if (!rep) {
++        ++rec_missing;
++        continue;
++      }
++      std::vector<GrBackendSemaphore> rbegin_sem, rend_sem;
++      auto access = rep->BeginScopedReadAccess(&rbegin_sem, &rend_sem);
++      if (!access) {
++        ++rec_missing;
++        continue;
++      }
++      sk_sp<SkImage> img = access->CreateSkImage(context_state_.get());
++      if (!img) {
++        ++rec_missing;
++        continue;
++      }
++      if (!rbegin_sem.empty()) {
++        output->wait(rbegin_sem.size(), rbegin_sem.data(),
++                     /*deleteSemaphoresAfterWait=*/false);
++      }
++      // LEFT EYE = the left half of the quad's EXISTING UV WINDOW, not of the
++      // whole texture (browser#73): |uv| is the normalized sub-rect of the
++      // resource that |rect| displays, and for an atlased or partially-mapped
++      // canvas resource the two are not the same rectangle. Halving the
++      // texture instead would sample the wrong pixels — often another tile's.
++      gfx::RectF uvw = c.uv;
++      if (uvw.IsEmpty()) {
++        uvw = gfx::RectF(0.f, 0.f, 1.f, 1.f);
++      }
++      const float iw = img->width();
++      const float ih = img->height();
++      const SkRect src = SkRect::MakeXYWH(uvw.x() * iw, uvw.y() * ih,
++                                          uvw.width() * 0.5f * iw,
++                                          uvw.height() * ih);
++      // Destination is the UNCLIPPED tile rect, exactly where the page would
++      // have drawn the quad; Skia clips it to the surface. This is the same
++      // browser#73 rule the weave input follows — express a clip on the
++      // DESTINATION, never by sub-regioning the source, because a
++      // viewport-clipped WebGL canvas resource's physical texture can be
++      // shorter than the SkImage claims and a source crop edge-clamps into a
++      // downward smear.
++      const SkRect dst = gfx::RectToSkRect(c.rect);
++      SkPaint paint;
++      paint.setBlendMode(SkBlendMode::kSrcOver);
++      // LINEAR, unlike phase (B): this is a 2x horizontal magnification of the
++      // eye half, not the device-pixel-exact 1:1 blit of an interlace lattice.
++      // NEAREST here would show the un-squeeze as visible column doubling.
++      out_canvas->drawImageRect(img.get(), src, dst,
++                                SkSamplingOptions(SkFilterMode::kLinear),
++                                &paint, SkCanvas::kStrict_SrcRectConstraint);
++      ++rec_drawn;
++      rec_reps.push_back(std::move(rep));
++      rec_accesses.push_back(std::move(access));
++    }
++    // The early-return path did NO flush of its own — phase (B)'s bracket is
++    // below this return and we never reach it — so the recovery frame has to
++    // bring its own, mirroring how phase (B) ends.
++    if (rec_drawn > 0) {
++      std::vector<GrBackendSemaphore> empty_sem;
++      FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
++      if (gr_context()) {
++        gr_context()->submit();
++      }
++      if (graphite_shared_context()) {
++        graphite_shared_context()->submit();
++      }
++    }
++    // browser#99's triage plan asked for exactly this number: how often are we
++    // punching a hole, and how many of those holes could we not repair.
++    // Throttled 1-in-60 (~once a second at 60 fps) — a frame that reaches here
++    // is by definition an unhealthy one, so it must not be able to flood.
++    static int rec_dbg = 0;
++    if ((rec_dbg++ % 60) == 0) {
++      VLOG(1) << "[DisplayXR] inline-3D recovery draw: n=" << rec_drawn
++              << " missing=" << rec_missing;
++    }
+     return;
++    // rec_accesses / rec_reps release here, after the submit.
+   }
+ 
+   // ---- (B) Draw back the accumulated window-sized woven output (Windows) ----
+-- 
+2.42.0.windows.2
+
