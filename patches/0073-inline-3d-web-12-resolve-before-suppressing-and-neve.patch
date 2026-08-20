@@ -1,0 +1,686 @@
+From 8fd0071e3b78a0884fc137ee9e460c235b11b3e9 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Wed, 19 Aug 2026 22:10:01 -0700
+Subject: [PATCH] inline-3d(web#12): resolve before suppressing, and never
+ weave the hole
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The dark tile that survived 0070, 0071 and 0072 is a set asymmetry in Viz, and
+the frames it ruins report success everywhere.
+
+Display::DrawAndSwap builds two lists from the same aggregated frame. The weave
+input is the post-resolve mailbox list, which silently drops any canvas layer
+whose ResourceId has no SharedImage mailbox. The suppression set is keyed on
+bare ResourceId and drops nothing. So a layer that failed to resolve was pulled
+out of the page raster and never handed to the weave. The GPU stage then found
+no clean canvas resource for that tile and fell back to snapshotting the
+composited output at the tile rect — which, since browser#22 landed suppression,
+is exactly the hole that was just punched. It wove the hole, the batch submitted,
+attempt_submit returned true, and 0070's recovery is gated on !wove_this_frame so
+it was unreachable by construction. Zero submit failures, zero AcquireSync
+timeouts, zero view flips, and a black tile. The shared weave input is never
+cleared between frames, which is why consecutive captures of a blink burst came
+out byte-identical and read as a stale misassembly.
+
+Four parts.
+
+Root: resolve first, suppress only what survived (display.cc). Never punch a hole
+you cannot fill. A tile whose resource is gone now stays an ordinary page quad
+for that frame instead of becoming a woven hole.
+
+Defence: attempt_submit refuses to weave |output| wherever it may be holed. The
+suppression set and inline_3d_canvas_layers_ are now the same list, so that list
+answers the question on its own — empty means nothing was suppressed and the
+composited snapshot is still the legitimate legacy weave source; non-empty means
+canvas quads were removed and a tile with no clean resource must be skipped, not
+snapshotted. The same gate covers the CPU-readback fallback, which sources ONLY
+from |output| and had no gate at all, and the case where a resolved resource
+fails to open.
+
+Recovery: 0070's mono repaint becomes per-tile. It closed the loop at the frame
+level and left it open at the tile level — a frame where tile A wove and tile B
+did not left B black. The two callers share one lambda; the per-tile form runs
+before the phase (B) draw-back, which is safe because the runtime clears its
+woven output to transparent each frame, so kSrcOver leaves the repaint intact.
+Part 1 and this cannot double-draw: an unsuppressed layer never reaches the GPU
+stage's list, so the loop cannot see it.
+
+Counters, on 0070's discipline (LOG(ERROR), first 3 then 1-in-300), because every
+step of this mechanism was silent: resolve drops, no-clean-resource skips,
+CPU-readback hole skips, zero-copy batches (the discriminator for the multi-second
+no-submit windows), the canvas-layer lookup returning nothing (logged NOWHERE
+before), and the id-miss and recovery-draw lines promoted off VLOG(1), where
+"no lines" was never evidence of absence. The root-render-pass size bail counts
+consecutive misses and speaks only after a run, since it fires harmlessly on
+every element-sized pass.
+
+Also fixes the latent keyed-mutex leak next door: the mixed-format guard asked
+about batch_entries_ when the thing at risk is the mutex, so a target that
+acquired the input and was then rejected by the destination clamp could let a
+differently-formatted target recreate the shared texture underneath the held
+mutex.
+
+Validated per-TU with clang-cl -fsyntax-only (all three TUs clean, tripwire
+confirms the check bites).
+
+Refs: DisplayXR/displayxr-web#12
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../displayxr/gpu/displayxr_weave_gpu.cc      |  35 +-
+ components/viz/service/display/display.cc     |  92 +++--
+ .../skia_output_surface_impl_on_gpu.cc        | 336 ++++++++++++++----
+ 3 files changed, 378 insertions(+), 85 deletions(-)
+
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index a5665b2f0e329..d239344dd6c1a 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -504,8 +504,20 @@ bool DisplayXRWeaveGpu::EnsureBatchInputAndAcquire(ID3D11Device* device,
+   // All of a frame's copies share ONE input; a mid-frame format mismatch would
+   // recreate it under the held mutex and lose the earlier copies. In practice
+   // every canvas copy comes from the same composited output format.
+-  if (!batch_entries_.empty() && shared_input_.input_tex &&
+-      shared_input_.input_format != format) {
++  //
++  // (web#12) The guard used to test |batch_entries_| alone, which is the wrong
++  // question: a target can ACQUIRE the input and then be rejected by the
++  // destination clamp in BatchCopyCanvas without ever pushing an entry. The
++  // batch is then mutex-held with an empty entry list, this guard waves a
++  // differently-formatted target through, EnsureInput destroys and recreates
++  // the shared texture underneath the held mutex, and the old mutex is never
++  // released while the new one is never acquired — |batch_mutex_held_| now
++  // describes a texture that no longer exists. Latent (it needs a clamp
++  // rejection and a format change in the same frame), but the failure is a
++  // stuck keyed mutex, which is exactly the class this whole issue family lives
++  // in. Ask about the mutex, since the mutex is what is at risk.
++  if ((batch_mutex_held_ || !batch_entries_.empty()) &&
++      shared_input_.input_tex && shared_input_.input_format != format) {
+     static bool logged_fmt = false;
+     if (!logged_fmt) {
+       logged_fmt = true;
+@@ -650,6 +662,7 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+     return false;
+   }
+   batch_open_ = false;
++  const bool had_mutex = batch_mutex_held_;
+   const bool had_copies = batch_mutex_held_ && !batch_entries_.empty();
+   if (batch_mutex_held_) {
+     // Hand the input to the service in the "caller done writing" state.
+@@ -658,6 +671,24 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+     batch_mutex_held_ = false;
+   }
+   if (!had_copies) {
++    // (web#12) A batch that copied NOTHING issues no submit at all, so the
++    // runtime never re-weaves, never runs its first-chunk transparent clear,
++    // and never even polls its capture trigger — which is what turned a stall
++    // into a multi-second window that read, from the outside, as "the weave is
++    // frozen" with not one line in either log. It was completely silent. It is
++    // now the discriminator for that window: when every target declines (a
++    // canvas resource that will not open, a readback that returns nothing, or —
++    // since this patch — every tile refusing to weave the page's suppression
++    // hole) this is the line that says so. First 3, then 1-in-300, matching the
++    // submit-failure counter below.
++    static int s_empty = 0;
++    const int n = s_empty++;
++    if (n < 3 || (n % 300) == 0) {
++      LOG(ERROR) << "[DisplayXR] batch weave: ZERO copies this frame — no "
++                    "submit issued (acquired_input="
++                 << had_mutex << " entries=" << batch_entries_.size()
++                 << " empties=" << (n + 1) << ")";
++    }
+     return false;
+   }
+ 
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index 3d1631de8972b..5f69e88260dca 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -987,26 +987,73 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+     // canvas rects to the GPU thread before DrawFrame (which enqueues
+     // FinishPaintCurrentFrame), so the post-paint output weave loop reads the
+     // rects that match this frame's composited pixels.
+-    if (skia_output_surface_) {
++    //
++    // ---- (web#12) RESOLVE BEFORE SUPPRESSING — one set, not two ----
++    //
++    // Two lists are built here from the same aggregated frame, and until this
++    // patch they were NOT the same set:
++    //   * the WEAVE INPUT — the post-resolve mailbox list handed to the GPU
++    //     stage, which SILENTLY DROPPED any layer whose ResourceId did not
++    //     resolve to a SharedImage mailbox;
++    //   * the SUPPRESSION set — keyed on bare ResourceId, which dropped
++    //     nothing.
++    // A layer that failed to resolve was therefore removed from the page raster
++    // (direct_renderer.cc drops the quad) while never reaching the weave. The
++    // GPU stage then found no clean canvas resource for that tile, fell back to
++    // snapshotting the composited output at the tile rect — which is EXACTLY
++    // the hole suppression had just punched — wove it, and reported success. A
++    // dark tile on a frame with zero errors anywhere: the fourth and root
++    // dark-tile path (after #99's missed submit, #92's stuck degraded mode and
++    // this issue's rig flips).
++    //
++    // So resolve FIRST and suppress only what survived. NEVER PUNCH A HOLE YOU
++    // CANNOT FILL. A tile whose resource is gone then simply stays an ordinary
++    // page quad for that frame — the page draws it exactly as it would with no
++    // inline-3D at all — instead of becoming a woven hole. That is a strictly
++    // better failure: the weave skips the tile, and the tile is still there.
++    //
++    // Ordering is safe by construction: both sets are built here, in
++    // DrawAndSwap, BEFORE renderer_->DrawFrame() below consumes the suppression
++    // set, and the resolve is a pure read of the resource provider Display
++    // already owns.
++    std::vector<SkiaOutputSurface::Inline3dLayerMailbox> resolved_canvas;
++    ResourceIdSet resolved_canvas_ids;
++    {
+       // Resolve each isolated canvas layer's ResourceId → its SharedImage
+       // mailbox here (Display owns the resource provider), handing the GPU
+       // stage plain {mailbox, rect} — the same shape the render-pass path used.
+       // browser#18.
+-      auto resolve =
+-          [this](
+-              const std::vector<AggregatedFrame::Inline3dLayerResource>& in) {
+-            std::vector<SkiaOutputSurface::Inline3dLayerMailbox> out;
+-            out.reserve(in.size());
+-            for (const auto& layer : in) {
+-              gpu::Mailbox m =
+-                  resource_provider_->GetMailbox(layer.resource_id);
+-              if (!m.IsZero()) {
+-                out.push_back(
+-                    {m, layer.rect, layer.visible_rect, layer.uv, layer.id});
+-              }
+-            }
+-            return out;
+-          };
++      int dropped = 0;
++      resolved_canvas.reserve(frame.inline_3d_canvas_resources.size());
++      for (const auto& layer : frame.inline_3d_canvas_resources) {
++        gpu::Mailbox m = resource_provider_->GetMailbox(layer.resource_id);
++        if (m.IsZero()) {
++          ++dropped;
++          continue;
++        }
++        resolved_canvas.push_back(
++            {m, layer.rect, layer.visible_rect, layer.uv, layer.id});
++        resolved_canvas_ids.insert(layer.resource_id);
++      }
++      // (web#12) This drop was invisible for the whole life of the bug — it is
++      // the event that used to desynchronize the two sets, so it must be
++      // countable now that it no longer does. LOG(ERROR), first 3 (a startup
++      // burst is never throttled away) then 1-in-300 (~5 s at 60 fps): a page
++      // that starts dropping ten minutes in must still leave a trace.
++      if (dropped > 0) {
++        static int s_drop = 0;
++        const int n = s_drop++;
++        if (n < 3 || (n % 300) == 0) {
++          LOG(ERROR) << "[DisplayXR] inline-3D canvas resolve dropped "
++                     << dropped << " of "
++                     << frame.inline_3d_canvas_resources.size()
++                     << " layers (no mailbox); left UNSUPPRESSED so the page "
++                        "draws them (drops="
++                     << (n + 1) << ")";
++        }
++      }
++    }
++    if (skia_output_surface_) {
+       // Phase-1 identity: the GPU stage keys its per-target weave state by the
+       // element token, so carry {rect, id} rather than bare rects.
+       std::vector<SkiaOutputSurface::Inline3dRect> weave_rects;
+@@ -1014,8 +1061,8 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+       for (const auto& r : frame.inline_3d_rects) {
+         weave_rects.push_back({r.rect, r.id});
+       }
+-      skia_output_surface_->SetInline3DRects(
+-          std::move(weave_rects), resolve(frame.inline_3d_canvas_resources));
++      skia_output_surface_->SetInline3DRects(std::move(weave_rects),
++                                             std::move(resolved_canvas));
+     }
+     // DisplayXR inline-3D (browser#22 B): hand the renderer the resources the
+     // weave draw-back is the single source for, so their quads are not painted
+@@ -1034,9 +1081,12 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+         // excludes already-suppressed resources from its over set); the
+         // difference clip punches its over-tile part out of the page raster and
+         // the over-plane composite draws it back on top.
+-        for (const auto& layer : frame.inline_3d_canvas_resources) {
+-          suppressed.insert(layer.resource_id);
+-        }
++        //
++        // (web#12) RESOLVED ids only — see the block above. This set is now, by
++        // construction, exactly the set of canvas layers the GPU stage received
++        // in |inline_3d_canvas_layers_|, which is what lets that stage reason
++        // about whether |output| at a tile rect is a hole or real page pixels.
++        suppressed = std::move(resolved_canvas_ids);
+       }
+       renderer_->SetInline3dSuppressedResources(std::move(suppressed));
+     }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 43b8034bb98fa..bcbe82f400ca4 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2821,9 +2821,30 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+   // inline_3d_rects_ are window-relative device-px, so only the window-sized root
+   // render pass (== the whole composited page, the CEF pageTex equivalent under
+   // DComp) carries them. Non-root overlay passes are element-sized — skip them.
++  //
++  // (web#12) This bail was SILENT, and it is one of the ranked candidates
++  // for a multi-second window in which NO weave submit is issued at all —
++  // during which every tile is a suppressed hole with no submit to repair it
++  // and nothing in the log to say why. It cannot simply be logged: it fires
++  // routinely and harmlessly for element-sized (non-root) overlay passes, so a
++  // per-event line would be noise on every healthy run. What is diagnostic is a
++  // RUN of them with no root-pass weave in between — that, and only that, is a
++  // stall. So count consecutive bails, reset on the first pass that reaches the
++  // weave, and speak up once the run passes ~1 s at 60 fps, then on the 0070
++  // 1-in-300 cadence for as long as it lasts.
++  static int s_consecutive_bails = 0;
+   if (gfx::Size(surface->width(), surface->height()) != size_) {
++    const int n = s_consecutive_bails++;
++    if (n == 60 || (n > 60 && (n % 300) == 0)) {
++      LOG(ERROR) << "[DisplayXR] MaybeWeaveRootRenderPass: " << (n + 1)
++                 << " consecutive passes with no root-sized pass (last "
++                 << surface->width() << "x" << surface->height()
++                 << " vs surface " << size_.ToString()
++                 << ") — inline-3D has not woven for this whole run";
++    }
+     return;
+   }
++  s_consecutive_bails = 0;
+   static bool logged = false;
+   if (!logged) {
+     logged = true;
+@@ -3021,12 +3042,19 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           return c;
+         }
+       }
++      // (web#12) Promoted from VLOG(1) to the 0070 throttle discipline. This
++      // line separates "the matcher missed" from "the resource is gone", which
++      // is precisely the distinction the no-clean-resource gate below acts on —
++      // and at VLOG(1) it was invisible in every default-verbosity run, so
++      // "no id-miss lines" was never evidence of absence.
+       static int id_miss_dbg = 0;
+-      if ((id_miss_dbg++ % 60) == 0) {
+-        VLOG(1) << "[DisplayXR] GPU canvas-layer id miss: id=" << id.ToString()
+-                << " rect=" << r.ToString() << " among "
+-                << inline_3d_canvas_layers_.size()
+-                << " canvas layers — falling back to overlap match";
++      const int n = id_miss_dbg++;
++      if (n < 3 || (n % 300) == 0) {
++        LOG(ERROR) << "[DisplayXR] GPU canvas-layer id miss: id="
++                   << id.ToString() << " rect=" << r.ToString() << " among "
++                   << inline_3d_canvas_layers_.size()
++                   << " canvas layers — falling back to overlap match (misses="
++                   << (n + 1) << ")";
+       }
+     }
+     for (const auto& c : inline_3d_canvas_layers_) {
+@@ -3038,9 +3066,48 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         return c;
+       }
+     }
++    // (web#12) The null return was logged NOWHERE — the single most
++    // consequential silence in this path, because it is what routed the tile
++    // into the output-snapshot fallback and therefore into weaving the
++    // suppression hole. Count it at the lookup site, with the context (id,
++    // rect, list size) that says WHICH of the two causes it was: an empty list
++    // means display.cc resolved nothing this frame (so nothing is suppressed
++    // and the composited output is real page pixels); a non-empty one means the
++    // matcher missed a layer that IS suppressed.
++    {
++      static int null_dbg = 0;
++      const int n = null_dbg++;
++      if (n < 3 || (n % 300) == 0) {
++        LOG(ERROR)
++            << "[DisplayXR] GPU canvas-layer lookup returned NO resource:"
++            << " id=" << id.ToString() << " rect=" << r.ToString()
++            << " layers=" << inline_3d_canvas_layers_.size()
++            << " (misses=" << (n + 1) << ")";
++      }
++    }
+     return SkiaOutputSurface::Inline3dLayerMailbox();
+   };
+ 
++  // (web#12) Which canvas layers actually reached the weave this frame, keyed
++  // by mailbox. Filled by attempt_submit on success; read by the per-tile
++  // recovery draw below, which repaints exactly the on-screen canvas layers
++  // that are NOT in here — the tiles display.cc suppressed and the weave then
++  // declined.
++  std::vector<gpu::Mailbox> submitted_canvas_mailboxes;
++  submitted_canvas_mailboxes.reserve(inline_3d_canvas_layers_.size());
++  // Plain loop rather than std::find: <algorithm> is only pulled in on the
++  // Apple branch of this file's includes, and a handful of mailboxes is not
++  // worth an include change in a header-fragile TU.
++  [[maybe_unused]] const auto canvas_was_submitted =
++      [&](const gpu::Mailbox& m) {
++        for (const gpu::Mailbox& s : submitted_canvas_mailboxes) {
++          if (s == m) {
++            return true;
++          }
++        }
++        return false;
++      };
++
+   // |key| identifies the target in |displayxr_targets_|; |t| indexes this
+   // frame's rects. Everything the submit touches now hangs off the keyed state,
+   // so a target's provider slot / scratch image / in-flight rect stay with it
+@@ -3067,6 +3134,44 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     const gfx::Rect clean_sbs_rect = clean_sbs.rect;  // UNCLIPPED full tile
+     const gfx::RectF clean_sbs_uv = clean_sbs.uv;     // resource sub-rect (#73)
+ 
++    // ---- (web#12) NEVER WEAVE THE HOLE ----
++    //
++    // |inline_3d_canvas_layers_| is now EXACTLY the set display.cc suppressed
++    // from the page raster this frame (that is what "resolve before suppress"
++    // bought us). So it answers, on its own, the only question that matters
++    // here: is |output| at |rect| real page pixels, or a hole?
++    //
++    //   * list EMPTY  -> nothing was suppressed, |output| still holds the
++    //   page's
++    //                    own side-by-side canvas quad. Snapshotting it is the
++    //                    pre-browser#18 weave source and is still correct; let
++    //                    it through.
++    //   * list NON-EMPTY, no match -> canvas quads WERE removed from |output|,
++    //                    and this tile has no clean resource to weave from.
++    //                    Snapshotting would weave the punched hole and report
++    //                    SUCCESS — the entire mechanism of this bug. Skip the
++    //                    tile's submit entry outright; the per-tile recovery
++    //                    draw below repaints it from the resource it does hold,
++    //                    and if it holds none the tile was never suppressed in
++    //                    the first place and the page already drew it.
++    //
++    // Skipping is not a degradation of a working path: the "working" path here
++    // produced a black tile. Returning false is also already wired correctly
++    // downstream — the caller clears |pending_rect| / |drawn_rect| for this
++    // target, so phase (B) will not draw a stale region back for it either.
++    if (clean_sbs_mailbox.IsZero() && !inline_3d_canvas_layers_.empty()) {
++      static int s_noclean = 0;
++      const int n = s_noclean++;
++      if (n < 3 || (n % 300) == 0) {
++        LOG(ERROR) << "[DisplayXR] weave tile skipped: no clean canvas resource"
++                   << " (id=" << inline_3d_rects_[t].id.ToString()
++                   << " rect=" << rect.ToString()
++                   << " layers=" << inline_3d_canvas_layers_.size()
++                   << " skips=" << (n + 1) << ")";
++      }
++      return false;
++    }
++
+     // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the
+     // composited sub-rect on the GPU instead of the readPixels roundtrip:
+     // Skia-copy it into an owned scratch D3DImageBacking, ProduceOverlay its
+@@ -3191,6 +3296,18 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+               }
+             }
+           }
++          // (web#12) The tile HAS a resolved canvas resource — so it IS one of
++          // the quads display.cc removed from the page raster — and we failed
++          // to open it (ProduceSkia / BeginScopedReadAccess / CreateSkImage).
++          // The output snapshot below is therefore guaranteed to be the hole,
++          // and weaving it would report success while presenting black. Refuse:
++          // fail() drops to the CPU-readback fallback, whose own web#12 gate
++          // (it reads the same |output|) then declines the tile properly.
++          if (!src_img && !clean_sbs_mailbox.IsZero()) {
++            return fail(
++                "clean canvas resource unusable — refusing to weave the "
++                "suppression hole");
++          }
+           if (!src_img) {
+             src_img = output->makeImageSnapshot(
+                 SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
+@@ -3408,6 +3525,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         // Remember where this target was submitted so phase (B) draws the woven
+         // pixels at the rect the runtime placed them, not a later drifted rect.
+         st.pending_rect = rect;
++        if (!clean_sbs_mailbox.IsZero()) {
++          submitted_canvas_mailboxes.push_back(clean_sbs_mailbox);
++        }
+         return true;
+       }
+     }
+@@ -3417,6 +3537,32 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // input. Ganesh has a synchronous SkSurface::readPixels; Graphite has no sync
+     // readback, so it uses the blocking-async path. This reads the clean pre-
+     // weave page (phase (A) runs before the woven draw-back in (B)).
++    //
++    // ---- (web#12) …and "the clean pre-weave page" is exactly what it stopped
++    // being when browser#22 landed suppression. This path sources ONLY from
++    // |output| — it never looks at the clean canvas resource — so on any frame
++    // where canvas quads were removed from the page raster it reads the hole
++    // and weaves it, with no gate of any kind. It was the second, unguarded
++    // mouth of the same mechanism.
++    //
++    // The gate is the same one-line question as above: did suppression fire
++    // this frame? If it did, |output| at |rect| is not a source. Fall out and
++    // let the per-tile recovery draw put the tile back from its own resource.
++    // If it did not (an empty layer list — the legacy no-canvas-resource
++    // channel, and the GL output-device path), this readback is still the
++    // correct weave source and is untouched.
++    if (!inline_3d_canvas_layers_.empty()) {
++      static int s_cpu_hole = 0;
++      const int n = s_cpu_hole++;
++      if (n < 3 || (n % 300) == 0) {
++        LOG(ERROR) << "[DisplayXR] weave tile skipped: CPU readback would "
++                      "sample the suppression hole (rect="
++                   << rect.ToString()
++                   << " layers=" << inline_3d_canvas_layers_.size()
++                   << " skips=" << (n + 1) << ")";
++      }
++      return false;
++    }
+     const SkImageInfo info = SkImageInfo::Make(
+         rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+         SkColorSpace::MakeSRGB());
+@@ -3582,49 +3728,60 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   }
+ 
+ #if BUILDFLAG(IS_WIN)
+-  // (browser#87) Liveness gate: skip the Phase (B) draw-back entirely when this
+-  // frame wove nothing, rather than blitting a woven texture that still holds
+-  // the previous page's pixels. Batch mode only: the batch weave completes
+-  // synchronously inside SubmitBatchSync, so "nothing submitted" there really
+-  // means "nothing woven". Async mode deliberately keeps the last woven output
+-  // visible while a submit is in flight — that is its one-frame-lag contract.
+-  if (batch && !wove_this_frame) {
+-    // ---- (B') RECOVERY DRAW (browser#99): degrade to mono, never to black ----
+-    //
+-    // The gate above is correct — a stale woven texture must not be blitted —
+-    // but returning bare leaves a HOLE, and that hole is browser#99's black
+-    // flicker. The two halves of the mechanism are decided in different places
+-    // and neither can see the other:
+-    //   1. Display::DrawAndSwap suppressed every canvas resource from the page
+-    //      raster (display.cc, keyed only on "this frame has rects"), on the
+-    //      COMPOSITOR thread, before the weave outcome is knowable.
+-    //   2. this early return then skips phase (B), the draw-back that was
+-    //      supposed to put those pixels back.
+-    // Net: the tile is drawn by nobody and shows the root pass's backdrop —
+-    // black. Patch 0047 predicted this exact asymmetry in its own commit
+-    // message ("if a frame ever has inline-3D rects but the weave does not
+-    // land, this blanks rather than glitches"); 0057 made it visible by
+-    // (rightly) refusing the stale blit that used to mask it.
+-    //
+-    // So paint the tiles ourselves this frame. Everything needed is already in
+-    // hand: |inline_3d_canvas_layers_| is exactly the set display.cc
+-    // suppressed, each entry carrying the resolved mailbox, the unclipped tile
+-    // rect and the quad's UV window. We draw MONO — the left eye of the
+-    // side-by-side, stretched across the whole tile. That is the same flat
+-    // fallback the SDK itself shows when 3D is unavailable, and it is the only
+-    // honest choice of the three: black is the bug, and a naive full-UV draw
+-    // would show the raw SBS horizontally squeezed to half width.
+-    //
+-    // This block is unreachable on a healthy frame — |wove_this_frame| true
+-    // skips it outright — so it costs nothing in the steady state. Batch mode
+-    // only, like the gate: async mode keeps the last woven output visible by
+-    // contract, so it has no hole to fill.
+-    //
+-    // The representations and read accesses must outlive the flush+submit
+-    // below (the 0064 lesson — Ganesh reads the texture at flush time, so an
+-    // access released before the submit draws nothing), hence the vectors:
+-    // they are the same idiom as |woven_access| / |over_access| in phase (B),
+-    // scaled to N tiles.
++  // ---- (B') RECOVERY DRAW: degrade to mono, never to black ----
++  //
++  // (browser#99, generalized from whole-frame to PER-TILE by web#12.)
++  //
++  // The two halves of the dark-tile mechanism are decided in different places
++  // and neither can see the other:
++  //   1. Display::DrawAndSwap withheld this tile's canvas quad from the page
++  //      raster (display.cc), on the compositor thread, before the weave
++  //      outcome is knowable;
++  //   2. the weave then did not put those pixels back — either because the
++  //      whole frame's batch missed (browser#99: the liveness gate below skips
++  //      phase (B) outright), or, since web#12, because THIS TILE's submit
++  //      entry was declined rather than fed the punched hole.
++  // Net either way: the tile is drawn by nobody and shows the root pass's
++  // backdrop — black. Patch 0047 predicted this exact asymmetry in its own
++  // commit message ("if a frame ever has inline-3D rects but the weave does not
++  // land, this blanks rather than glitches"); 0057 made it visible by (rightly)
++  // refusing the stale blit that used to mask it; 0070 closed it at the FRAME
++  // level and left it open at the TILE level, which is what this patch closes.
++  //
++  // So paint the tiles ourselves. Everything needed is already in hand:
++  // |inline_3d_canvas_layers_| is exactly the set display.cc suppressed, each
++  // entry carrying the resolved mailbox, the unclipped tile rect and the quad's
++  // UV window. We draw MONO — the left eye of the side-by-side, stretched
++  // across the whole tile. That is the same flat fallback the SDK itself shows
++  // when 3D is unavailable, and it is the only honest choice of the three:
++  // black is the bug, and a naive full-UV draw would show the raw SBS squeezed
++  // to half width.
++  //
++  // |only_unsubmitted| picks between the two callers:
++  //   * false — the WHOLE-FRAME miss (browser#99). Nothing was woven at all, so
++  //     every on-screen suppressed tile needs repainting.
++  //   * true  — the PER-TILE miss (web#12). The frame did weave, so repaint
++  //   only
++  //     the layers that no submit consumed. Called BEFORE phase (B)'s
++  //     whole-window kSrcOver blit, which is safe by construction: the runtime
++  //     clears its woven output to premultiplied transparent on each frame's
++  //     first chunk, so an unwoven tile's region in that texture is transparent
++  //     and the kSrcOver leaves what we painted here intact. Phase 2's
++  //     over-plane then composites above it — the right order for content over
++  //     the tile.
++  //
++  // What can NEVER double-draw, and why part 1 of web#12 and this loop do not
++  // fight: a canvas layer display.cc left UNSUPPRESSED (its ResourceId did not
++  // resolve) is by construction absent from |inline_3d_canvas_layers_|, so this
++  // loop cannot see it. The page raster is that tile's recovery — a better one,
++  // since it is the page's own quad rather than our mono approximation.
++  //
++  // The representations and read accesses must outlive the flush+submit below
++  // (the 0064 lesson — Ganesh reads the texture at flush time, so an access
++  // released before the submit draws nothing), hence the vectors: they are the
++  // same idiom as |woven_access| / |over_access| in phase (B), scaled to N
++  // tiles.
++  auto recovery_draw = [&](bool only_unsubmitted) {
+     std::vector<std::unique_ptr<gpu::SkiaImageRepresentation>> rec_reps;
+     std::vector<std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>>
+         rec_accesses;
+@@ -3640,11 +3797,17 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       if (on_screen.IsEmpty()) {
+         continue;
+       }
++      // (web#12) This layer's pixels already went into this frame's weave.
++      // Repainting it would draw a mono left eye over a correctly woven stereo
++      // tile — the one way a recovery draw could make things worse.
++      if (only_unsubmitted && canvas_was_submitted(c.mailbox)) {
++        continue;
++      }
+       // Nothing in hand -> this tile stays black; count it so the log below
+-      // separates "we repaired it" from "we could not". Note display.cc's
+-      // resolve() already DROPS layers whose ResourceId has no mailbox while
+-      // still suppressing them, so that class never reaches this loop and
+-      // cannot be counted here; this guard covers the rest.
++      // separates "we repaired it" from "we could not". Since web#12 part 1 a
++      // layer with no mailbox never reaches the GPU stage at all (display.cc
++      // keeps it in the page raster rather than suppressing it), so this guard
++      // is now belt-and-braces rather than the load-bearing case it was.
+       if (c.mailbox.IsZero()) {
+         ++rec_missing;
+         continue;
+@@ -3704,9 +3867,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       rec_reps.push_back(std::move(rep));
+       rec_accesses.push_back(std::move(access));
+     }
+-    // The early-return path did NO flush of its own — phase (B)'s bracket is
+-    // below this return and we never reach it — so the recovery frame has to
+-    // bring its own, mirroring how phase (B) ends.
++    // The whole-frame caller returns immediately after this and does NO flush
++    // of its own — phase (B)'s bracket is past that return and is never reached
++    // — so the recovery has to bring its own, mirroring how phase (B) ends. The
++    // per-tile caller falls through to phase (B), which flushes again; a second
++    // flush on an unhealthy frame is cheaper than reasoning about which of two
++    // brackets owns these read accesses.
+     if (rec_drawn > 0) {
+       std::vector<GrBackendSemaphore> empty_sem;
+       FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
+@@ -3719,15 +3885,61 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+     // browser#99's triage plan asked for exactly this number: how often are we
+     // punching a hole, and how many of those holes could we not repair.
+-    // Throttled 1-in-60 (~once a second at 60 fps) — a frame that reaches here
+-    // is by definition an unhealthy one, so it must not be able to flood.
+-    static int rec_dbg = 0;
+-    if ((rec_dbg++ % 60) == 0) {
+-      VLOG(1) << "[DisplayXR] inline-3D recovery draw: n=" << rec_drawn
+-              << " missing=" << rec_missing;
++    // (web#12) Promoted from VLOG(1)/1-in-60 to the 0070 throttle discipline —
++    // LOG(ERROR), first 3 then 1-in-300 — because at VLOG(1) "zero recovery
++    // lines" was never evidence of absence, and this counter is now the direct
++    // readout of how many tiles are being carried by the recovery rather than
++    // by the weave. Silent when there was nothing to do, so a healthy frame
++    // that calls the per-tile form costs one loop and no log.
++    if (rec_drawn > 0 || rec_missing > 0) {
++      static int rec_dbg = 0;
++      const int n = rec_dbg++;
++      if (n < 3 || (n % 300) == 0) {
++        LOG(ERROR) << "[DisplayXR] inline-3D recovery draw: n=" << rec_drawn
++                   << " missing=" << rec_missing
++                   << (only_unsubmitted ? " (per-tile)" : " (whole-frame)")
++                   << " events=" << (n + 1);
++      }
+     }
+-    return;
+     // rec_accesses / rec_reps release here, after the submit.
++  };
++
++  // (browser#87) Liveness gate: skip the Phase (B) draw-back entirely when this
++  // frame wove nothing, rather than blitting a woven texture that still holds
++  // the previous page's pixels. Batch mode only: the batch weave completes
++  // synchronously inside SubmitBatchSync, so "nothing submitted" there really
++  // means "nothing woven". Async mode deliberately keeps the last woven output
++  // visible while a submit is in flight — that is its one-frame-lag contract.
++  if (batch && !wove_this_frame) {
++    // The gate above is correct — a stale woven texture must not be blitted —
++    // but returning bare leaves a HOLE, and that hole is browser#99's black
++    // flicker: phase (B), the draw-back that was supposed to put the suppressed
++    // canvas quads back, is skipped. So repaint EVERY on-screen suppressed tile
++    // (see the recovery_draw header above), then return: this path does not
++    // reach phase (B)'s flush, and the recovery brings its own.
++    //
++    // Unreachable on a healthy frame — |wove_this_frame| true skips it outright
++    // — so it costs nothing in the steady state. Batch mode only, like the
++    // gate: async mode keeps the last woven output visible by contract, so it
++    // has no hole to fill.
++    recovery_draw(/*only_unsubmitted=*/false);
++    return;
++  }
++
++  // (web#12) PER-TILE recovery. The frame DID weave, so the whole-frame gate
++  // above let it through — but a tile whose submit entry was declined (no clean
++  // canvas resource, or a CPU-readback that would have sampled the suppression
++  // hole) is still a hole on screen, and phase (B) will not cover it: the woven
++  // texture is transparent wherever nothing was woven. Repaint exactly those
++  // layers, from the resources they already resolved to.
++  //
++  // Called unconditionally in batch mode rather than behind a count compare:
++  // the per-layer |canvas_was_submitted| test inside is the authoritative one
++  // (two rects can match the same canvas layer, so set sizes do not compare
++  // cleanly), the loop is O(layers) on a list capped at a handful, and it logs
++  // nothing when it finds nothing to do.
++  if (batch) {
++    recovery_draw(/*only_unsubmitted=*/true);
+   }
+ 
+   // ---- (B) Draw back the accumulated window-sized woven output (Windows) ----
+-- 
+2.42.0.windows.2
+

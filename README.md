@@ -37,7 +37,7 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 |---|---|
 | Latest preview | [**0.1.11**](https://github.com/DisplayXR/displayxr-browser/releases/latest) — occlusion by draw order |
 | Chromium pin | **151.0.7922.77** (stable) — `scripts/config.env` |
-| Patch series | 72 patches over the pinned tag, ~100 files of real integration surface |
+| Patch series | 73 patches over the pinned tag, ~100 files of real integration surface |
 | Platform | Windows — D3D11 + DirectComposition |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
@@ -89,6 +89,26 @@ you scroll no longer loses the scene role along with the recycled tile, either. 
 the misses invisible, the producer now counts them by reason: grep `inline3d rig miss` for the rates, and
 `head tracking starving under load` for the one warning that says the latch is what is holding a scene
 together.
+
+The fourth way — and the **root** one, the case that survived all three fixes above — was that a tile
+could be woven **from the hole the browser had just punched in the page**. To weave an element, the
+compositor withholds its canvas quad from the page raster, because the woven pixels are drawn back over
+that spot a moment later; the weave stage is separately handed the list of canvas resources it may
+sample from. Those two lists were built from the same frame but were **not the same set**: the second
+silently dropped any canvas whose resource had not resolved, while the first dropped nothing. A tile in
+that gap was removed from the page and never offered to the weave — so the weave stage, finding no
+resource for it, fell back to sampling the composited page **at the tile's rectangle**, which was by then
+the empty hole. It wove the hole, the submit succeeded, and every counter in the system reported a
+healthy frame while the tile went dark. It also explained the strangest symptom in the report: the weave
+input is not cleared between frames, so consecutive captures of a blink came out byte-for-byte identical
+and looked like a stale frame rather than a fresh mistake. The rule now is **never punch a hole you
+cannot fill** — resolve first, withhold only what resolved, so a tile whose resource has gone simply
+stays an ordinary page element for that frame. The weave stage additionally refuses, at every entry
+point, to sample the page where the page may be holed; a tile that reaches neither route is repainted
+flat from its own resource, per tile rather than only when the whole frame missed. And because every
+step of this mechanism was silent — including a lookup whose failure was logged nowhere at all — the
+whole path is now counted at error level: grep `[DisplayXR] weave tile skipped`, `canvas resolve
+dropped`, `ZERO copies this frame`, and `inline-3D recovery draw`.
 
 The design and rationale live in the runtime repo:
 [`webxr-support.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-support.md)
