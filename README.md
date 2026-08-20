@@ -37,7 +37,7 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 |---|---|
 | Latest preview | [**0.1.11**](https://github.com/DisplayXR/displayxr-browser/releases/latest) — occlusion by draw order |
 | Chromium pin | **151.0.7922.77** (stable) — `scripts/config.env` |
-| Patch series | 71 patches over the pinned tag, ~100 files of real integration surface |
+| Patch series | 72 patches over the pinned tag, ~100 files of real integration surface |
 | Platform | Windows — D3D11 + DirectComposition |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
@@ -73,6 +73,22 @@ negotiated weave-extension version and nothing else, and a client that did come 
 climbs back to a full session on a bounded backoff (seconds, then minutes) — while a runtime that
 genuinely does not have those extensions is detected once and left alone. Grep `[DisplayXR][weave-mode]`
 in the browser log for which mode a session is in and when it recovered.
+
+The third way a tile could go dark had nothing to do with the weave at all — the page was told,
+for one frame, that it had no 3D to render ([displayxr-web#12](https://github.com/DisplayXR/displayxr-web/issues/12)).
+The runtime builds the two off-axis eye views for a scene element on demand, and declines when the head
+tracker has no fresh sample for that instant — correct, since inventing eye positions would be worse. But
+the session consumed that answer on every animation frame and overwrote its views with it, so a single
+declined locate collapsed `getViewerPose()` to one mono view, the scene drew one eye's worth of content
+into a side-by-side canvas, and the tile blinked. Under GPU load the declines cluster, which is exactly
+when it was reported. The last good views are now **latched** across a short run of misses (~0.5 s)
+before the session concedes to mono; the cost is half a second of slightly stale head parallax in the
+rare case the rig really has gone, which nobody can see. Changes that genuinely end the rig — session
+end, the last scene element closing — still drop to mono at once. A gallery that recycles tile layers as
+you scroll no longer loses the scene role along with the recycled tile, either. Because the latch makes
+the misses invisible, the producer now counts them by reason: grep `inline3d rig miss` for the rates, and
+`head tracking starving under load` for the one warning that says the latch is what is holding a scene
+together.
 
 The design and rationale live in the runtime repo:
 [`webxr-support.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-support.md)
