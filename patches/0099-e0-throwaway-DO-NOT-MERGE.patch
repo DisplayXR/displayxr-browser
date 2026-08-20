@@ -1,0 +1,408 @@
+From bc054540fe529432b8f24bc8e82b2df796354049 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 12:46:00 -0700
+Subject: [PATCH] =?UTF-8?q?E0=20THROWAWAY=20DIAGNOSTIC=20=E2=80=94=20DO=20?=
+ =?UTF-8?q?NOT=20MERGE=20(browser#103=20=C2=A73)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Answers the one question #103's whole design forks on: can the Chromium GPU
+process, AFTER LowerToken(), still reach displayxr-service?
+
+  pipe opens AND xrCreateInstance succeeds -> BRANCH A  (~2 patches, no broker,
+                                                         no runtime change)
+  pipe opens, create fails                 -> BRANCH A' (+1 small runtime
+                                                         change for R2)
+  pipe blocked                             -> BRANCH B  (4 browser patches +
+                                                         4 runtime changes,
+                                                         incl. an IPC wire
+                                                         change)
+
+The issue and 0071's comment both assert the pipe is unreachable post-sandbox.
+The runtime source says the opposite: the pipe's security descriptor grants AC
+(AppContainer) and RC (restricted code) GRGWGX against an object labelled Low
+integrity (ipc_server_mainloop_windows.cpp:120-129 — that is exactly a Chromium
+GPU process's token), and there are ZERO registry reads under
+src/xrt/ipc/client/. The belief predates runtime#743's pipe work and appears
+never to have been re-tested.
+
+TWO PROBES, both from inside SubmitBatchSync — Viz's present sequence, hundreds
+of frames after the sandbox engaged, so "post-LowerToken" is not an assumption:
+
+  1. CreateFileA on the runtime pipe, logging the handle or GetLastError().
+     The name was read out of the runtime source rather than trusted from prose;
+     both ends agree on it:
+       client: src/xrt/ipc/client/ipc_client_connection.c:554
+       server: src/xrt/ipc/server/ipc_server_mainloop_windows.cpp:328
+       "\\.\pipe\displayxr\displayxr_comp_ipc"
+     Same access flags the real client uses (:372). The log interprets the three
+     answers that matter: ACCESS_DENIED = Branch B; PIPE_BUSY = the access check
+     PASSED (Branch A); FILE_NOT_FOUND = the service is not running, re-run.
+
+  2. A full second xrCreateInstance via the REAL init helpers
+     (EnumerateInstanceExtensions + CreateWeaveInstance), so the probe tests the
+     same extension list the real create would — a probe with a different list
+     proves nothing. Tried with the rig set, then weave-only, which separates
+     "the loader and the pipe refused us" from "only the rig refused", i.e.
+     R2 from the connection. Destroyed immediately.
+
+     Knowingly accepted for the probe's lifetime: the runtime holds
+     `static volatile uintptr_t g_live_instance` (oxr_api_instance.c:43), a
+     one-live-instance-per-process assumption, and a second live instance makes
+     xrPollEvent on the FIRST return XR_EVENT_UNAVAILABLE. The weave client
+     never calls xrPollEvent, so it is harmless for this consumer — but it is a
+     documented assumption being violated on purpose, which is why the probe
+     destroys what it creates on the spot and why this patch never merges.
+
+FIRING. The design asks for %TEMP% trigger files
+(displayxr_e0_pipe_probe / displayxr_e0_create_probe) and they are here, but as
+the SECONDARY trigger: a %TEMP% existence check is itself something the sandbox
+may refuse, and a probe that never fires proves nothing. The PRIMARY trigger is
+automatic — both probes run once at batch frame 300 (~5 s), needing no
+filesystem at all. Whether the %TEMP% check was even reachable is logged as its
+own datum, since that is useful to know independently.
+
+All output is LOG(ERROR) tagged [DisplayXR][E0] so it lands without --v.
+
+HOW TO RUN: build this branch on the box, install, launch the browser by
+double-clicking the icon with --log-file, open an inline-3D page, wait ~10 s,
+then grep the log for "[DisplayXR][E0]". Attach the slice to #103. Re-fire under
+other conditions (service stopped / just restarted) by touching the trigger
+files, if the reachable= line says the check works.
+
+NOT FOR MERGE. Never rebase this onto main; it exists to be built once and
+deleted. 0077 (the reconnect ladder) is gated on what it reports.
+
+Refs: DisplayXR/displayxr-browser#103
+---
+ .../browser/displayxr_weave_client.cc         |  59 ++++++
+ .../browser/displayxr_weave_client.h          |  35 ++++
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 177 ++++++++++++++++++
+ 3 files changed, 271 insertions(+)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 0c60f64..246b200 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -1604,6 +1604,54 @@ void NoteSessionLostWin(DisplayXRWeaveClient::SessionLostReason reason,
+   }
+ }
+ 
++// =====================================================================
++// browser#103 EXPERIMENT E0 — THROWAWAY DIAGNOSTIC, DO NOT MERGE.
++//
++// A full second xrCreateInstance in whatever process calls this, reusing the
++// REAL init helpers (EnumerateInstanceExtensions + CreateWeaveInstance) rather
++// than a hand-rolled create — a probe that enabled a different extension set
++// than the real create would prove nothing about whether the real create is
++// going to work. This is the same trick 0071's re-negotiation probe already
++// plays; the only new thing is WHERE it runs (post-LowerToken, GPU process).
++//
++// The live session is left completely alone: nothing here touches State().
++// See the header for the g_live_instance caveat.
++// =====================================================================
++DisplayXRWeaveClient::E0CreateProbeResult E0ProbeCreateInstanceWin() {
++  DisplayXRWeaveClient::E0CreateProbeResult out;
++  std::vector<XrExtensionProperties> exts;
++  if (!EnumerateInstanceExtensions(&exts)) {
++    // Interesting on its own: the loader could not answer AT ALL post-sandbox.
++    // That is an ActiveRuntime/manifest read, not the runtime pipe, so it would
++    // localise the failure to R2 rather than to the connection.
++    return out;
++  }
++  out.enumerated = true;
++
++  // Try the FULL set first, then weave-only — the split separates "the loader
++  // and the pipe refused us" (both fail) from "only the rig refused" (the first
++  // fails, the second succeeds), which is exactly the A vs A' fork in §3.
++  XrInstance probe = XR_NULL_HANDLE;
++  out.rig_result = static_cast<int32_t>(
++      CreateWeaveInstance(exts, /*with_rig=*/RigEnumerated(exts), &probe));
++  if (XR_SUCCEEDED(static_cast<XrResult>(out.rig_result)) &&
++      probe != XR_NULL_HANDLE) {
++    out.created = true;
++    xrDestroyInstance(probe);  // immediately — see the g_live_instance caveat
++    return out;
++  }
++
++  probe = XR_NULL_HANDLE;
++  out.weave_only_result = static_cast<int32_t>(
++      CreateWeaveInstance(exts, /*with_rig=*/false, &probe));
++  if (XR_SUCCEEDED(static_cast<XrResult>(out.weave_only_result)) &&
++      probe != XR_NULL_HANDLE) {
++    out.created = true;
++    xrDestroyInstance(probe);
++  }
++  return out;
++}
++
+ // browser#55: may this session drive the panel's 2D/3D element at all?
+ //
+ // The runtime exposes requestability as a per-session out-field of
+@@ -2307,6 +2355,17 @@ void DisplayXRWeaveClient::NoteSessionLost(SessionLostReason reason,
+ #endif
+ }
+ 
++// static
++// browser#103 E0 — THROWAWAY DIAGNOSTIC, DO NOT MERGE.
++DisplayXRWeaveClient::E0CreateProbeResult
++DisplayXRWeaveClient::E0ProbeCreateInstance() {
++#if BUILDFLAG(IS_WIN)
++  return E0ProbeCreateInstanceWin();
++#else
++  return {};
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::SnapWindowIfMoved() {
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index 3cb7317..df05e5b 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -247,6 +247,41 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+                               int32_t last_result,
+                               uint32_t fail_count);
+ 
++  // =====================================================================
++  // browser#103 EXPERIMENT E0 — THROWAWAY DIAGNOSTIC, DO NOT MERGE.
++  //
++  // Design §3. Everything in #103 forks on one unanswered question: can a
++  // Chromium GPU process, AFTER LowerToken(), still reach displayxr-service?
++  // The issue and 0071's comment both assert it cannot. The runtime source says
++  // the pipe was deliberately opened up to exactly that caller — its security
++  // descriptor grants AC (AppContainer) and RC (restricted code) read/write/
++  // execute against a Low-integrity-labelled object
++  // (ipc_server_mainloop_windows.cpp:120-129), which is precisely a Chromium
++  // GPU process's token, and there are ZERO registry reads under
++  // src/xrt/ipc/client/. The "sandbox blocks the pipe" belief predates
++  // runtime#743 and appears never to have been re-tested.
++  //
++  // The remaining unknown is R2: the Khronos loader's ActiveRuntime registry
++  // read on a SECOND xrCreateInstance in the same process. This probe answers
++  // it directly by doing exactly that and logging the XrResult.
++  //
++  // Caveat, knowingly accepted for the probe's lifetime: the runtime holds
++  // `static volatile uintptr_t g_live_instance` (oxr_api_instance.c:43), a
++  // one-live-instance-per-process assumption, and creating a second instance
++  // while the weave one lives makes xrPollEvent on the FIRST return
++  // XR_EVENT_UNAVAILABLE. The weave client never calls xrPollEvent, so this is
++  // harmless for this consumer — but it is a knowing violation of a documented
++  // assumption, which is why the probe destroys what it creates immediately and
++  // why this code never ships.
++  // =====================================================================
++  struct E0CreateProbeResult {
++    bool enumerated = false;        // did the instance-free enumeration answer
++    bool created = false;           // did either create succeed
++    int32_t rig_result = 0;         // XrResult of the FULL (rig) create
++    int32_t weave_only_result = 0;  // XrResult of the weave-only fallback
++  };
++  static E0CreateProbeResult E0ProbeCreateInstance();
++
+   // #625 phase-snap (CEF parity): if the bound browser window has moved since the
+   // last call, drive xrWeaveSnapWindowRectDXR so the DP re-locks the interlace
+   // lattice to the window's new absolute screen position. Idempotent + cheap
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index caa8d63..b6ff6f4 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -9,6 +9,7 @@
+ #include <dxgi1_2.h>
+ 
+ #include <algorithm>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -24,6 +25,177 @@ namespace displayxr {
+ 
+ using Microsoft::WRL::ComPtr;
+ 
++// ===========================================================================
++// browser#103 EXPERIMENT E0 — THROWAWAY DIAGNOSTIC. DO NOT MERGE.
++//
++// Design §3. #103's entire cost estimate forks on one question that has never
++// been re-tested: can this process — the Chromium GPU process, AFTER
++// LowerToken() — still reach displayxr-service?
++//
++//   pipe opens AND xrCreateInstance succeeds -> Branch A, ~2 patches, no
++//                                               broker, no runtime change
++//   pipe opens, create fails                 -> Branch A', + 1 small runtime
++//                                               change (R2, the loader's
++//                                               ActiveRuntime read)
++//   pipe blocked                             -> Branch B, 4 browser patches +
++//                                               4 runtime changes incl. an IPC
++//                                               wire change
++//
++// Two probes, both from a point that is unambiguously post-sandbox (inside the
++// per-frame batch submit, on Viz's present sequence):
++//
++//   1. CreateFileA on the runtime's named pipe. The name is taken verbatim from
++//      the runtime source, where BOTH ends agree on it:
++//        src/xrt/ipc/client/ipc_client_connection.c:554  (client CreateFileA)
++//        src/xrt/ipc/server/ipc_server_mainloop_windows.cpp:328 (server
++//                                                                CreateNamedPipeA)
++//      Same access flags the real client uses (:372). Handle closed at once.
++//
++//   2. A full second xrCreateInstance through the REAL init helpers, logged and
++//      destroyed immediately (see DisplayXRWeaveClient::E0ProbeCreateInstance
++//      for the g_live_instance caveat).
++//
++// FIRING. The design asks for %TEMP% trigger files, and they are here — but
++// they are the SECONDARY trigger, because a %TEMP% existence check is itself
++// something the sandbox may refuse, and a probe that never fires proves
++// nothing. The primary trigger is automatic: both probes run once, on frame
++// kE0AutoFireFrame of the batch path, which is post-LowerToken by construction
++// and needs no filesystem at all. Whether the %TEMP% check worked is logged as
++// its own datum (it is useful to know how far the sandbox lets us reach).
++//
++// Everything logs at LOG(ERROR) under [DisplayXR][E0] so it lands without --v.
++// ===========================================================================
++namespace {
++
++// Verified against the runtime source (see above), not assumed.
++constexpr char kE0PipeName[] = "\\\\.\\pipe\\displayxr\\displayxr_comp_ipc";
++constexpr char kE0PipeTriggerFile[] = "displayxr_e0_pipe_probe";
++constexpr char kE0CreateTriggerFile[] = "displayxr_e0_create_probe";
++
++// ~5 s at 60 fps: late enough that the sandbox has long since engaged and the
++// weave is in steady state, early enough that a test run does not have to be
++// babysat.
++constexpr int kE0AutoFireFrame = 300;
++
++// Does %TEMP%\<name> exist? |reach_error| receives the Win32 error when the
++// check could not be made at all (0 = the check itself worked), which on a
++// sandboxed process is as interesting as the answer.
++bool E0TriggerPresent(const char* name, DWORD* reach_error) {
++  *reach_error = 0;
++  char dir[MAX_PATH] = {};
++  const DWORD n = ::GetTempPathA(MAX_PATH, dir);
++  if (n == 0 || n >= MAX_PATH) {
++    *reach_error = ::GetLastError();
++    return false;
++  }
++  std::string path(dir);
++  path += name;
++  if (::GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
++    return true;
++  }
++  const DWORD err = ::GetLastError();
++  // FILE_NOT_FOUND / PATH_NOT_FOUND mean the check WORKED and said no.
++  if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
++    *reach_error = err;
++  }
++  return false;
++}
++
++void E0RunPipeProbe(const char* why) {
++  const HANDLE h = ::CreateFileA(kE0PipeName, GENERIC_READ | GENERIC_WRITE, 0,
++                                 nullptr, OPEN_EXISTING, 0, nullptr);
++  if (h == INVALID_HANDLE_VALUE) {
++    const DWORD err = ::GetLastError();
++    // ERROR_PIPE_BUSY (231) is a SUCCESS for this experiment's purposes: the
++    // access check passed and every pipe instance simply happened to be taken.
++    // ERROR_ACCESS_DENIED (5) is the only answer that means Branch B.
++    LOG(ERROR) << "[DisplayXR][E0] pipe probe (" << why << "): CreateFileA(\""
++               << kE0PipeName << "\") FAILED, GetLastError=" << err
++               << (err == ERROR_ACCESS_DENIED
++                       ? " (ACCESS_DENIED — the sandbox blocks it: BRANCH B)"
++                   : err == ERROR_PIPE_BUSY
++                       ? " (PIPE_BUSY — the access check PASSED: BRANCH A)"
++                   : err == ERROR_FILE_NOT_FOUND
++                       ? " (FILE_NOT_FOUND — is displayxr-service running? "
++                         "inconclusive, re-run with the service up)"
++                       : "");
++    return;
++  }
++  LOG(ERROR) << "[DisplayXR][E0] pipe probe (" << why
++             << "): CreateFileA SUCCEEDED post-LowerToken, handle=" << h
++             << " — the sandboxed GPU process CAN open the runtime pipe: "
++                "BRANCH A";
++  ::CloseHandle(h);
++}
++
++void E0RunCreateProbe(const char* why) {
++  const DisplayXRWeaveClient::E0CreateProbeResult r =
++      DisplayXRWeaveClient::E0ProbeCreateInstance();
++  LOG(ERROR) << "[DisplayXR][E0] create probe (" << why
++             << "): enumerated=" << r.enumerated << " created=" << r.created
++             << " rig_result=" << r.rig_result
++             << " weave_only_result=" << r.weave_only_result
++             << (r.created ? " — a SECOND xrCreateInstance works post-sandbox: "
++                             "BRANCH A, R2 is a non-issue"
++                 : r.enumerated
++                     ? " — the loader answered but the create failed: R2 is "
++                       "real (BRANCH A'), or the service is down"
++                     : " — the loader could not even ENUMERATE post-sandbox: "
++                       "R2, not the pipe");
++}
++
++// One-shot latches so neither probe can loop, whatever the trigger did.
++bool g_e0_pipe_fired = false;
++bool g_e0_create_fired = false;
++int g_e0_frames = 0;
++
++void E0MaybeRun() {
++  const int frame = ++g_e0_frames;
++
++  if (frame == kE0AutoFireFrame) {
++    LOG(ERROR) << "[DisplayXR][E0] auto-firing both probes at batch frame "
++               << frame
++               << " (post-LowerToken by construction; no filesystem needed)";
++    if (!g_e0_pipe_fired) {
++      g_e0_pipe_fired = true;
++      E0RunPipeProbe("auto");
++    }
++    if (!g_e0_create_fired) {
++      g_e0_create_fired = true;
++      E0RunCreateProbe("auto");
++    }
++    return;
++  }
++
++  // Secondary %TEMP% triggers, for a re-run under different conditions (service
++  // stopped, service restarted, ...). Checked ~1/s, and only while a probe is
++  // still un-fired, so a sandbox that refuses the check costs one
++  // GetFileAttributes per second and nothing else.
++  if ((frame % 60) != 0 || (g_e0_pipe_fired && g_e0_create_fired)) {
++    return;
++  }
++  static bool logged_reach = false;
++  DWORD reach_error = 0;
++  if (!g_e0_pipe_fired && E0TriggerPresent(kE0PipeTriggerFile, &reach_error)) {
++    g_e0_pipe_fired = true;
++    E0RunPipeProbe("%TEMP% trigger");
++  }
++  if (!g_e0_create_fired &&
++      E0TriggerPresent(kE0CreateTriggerFile, &reach_error)) {
++    g_e0_create_fired = true;
++    E0RunCreateProbe("%TEMP% trigger");
++  }
++  if (!logged_reach) {
++    logged_reach = true;
++    LOG(ERROR) << "[DisplayXR][E0] %TEMP% trigger check reachable="
++               << (reach_error == 0) << " (err=" << reach_error
++               << ") — if 0/unreachable, only the auto-fire path will report";
++  }
++}
++
++}  // namespace
++// ============ end browser#103 E0 THROWAWAY DIAGNOSTIC ======================
++
+ DisplayXRWeaveGpu::DisplayXRWeaveGpu() = default;
+ 
+ DisplayXRWeaveGpu::~DisplayXRWeaveGpu() {
+@@ -863,6 +1035,11 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+   // carrying a verdict raised by the snap, and take-and-clear means calling it
+   // when there is nothing to say costs a bool read.
+   ReportWeaveSessionLostIfDetected();
++  // browser#103 E0 THROWAWAY DIAGNOSTIC — DO NOT MERGE. Unambiguously
++  // post-LowerToken: this is Viz's present sequence, hundreds of frames after
++  // the sandbox engaged. Runs its two probes once each and then costs one
++  // integer increment per frame.
++  E0MaybeRun();
+   if (!sr.ok) {
+     // (browser#99) THROTTLED, not capped-at-3-ever. This line is the direct
+     // signal for the black-flicker mechanism — a failed submit is what trips
