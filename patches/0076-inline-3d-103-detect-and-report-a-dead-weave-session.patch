@@ -1,0 +1,755 @@
+From ae1b614374e34b0174aedcda683a2eb9d3d5aa9a Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 12:45:58 -0700
+Subject: [PATCH] inline-3d(#103): detect and report a dead weave session
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Today a weave-only client is the one client in the system that never learns its
+connection died. displayxr-service restarts are routine (runtime #1002 exits the
+service for relaunch on device-lost), and the browser's response is nothing at
+all: the failed submits are counted by 0070 and the tiles go mono, but no state
+changes, nothing crosses to the browser process, and the log says only "batch
+weave submit failed" — the same line a bad frame produces.
+
+This patch adds detection and reporting. It adds NO recovery: no ladder, no
+reconnect attempt, no timers, no session teardown. Those are 0077, which is
+gated on the E0 experiment (can a post-LowerToken GPU process open the runtime
+pipe at all?). 0076 ships without any runtime dependency and gives field signal
+before recovery exists.
+
+DETECTION (GPU process, displayxr_weave_client.cc). One classifier,
+NoteWeaveCallResult(), on the four channels that talk to the runtime on the
+weave session: the batch submit, the per-element submit, the v8 sticky
+screen-flat wish and the phase snap. All four, because which one notices first
+depends on the page: an animating page detects on its next batch submit
+(~16 ms), while an IDLE page submits nothing and its only edges are a popup
+opening (sticky wish) or the window being dragged (snap).
+
+The verdict is a failure STREAK — three consecutive failed calls, any success
+anywhere resetting it — because that is all today's runtime gives us. The
+XR_DXR_weave entry points bypass OXR_CHECK_XRET and hand-roll
+XR_ERROR_RUNTIME_FAILURE, so a broken pipe is byte-identical to any other
+refusal and never sets sess->has_lost, while every other IPC-backed call
+(xrEndFrame, xrSyncActions, xrLocateViews, xrPollEvent) maps
+XRT_ERROR_IPC_FAILURE to XR_ERROR_INSTANCE_LOST. The classifier already reads
+XR_ERROR_INSTANCE_LOST / XR_ERROR_SESSION_LOST as a SINGLE-CALL verdict, so
+when the runtime-side fix lands (#103 RC-2, runtime PR #1094) there is no new
+plumbing — this simply stops having to wait for three.
+
+REPORTING. displayxr_weave.mojom gains WeaveSessionLost(reason, last_result,
+fail_count) on the existing DisplayXRWeaver interface — fire-and-forget, since
+there is nothing the browser could reply that the GPU could act on and a round
+trip on the present sequence is the last thing a frame that is already losing
+wants. It rides a remote sync mode already has open and idle (Bind() is
+unconditional under --enable-inline-3d). The GPU side takes the client's
+verdict take-and-clear in ReportWeaveSessionLostIfDetected(), from the submit
+paths, i.e. the same GPU-main/present sequence WeaveSubmit is dispatched from —
+so exactly one message crosses per outage.
+
+The browser has to know because it owns the other half of the problem: its own
+snap/query session backs LocateViewsForRect and therefore every inline-3D
+SCENE, and it is the only process that can ever relaunch displayxr-service (a
+sandboxed GPU process cannot spawn children). 0076 records and logs that; 0077
+acts on it.
+
+STATE + LOGGING (design §6.5, §9). One weave-mode state word replaces the
+accumulating booleans: LIVE / DEGRADED / DISCONNECTED / RECONNECTING /
+RECOVERED / SKEW. 0076 drives the first three (kDegraded/kLive mirror 0071's
+existing transitions; the |degraded| bool stays authoritative for 0071's own
+logic), and a DISCONNECT SUPERSEDES A DEGRADE — you cannot re-negotiate the rig
+on a dead pipe. Both new lines are counted LOG(ERROR), first-3-then-1-in-300,
+tagged [DisplayXR][weave-mode], and the GPU-side one keeps §9's prefix verbatim
+so a grep written against the design matches:
+
+  [DisplayXR][weave-mode] DISCONNECTED: weave session lost (result=<r>
+  fails=<n> generation=<g>) — tiles render MONO until reconnect [channel=...]
+
+|generation| is always 0 here (nothing reconnects yet) and is carried so the
+line shape is final and 0077 only has to increment it.
+
+NEGATIVE CONTROL (design §9, required). Both the classifier and the browser's
+receiving end return early unless a weave session was ever established in this
+process. On a machine with no DisplayXR runtime InitOutcome::kUnavailable
+latches, the latch stays false, and none of this can fire — no log line, no
+report, no counter. The browser's guard is the load-bearing one, because that
+entry point is driven by an IPC message rather than by our own state.
+
+Deliberately deferred: the sticky-wish and phase-snap channels are CLASSIFIED
+and LOGGED the instant they fail, but their mojo push to the browser rides the
+next GPU frame rather than firing from the display-mode receiver's sequence.
+Reaching the weaver_ remote from there would be a cross-sequence mojo hazard
+for no gain in 0076, where the browser has no ladder to arm.
+
+Refs: DisplayXR/displayxr-browser#103, #99, #92, #96; runtime #1002, #1094
+---
+ .../browser/displayxr_weave_client.cc         | 285 ++++++++++++++++++
+ .../browser/displayxr_weave_client.h          |  36 +++
+ .../browser/displayxr_weaver_impl.cc          |  38 +++
+ .../displayxr/browser/displayxr_weaver_impl.h |  10 +
+ .../displayxr/common/displayxr_weave.mojom    |  45 +++
+ .../displayxr/gpu/displayxr_weave_gpu.cc      |  44 +++
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  13 +
+ 7 files changed, 471 insertions(+)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 6e5230a..0c60f64 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -62,6 +62,62 @@ constexpr char kInline3DSyncWeaveSwitch[] = "inline-3d-sync-weave";
+ 
+ #if BUILDFLAG(IS_WIN)
+ 
++// browser#103: the ONE weave-mode state word, replacing the growing set of
++// independent booleans the negotiation paths had started to accumulate. 0071's
++// |degraded| and #103's disconnect are orthogonal axes of the same machine
++// (design §6.5): degraded = weave live but rig refused, so scenes are mono;
++// disconnected = no weave at all, so TILES are mono. A disconnect SUPERSEDES a
++// degrade — you cannot re-negotiate the rig on a dead pipe.
++//
++// 0076 sets kLive / kDegraded / kDisconnected. kReconnecting / kRecovered /
++// kSkew are declared here because they are the rest of the same machine and
++// splitting the enum across two patches would leave neither readable; 0077
++// drives them.
++enum class WeaveMode {
++  kLive,          // weave live, rig live
++  kDegraded,      // weave live, rig NOT enabled (0071) — scenes mono
++  kDisconnected,  // no weave at all — tiles mono via 0070's recovery draw
++  kReconnecting,  // a ladder step is in flight (0077)
++  kRecovered,     // came back after an outage (0077)
++  kSkew,          // client library / service git tags disagree (0077)
++};
++
++const char* WeaveModeName(WeaveMode m) {
++  switch (m) {
++    case WeaveMode::kLive:
++      return "LIVE";
++    case WeaveMode::kDegraded:
++      return "DEGRADED";
++    case WeaveMode::kDisconnected:
++      return "DISCONNECTED";
++    case WeaveMode::kReconnecting:
++      return "RECONNECTING";
++    case WeaveMode::kRecovered:
++      return "RECOVERED";
++    case WeaveMode::kSkew:
++      return "SKEW";
++  }
++  return "?";
++}
++
++// browser#103: how many CONSECUTIVE failed weave calls mean "the connection is
++// gone" rather than "one call went wrong".
++//
++// Three, because that is the smallest number that cannot be produced by a
++// single bad frame and still fires inside ~50 ms on an animating page (three
++// batch submits at 60 fps). It is a heuristic only because today's runtime
++// cannot tell us outright — see NoteWeaveCallResult's RC-2 note.
++constexpr int kWeaveFailStreakForDisconnect = 3;
++
++// The [DisplayXR][weave-mode] log gate: first 3, then 1-in-300. The pattern
++// 0070 established when it converted `s_fail < 3` into a counter, precisely
++// because a session that starts failing ten minutes in must still leave a
++// trace. Takes the counter by reference so each call site owns its own.
++bool WeaveModeLogGate(uint64_t& counter) {
++  const uint64_t n = counter++;
++  return n < 3 || (n % 300) == 0;
++}
++
+ // File-static client state. B2a only proves instance + extension availability;
+ // B2b/B2c add the session, the bound HWND, and the per-frame weave bridge.
+ struct WeaveClientState {
+@@ -161,6 +217,39 @@ struct WeaveClientState {
+   // yet. See DisplayXRWeaveClient::WasSyncSessionEstablished().
+   bool sync_session_established = false;
+ 
++  // browser#103 detection + reporting (design §6.1, §9). All of this is
++  // OBSERVABILITY: nothing here arms a timer, tears a session down, or changes
++  // a submit. 0077 is what consumes it.
++  //
++  // The mode word. Set to kDegraded / kLive at 0071's existing transitions
++  // (pure bookkeeping — the |degraded| bool stays authoritative for 0071's own
++  // logic) and to kDisconnected on detection.
++  WeaveMode weave_mode = WeaveMode::kLive;
++  // Consecutive failed weave calls across ALL channels (batch submit,
++  // per-element submit, the sticky screen-flat wish, the phase snap). Any
++  // success anywhere resets it: a connection that can still carry one call is
++  // not gone.
++  int weave_fail_streak = 0;
++  // Failed weave calls this EPISODE (cleared with the streak). This is the
++  // number triage wants — "how long has this been going on" — not the streak.
++  uint64_t weave_fail_total = 0;
++  // The XrResult of the call that tripped detection.
++  XrResult weave_last_result = XR_SUCCESS;
++  // GPU side: a raised report the provider has not yet pushed over mojo.
++  bool session_lost_pending = false;
++  // GPU side: this episode has already been reported; cleared when a weave call
++  // succeeds again, so a SECOND outage is reported too.
++  bool session_lost_reported = false;
++  DisplayXRWeaveClient::SessionLostReason session_lost_reason =
++      DisplayXRWeaveClient::SessionLostReason::kUnknown;
++  // How many times this process has successfully re-established the weave after
++  // an outage. Always 0 in 0076 (nothing reconnects); carried so the
++  // [DisplayXR][weave-mode] line shape is final and 0077 only has to ++ it.
++  uint32_t weave_generation = 0;
++  // Log-gate counters for the two counted [weave-mode] lines.
++  uint64_t disconnect_log_count = 0;
++  uint64_t disconnect_receipt_log_count = 0;
++
+   // B3d: static display geometry (XR_DXR_display_info via xrGetSystemProperties)
+   // + the latest weave frame, cached for the DisplayXRService renderer pull.
+   float display_w_m = 0.f;
+@@ -274,6 +363,86 @@ WeaveClientState& State() {
+   return *s;
+ }
+ 
++// ---------------------------------------------------------------------------
++// browser#103: detection. Design §6.1.
++// ---------------------------------------------------------------------------
++//
++// The ONE place a weave-call result becomes a verdict about the CONNECTION.
++// Every channel that talks to the runtime on the weave session routes through
++// here — the batch submit, the per-element submit, the v8 sticky screen-flat
++// wish and the phase snap — because which of them notices first depends
++// entirely on what the page is doing. An animating page notices on its next
++// batch submit (~16 ms); an IDLE page submits nothing at all, and its only
++// edges are the sticky wish (a popup opening over a still page) and the snap
++// (the window being dragged).
++//
++// WHY A STREAK, AND WHERE THE REAL ANSWER SLOTS IN. Today the weave path cannot
++// detect death at all: the runtime's XR_DXR_weave entry points BYPASS
++// OXR_CHECK_XRET and hand-roll `oxr_error(..., XR_ERROR_RUNTIME_FAILURE, ...)`,
++// so a broken pipe is byte-identical to any other refusal and never sets
++// sess->has_lost. Every other IPC-backed call in the runtime (xrEndFrame,
++// xrSyncActions, xrLocateViews, xrPollEvent) goes through OXR_CHECK_XRET, which
++// maps XRT_ERROR_IPC_FAILURE -> XR_ERROR_INSTANCE_LOST — a weave-only client is
++// the one client in the system that never learns its connection died. Routing
++// those entry points through the existing macro is #103's RC-2 (runtime PR
++// #1094). The switch below ALREADY reads that code, so adopting RC-2 is not new
++// plumbing: this classifier simply stops having to wait for three failures.
++//
++// NEGATIVE CONTROL (design §9, required): a process where no weave session was
++// ever established cannot lose one. On a machine with no DisplayXR runtime
++// InitOutcome::kUnavailable latches, |sync_session_established| stays false,
++// and nothing below can fire — no log line, no report, no counter.
++void NoteWeaveCallResult(const char* call, XrResult r) {
++  WeaveClientState& s = State();
++  if (!s.sync_session_established) {
++    return;
++  }
++  if (XR_SUCCEEDED(r)) {
++    // A connection that can still carry ONE call is not gone. Ending the
++    // episode here (rather than only on a reconnect) is what makes a second
++    // outage reportable, and what keeps a lone bad frame from ever adding up.
++    s.weave_fail_streak = 0;
++    s.weave_fail_total = 0;
++    s.session_lost_reported = false;
++    return;
++  }
++
++  ++s.weave_fail_streak;
++  ++s.weave_fail_total;
++  s.weave_last_result = r;
++
++  // RC-2's single-call verdict, honoured the moment a runtime starts producing
++  // it. Until then these codes simply never arrive and the streak carries.
++  const bool told_outright =
++      (r == XR_ERROR_INSTANCE_LOST || r == XR_ERROR_SESSION_LOST);
++  if (!told_outright && s.weave_fail_streak < kWeaveFailStreakForDisconnect) {
++    return;
++  }
++  if (s.session_lost_reported) {
++    return;  // one report per episode; the counters keep climbing
++  }
++  s.session_lost_reported = true;
++  s.session_lost_pending = true;
++  s.session_lost_reason =
++      told_outright ? DisplayXRWeaveClient::SessionLostReason::kInstanceLost
++                    : DisplayXRWeaveClient::SessionLostReason::kFailureStreak;
++  s.weave_mode = WeaveMode::kDisconnected;
++
++  // Design §9, "First detection". ERROR so it lands without --v; counted rather
++  // than capped so an outage that starts an hour in is still visible.
++  if (WeaveModeLogGate(s.disconnect_log_count)) {
++    LOG(ERROR) << "[DisplayXR][weave-mode] DISCONNECTED: weave session lost "
++                  "(result="
++               << r << " fails=" << s.weave_fail_total
++               << " generation=" << s.weave_generation
++               << ") — tiles render "
++                  "MONO until reconnect"
++               << " [channel=" << call
++               << (told_outright ? " verdict=runtime" : " verdict=streak")
++               << "]";
++  }
++}
++
+ bool HasExtension(const std::vector<XrExtensionProperties>& exts,
+                   const char* name) {
+   for (const auto& e : exts) {
+@@ -589,6 +758,13 @@ InitOutcome InitializeCore(HWND hwnd) {
+         s.degraded_since = base::TimeTicks::Now();
+       }
+       s.degraded = true;
++      // browser#103: mirror 0071's bool into the mode word. Guarded because a
++      // DISCONNECT SUPERSEDES A DEGRADE — you cannot re-negotiate the rig on a
++      // dead pipe, and the honest state of a process with no weave at all is
++      // not "scenes are mono".
++      if (s.weave_mode != WeaveMode::kDisconnected) {
++        s.weave_mode = WeaveMode::kDegraded;
++      }
+       // A runtime that will NEVER enable these answers with one of the
+       // permanent codes; there is no point waking up every five minutes to ask
+       // it again for the rest of the browser session.
+@@ -787,6 +963,9 @@ InitOutcome InitializeCore(HWND hwnd) {
+     s.degraded = false;
+     s.degraded_warned = false;
+     s.renegotiate_attempts = 0;
++    if (s.weave_mode != WeaveMode::kDisconnected) {  // browser#103
++      s.weave_mode = WeaveMode::kLive;
++    }
+   }
+   return InitOutcome::kOk;
+ }
+@@ -964,6 +1143,7 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+ 
+   XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+   const XrResult sr = s.submit(s.session, &in, &out);
++  NoteWeaveCallResult("submit", sr);  // browser#103
+   if (XR_FAILED(sr)) {
+     static int s_fail = 0;
+     if (s_fail < 3) {
+@@ -1146,6 +1326,11 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchWin(
+ 
+     XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+     const XrResult sr = s.submit(s.session, &in, &out);
++    // browser#103: the fastest edge there is — an animating page reaches this
++    // every frame, so a service that dies is classified within ~3 frames.
++    // Noted per CHUNK, deliberately: a multi-chunk frame that fails on its
++    // second chunk has still had a call refused by the runtime.
++    NoteWeaveCallResult("batch-submit", sr);
+     if (XR_FAILED(sr)) {
+       static int s_fail = 0;
+       if (s_fail < 3) {
+@@ -1358,6 +1543,67 @@ bool WasSyncSessionEstablishedWin() {
+   return State().sync_session_established;
+ }
+ 
++// browser#103, GPU process: the seam between classification (here, where the
++// XrResult is) and reporting (DisplayXRWeaveGpu, where the mojo remote is).
++// Take-and-clear, so a per-frame poller sends exactly one WeaveSessionLost per
++// outage no matter how many frames the outage lasts.
++bool TakeSessionLostReportWin(DisplayXRWeaveClient::SessionLostReason* reason,
++                              int32_t* last_result,
++                              uint32_t* fail_count) {
++  WeaveClientState& s = State();
++  if (!s.session_lost_pending) {
++    return false;
++  }
++  s.session_lost_pending = false;
++  if (reason) {
++    *reason = s.session_lost_reason;
++  }
++  if (last_result) {
++    *last_result = static_cast<int32_t>(s.weave_last_result);
++  }
++  if (fail_count) {
++    *fail_count = static_cast<uint32_t>(
++        std::min<uint64_t>(s.weave_fail_total, 0xFFFFFFFFull));
++  }
++  return true;
++}
++
++// browser#103, BROWSER process: the receiving end of the mojo report.
++//
++// The browser has its OWN session — the snap/query one that backs
++// LocateViewsForRect (and therefore every inline-3D SCENE) and
++// isSessionSupported. Whatever killed the GPU's weave session almost certainly
++// killed this one too, since they are two connections to the same
++// displayxr-service. 0076 records that and says so; recovering both is 0077.
++void NoteSessionLostWin(DisplayXRWeaveClient::SessionLostReason reason,
++                        int32_t last_result,
++                        uint32_t fail_count) {
++  WeaveClientState& s = State();
++  // Negative control, again — and it matters more here than on the GPU side,
++  // because this entry point is driven by an IPC message rather than by our own
++  // state. A browser that never brought a weave client up has nothing to record
++  // and must not start logging because some other process said so.
++  if (!s.sync_session_established) {
++    return;
++  }
++  s.weave_mode = WeaveMode::kDisconnected;
++  s.weave_last_result = static_cast<XrResult>(last_result);
++  if (WeaveModeLogGate(s.disconnect_receipt_log_count)) {
++    LOG(ERROR)
++        << "[DisplayXR][weave-mode] DISCONNECTED: the GPU process reported its "
++           "weave session lost (reason="
++        << (reason == DisplayXRWeaveClient::SessionLostReason::kInstanceLost
++                ? "instance-lost"
++                : "failure-streak")
++        << " result=" << last_result << " fails=" << fail_count
++        << " generation=" << s.weave_generation
++        << " state=" << WeaveModeName(s.weave_mode)
++        << ") — tiles render MONO; this browser session's own rig locates are "
++           "very likely dead too (same service). No reconnect ladder yet "
++           "(#103/0077).";
++  }
++}
++
+ // browser#55: may this session drive the panel's 2D/3D element at all?
+ //
+ // The runtime exposes requestability as a per-session out-field of
+@@ -1519,6 +1765,11 @@ void SetScreenFlatRegionsWin(
+ 
+   const XrResult r = s.set_screen_flat_regions(
+       s.session, static_cast<uint32_t>(n), n > 0 ? xr_rects : nullptr);
++  // browser#103: the IDLE-page edge. A page producing no frames issues no
++  // submit, so this call (a popup opening over a still page) and the phase snap
++  // are the only two things that touch the runtime — which is exactly why the
++  // sticky wish channel has to report too, and not just the submit path.
++  NoteWeaveCallResult("sticky-wish", r);
+   if (XR_FAILED(r)) {
+     static int s_fail = 0;
+     if (s_fail < 3) {
+@@ -1745,6 +1996,11 @@ void SnapWindowIfMovedWin() {
+   XrRect2Di target_rect = {{origin.x, origin.y}, {0, 0}};
+   XrRect2Di snapped = {};
+   const XrResult r = s.snap(s.session, &origin_rect, &target_rect, &snapped);
++  // browser#103: the other idle-page edge (the user drags the window while the
++  // page is still). Cannot produce a false DISCONNECTED on its own — the snap
++  // only runs from the batch path, so any frame that reaches it has already
++  // noted a submit result, and a single success anywhere resets the streak.
++  NoteWeaveCallResult("phase-snap", r);
+   if (XR_SUCCEEDED(r)) {
+     s.last_snap_x = origin.x;
+     s.last_snap_y = origin.y;
+@@ -2022,6 +2278,35 @@ bool DisplayXRWeaveClient::WasSyncSessionEstablished() {
+ #endif
+ }
+ 
++// static
++bool DisplayXRWeaveClient::TakeSessionLostReport(SessionLostReason* reason,
++                                                 int32_t* last_result,
++                                                 uint32_t* fail_count) {
++#if BUILDFLAG(IS_WIN)
++  return TakeSessionLostReportWin(reason, last_result, fail_count);
++#else
++  // No #103 detection on the other backends yet: the mac weave session lives in
++  // the same process as the provider and has no second connection to lose.
++  (void)reason;
++  (void)last_result;
++  (void)fail_count;
++  return false;
++#endif
++}
++
++// static
++void DisplayXRWeaveClient::NoteSessionLost(SessionLostReason reason,
++                                           int32_t last_result,
++                                           uint32_t fail_count) {
++#if BUILDFLAG(IS_WIN)
++  NoteSessionLostWin(reason, last_result, fail_count);
++#else
++  (void)reason;
++  (void)last_result;
++  (void)fail_count;
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::SnapWindowIfMoved() {
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index aa4a0a9..3cb7317 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -211,6 +211,42 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   // nothing must not silently demote the batch shape either.
+   static bool WasSyncSessionEstablished();
+ 
++  // browser#103: why the client believes its weave session is gone. Mirrors
++  // displayxr.mojom.WeaveSessionLostReason value-for-value; kept as a separate
++  // plain enum so this header stays mojo-free (it is included from the OpenXR
++  // TU on one side and from chromium_code TUs on the other).
++  enum class SessionLostReason : uint32_t {
++    kUnknown = 0,
++    kFailureStreak = 1,
++    kInstanceLost = 2,
++  };
++
++  // browser#103, GPU PROCESS. Take the pending "this weave session is dead"
++  // report, if the classifier raised one since the last call.
++  //
++  // The classification lives here, next to the XrResult, and the REPORTING
++  // lives in DisplayXRWeaveGpu, next to the mojo remote — this is the seam.
++  // Returns true at most once per detection episode (an episode ends when a
++  // weave call succeeds again), so a caller that polls it every frame sends
++  // exactly one WeaveSessionLost per outage.
++  //
++  // Safe to call unconditionally: it answers false in a process where no weave
++  // session was ever established, which is the required negative control for a
++  // machine with no DisplayXR runtime.
++  static bool TakeSessionLostReport(SessionLostReason* reason,
++                                    int32_t* last_result,
++                                    uint32_t* fail_count);
++
++  // browser#103, BROWSER PROCESS. Record + log a WeaveSessionLost the GPU
++  // process pushed over the DisplayXRWeaver pipe. Moves the browser's weave
++  // mode word to DISCONNECTED and emits the [DisplayXR][weave-mode] receipt.
++  //
++  // Observability only in 0076 — it arms nothing. The reconnect ladder that
++  // consumes this state is 0077, gated on the E0 experiment.
++  static void NoteSessionLost(SessionLostReason reason,
++                              int32_t last_result,
++                              uint32_t fail_count);
++
+   // #625 phase-snap (CEF parity): if the bound browser window has moved since the
+   // last call, drive xrWeaveSnapWindowRectDXR so the DP re-locks the interlace
+   // lattice to the window's new absolute screen position. Idempotent + cheap
+diff --git a/components/displayxr/browser/displayxr_weaver_impl.cc b/components/displayxr/browser/displayxr_weaver_impl.cc
+index 490bfea..d139e2a 100644
+--- a/components/displayxr/browser/displayxr_weaver_impl.cc
++++ b/components/displayxr/browser/displayxr_weaver_impl.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "components/displayxr/browser/displayxr_weaver_impl.h"
+ 
++#include <cstdint>
+ #include <memory>
+ #include <utility>
+ 
+@@ -46,6 +47,25 @@ std::optional<gfx::DXGIHandle> WrapHandle(uintptr_t handle) {
+       base::win::ScopedHandle(reinterpret_cast<HANDLE>(handle)));
+ }
+ 
++// browser#103: DisplayXRWeaveClient::SessionLostReason mirrors
++// displayxr.mojom.WeaveSessionLostReason value-for-value, so the cast in
++// WeaveSessionLost is free. Asserted rather than trusted — a silent renumber
++// would mislabel every outage in the log and nothing would ever catch it.
++static_assert(static_cast<uint32_t>(mojom::WeaveSessionLostReason::kUnknown) ==
++                  static_cast<uint32_t>(
++                      DisplayXRWeaveClient::SessionLostReason::kUnknown),
++              "WeaveSessionLostReason drift: kUnknown");
++static_assert(
++    static_cast<uint32_t>(mojom::WeaveSessionLostReason::kFailureStreak) ==
++        static_cast<uint32_t>(
++            DisplayXRWeaveClient::SessionLostReason::kFailureStreak),
++    "WeaveSessionLostReason drift: kFailureStreak");
++static_assert(
++    static_cast<uint32_t>(mojom::WeaveSessionLostReason::kInstanceLost) ==
++        static_cast<uint32_t>(
++            DisplayXRWeaveClient::SessionLostReason::kInstanceLost),
++    "WeaveSessionLostReason drift: kInstanceLost");
++
+ }  // namespace
+ 
+ void DisplayXRWeaverImpl::WeaveSubmit(gfx::DXGIHandle texture,
+@@ -72,6 +92,24 @@ void DisplayXRWeaverImpl::WeaveSubmit(gfx::DXGIHandle texture,
+   std::move(callback).Run(std::move(out));
+ }
+ 
++// browser#103. Straight pass-through to the client, which owns the browser's
++// weave-mode state word and its logging — the same division of labour
++// SetPopupOccluders uses on the way out (policy at the edges, state and wire in
++// the client). Nothing is validated here on purpose: |reason| is an enum mojo
++// has already range-checked, and the other two are opaque diagnostics that only
++// ever reach a log line.
++//
++// Runs on the UI thread (the receiver is bound there via
++// ContentBrowserClient::BindGpuHostReceiver), which is the sequence every other
++// browser-process toucher of the client's State() runs on.
++void DisplayXRWeaverImpl::WeaveSessionLost(mojom::WeaveSessionLostReason reason,
++                                           int32_t last_result,
++                                           uint32_t fail_count) {
++  DisplayXRWeaveClient::NoteSessionLost(
++      static_cast<DisplayXRWeaveClient::SessionLostReason>(reason), last_result,
++      fail_count);
++}
++
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_weaver_impl.h b/components/displayxr/browser/displayxr_weaver_impl.h
+index 13f755f..9b631a3 100644
+--- a/components/displayxr/browser/displayxr_weaver_impl.h
++++ b/components/displayxr/browser/displayxr_weaver_impl.h
+@@ -5,6 +5,8 @@
+ #ifndef COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
+ #define COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVER_IMPL_H_
+ 
++#include <cstdint>
++
+ #include "build/build_config.h"
+ #include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -33,6 +35,14 @@ class DisplayXRWeaverImpl : public mojom::DisplayXRWeaver {
+   void WeaveSubmit(gfx::DXGIHandle texture,
+                    const gfx::Rect& rect,
+                    WeaveSubmitCallback callback) override;
++
++  // browser#103: the GPU process's weave session is dead. Fire-and-forget;
++  // records the browser's weave-mode state word and logs the
++  // [DisplayXR][weave-mode] DISCONNECTED receipt. Arms nothing — the reconnect
++  // ladder is 0077 and is gated on the E0 experiment.
++  void WeaveSessionLost(mojom::WeaveSessionLostReason reason,
++                        int32_t last_result,
++                        uint32_t fail_count) override;
+ #endif
+ };
+ 
+diff --git a/components/displayxr/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
+index 102fe58..d7657b7 100644
+--- a/components/displayxr/common/displayxr_weave.mojom
++++ b/components/displayxr/common/displayxr_weave.mojom
+@@ -41,6 +41,26 @@ struct DisplayXRWeaveResult {
+   bool eyes_valid;
+ };
+ 
++// browser#103: why the GPU process believes its weave session is gone.
++//
++// The two values are the two DETECTION mechanisms, not two different failures —
++// the underlying event ("displayxr-service went away under a live session") is
++// the same and only our confidence in naming it differs.
++enum WeaveSessionLostReason {
++  // Nothing classified it; carried so a future producer has an honest default.
++  kUnknown,
++  // The failure-STREAK heuristic: N consecutive weave calls failed. This is
++  // what today's runtimes give us, because the four XR_DXR_weave entry points
++  // bypass OXR_CHECK_XRET and hand-roll XR_ERROR_RUNTIME_FAILURE, so a broken
++  // pipe is indistinguishable from any other failure on a single call.
++  kFailureStreak,
++  // A single call returned XR_ERROR_INSTANCE_LOST / XR_ERROR_SESSION_LOST —
++  // the runtime told us outright. Requires the runtime-side fix that routes
++  // the weave entry points through OXR_CHECK_XRET (#103 design RC-2); the
++  // browser is forward-compatible with it either way.
++  kInstanceLost,
++};
++
+ interface DisplayXRWeaver {
+   // Weave one window sub-rect. |texture| is the pre-weave SBS keyed-mutex shared
+   // texture; |rect| is its window-relative device-pixel placement. Replies with
+@@ -56,6 +76,31 @@ interface DisplayXRWeaver {
+   WeaveSubmit(gfx.mojom.DXGIHandle texture, gfx.mojom.Rect rect)
+       => (DisplayXRWeaveResult? result);
+ 
++  // browser#103: the GPU process's weave session is dead. FIRE-AND-FORGET, and
++  // deliberately so — there is nothing the browser can reply that the GPU could
++  // act on, and a reply-carrying call would put a round trip on the present
++  // sequence at the exact moment it is already losing frames.
++  //
++  // This rides the SAME pipe as WeaveSubmit even though sync mode never calls
++  // WeaveSubmit: the remote is bound unconditionally in the GPU process
++  // (ChromeContentGpuClient::PostCompositorThreadCreated -> Bind()), so sync
++  // mode already has it open and idle. It is sent from the GPU-main/present
++  // sequence, the same one WeaveSubmit is dispatched on.
++  //
++  // |last_result| is the raw XrResult of the call that tripped detection,
++  // carried as a plain int32 so the browser can print it in the
++  // [DisplayXR][weave-mode] DISCONNECTED line without the client header
++  // growing an OpenXR dependency. |fail_count| is the running total of failed
++  // weave calls in this episode, not the streak length — it is the number
++  // triage wants ("how long has this been going on").
++  //
++  // 0076 is OBSERVABILITY ONLY: the browser records the state and logs. The
++  // reconnect ladder that consumes this is #103's 0077 and is gated on the E0
++  // experiment.
++  [EnableIf=is_win]
++  WeaveSessionLost(WeaveSessionLostReason reason,
++                   int32 last_result,
++                   uint32 fail_count);
+ };
+ 
+ // browser#55. BROWSER -> GPU, the opposite direction to DisplayXRWeaver above.
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index b18e1d9..caa8d63 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -70,6 +70,40 @@ bool DisplayXRWeaveGpu::SyncMode() {
+   return DisplayXRWeaveClient::WasSyncSessionEstablished();
+ }
+ 
++// browser#103: push the client's dead-session verdict to the browser process.
++//
++// Two processes have to know. The GPU process is where detection happens (it
++// owns the weaving session and sees every failed call), but the BROWSER process
++// owns the other half of the problem: its own snap/query session backs
++// LocateViewsForRect, i.e. every inline-3D SCENE, and it is the only process
++// that can ever relaunch displayxr-service — a sandboxed GPU process cannot
++// spawn children. So the verdict has to cross, even though 0076 does nothing
++// with it yet beyond recording and logging.
++void DisplayXRWeaveGpu::ReportWeaveSessionLostIfDetected() {
++  DisplayXRWeaveClient::SessionLostReason reason =
++      DisplayXRWeaveClient::SessionLostReason::kUnknown;
++  int32_t last_result = 0;
++  uint32_t fail_count = 0;
++  if (!DisplayXRWeaveClient::TakeSessionLostReport(&reason, &last_result,
++                                                   &fail_count)) {
++    return;
++  }
++  if (!weaver_.is_bound()) {
++    // Sync mode never calls WeaveSubmit, so this remote is otherwise idle —
++    // but it IS bound (ChromeContentGpuClient::PostCompositorThreadCreated
++    // calls Bind() unconditionally under --enable-inline-3d). If it somehow is
++    // not, the client has already logged the DISCONNECTED line locally and
++    // dropping the hop is strictly better than wedging the present sequence.
++    LOG(ERROR) << "[DisplayXR][weave-mode] weave session lost but the browser "
++                  "bridge is not bound — reported GPU-side only";
++    return;
++  }
++  // Value-for-value with the client enum; asserted once, at the receiving cast
++  // in displayxr_weaver_impl.cc, which fails the same build if either drifts.
++  weaver_->WeaveSessionLost(static_cast<mojom::WeaveSessionLostReason>(reason),
++                            last_result, fail_count);
++}
++
+ // static
+ void DisplayXRWeaveGpu::ResetInput(WeaveInput& in) {
+   in.input_tex.Reset();
+@@ -386,6 +420,9 @@ bool DisplayXRWeaveGpu::SubmitSync(WeaveInput& in,
+       reinterpret_cast<uintptr_t>(in.input_handle), window_rect.x(),
+       window_rect.y(), window_rect.width(), window_rect.height(),
+       /*input_is_dxgi=*/true);
++  // browser#103: the spec-v2 per-target path detects exactly like the batch one
++  // — the client classified the result inside Submit(); this is only the push.
++  ReportWeaveSessionLostIfDetected();
+   if (!sr.ok) {
+     return false;
+   }
+@@ -819,6 +856,13 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+       reinterpret_cast<uintptr_t>(shared_input_.input_handle), rects,
+       /*input_is_dxgi=*/true, overlay_handle, /*overlay_is_dxgi=*/true, flat);
+   const base::TimeDelta dt = base::TimeTicks::Now() - t0;
++  // browser#103: the primary detection edge. The client classified every chunk
++  // result inside SubmitBatch (and, on this same frame, the phase snap above);
++  // this is the one place a raised verdict crosses to the browser. Called on
++  // BOTH outcomes deliberately — a frame whose submit succeeded may still be
++  // carrying a verdict raised by the snap, and take-and-clear means calling it
++  // when there is nothing to say costs a bool read.
++  ReportWeaveSessionLostIfDetected();
+   if (!sr.ok) {
+     // (browser#99) THROTTLED, not capped-at-3-ever. This line is the direct
+     // signal for the black-flicker mechanism — a failed submit is what trips
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index b2aa3c5..d82d2e0 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -181,6 +181,19 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   // Close any owned Win32 handles carried in |r| (un-taken woven result).
+   static void CloseResultHandles(Result& r);
+ 
++  // browser#103: if the weave client's classifier has raised a "this session is
++  // dead" verdict since the last check, push it to the browser process over
++  // |weaver_| as a fire-and-forget WeaveSessionLost.
++  //
++  // Call sites are the submit paths, i.e. the GPU-main/present sequence that
++  // owns |weaver_| — the same one WeaveSubmit is dispatched from. The client
++  // side is take-and-clear, so this sends exactly ONE message per outage no
++  // matter how often it is called.
++  //
++  // OBSERVABILITY ONLY (0076). It arms nothing, retries nothing, and waits for
++  // no reply; the reconnect ladder is 0077 and is gated on the E0 experiment.
++  void ReportWeaveSessionLostIfDetected();
++
+   mojo::Remote<mojom::DisplayXRWeaver> weaver_;
+ 
+   // Async weave state. Latest completed woven result per target id (index of the
