@@ -20,3 +20,7 @@ Thumbs.db
 _artifact/
 _staged/
 _signed/
+
+# Secrets / local machine coordinates (never committed)
+.secrets/
+.env.local
