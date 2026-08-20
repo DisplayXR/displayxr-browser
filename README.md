@@ -37,7 +37,7 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 |---|---|
 | Latest preview | [**0.1.11**](https://github.com/DisplayXR/displayxr-browser/releases/latest) — occlusion by draw order |
 | Chromium pin | **151.0.7922.77** (stable) — `scripts/config.env` |
-| Patch series | 68 patches over the pinned tag, ~100 files of real integration surface |
+| Patch series | 70 patches over the pinned tag, ~100 files of real integration surface |
 | Platform | Windows — D3D11 + DirectComposition |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
@@ -51,6 +51,15 @@ What works today: the `inline-3d` WebXR session mode and its JS surface, GPU-res
 in the GPU process, batched per-frame submission of every visible element, per-element weave with
 2D DOM overlays composited over the woven tiles, phase lock under scroll / zoom / window drag, and the
 panel's hardware 2D/3D element following the foreground tab.
+
+A weave can still miss on any given frame — the runtime's weave-input acquire runs on a deliberately
+tight budget, and a heavy WebGL scene tile is the producer most likely to still be mid-write when the
+service reaches for it. The browser now **degrades rather than blanks** when that happens. A tile's
+canvas quad is withheld from the page raster on the compositor thread, before the weave outcome can
+be known, so a missed weave used to draw the tile from neither side and flash it black
+([#99](https://github.com/DisplayXR/displayxr-browser/issues/99)). On such a frame the GPU thread now
+paints the tile itself from the resource it already holds, as a flat mono frame — the same fallback
+the SDK shows when 3D is unavailable — and is invisible at frame rate.
 
 The design and rationale live in the runtime repo:
 [`webxr-support.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-support.md)
