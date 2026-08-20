@@ -246,24 +246,26 @@ index 42e40d58ebc42..638267d2dd173 100644
    void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
    const OverscrollBehavior& overscroll_behavior() const {
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index b066a935b15e0..89a660342c158 100644
+index 2b3fadbf73c47..009e085684d83 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2462,10 +2462,13 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2632,12 +2632,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    if (settings().trees_in_viz_in_viz_process) {
      metadata.tracked_element_rects = tracked_element_rects_from_client_;
      metadata.inline_3d_rects = inline_3d_rects_from_client_;
 +    metadata.inline_3d_exclusion_rects = inline_3d_exclusion_rects_from_client_;
    } else {
      metadata.tracked_element_rects = CollectTrackedElementRects(
-         /*is_for_compositor_frame_metadata=*/true);
+         /*is_for_compositor_frame_metadata=*/true,
+         frame.tracked_element_status ==
+             TrackedElementStatus::kHasTrackedElementsNeedingOcclusion);
      metadata.inline_3d_rects = active_tree()->inline_3d_rects();
 +    metadata.inline_3d_exclusion_rects =
 +        active_tree()->inline_3d_exclusion_rects();
    }
    // DisplayXR inline-3D (#625, Step B / Phase 2 — scroll-sync): the rects above
    // are getBoundingClientRect measured on the Blink main thread at the COMMITTED
-@@ -2476,7 +2479,8 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2648,7 +2651,8 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    // offset − committed base) so the weave rect tracks the pixels presented THIS
    // frame. Handles the dominant case (content scrolling with the root viewport);
    // nested-scroller content is a follow-up.
@@ -273,7 +275,7 @@ index b066a935b15e0..89a660342c158 100644
      const ScrollNode* viewport_scroll = OuterViewportScrollNode();
      if (!viewport_scroll) {
        viewport_scroll = InnerViewportScrollNode();
-@@ -2495,10 +2499,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2667,10 +2671,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
          const int dy = base::ClampRound(delta.y() * dsf);
          if (dx != 0 || dy != 0) {
            // Growing scroll offset moves content up/left → element window origin
@@ -290,7 +292,7 @@ index b066a935b15e0..89a660342c158 100644
            static int log_throttle = 0;
            if ((log_throttle++ % 30) == 0) {
              VLOG(1) << "[DisplayXR] Phase2 scroll-sync: viewport impl delta dip="
-@@ -2685,7 +2694,7 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+@@ -2859,7 +2868,7 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
      // Send updates to Viz even for no damage case when TreesInViz is enabled.
      if (settings_.TreesInVizInClientProcess()) {
        UpdateDisplayTree(*frame, {}, viz::TrackedElementRects(),
@@ -299,7 +301,7 @@ index b066a935b15e0..89a660342c158 100644
      }
  
      active_tree()->ResetAllChangeTracking();
-@@ -2778,7 +2787,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+@@ -2952,7 +2961,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
      trees_in_viz_submit_time = UpdateDisplayTree(
          *frame, std::move(compositor_frame.metadata.latency_info),
          std::move(compositor_frame.metadata.tracked_element_rects),
@@ -309,7 +311,7 @@ index b066a935b15e0..89a660342c158 100644
  
      layer_tree_frame_sink_->ExportFrameTiming();
    } else {
-@@ -3307,6 +3317,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+@@ -3471,6 +3481,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
      std::vector<ui::LatencyInfo> latency_info,
      viz::TrackedElementRects tracked_element_rects,
      std::vector<gfx::Rect> inline_3d_rects,
@@ -317,7 +319,7 @@ index b066a935b15e0..89a660342c158 100644
      bool is_flush) {
    DCHECK(settings_.TreesInVizInClientProcess());
    DCHECK(layer_context_);
-@@ -3318,7 +3329,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+@@ -3482,7 +3493,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
        layer_tree_frame_sink_->shared_image_interface().get(),
        viewport_damage_rect_, !frame.has_no_damage, is_flush,
        std::move(latency_info), std::move(tracked_element_rects),
@@ -326,7 +328,7 @@ index b066a935b15e0..89a660342c158 100644
  }
  
  void LayerTreeHostImpl::FlushDisplayTree() {
-@@ -3348,7 +3359,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
+@@ -3512,7 +3523,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
    // (like frame tokens in ACKs) remains consistent.
    ++next_frame_token_;
    UpdateDisplayTree(frame, {}, viz::TrackedElementRects(),

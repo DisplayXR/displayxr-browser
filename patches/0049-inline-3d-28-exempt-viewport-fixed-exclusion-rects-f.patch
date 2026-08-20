@@ -143,10 +143,10 @@ index 638267d2dd173..12cc1cfcd1590 100644
    void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
    const OverscrollBehavior& overscroll_behavior() const {
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 89a660342c158..2c5fdfae88100 100644
+index 009e085684d83..663375700510f 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2459,16 +2459,31 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2629,10 +2629,23 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    // rects (window-relative device px) so Viz can weave those output sub-rects.
    // In TreesInViz-in-viz mode the Viz-side active tree never receives the rects,
    // so take them from the client-supplied copy (mirrors tracked_element_rects).
@@ -169,7 +169,8 @@ index 89a660342c158..2c5fdfae88100 100644
 +        inline_3d_exclusion_fixed_rects_from_client_;
    } else {
      metadata.tracked_element_rects = CollectTrackedElementRects(
-         /*is_for_compositor_frame_metadata=*/true);
+         /*is_for_compositor_frame_metadata=*/true,
+@@ -2641,6 +2654,8 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
      metadata.inline_3d_rects = active_tree()->inline_3d_rects();
      metadata.inline_3d_exclusion_rects =
          active_tree()->inline_3d_exclusion_rects();
@@ -178,7 +179,7 @@ index 89a660342c158..2c5fdfae88100 100644
    }
    // DisplayXR inline-3D (#625, Step B / Phase 2 — scroll-sync): the rects above
    // are getBoundingClientRect measured on the Blink main thread at the COMMITTED
-@@ -2508,6 +2523,9 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2680,6 +2695,9 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
            for (gfx::Rect& r : metadata.inline_3d_exclusion_rects) {
              r.Offset(-dx, -dy);
            }
@@ -188,7 +189,7 @@ index 89a660342c158..2c5fdfae88100 100644
            static int log_throttle = 0;
            if ((log_throttle++ % 30) == 0) {
              VLOG(1) << "[DisplayXR] Phase2 scroll-sync: viewport impl delta dip="
-@@ -2520,6 +2538,22 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2692,6 +2710,22 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
      }
    }
  

@@ -1152,7 +1152,7 @@ index fde37693d527e..d1102319cd776 100644
 +  SetInline3DDemand(bool wants_3d);
  };
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index bdce2d264c4a2..180aa4372a670 100644
+index d9af1fbc81e65..32a58cc1c95ac 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
 @@ -13,6 +13,7 @@
@@ -1162,8 +1162,8 @@ index bdce2d264c4a2..180aa4372a670 100644
 +#include "base/numerics/safe_conversions.h"
  #include "base/trace_event/trace_event.h"
  #include "base/types/pass_key.h"
- #include "device/vr/buildflags/buildflags.h"
-@@ -1629,6 +1630,14 @@ void XRSession::HandleShutdown() {
+ #include "build/build_config.h"
+@@ -1645,6 +1646,14 @@ void XRSession::HandleShutdown() {
    DCHECK(ended_);
    waiting_for_shutdown_ = false;
  
@@ -1178,7 +1178,7 @@ index bdce2d264c4a2..180aa4372a670 100644
    if (xr_->IsContextDestroyed()) {
      // If this is being called due to the context being destroyed,
      // it's illegal to run JavaScript code, so we cannot emit an
-@@ -2681,6 +2690,16 @@ void XRSession::ReportInline3DRects() {
+@@ -2706,6 +2715,16 @@ void XRSession::ReportInline3DRects() {
      css_rect.Scale(static_cast<float>(dsf));
      return gfx::ToRoundedRect(css_rect);
    };
@@ -1195,7 +1195,7 @@ index bdce2d264c4a2..180aa4372a670 100644
    std::vector<gfx::Rect> rects;
    rects.reserve(display_layers_.size());
    // Overlay-exclusion rects (browser#18): 2D UI the page declared as painted
-@@ -2729,6 +2748,9 @@ void XRSession::ReportInline3DRects() {
+@@ -2754,6 +2773,9 @@ void XRSession::ReportInline3DRects() {
      gfx::Rect device_rect = device_rect_of(target);
      if (!device_rect.IsEmpty()) {
        rects.push_back(device_rect);
@@ -1205,7 +1205,7 @@ index bdce2d264c4a2..180aa4372a670 100644
      }
      for (const auto& excluded : layer->excluded_elements()) {
        if (!excluded->isConnected()) {
-@@ -2746,6 +2768,26 @@ void XRSession::ReportInline3DRects() {
+@@ -2771,6 +2793,26 @@ void XRSession::ReportInline3DRects() {
      }
    }
    widget->SetInline3DRects(rects, exclusion_rects, exclusion_fixed_rects);

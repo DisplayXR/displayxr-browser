@@ -27,11 +27,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  6 files changed, 255 insertions(+), 126 deletions(-)
 
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 7f28122e1fc1a..80d8cc6dcd2bc 100644
+index 8c1cb14babd9e..2a89386cc9245 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2457,6 +2457,49 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
-         /*is_for_compositor_frame_metadata=*/true);
+@@ -2628,6 +2628,49 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
+             TrackedElementStatus::kHasTrackedElementsNeedingOcclusion);
      metadata.inline_3d_rects = active_tree()->inline_3d_rects();
    }
 +  // DisplayXR inline-3D (#625, Step B / Phase 2 — scroll-sync): the rects above
