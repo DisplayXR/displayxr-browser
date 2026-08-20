@@ -13,7 +13,8 @@ weave silently no-ops.
 milestone tag, plus the fetch/build/brand/package/sign/release lane.
 
 - **`scripts/config.env` is the SINGLE source of truth for the pin** — currently
-  `CHROMIUM_TAG=151.0.7922.77`, **56 patches** in `patches/`. Bump it there and nowhere else.
+  `CHROMIUM_TAG=151.0.7922.77`. Bump it there and nowhere else. The patch count in `patches/`
+  grows week to week (65 as of 2026-08-19) — count it, don't quote a doc.
 - Applied with `git am --3way patches/*.patch` onto a fresh checkout of the tag (`scripts/build.sh`
   does this). The series is verified to reproduce the fork branch's tree hash **exactly**.
 - Rebase cadence, conflict triage, and the mandatory weave verification: **`docs/rebase-runbook.md`**.
