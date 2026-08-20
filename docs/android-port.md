@@ -295,12 +295,14 @@ display-mode controller. Call it a low four figures of new code and zero lines o
 
 ## Known risks
 
-1. **The series is already at `XR_DXR_weave` spec v8; the runtime's `main` is at v7.** Patch 0067
-   re-syncs the vendored header to `XR_DXR_weave_SPEC_VERSION 8` and calls
-   `xrWeaveSetScreenFlatRegionsDXR`, which does not exist anywhere in the runtime tree yet. Both 0067
-   and 0069 guard on `weave_spec_version >= 8`, so they degrade safely — but until v8 lands on the
-   Android `comp_multi` path, the panel's hardware 3D element stays all-or-nothing and flat page
-   content around a tile will be viewed through a lenticular it did not ask for.
+1. **`XR_DXR_weave` spec v8 landed on runtime `main` the same day this doc was written**
+   (runtime `040536b42`, released v2.8.0 2026-08-19) — the header, `xrWeaveSetScreenFlatRegionsDXR`,
+   and `XrWeaveSubmitFlatRegionsDXR` all exist now, so patches 0067/0069's `weave_spec_version >= 8`
+   guard passes against a current runtime. Remaining Android-specific gap: the Android weave path
+   (`comp_multi_weave_android.c`) accepts flat regions but ignores them (`(void)flat_rects`) — safe,
+   since v8 is advisory and hardware-only (woven pixels are bit-identical), but the panel's hardware
+   3D element stays all-or-nothing on Android until the flat-region wish is wired to the Android DP's
+   zone/lens channel. Runtime follow-up, not a port blocker.
 2. Whether Android's `SkiaOutputDevice` reaches the weave through `MaybeWeaveOutput()` or
    `MaybeWeaveRootRenderPass()` — decides whether 0013 needs an Android arm.
 3. Whether `ProduceOverlayForWeave` yields an `AHardwareBuffer` for a Graphite-Dawn-backed canvas
