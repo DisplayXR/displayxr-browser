@@ -35,12 +35,17 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 
 | | |
 |---|---|
-| Latest preview | [**0.1.8**](https://github.com/DisplayXR/displayxr-browser/releases/tag/preview-0.1.8) — *DisplayXR-Browser-Preview-Setup-0.1.8.exe* |
+| Latest preview | [**0.1.11**](https://github.com/DisplayXR/displayxr-browser/releases/latest) — occlusion by draw order |
 | Chromium pin | **151.0.7922.77** (stable) — `scripts/config.env` |
 | Patch series | 56 patches over the pinned tag, ~100 files of real integration surface |
 | Platform | Windows — D3D11 + DirectComposition |
-| Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it) + a display plug-in for the glasses-free effect |
+| Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
+
+Recent releases: **0.1.9** — scroll-sync + navigation-ghost fixes. **0.1.10** — element identity
+end-to-end. **0.1.11** — occlusion by draw order: any 2D content over woven tiles now composites
+correctly, per-pixel, automatically (the exclusion APIs are deprecated no-ops). Full notes on the
+[Releases](https://github.com/DisplayXR/displayxr-browser/releases) page.
 
 What works today: the `inline-3d` WebXR session mode and its JS surface, GPU-resident zero-copy weave
 in the GPU process, batched per-frame submission of every visible element, per-element weave with
@@ -56,9 +61,10 @@ The design and rationale live in the runtime repo:
 
 ## Try it
 
-1. Install the [DisplayXR runtime](https://github.com/DisplayXR/displayxr-runtime/releases) (v2.2.3+)
-   and, on Leia hardware, the [Leia SR plug-in](https://github.com/DisplayXR/displayxr-leia-plugin/releases).
-2. Install [`DisplayXR-Browser-Preview-Setup-*.exe`](https://github.com/DisplayXR/displayxr-browser/releases).
+1. Install the [DisplayXR runtime](https://github.com/DisplayXR/displayxr-runtime/releases) (v2.2.3+
+   minimum; v2.7.2+ strongly recommended) and, on Leia hardware, the
+   [Leia SR plug-in](https://github.com/DisplayXR/displayxr-leia-plugin/releases).
+2. Install [`DisplayXR-Browser-Preview-Setup-*.exe`](https://github.com/DisplayXR/displayxr-browser/releases/latest).
 3. Open the live samples — <https://displayxr.github.io/displayxr-web/> — which is also the browser's
    default start page. In any other browser those pages render as ordinary 2D.
 
