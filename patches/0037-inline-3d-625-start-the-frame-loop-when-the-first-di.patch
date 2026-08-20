@@ -1,7 +1,7 @@
-From ab2d5e2d1f7448a46498adcd275e03cd0480311b Mon Sep 17 00:00:00 2001
+From 96a05161cef0f9250f6e87559e7ea7682c4c5a64 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 22:02:43 -0700
-Subject: [PATCH 37/54] inline-3d(#625): start the frame loop when the first
+Subject: [PATCH 37/71] inline-3d(#625): start the frame loop when the first
  display layer registers
 
 Every page load showed ~10-13s of horizontally smeared tiles -- photos and the
@@ -40,10 +40,10 @@ before jumping to n=6 once the loop finally started.
  1 file changed, 13 insertions(+)
 
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 2f3d77e502979..760c700a37891 100644
+index 7a2af2c427a53..305f140d866bb 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2615,6 +2615,19 @@ void XRSession::OnInline3DViews(
+@@ -2640,6 +2640,19 @@ void XRSession::OnInline3DViews(
  
  void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
    display_layers_.insert(layer);

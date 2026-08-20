@@ -1,7 +1,7 @@
-From 3622143ef39e0a71977f8df68f72bca661b113e4 Mon Sep 17 00:00:00 2001
+From 95af6d227f3a9ef6060108cc718e7b77fe3f995a Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 7 Jul 2026 18:43:26 -0700
-Subject: [PATCH 10/54] =?UTF-8?q?inline-3d(#625):=20auto-force=20high-perf?=
+Subject: [PATCH 10/71] =?UTF-8?q?inline-3d(#625):=20auto-force=20high-perf?=
  =?UTF-8?q?=20GPU=20adapter=20=E2=80=94=20retire=20--force=5Fhigh=5Fperfor?=
  =?UTF-8?q?mance=5Fgpu?=
 MIME-Version: 1.0
@@ -41,10 +41,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  3 files changed, 50 insertions(+), 6 deletions(-)
 
 diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
-index d791d1896ac5b..59563cbd9dcdd 100644
+index 51267aeaed16a..3abe501d2731b 100644
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
-@@ -382,6 +382,7 @@
+@@ -388,6 +388,7 @@
  #include "extensions/common/switches.h"
  #include "google_apis/gaia/gaia_urls.h"
  #include "google_apis/google_api_keys.h"
@@ -52,7 +52,7 @@ index d791d1896ac5b..59563cbd9dcdd 100644
  #include "gpu/config/gpu_switches.h"
  #include "ipc/ipc_channel_proxy.h"
  #include "media/base/media_switches.h"
-@@ -2835,9 +2836,28 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+@@ -2848,9 +2849,28 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
    // DisplayXR inline-3D (#625, Step B / B4): forward the opt-in to child
    // processes so the GPU/Viz process registers the weave provider + tags the
    // canvas quad. Dormant unless requested.
@@ -85,7 +85,7 @@ index d791d1896ac5b..59563cbd9dcdd 100644
  
  #if BUILDFLAG(IS_MAC)
 diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
-index b7acdec95f7cd..a4ec6e5f11a0c 100644
+index 567789b416ce5..4ee8364af8e78 100644
 --- a/content/shell/BUILD.gn
 +++ b/content/shell/BUILD.gn
 @@ -421,6 +421,10 @@ static_library("content_shell_lib") {

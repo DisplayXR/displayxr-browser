@@ -1,7 +1,7 @@
-From 3a4f86191dc1480b23ad0aab3a0eb2fa9da14660 Mon Sep 17 00:00:00 2001
+From 0ad5d03a7a20d70ca431214cc3635f57945db9f2 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 00:46:56 -0700
-Subject: [PATCH 64/64] inline-3d(Phase 2): make the flag composite the split
+Subject: [PATCH 64/71] inline-3d(Phase 2): make the flag composite the split
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -78,7 +78,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  7 files changed, 371 insertions(+), 67 deletions(-)
 
 diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
-index 636a828..ee41e26 100644
+index 636a828f52737..ee41e26125d72 100644
 --- a/chrome/app/chrome_main_delegate.cc
 +++ b/chrome/app/chrome_main_delegate.cc
 @@ -1121,11 +1121,13 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
@@ -100,7 +100,7 @@ index 636a828..ee41e26 100644
      // What IS established now is the precedence, so the escape hatch works from
      // this patch on: --disable-inline-3d-occlusion beats an explicit
 diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
-index 01d47e5..57a54dc 100644
+index 01d47e50b22c7..57a54dc871fe3 100644
 --- a/components/viz/service/display/direct_renderer.h
 +++ b/components/viz/service/display/direct_renderer.h
 @@ -108,9 +108,12 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
@@ -120,7 +120,7 @@ index 01d47e5..57a54dc 100644
  
    void ReallocatedFrameBuffers();
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index 82f52aa..fa18be2 100644
+index 82f52aac74a1d..fa18be225ff9a 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
 @@ -1023,11 +1023,31 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
@@ -158,7 +158,7 @@ index 82f52aa..fa18be2 100644
        }
        renderer_->SetInline3dSuppressedResources(std::move(suppressed));
 diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
-index 117f738..b3525fe 100644
+index 117f73876d7c7..b3525fe4ebd7e 100644
 --- a/components/viz/service/display/skia_renderer.cc
 +++ b/components/viz/service/display/skia_renderer.cc
 @@ -1581,12 +1581,14 @@ void SkiaRenderer::SetInline3dQuadClips(
@@ -238,7 +238,7 @@ index 117f738..b3525fe 100644
  }
  
 diff --git a/components/viz/service/display/skia_renderer.h b/components/viz/service/display/skia_renderer.h
-index 5d15843..9bd2f6c 100644
+index 5d15843aa4c8d..9bd2f6c725b24 100644
 --- a/components/viz/service/display/skia_renderer.h
 +++ b/components/viz/service/display/skia_renderer.h
 @@ -652,14 +652,21 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
@@ -272,7 +272,7 @@ index 5d15843..9bd2f6c 100644
    // Sets the two clips above, flushing any in-progress batch first if they
    // change (a batch is drawn with ONE PrepareCanvas, so a mid-batch clip change
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 7fd5544..c6c5931 100644
+index 7fd5544fe64ab..c6c59318d9de3 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -11,6 +11,7 @@
@@ -645,7 +645,7 @@ index 7fd5544..c6c5931 100644
        // (1) Ensure a window-sized BGRA8 premul atlas as an IOSurface-backed
        // SharedImage (SCANOUT routes it to IOSurfaceImageBacking — Skia-writable
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index e83fbb2..14e2514 100644
+index e83fbb275487b..14e251484067b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 @@ -242,8 +242,9 @@ class SkiaOutputSurfaceImplOnGpu

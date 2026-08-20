@@ -1,7 +1,7 @@
-From 1f110e06893af3b5255986668ae37de23c1d809d Mon Sep 17 00:00:00 2001
+From 01a119a05859117f98fbf6b4759e9fbddc2a05f4 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 26 Jun 2026 03:29:28 -0500
-Subject: [PATCH 04/54] [displayxr inline-3d #625 B2c.1] GPU-thread synthetic
+Subject: [PATCH 04/71] [displayxr inline-3d #625 B2c.1] GPU-thread synthetic
  weave pipe + Viz substitution
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -76,7 +76,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  create mode 100644 content/shell/gpu/displayxr_weave_gpu.h
 
 diff --git a/components/viz/service/BUILD.gn b/components/viz/service/BUILD.gn
-index 2488069770015..0bebcfe074d5d 100644
+index b03cd1aea2a08..f67921d7c8ffb 100644
 --- a/components/viz/service/BUILD.gn
 +++ b/components/viz/service/BUILD.gn
 @@ -149,6 +149,8 @@ viz_component("service") {
@@ -125,7 +125,7 @@ index 45928e1d5f6d7..f1be125de2ef8 100644
  
    // If |maybe_concurrent_reads| is true then there can be concurrent reads to
 diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
-index 9da0682f44848..f9e9a97eea2cf 100644
+index 1724881830b7b..70b6cb63b0ea6 100644
 --- a/components/viz/service/display/skia_renderer.cc
 +++ b/components/viz/service/display/skia_renderer.cc
 @@ -115,6 +115,17 @@ namespace viz {
@@ -146,7 +146,7 @@ index 9da0682f44848..f9e9a97eea2cf 100644
  // Feature to temporarily create a dump in the case where we try and sample from
  // a render pass that has never been drawn to.
  // See: crbug.com/344458294, crbug.com/345673794
-@@ -682,11 +693,17 @@ class SkiaRenderer::ScopedSkImageBuilder {
+@@ -756,11 +767,17 @@ class SkiaRenderer::ScopedSkImageBuilder {
    const SkImage* sk_image() const { return sk_image_.get(); }
    const cc::PaintOpBuffer* paint_op_buffer() const { return paint_op_buffer_; }
    const std::optional<SkColor4f>& clear_color() const { return clear_color_; }
@@ -164,7 +164,7 @@ index 9da0682f44848..f9e9a97eea2cf 100644
  };
  
  SkiaRenderer::ScopedSkImageBuilder::ScopedSkImageBuilder(
-@@ -704,6 +721,7 @@ SkiaRenderer::ScopedSkImageBuilder::ScopedSkImageBuilder(
+@@ -778,6 +795,7 @@ SkiaRenderer::ScopedSkImageBuilder::ScopedSkImageBuilder(
  
    auto* image_context = skia_renderer->lock_set_for_external_use_.LockResource(
        resource_id, maybe_concurrent_reads, raw_draw_if_possible);
@@ -172,7 +172,7 @@ index 9da0682f44848..f9e9a97eea2cf 100644
  
    // |ImageContext::image| provides thread safety: (a) this ImageContext is
    // only accessed by GPU thread after |image| is set and (b) the fields of
-@@ -2669,6 +2687,20 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
+@@ -2744,6 +2762,20 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
    if (!image)
      return;
  
@@ -293,10 +293,10 @@ index 0000000000000..10b7b4d7ff188
 +
 +#endif  // COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_DISPLAYXR_WEAVE_PROVIDER_H_
 diff --git a/components/viz/service/display_embedder/image_context_impl.cc b/components/viz/service/display_embedder/image_context_impl.cc
-index 21c009b185357..2b0001b3099eb 100644
+index ff04ee7695e94..fd3f5470dbb59 100644
 --- a/components/viz/service/display_embedder/image_context_impl.cc
 +++ b/components/viz/service/display_embedder/image_context_impl.cc
-@@ -367,11 +367,29 @@ bool ImageContextImpl::BeginRasterAccess(
+@@ -372,11 +372,29 @@ bool ImageContextImpl::BeginRasterAccess(
    return true;
  }
  
@@ -326,7 +326,7 @@ index 21c009b185357..2b0001b3099eb 100644
    // Skip the context if it has been processed.
    if (representation_scoped_read_access_) {
      CHECK(owned_promise_image_textures_.empty());
-@@ -396,7 +414,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+@@ -401,7 +419,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
  
    if (!representation_) {
      auto representation = representation_factory->ProduceSkia(
@@ -335,7 +335,7 @@ index 21c009b185357..2b0001b3099eb 100644
          /*required_usages=*/{gpu::SHARED_IMAGE_USAGE_DISPLAY_READ});
      if (!representation) {
        DLOG(ERROR) << "Failed to fulfill the promise texture - SharedImage "
-@@ -404,7 +422,10 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+@@ -409,7 +427,10 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
        return false;
      }
  
@@ -347,7 +347,7 @@ index 21c009b185357..2b0001b3099eb 100644
        DLOG(ERROR) << "Failed to fulfill the promise texture - SharedImage "
                       "size does not match TransferableResource size: "
                    << representation->size().ToString() << " vs "
-@@ -413,6 +434,8 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+@@ -429,6 +450,8 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
      }
  
      representation_ = std::move(representation);
@@ -389,7 +389,7 @@ index e53873c82fbc7..fe70cd76b73a4 100644
  
  }  // namespace viz
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index b833608be6455..d2d8eda177072 100644
+index 6b896949d9bfe..581e4bf1e2e3e 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -100,8 +100,16 @@
@@ -434,7 +434,7 @@ index b833608be6455..d2d8eda177072 100644
      promise_image_access_helper_.BeginAccess(
          std::move(image_contexts), &begin_semaphores, &end_semaphores);
      if (!begin_semaphores.empty()) {
-@@ -2647,6 +2666,95 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+@@ -2646,6 +2665,95 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
    return {};
  }
  
@@ -531,7 +531,7 @@ index b833608be6455..d2d8eda177072 100644
      gpu::Mailbox mailbox,
      SharedImageFormat format,
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 1236539ebebf9..02ca43fbc7fe4 100644
+index efaad72e9e728..518becd71f7e0 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 @@ -59,6 +59,9 @@ namespace mojom {
@@ -544,7 +544,7 @@ index 1236539ebebf9..02ca43fbc7fe4 100644
  }  // namespace gfx
  
  namespace gl {
-@@ -479,6 +482,17 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -478,6 +481,17 @@ class SkiaOutputSurfaceImplOnGpu
    // returns a newly produced one and caches it.
    gpu::SkiaImageRepresentation* GetSkiaRepresentation(gpu::Mailbox mailbox);
  
@@ -562,7 +562,7 @@ index 1236539ebebf9..02ca43fbc7fe4 100644
    class ReleaseCurrent {
     public:
      ReleaseCurrent(scoped_refptr<gl::GLSurface> gl_surface,
-@@ -614,6 +628,15 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -613,6 +627,15 @@ class SkiaOutputSurfaceImplOnGpu
    // destructor.
    base::flat_set<gpu::Mailbox> solid_color_images_;
  
@@ -579,7 +579,7 @@ index 1236539ebebf9..02ca43fbc7fe4 100644
  
  #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
 diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
-index 0d86b8bb1ed44..5e37a5fff624c 100644
+index 3dcdce6154c12..4fb7d6d8d091a 100644
 --- a/content/shell/BUILD.gn
 +++ b/content/shell/BUILD.gn
 @@ -435,8 +435,21 @@ static_library("content_shell_lib") {
@@ -605,7 +605,7 @@ index 0d86b8bb1ed44..5e37a5fff624c 100644
    }
  
    if (is_linux) {
-@@ -1190,7 +1203,10 @@ mojom("shell_controller_mojom") {
+@@ -1206,7 +1219,10 @@ mojom("shell_controller_mojom") {
  # weave RPC. See docs/roadmap/webxr-step-b-design.md.
  mojom("displayxr_weave_mojom") {
    sources = [ "common/displayxr_weave.mojom" ]

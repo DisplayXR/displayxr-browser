@@ -1,7 +1,7 @@
-From ee8029076a7dac79a318d6df9bdc0b09c2e323e1 Mon Sep 17 00:00:00 2001
+From e2c8ea66f5969bc6a5f1a157ada659c39a7630a9 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 12:34:33 -0700
-Subject: [PATCH 67/68] inline-3d(Phase 3): name the flat regions and wish them
+Subject: [PATCH 67/71] inline-3d(Phase 3): name the flat regions and wish them
  2D
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -329,7 +329,7 @@ index cbdd53c2e0aef..1e664023660ca 100644
    // the inputs live on, plus its immediate context (used for the canvas->input
    // copy + keyed-mutex acquire/release). Held to detect a device change. Each
 diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
-index 4ee7450f9a31a..32a46091cd2d1 100644
+index 900e547637868..252e9c620aec7 100644
 --- a/components/viz/service/display/direct_renderer.cc
 +++ b/components/viz/service/display/direct_renderer.cc
 @@ -77,6 +77,68 @@ enum class RenderPassDrawRectAssign {
@@ -401,7 +401,7 @@ index 4ee7450f9a31a..32a46091cd2d1 100644
  }  // namespace
  
  DirectRenderer::DrawingFrame::DrawingFrame() = default;
-@@ -263,7 +325,13 @@ void DirectRenderer::DrawFrame(
+@@ -269,7 +331,13 @@ void DirectRenderer::DrawFrame(
    // pass is drawn, so a non-root pass can never match a pointer left over from
    // the previous frame (which is reachable: the root pass may be skipped
    // entirely). It is repopulated just before the root pass below.
@@ -415,7 +415,7 @@ index 4ee7450f9a31a..32a46091cd2d1 100644
  
    output_surface_->SetNeedsMeasureNextDrawLatency();
    BeginDrawingFrame();
-@@ -546,6 +614,7 @@ bool DirectRenderer::IsInline3dOcclusionEnabled() {
+@@ -557,6 +625,7 @@ bool DirectRenderer::IsInline3dOcclusionEnabled() {
  void DirectRenderer::ComputeInline3dPlaneSplit(
      const AggregatedRenderPass* root) {
    inline3d_over_clips_.clear();
@@ -423,7 +423,7 @@ index 4ee7450f9a31a..32a46091cd2d1 100644
    if (!root || inline_3d_tiles_.empty()) {
      return;
    }
-@@ -593,6 +662,12 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+@@ -604,6 +673,12 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
    size_t tiles_without_k = 0;
    std::string per_tile_k;
  
@@ -436,7 +436,7 @@ index 4ee7450f9a31a..32a46091cd2d1 100644
    for (const Inline3dTile& tile : inline_3d_tiles_) {
      if (tile.rect.IsEmpty()) {
        continue;
-@@ -675,9 +750,42 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+@@ -686,9 +761,42 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
          continue;
        }
        inline3d_over_clips_[c.quad].push_back(tile.rect);
@@ -479,7 +479,7 @@ index 4ee7450f9a31a..32a46091cd2d1 100644
    static int split_dbg = 0;
    if ((split_dbg++ % 60) == 0) {
      VLOG(1) << "[DisplayXR] inline-3D plane-split: tiles="
-@@ -688,7 +796,17 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+@@ -699,7 +807,17 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
              << " blend=" << excl_blend_mode << " rpdq=" << excl_render_pass_quad
              << " overlay=" << excl_requires_overlay
              << " tile_canvas=" << excl_tile_canvas
@@ -499,10 +499,10 @@ index 4ee7450f9a31a..32a46091cd2d1 100644
  }
  
 diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
-index 8fc6ba35ee7c4..d2338d3b32892 100644
+index 57a54dc871fe3..88f3ce13eb335 100644
 --- a/components/viz/service/display/direct_renderer.h
 +++ b/components/viz/service/display/direct_renderer.h
-@@ -347,7 +347,8 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+@@ -349,7 +349,8 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
    //
    // Compute, for the frame about to be drawn, which quads in |root| sit OVER an
    // inline-3D tile, and against which tile rect(s) each of them is clipped.
@@ -512,7 +512,7 @@ index 8fc6ba35ee7c4..d2338d3b32892 100644
    //
    // ORDERING TRUTH (get this right or the split inverts):
    //   QuadList index 0 is the FRONTMOST quad — it is painted LAST and appears
-@@ -468,6 +469,26 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+@@ -470,6 +471,26 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
    base::flat_map<const DrawQuad*, absl::InlinedVector<gfx::Rect, 2>>
        inline3d_over_clips_;
  
@@ -565,10 +565,10 @@ index beda9739c2fee..330fad2f9917d 100644
  #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
      BUILDFLAG(USE_V4L2_CODEC)
 diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
-index 45484bf130bc5..8c4c198e271e7 100644
+index b3525fe4ebd7e..5edf21618c79b 100644
 --- a/components/viz/service/display/skia_renderer.cc
 +++ b/components/viz/service/display/skia_renderer.cc
-@@ -3924,8 +3924,14 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
+@@ -3999,8 +3999,14 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
    // task queue is FIFO, so the consumer (WeaveCompositedSurface phase (B),
    // which runs off the root pass's FinishPaintRenderPass) sees the plane
    // already filled and strictly ahead of the page/weave. Risk guard R7.
@@ -645,10 +645,10 @@ index 6dfbaa14b14d2..5670e5ec9db9f 100644
    // per batch frame, between BeginBatchSync and SubmitBatchSync, with a
    // window-sized PREMULTIPLIED-alpha RGBA atlas the caller assembled (all 2D
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-index 7911373f73185..40ee6d32f664b 100644
+index 12b3721a6a21f..8c924fd0ade0c 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-@@ -1087,8 +1087,10 @@ void SkiaOutputSurfaceImpl::SetInline3DRects(
+@@ -1080,8 +1080,10 @@ void SkiaOutputSurfaceImpl::SetInline3DRects(
                   /*need_framebuffer=*/false);
  }
  
@@ -661,7 +661,7 @@ index 7911373f73185..40ee6d32f664b 100644
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
    DCHECK(impl_on_gpu_);
    // Phase 2 plane split. This rides the SAME FIFO task queue as the
-@@ -1097,9 +1099,14 @@ void SkiaOutputSurfaceImpl::SetInline3dOverPlane(gpu::Mailbox mailbox,
+@@ -1090,9 +1092,14 @@ void SkiaOutputSurfaceImpl::SetInline3dOverPlane(gpu::Mailbox mailbox,
    // strictly: paint plane -> publish plane -> paint page (+ weave). Risk guard
    // R7: a consumer therefore never sees a mailbox from a frame later than the
    // pixels it is compositing, but it must still validate |size| itself.
@@ -680,10 +680,10 @@ index 7911373f73185..40ee6d32f664b 100644
                   /*need_framebuffer=*/false);
  }
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
-index f807b9eb86cc7..5d8cd48bcb0a3 100644
+index 4fcfbe3779a49..6b0b6801fbbc7 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
-@@ -182,7 +182,9 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
+@@ -181,7 +181,9 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
        std::vector<Inline3dLayerMailbox> canvas_layers) override;
    // Phase 2 plane split: the over-plane the weave stage composites above the
    // weave (patch 0064).
@@ -695,10 +695,10 @@ index f807b9eb86cc7..5d8cd48bcb0a3 100644
    // ExternalUseClient implementation:
    gpu::SyncToken ReleaseImageContexts(
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index c6efd00ba72ce..e965ce377852a 100644
+index 3f00285413344..e311d955580e5 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2744,12 +2744,17 @@ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
+@@ -2743,12 +2743,17 @@ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
    inline_3d_canvas_layers_ = std::move(canvas_layers);
  }
  
@@ -719,7 +719,7 @@ index c6efd00ba72ce..e965ce377852a 100644
  }
  
  #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
-@@ -3529,6 +3534,43 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3528,6 +3533,43 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    }
  
    if (batch) {
@@ -764,10 +764,10 @@ index c6efd00ba72ce..e965ce377852a 100644
      // leaves the runtime's woven output untouched, so it is NOT live this frame
      // no matter how many targets copied in.
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 384bb3872549d..9cc8da4bcdc6b 100644
+index c3fe5379c15d3..13a0a0e5d3be8 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -244,8 +244,11 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -243,8 +243,11 @@ class SkiaOutputSurfaceImplOnGpu
    // DisplayXR inline-3D Phase 2 (plane split): record the over-plane painted
    // for the frame currently being finished. Consumed by
    // WeaveCompositedSurface's phase (B), which composites it over the woven
@@ -781,7 +781,7 @@ index 384bb3872549d..9cc8da4bcdc6b 100644
  
    void SetCapabilitiesForTesting(
        const OutputSurface::Capabilities& capabilities);
-@@ -741,6 +744,24 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -740,6 +743,24 @@ class SkiaOutputSurfaceImplOnGpu
    gpu::Mailbox inline_3d_over_plane_mailbox_;
    gfx::Size inline_3d_over_plane_size_;
  
@@ -1173,6 +1173,3 @@ index 421e625062507..45390f124302d 100644
  #endif /* !XR_NO_PROTOTYPES */
  
  #ifdef __cplusplus
--- 
-2.42.0.windows.2
-

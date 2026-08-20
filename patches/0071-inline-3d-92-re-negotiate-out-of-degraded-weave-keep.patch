@@ -1,8 +1,8 @@
-From 3ae7dbc4b17c7999dd49e1ef8c27199283e24fd5 Mon Sep 17 00:00:00 2001
+From 1b98ecceb18e63d60d7d86de9ed1575ae3c2cfd0 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 18:48:00 -0700
-Subject: [PATCH] inline-3d(#92): re-negotiate out of degraded weave, keep the
- batch shape
+Subject: [PATCH 71/71] inline-3d(#92): re-negotiate out of degraded weave,
+ keep the batch shape
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -794,6 +794,3 @@ index 8586359d4e2df..7e0310e9bf806 100644
  // #625 phase-snap (CEF parity): poll the bound window's client-area screen
  // origin; when it changes (the user dragged/repositioned the browser window),
  // drive xrWeaveSnapWindowRectDXR so the DP re-locks the interlace lattice to the
--- 
-2.42.0.windows.2
-

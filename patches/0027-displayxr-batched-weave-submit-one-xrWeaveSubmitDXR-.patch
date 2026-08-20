@@ -1,7 +1,7 @@
-From 3cbb1a1b8f079f2e323b9c765ad537c92b570de1 Mon Sep 17 00:00:00 2001
+From 61f76b0f4f284d43996dd25de9056f684d8b2e44 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 01:10:04 -0700
-Subject: [PATCH 27/54] =?UTF-8?q?displayxr:=20batched=20weave=20submit=20?=
+Subject: [PATCH 27/71] =?UTF-8?q?displayxr:=20batched=20weave=20submit=20?=
  =?UTF-8?q?=E2=80=94=20one=20xrWeaveSubmitDXR=20per=20frame=20(spec=20v3)?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -762,10 +762,10 @@ index f9e706e7c44d0..ab0f0b6f224bf 100644
  
  // Register / fetch the process-global provider (GPU process, GPU main thread).
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index d147be01db680..3b750a23e820c 100644
+index 4ef9134e2a31b..4e0e05b269ce3 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3051,17 +3051,30 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3050,17 +3050,30 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // per-target SubmitInFlight(t) gate skips only a target whose prior submit has
    // not yet replied (its input must stay stable until then). This kills the old
    // ~N-frame round-robin lag — each element re-weaves every frame.

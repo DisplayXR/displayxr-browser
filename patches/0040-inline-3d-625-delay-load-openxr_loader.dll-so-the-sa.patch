@@ -1,7 +1,7 @@
-From 70b64ba67c35527f916ea279e7c91253263ac115 Mon Sep 17 00:00:00 2001
+From 20dc759b7c456b93bd54cfdb86cde09c22572bc5 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 15 Jul 2026 14:56:17 -0700
-Subject: [PATCH 40/54] inline-3d(#625): delay-load openxr_loader.dll so the
+Subject: [PATCH 40/71] inline-3d(#625): delay-load openxr_loader.dll so the
  sandboxed renderer survives
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -40,10 +40,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  2 files changed, 20 insertions(+)
 
 diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
-index 101c2339697ca..f00fed5c7e01a 100644
+index 069432bbae2ff..db82f71a8d3a2 100644
 --- a/build/config/win/BUILD.gn
 +++ b/build/config/win/BUILD.gn
-@@ -433,6 +433,16 @@ config("delayloads_except_dbghelp") {
+@@ -434,6 +434,16 @@ config("delayloads_except_dbghelp") {
      "/DELAYLOAD:netapi32.dll",
      "/DELAYLOAD:ncrypt.dll",
      "/DELAYLOAD:ole32.dll",

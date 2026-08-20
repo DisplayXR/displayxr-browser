@@ -1,7 +1,7 @@
-From ff9dbd5301e52d11f45541fc764706b7da22e74f Mon Sep 17 00:00:00 2001
+From 3e7f83e5bc4b7f555ffb90a43b7f69b0e14e4ee1 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 26 Jun 2026 01:07:32 -0500
-Subject: [PATCH 02/54] [displayxr inline-3d #625 B2a] add present-owner
+Subject: [PATCH 02/71] [displayxr inline-3d #625 B2a] add present-owner
  session + bindWindow (Level 4)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -23,7 +23,7 @@ device field marked RAW_PTR_EXCLUSION (manual lifetime).
  2 files changed, 132 insertions(+), 2 deletions(-)
 
 diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
-index 56c06e604af60..f2423637d1d5e 100644
+index c9f837694769b..f8205ebf5de88 100644
 --- a/content/shell/BUILD.gn
 +++ b/content/shell/BUILD.gn
 @@ -187,6 +187,10 @@ source_set("displayxr_weave") {

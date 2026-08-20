@@ -1,7 +1,7 @@
-From d14bf0c178d821a8cd4e50323a144ad75aef507d Mon Sep 17 00:00:00 2001
+From 0a65fdb021849268f05aba5abc5c79280bc176da Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 14:57:05 -0700
-Subject: [PATCH 29/54] inline-3d(#625): virtualDisplayHeight scene-scale on
+Subject: [PATCH 29/71] inline-3d(#625): virtualDisplayHeight scene-scale on
  XRDisplayLayer (display-rig m2v)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -108,10 +108,10 @@ index fc24a2d829651..971f4bfe555b9 100644
 +  double virtualDisplayHeight = 0.0;
  };
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 0c8310c272f06..20d3bfc7ee879 100644
+index 44e0dca6e9265..6087962c7223a 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2645,6 +2645,20 @@ void XRSession::UpdateInline3DViews() {
+@@ -2670,6 +2670,20 @@ void XRSession::UpdateInline3DViews() {
    const float half_w_m = er.width() * pixel_m * 0.5f;
    const float half_h_m = er.height() * pixel_m * 0.5f;
  
@@ -132,7 +132,7 @@ index 0c8310c272f06..20d3bfc7ee879 100644
    const wtf_size_t eye_count =
        static_cast<wtf_size_t>(inline_3d_eyes_.size() / 3u);
    for (wtf_size_t i = 0; i < 2u; ++i) {
-@@ -2672,10 +2686,13 @@ void XRSession::UpdateInline3DViews() {
+@@ -2697,10 +2711,13 @@ void XRSession::UpdateInline3DViews() {
      XRViewData* view = views_[i];
      view->UpdateProjectionMatrixFromFoV(up_rad, down_rad, left_rad, right_rad,
                                          near_depth, far_depth);
@@ -150,7 +150,7 @@ index 0c8310c272f06..20d3bfc7ee879 100644
    }
  }
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 20ed4c009c1f9..93f04bc9f5049 100644
+index 41a9fa558ab9b..07289f1b2015b 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -339,6 +339,16 @@ class XRSession final : public EventTarget,

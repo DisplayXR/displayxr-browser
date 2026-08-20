@@ -1,8 +1,8 @@
-From 01c98c60e4df28ef9c25d7861965fbc4e39dbf53 Mon Sep 17 00:00:00 2001
+From 7c92e1c456edcd39189af1250dfa9c56e5748006 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 18:03:30 -0700
-Subject: [PATCH] inline-3d(#99): recover the suppressed tile when a weave
- submit misses
+Subject: [PATCH 70/71] inline-3d(#99): recover the suppressed tile when a
+ weave submit misses
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -104,10 +104,10 @@ index fc1caa6fd1db1..a5665b2f0e329 100644
      return false;
    }
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 01926790756ec..43b8034bb98fa 100644
+index 7df5440c83ad7..93ed2a62b8d58 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3589,7 +3589,145 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3588,7 +3588,145 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // means "nothing woven". Async mode deliberately keeps the last woven output
    // visible while a submit is in flight — that is its one-frame-lag contract.
    if (batch && !wove_this_frame) {
@@ -253,6 +253,3 @@ index 01926790756ec..43b8034bb98fa 100644
    }
  
    // ---- (B) Draw back the accumulated window-sized woven output (Windows) ----
--- 
-2.42.0.windows.2
-

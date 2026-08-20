@@ -1,7 +1,7 @@
-From b27cce699dd44911f2e5da26c6e1253068ef32e0 Mon Sep 17 00:00:00 2001
+From d04b44d62d1725f358696888d5075af73d4b81a0 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 18 Aug 2026 14:53:57 -0700
-Subject: [PATCH 58/58] inline-3d(#87): clear the inline-3D rect state on
+Subject: [PATCH 58/71] inline-3d(#87): clear the inline-3D rect state on
  session end and navigation
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -47,10 +47,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  3 files changed, 54 insertions(+)
 
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-index 0810a621efb5c..e4edbd6eca2e4 100644
+index 9474ff506be24..5a07e2afdd694 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-@@ -4131,6 +4131,18 @@ void WebFrameWidgetImpl::SetNeedsUnbufferedInputForDebugger(bool unbuffered) {
+@@ -4392,6 +4392,18 @@ void WebFrameWidgetImpl::SetNeedsUnbufferedInputForDebugger(bool unbuffered) {
  }
  
  void WebFrameWidgetImpl::DidNavigate() {
@@ -70,10 +70,10 @@ index 0810a621efb5c..e4edbd6eca2e4 100644
    // suppress input until the newly navigated page has a committed frame.
    // It also resets the state for UMA reporting of input arrival with respect
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 88835cc0b8a84..b6deba276f66d 100644
+index 9edea59607c78..ddbd3c52d8605 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -1638,6 +1638,15 @@ void XRSession::HandleShutdown() {
+@@ -1654,6 +1654,15 @@ void XRSession::HandleShutdown() {
    // forget mojo call, not script.
    ReportInline3DDemand(false);
  
@@ -89,7 +89,7 @@ index 88835cc0b8a84..b6deba276f66d 100644
    if (xr_->IsContextDestroyed()) {
      // If this is being called due to the context being destroyed,
      // it's illegal to run JavaScript code, so we cannot emit an
-@@ -2781,6 +2790,30 @@ void XRSession::ReportInline3DRects() {
+@@ -2806,6 +2815,30 @@ void XRSession::ReportInline3DRects() {
    ReportInline3DDemand(any_visible_3d);
  }
  
@@ -121,7 +121,7 @@ index 88835cc0b8a84..b6deba276f66d 100644
    if (!is_inline_3d_) {
      return;
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 90f42538dda0d..79631a6fdf0d6 100644
+index c8cc19fab507d..dc770347c05bc 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -358,6 +358,15 @@ class XRSession final : public EventTarget,
@@ -140,6 +140,3 @@ index 90f42538dda0d..79631a6fdf0d6 100644
    // browser#55: push this document's inline-3D DEMAND to the browser, but only
    // when it changes. |wants_3d| is "a registered layer's target intersects the
    // viewport right now", the same signal that decides whether the frame has any
--- 
-2.42.0.windows.2
-

@@ -1,7 +1,7 @@
-From 3faaa4329d3c0083da8f0b20362dcba72263a0c9 Mon Sep 17 00:00:00 2001
+From 205e7b2a106b3bd025a2af169f27dab4b784e67d Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 17 Jul 2026 00:51:29 -0700
-Subject: [PATCH 44/54] inline-3d(#18): 2D-over-3D via composited-layer
+Subject: [PATCH 44/71] inline-3d(#18): 2D-over-3D via composited-layer
  resources (isolate overlay + clean SBS)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -71,10 +71,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  32 files changed, 432 insertions(+), 45 deletions(-)
 
 diff --git a/cc/mojo_embedder/viz_layer_context.cc b/cc/mojo_embedder/viz_layer_context.cc
-index 3a7bcf768eed7..84bd45002b618 100644
+index edd159a7a9e67..7a86a69253989 100644
 --- a/cc/mojo_embedder/viz_layer_context.cc
 +++ b/cc/mojo_embedder/viz_layer_context.cc
-@@ -1464,7 +1464,8 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+@@ -1474,7 +1474,8 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
      bool is_flush,
      std::vector<ui::LatencyInfo> latency_info,
      viz::TrackedElementRects tracked_element_rects,
@@ -84,7 +84,7 @@ index 3a7bcf768eed7..84bd45002b618 100644
    TRACE_EVENT0("viz", "VizLayerContext::UpdateDisplayTreeFrom");
  
    auto& property_trees = *tree.property_trees();
-@@ -1499,6 +1500,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
+@@ -1509,6 +1510,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
    update->latency_info = std::move(latency_info);
    update->tracked_element_rects = std::move(tracked_element_rects);
    update->inline_3d_rects = std::move(inline_3d_rects);
@@ -205,10 +205,10 @@ index d09799a720422..dc79fda79dde3 100644
    // Pushes an update to a single tile in the context's display tree.
    virtual void UpdateDisplayTile(
 diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
-index cc753c14f1799..29f899a040082 100644
+index 240abe874db5a..07eb1aafe8d14 100644
 --- a/cc/trees/layer_tree_host.cc
 +++ b/cc/trees/layer_tree_host.cc
-@@ -1564,10 +1564,15 @@ void LayerTreeHost::SetBrowserControlsParams(
+@@ -1568,10 +1568,15 @@ void LayerTreeHost::SetBrowserControlsParams(
    SetNeedsCommit();
  }
  
@@ -227,10 +227,10 @@ index cc753c14f1799..29f899a040082 100644
  }
  
 diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
-index 42e40d58ebc42..638267d2dd173 100644
+index c93094b95d5b4..5df8e5c68654d 100644
 --- a/cc/trees/layer_tree_host.h
 +++ b/cc/trees/layer_tree_host.h
-@@ -585,8 +585,12 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
+@@ -581,8 +581,12 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
  
    // DisplayXR inline-3D (#625, Step B / B4b): set the window-relative device-px
    // rects of the page's inline-3d canvases for the next commit. Carried to Viz
@@ -246,24 +246,26 @@ index 42e40d58ebc42..638267d2dd173 100644
    void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
    const OverscrollBehavior& overscroll_behavior() const {
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index b066a935b15e0..89a660342c158 100644
+index 2b3fadbf73c47..009e085684d83 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2462,10 +2462,13 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2632,12 +2632,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    if (settings().trees_in_viz_in_viz_process) {
      metadata.tracked_element_rects = tracked_element_rects_from_client_;
      metadata.inline_3d_rects = inline_3d_rects_from_client_;
 +    metadata.inline_3d_exclusion_rects = inline_3d_exclusion_rects_from_client_;
    } else {
      metadata.tracked_element_rects = CollectTrackedElementRects(
-         /*is_for_compositor_frame_metadata=*/true);
+         /*is_for_compositor_frame_metadata=*/true,
+         frame.tracked_element_status ==
+             TrackedElementStatus::kHasTrackedElementsNeedingOcclusion);
      metadata.inline_3d_rects = active_tree()->inline_3d_rects();
 +    metadata.inline_3d_exclusion_rects =
 +        active_tree()->inline_3d_exclusion_rects();
    }
    // DisplayXR inline-3D (#625, Step B / Phase 2 — scroll-sync): the rects above
    // are getBoundingClientRect measured on the Blink main thread at the COMMITTED
-@@ -2476,7 +2479,8 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2648,7 +2651,8 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    // offset − committed base) so the weave rect tracks the pixels presented THIS
    // frame. Handles the dominant case (content scrolling with the root viewport);
    // nested-scroller content is a follow-up.
@@ -273,7 +275,7 @@ index b066a935b15e0..89a660342c158 100644
      const ScrollNode* viewport_scroll = OuterViewportScrollNode();
      if (!viewport_scroll) {
        viewport_scroll = InnerViewportScrollNode();
-@@ -2495,10 +2499,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2667,10 +2671,15 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
          const int dy = base::ClampRound(delta.y() * dsf);
          if (dx != 0 || dy != 0) {
            // Growing scroll offset moves content up/left → element window origin
@@ -290,7 +292,7 @@ index b066a935b15e0..89a660342c158 100644
            static int log_throttle = 0;
            if ((log_throttle++ % 30) == 0) {
              VLOG(1) << "[DisplayXR] Phase2 scroll-sync: viewport impl delta dip="
-@@ -2685,7 +2694,7 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+@@ -2859,7 +2868,7 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
      // Send updates to Viz even for no damage case when TreesInViz is enabled.
      if (settings_.TreesInVizInClientProcess()) {
        UpdateDisplayTree(*frame, {}, viz::TrackedElementRects(),
@@ -299,7 +301,7 @@ index b066a935b15e0..89a660342c158 100644
      }
  
      active_tree()->ResetAllChangeTracking();
-@@ -2778,7 +2787,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
+@@ -2952,7 +2961,8 @@ std::optional<SubmitInfo> LayerTreeHostImpl::DrawLayers(FrameData* frame) {
      trees_in_viz_submit_time = UpdateDisplayTree(
          *frame, std::move(compositor_frame.metadata.latency_info),
          std::move(compositor_frame.metadata.tracked_element_rects),
@@ -309,7 +311,7 @@ index b066a935b15e0..89a660342c158 100644
  
      layer_tree_frame_sink_->ExportFrameTiming();
    } else {
-@@ -3307,6 +3317,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+@@ -3471,6 +3481,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
      std::vector<ui::LatencyInfo> latency_info,
      viz::TrackedElementRects tracked_element_rects,
      std::vector<gfx::Rect> inline_3d_rects,
@@ -317,7 +319,7 @@ index b066a935b15e0..89a660342c158 100644
      bool is_flush) {
    DCHECK(settings_.TreesInVizInClientProcess());
    DCHECK(layer_context_);
-@@ -3318,7 +3329,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
+@@ -3482,7 +3493,7 @@ base::TimeTicks LayerTreeHostImpl::UpdateDisplayTree(
        layer_tree_frame_sink_->shared_image_interface().get(),
        viewport_damage_rect_, !frame.has_no_damage, is_flush,
        std::move(latency_info), std::move(tracked_element_rects),
@@ -326,7 +328,7 @@ index b066a935b15e0..89a660342c158 100644
  }
  
  void LayerTreeHostImpl::FlushDisplayTree() {
-@@ -3348,7 +3359,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
+@@ -3512,7 +3523,8 @@ void LayerTreeHostImpl::FlushDisplayTree() {
    // (like frame tokens in ACKs) remains consistent.
    ++next_frame_token_;
    UpdateDisplayTree(frame, {}, viz::TrackedElementRects(),
@@ -337,10 +339,10 @@ index b066a935b15e0..89a660342c158 100644
    // A flush update synchronizes state (e.g. tile evictions) to Viz but does not
    // result in a frame draw. We reset internal damage tracking and tree change
 diff --git a/cc/trees/layer_tree_host_impl.h b/cc/trees/layer_tree_host_impl.h
-index aac12746cdb29..8fe6593739b27 100644
+index 2f6154a449e05..62550fc8d6847 100644
 --- a/cc/trees/layer_tree_host_impl.h
 +++ b/cc/trees/layer_tree_host_impl.h
-@@ -425,6 +425,7 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -429,6 +429,7 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
        std::vector<ui::LatencyInfo> latency_info,
        viz::TrackedElementRects tracked_element_rects,
        std::vector<gfx::Rect> inline_3d_rects,
@@ -348,7 +350,7 @@ index aac12746cdb29..8fe6593739b27 100644
        bool is_flush = false);
  
    // Synchronizes the current tree state to Viz without triggering a draw.
-@@ -584,6 +585,11 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -595,6 +596,11 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
      inline_3d_rects_from_client_ = std::move(inline_3d_rects);
    }
  
@@ -360,7 +362,7 @@ index aac12746cdb29..8fe6593739b27 100644
    // Buffers `callback` until a relevant presentation feedback arrives, at which
    // point the callback will be posted to run on the main thread. A presentation
    // feedback is considered relevant if the frame's token is greater than or
-@@ -1376,6 +1382,8 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
+@@ -1391,6 +1397,8 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
    // inline-3d canvas rects passed from the client so they can be added to
    // generated frame metadata in Viz (mirrors tracked_element_rects_from_client_).
    std::vector<gfx::Rect> inline_3d_rects_from_client_;
@@ -370,10 +372,10 @@ index aac12746cdb29..8fe6593739b27 100644
    // Settings whether we dump generated compositor frame during DrawLayers.
    // They are for debug purposes for TreesInViz and TreeAnimationsInViz.
 diff --git a/cc/trees/layer_tree_impl.cc b/cc/trees/layer_tree_impl.cc
-index 915b041222b28..7fad55bdb07c7 100644
+index 236ba40993ce2..e6863ff7a1f91 100644
 --- a/cc/trees/layer_tree_impl.cc
 +++ b/cc/trees/layer_tree_impl.cc
-@@ -885,7 +885,8 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
+@@ -891,7 +891,8 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
                                commit_state.page_scale_factor_limits_set);
  
    SetBrowserControlsParams(commit_state.browser_controls_params);
@@ -383,7 +385,7 @@ index 915b041222b28..7fad55bdb07c7 100644
    set_overscroll_behavior(commit_state.overscroll_behavior);
    PushBrowserControlsFromMainThread(commit_state.top_controls_shown_ratio,
                                      commit_state.bottom_controls_shown_ratio);
-@@ -1012,7 +1013,7 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
+@@ -1018,7 +1019,7 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
    target_tree->SetExternalPageScaleFactor(external_page_scale_factor_);
  
    target_tree->SetBrowserControlsParams(browser_controls_params_);
@@ -393,7 +395,7 @@ index 915b041222b28..7fad55bdb07c7 100644
  
    target_tree->set_overscroll_behavior(overscroll_behavior_);
 diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
-index 438ba4dd67ee5..b359821886024 100644
+index 02021cfb956f3..ce055f376aa0d 100644
 --- a/cc/trees/layer_tree_impl.h
 +++ b/cc/trees/layer_tree_impl.h
 @@ -671,13 +671,19 @@ class CC_EXPORT LayerTreeImpl {
@@ -512,10 +514,10 @@ index 94b53d23601bc..58a21f4d91b88 100644
  
  }  // namespace viz
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index 464a6afe51812..64e41be8633e7 100644
+index 77bd216f544f7..9c8fa028e4fbb 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
-@@ -988,7 +988,25 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -987,7 +987,25 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
      // FinishPaintCurrentFrame), so the post-paint output weave loop reads the
      // rects that match this frame's composited pixels.
      if (skia_output_surface_) {
@@ -584,10 +586,10 @@ index 0a662c4c41fdf..4789f9b212bae 100644
  #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
      BUILDFLAG(USE_V4L2_CODEC)
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 1f1bd1dee1cc0..c3de37c98938b 100644
+index fc346178abdac..aa10aa72882cb 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
-@@ -1483,6 +1483,26 @@ void SurfaceAggregator::CopyQuadsToPass(
+@@ -1484,6 +1484,26 @@ void SurfaceAggregator::CopyQuadsToPass(
        }
        if (dest_quad) {
          dest_quad->resource_id = quad_data.remapped_resource_id;
@@ -614,7 +616,7 @@ index 1f1bd1dee1cc0..c3de37c98938b 100644
        }
      }
    }
-@@ -2159,6 +2179,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2160,6 +2180,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
    root_surface_id_ = surface_id;
    tracked_element_rects_ = {};
    inline_3d_rects_ = {};
@@ -623,7 +625,7 @@ index 1f1bd1dee1cc0..c3de37c98938b 100644
  
    ResolvedFrameData* resolved_frame = GetResolvedFrame(surface_id);
  
-@@ -2350,6 +2372,62 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2351,6 +2373,62 @@ AggregatedFrame SurfaceAggregator::Aggregate(
                 std::make_tuple(b.y(), b.x(), b.width(), b.height());
        });
    frame.inline_3d_rects = std::move(inline_3d_rects_);
@@ -686,7 +688,7 @@ index 1f1bd1dee1cc0..c3de37c98938b 100644
  
    return frame;
  }
-@@ -2549,6 +2627,20 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2550,6 +2628,20 @@ void SurfaceAggregator::CollectTrackedElementRects(
            root_target_clip_rect));
      }
    }
@@ -732,10 +734,10 @@ index cf8adee5f9d47..33d722accb2ed 100644
  
  }  // namespace viz
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-index 03ec65aba481b..d3965d5809335 100644
+index 4a0ec121739d0..a42ef3fae88d4 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-@@ -1070,15 +1070,21 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
+@@ -1063,15 +1063,21 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
  }
  #endif
  
@@ -763,10 +765,10 @@ index 03ec65aba481b..d3965d5809335 100644
                   /*need_framebuffer=*/false);
  }
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
-index af245cd95356f..969fa01f779fa 100644
+index a970cdea1ca63..102154029f475 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
-@@ -176,8 +176,11 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
+@@ -175,8 +175,11 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
    void SetSharedImagePurgeable(const gpu::Mailbox& mailbox,
                                 bool purgeable) override;
    bool SupportsBGRA() const override;
@@ -781,10 +783,10 @@ index af245cd95356f..969fa01f779fa 100644
    // ExternalUseClient implementation:
    gpu::SyncToken ReleaseImageContexts(
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 7a5c4dddcee8f..8c66d3c3c732c 100644
+index ffa2d5ccccf2b..90f8f81d80d07 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2690,8 +2690,12 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+@@ -2689,8 +2689,12 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
  }
  
  void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
@@ -798,7 +800,7 @@ index 7a5c4dddcee8f..8c66d3c3c732c 100644
  }
  
  #if BUILDFLAG(IS_WIN)
-@@ -2830,6 +2834,26 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2829,6 +2833,26 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // Read the composited sub-rect and fire the weave without blocking. Returns
    // true if a submit was dispatched. The single keyed-mutex input means only one
    // submit may be in flight, so this runs for at most one target per frame.
@@ -825,7 +827,7 @@ index 7a5c4dddcee8f..8c66d3c3c732c 100644
    auto attempt_submit = [&](size_t t) -> bool {
      gfx::Rect rect = inline_3d_rects_[t];
      rect.Intersect(window_bounds);
-@@ -2838,6 +2862,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2837,6 +2861,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      }
      const int rw = rect.width();
      const int rh = rect.height();
@@ -833,7 +835,7 @@ index 7a5c4dddcee8f..8c66d3c3c732c 100644
  
      // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the composited
      // sub-rect on the GPU instead of the readPixels roundtrip: Skia-copy it into
-@@ -2922,15 +2947,45 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2921,15 +2946,45 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            if (context_state_->graphite_shared_context()) {
              context_state_->FlushGraphiteRecorder();
            }
@@ -882,7 +884,7 @@ index 7a5c4dddcee8f..8c66d3c3c732c 100644
                SkSamplingOptions(SkFilterMode::kNearest), &paint,
                SkCanvas::kStrict_SrcRectConstraint);
            FlushSurface(scratch_surface, send, scratch_write.get());
-@@ -3206,6 +3261,75 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3205,6 +3260,75 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      drew_any = true;
    }
  
@@ -959,7 +961,7 @@ index 7a5c4dddcee8f..8c66d3c3c732c 100644
    // before |woven_access| releases — otherwise Ganesh reads the released woven
    // texture at flush time and the draws show nothing.
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index ee19656343f75..388ad41f9a039 100644
+index 476466e6ae437..6864cd2a200df 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 @@ -30,6 +30,7 @@
@@ -970,7 +972,7 @@ index ee19656343f75..388ad41f9a039 100644
  #include "components/viz/service/display_embedder/skia_output_surface_dependency.h"
  #include "components/viz/service/display_embedder/skia_render_copy_results.h"
  #include "gpu/command_buffer/common/mailbox.h"
-@@ -229,9 +230,15 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -228,9 +229,15 @@ class SkiaOutputSurfaceImplOnGpu
  
    // DisplayXR inline-3D (#625, Step B / B4b): the page's inline-3d canvas rects
    // (root-render-pass / window-relative device px) for the frame currently being
@@ -989,7 +991,7 @@ index ee19656343f75..388ad41f9a039 100644
  
    void SetCapabilitiesForTesting(
        const OutputSurface::Capabilities& capabilities);
-@@ -661,6 +668,12 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -660,6 +667,12 @@ class SkiaOutputSurfaceImplOnGpu
    // MaybeWeaveOutput). Empty when inline-3d is inactive.
    std::vector<gfx::Rect> inline_3d_rects_;
  
@@ -1003,10 +1005,10 @@ index ee19656343f75..388ad41f9a039 100644
    // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model) GPU-thread
    // weave state. Per inline-3d rect (index-keyed), |woven_mailbox| is the
 diff --git a/components/viz/service/layers/layer_context_impl.cc b/components/viz/service/layers/layer_context_impl.cc
-index 9820a5a255d43..5551b755e7b83 100644
+index 8973d8c170f07..320774587f22d 100644
 --- a/components/viz/service/layers/layer_context_impl.cc
 +++ b/components/viz/service/layers/layer_context_impl.cc
-@@ -2032,6 +2032,9 @@ base::expected<void, std::string> LayerContextImpl::DoUpdateDisplayTree(
+@@ -2168,6 +2168,9 @@ base::expected<void, std::string> LayerContextImpl::DoUpdateDisplayTree(
    host_impl_->set_inline_3d_rects_from_client(
        std::move(update->inline_3d_rects));
  

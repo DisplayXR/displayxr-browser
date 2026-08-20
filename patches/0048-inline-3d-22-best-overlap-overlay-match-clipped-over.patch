@@ -1,7 +1,7 @@
-From fae242772ccdf7f6546fb110885b02dffe717f2c Mon Sep 17 00:00:00 2001
+From 313057bfea28ca497b7a864dab00d412a977ce0f Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 19 Jul 2026 18:35:06 +0900
-Subject: [PATCH 48/54] inline-3d(#22): best-overlap overlay match,
+Subject: [PATCH 48/71] inline-3d(#22): best-overlap overlay match,
  clipped-overlay source region, probes
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -46,10 +46,10 @@ Claude-Session: https://claude.ai/code/session_016XbEsBfb96NRCqZYindyzP
  2 files changed, 110 insertions(+), 3 deletions(-)
 
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index a4967b6f91867..912e924017628 100644
+index 4e12381f06a1f..061d43063d8e2 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
-@@ -2397,6 +2397,16 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2398,6 +2398,16 @@ AggregatedFrame SurfaceAggregator::Aggregate(
           const std::vector<std::pair<ResourceId, gfx::Rect>>& quads)
        -> std::optional<std::pair<ResourceId, gfx::Rect>> {
      std::optional<std::pair<ResourceId, gfx::Rect>> found;
@@ -66,7 +66,7 @@ index a4967b6f91867..912e924017628 100644
      for (const auto& [rid, qr] : quads) {
        if (qr.IsEmpty()) {
          continue;
-@@ -2408,15 +2418,93 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2409,15 +2419,93 @@ AggregatedFrame SurfaceAggregator::Aggregate(
        const int64_t ta =
            static_cast<int64_t>(target.width()) * target.height();
        const int64_t max_area = std::max(qa, ta);
@@ -163,10 +163,10 @@ index a4967b6f91867..912e924017628 100644
    }
    for (const gfx::Rect& canvas : frame.inline_3d_rects) {
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 5edc4da1aa2e6..22da0b9cf3092 100644
+index 48e5e3c7c3584..9f0094de0bbd5 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3269,8 +3269,27 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3268,8 +3268,27 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
              atlas_surface->wait(obegin.size(), obegin.data(),
                                  /*deleteSemaphoresAfterWait=*/false);
            }

@@ -1,7 +1,7 @@
-From 14efab4d45aaaa03505966b97e0b294ef46461a6 Mon Sep 17 00:00:00 2001
+From a129af3fdf952ec8157d0f9c7edadf62a06849b0 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 7 Jul 2026 15:25:13 -0700
-Subject: [PATCH 09/54] B4b cleanup: strip bring-up diagnostics + drop the dead
+Subject: [PATCH 09/71] B4b cleanup: strip bring-up diagnostics + drop the dead
  weave_target plumbing (#625)
 
 Post-eyeball cleanup of the B4b per-element inline-3D weave (CEF sub-rect model).
@@ -187,10 +187,10 @@ index b33cf36c32345..1843f885a8af6 100644
    // True while the |transferable_resource_| is owned by this layer, and
    // becomes false once it is passed to another layer or to the
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 93419b319fca0..123052d1f4398 100644
+index d8fd8a07577b6..7b38d60eaa483 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2448,13 +2448,6 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2617,13 +2617,6 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    // DisplayXR inline-3D (#625, Step B / B4b): carry the page's inline-3d canvas
    // rects (window-relative device px) so Viz can weave those output sub-rects.
    metadata.inline_3d_rects = active_tree()->inline_3d_rects();
@@ -224,10 +224,10 @@ index ff1748a866e94..3c909cf0903fa 100644
      static constexpr size_t kMaxRoundedDisplayMasksCount = 2;
      static constexpr size_t kOriginRoundedDisplayMaskIndex = 0;
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index 56e7fbab76e43..464a6afe51812 100644
+index ca5d3d360aa15..77bd216f544f7 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
-@@ -988,11 +988,6 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -987,11 +987,6 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
      // FinishPaintCurrentFrame), so the post-paint output weave loop reads the
      // rects that match this frame's composited pixels.
      if (skia_output_surface_) {
@@ -277,7 +277,7 @@ index f41dd2342728e..ecc0c8c97c7dd 100644
  
    // If |maybe_concurrent_reads| is true then there can be concurrent reads to
 diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
-index 95303895f289d..facb72165f13d 100644
+index 22dd31c85e8d4..4fff9a6a4c28d 100644
 --- a/components/viz/service/display/skia_renderer.cc
 +++ b/components/viz/service/display/skia_renderer.cc
 @@ -13,7 +13,6 @@
@@ -306,7 +306,7 @@ index 95303895f289d..facb72165f13d 100644
  // Feature to temporarily create a dump in the case where we try and sample from
  // a render pass that has never been drawn to.
  // See: crbug.com/344458294, crbug.com/345673794
-@@ -2687,27 +2675,6 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
+@@ -2762,27 +2750,6 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
    if (!image)
      return;
  
@@ -335,10 +335,10 @@ index 95303895f289d..facb72165f13d 100644
        gfx::Size(image->width(), image->height()));
    params->vis_tex_coords = cc::MathUtil::ScaleRectProportional(
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index a88fac079e73e..e68dc4659288d 100644
+index 88a5575257528..53f8b34cae4b0 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
-@@ -2501,14 +2501,6 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2502,14 +2502,6 @@ void SurfaceAggregator::CollectTrackedElementRects(
    }
    // DisplayXR inline-3D (#625, Step B / B4b): collect the inline-3d canvas rects
    // alongside tracked elements, transformed into the root render pass space.
@@ -354,10 +354,10 @@ index a88fac079e73e..e68dc4659288d 100644
      inline_3d_rects_.push_back(TransformRectToDestRootTargetSpace(
          rect, target_transform, transform_to_root_target,
 diff --git a/components/viz/service/display_embedder/image_context_impl.cc b/components/viz/service/display_embedder/image_context_impl.cc
-index 2b0001b3099eb..21c009b185357 100644
+index fd3f5470dbb59..ff04ee7695e94 100644
 --- a/components/viz/service/display_embedder/image_context_impl.cc
 +++ b/components/viz/service/display_embedder/image_context_impl.cc
-@@ -367,29 +367,11 @@ bool ImageContextImpl::BeginRasterAccess(
+@@ -372,29 +372,11 @@ bool ImageContextImpl::BeginRasterAccess(
    return true;
  }
  
@@ -387,7 +387,7 @@ index 2b0001b3099eb..21c009b185357 100644
    // Skip the context if it has been processed.
    if (representation_scoped_read_access_) {
      CHECK(owned_promise_image_textures_.empty());
-@@ -414,7 +396,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+@@ -419,7 +401,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
  
    if (!representation_) {
      auto representation = representation_factory->ProduceSkia(
@@ -396,7 +396,7 @@ index 2b0001b3099eb..21c009b185357 100644
          /*required_usages=*/{gpu::SHARED_IMAGE_USAGE_DISPLAY_READ});
      if (!representation) {
        DLOG(ERROR) << "Failed to fulfill the promise texture - SharedImage "
-@@ -422,10 +404,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+@@ -427,10 +409,7 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
        return false;
      }
  
@@ -408,7 +408,7 @@ index 2b0001b3099eb..21c009b185357 100644
        DLOG(ERROR) << "Failed to fulfill the promise texture - SharedImage "
                       "size does not match TransferableResource size: "
                    << representation->size().ToString() << " vs "
-@@ -434,8 +413,6 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
+@@ -450,8 +429,6 @@ bool ImageContextImpl::BeginAccessIfNecessaryInternal(
      }
  
      representation_ = std::move(representation);
@@ -450,7 +450,7 @@ index fe70cd76b73a4..e53873c82fbc7 100644
  
  }  // namespace viz
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index c2533668bbc4b..1c8286eb2a5f0 100644
+index 90d1cd0c7f01a..17bbfecd893d4 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -70,7 +70,6 @@
@@ -472,7 +472,7 @@ index c2533668bbc4b..1c8286eb2a5f0 100644
  #include "third_party/skia/include/gpu/GpuTypes.h"
  #include "third_party/skia/include/gpu/ganesh/GrTypes.h"
  #include "third_party/skia/include/gpu/ganesh/SkSurfaceGanesh.h"
-@@ -2677,26 +2674,12 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+@@ -2676,26 +2673,12 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
  
  void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
      std::vector<gfx::Rect> rects) {
@@ -499,7 +499,7 @@ index c2533668bbc4b..1c8286eb2a5f0 100644
    if (inline_3d_rects_.empty()) {
      return;
    }
-@@ -2724,23 +2707,13 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2723,23 +2706,13 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
  
    // CEF sub-rect model (design §13.3): the composited page (2D chrome + each
    // inline-3d canvas's flat SBS pixels, already squashed together) is now in the
@@ -530,7 +530,7 @@ index c2533668bbc4b..1c8286eb2a5f0 100644
  
    // Prune woven state beyond the current rect count (canvas removed / count
    // shrank) before (re)sizing, so the woven SharedImages are not leaked.
-@@ -2773,7 +2746,8 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2772,7 +2745,8 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
      }
  
      // Read the composited sub-rect back to CPU (BGRA8), then upload it into the
@@ -540,7 +540,7 @@ index c2533668bbc4b..1c8286eb2a5f0 100644
      const int rw = rect.width();
      const int rh = rect.height();
      const size_t stride = static_cast<size_t>(rw) * 4;
-@@ -2781,24 +2755,12 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2780,24 +2754,12 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
      const SkImageInfo info = SkImageInfo::Make(
          rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
          SkColorSpace::MakeSRGB());
@@ -565,7 +565,7 @@ index c2533668bbc4b..1c8286eb2a5f0 100644
      if (!r.ok) {
        continue;
      }
-@@ -2833,11 +2795,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2832,11 +2794,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
      if (st.woven_mailbox.IsZero()) {
        continue;
      }
@@ -577,7 +577,7 @@ index c2533668bbc4b..1c8286eb2a5f0 100644
  
      // (Re)open + GPU-wait the service->caller fence so the woven content is ready
      // before we sample it (fence-synced, no keyed mutex).
-@@ -2874,30 +2831,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2873,30 +2830,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
      if (!woven_img) {
        continue;
      }
@@ -608,7 +608,7 @@ index c2533668bbc4b..1c8286eb2a5f0 100644
      if (!wbegin_sem.empty()) {
        output->wait(wbegin_sem.size(), wbegin_sem.data(),
                     /*deleteSemaphoresAfterWait=*/false);
-@@ -2929,9 +2862,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2928,9 +2861,6 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
      }
    }
    // held_reps / held_accesses release here, after the submit.
@@ -696,7 +696,7 @@ index 5b25867dac708..efa9b5af0509b 100644
      const Mailbox& mailbox,
      MemoryTypeTracker* tracker) {
 diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.h b/gpu/command_buffer/service/shared_image/shared_image_manager.h
-index 40fd5bfea6163..f871108f5afeb 100644
+index 0d5c29bd24320..66f83b95d49df 100644
 --- a/gpu/command_buffer/service/shared_image/shared_image_manager.h
 +++ b/gpu/command_buffer/service/shared_image/shared_image_manager.h
 @@ -117,17 +117,6 @@ class GPU_GLES2_EXPORT SharedImageManager
@@ -791,10 +791,10 @@ index e9613a87aeee7..4169c4cf760c9 100644
  
  struct TileQuadState {
 diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-index 226fde99134c6..ce8231f02d134 100644
+index 98b5774dc47e4..4c784e3285328 100644
 --- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 +++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-@@ -1648,24 +1648,10 @@ cc::TextureLayer* HTMLCanvasElement::GetOrCreateCcLayerForCanvas2DIfNeeded() {
+@@ -1620,24 +1620,10 @@ cc::TextureLayer* HTMLCanvasElement::GetOrCreateCcLayerForCanvas2DIfNeeded() {
      cc_layer_->SetHitTestable(true);
      cc_layer_->SetContentsOpaque(is_opaque_);
      cc_layer_->SetBlendBackgroundColor(!is_opaque_);
@@ -906,10 +906,10 @@ index b7519da9c69e6..716ccc5b027a6 100644
    DEFINE_WRAPPERTYPEINFO();
  
 diff --git a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
-index 0466fd423ee5a..939e6af99c425 100644
+index 0ccb4879fc408..afb3e1b1e7432 100644
 --- a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
-@@ -508,24 +508,6 @@ void XRFrameProvider::ProcessScheduledFrame(
+@@ -512,24 +512,6 @@ void XRFrameProvider::ProcessScheduledFrame(
    TRACE_EVENT2("gpu", "XRFrameProvider::ProcessScheduledFrame", "frame",
                 frame_id_, "timestamp", high_res_now_ms);
  
@@ -934,7 +934,7 @@ index 0466fd423ee5a..939e6af99c425 100644
    LocalDOMWindow* window = xr_->DomWindow();
    if (!window)
      return;
-@@ -659,13 +641,6 @@ void XRFrameProvider::OnPreDispatchInlineFrame(XRSession* session,
+@@ -663,13 +645,6 @@ void XRFrameProvider::OnPreDispatchInlineFrame(XRSession* session,
  
    // If we still have the session and don't have an immersive session, then we
    // should serve the frame.
@@ -949,10 +949,10 @@ index 0466fd423ee5a..939e6af99c425 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 7ec4782aa8190..0c8310c272f06 100644
+index 7eab87e8ec94c..44e0dca6e9265 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -1836,16 +1836,6 @@ void XRSession::MaybeRequestFrame() {
+@@ -1852,16 +1852,6 @@ void XRSession::MaybeRequestFrame() {
    // and wants one.
    bool request_frame =
        !pending_frame_ && page_allowed_frames && page_can_process_frames;
@@ -969,7 +969,7 @@ index 7ec4782aa8190..0c8310c272f06 100644
    if (request_frame) {
      xr_->frameProvider()->RequestFrame(this);
      pending_frame_ = true;
-@@ -2614,15 +2604,6 @@ void XRSession::ReportInline3DRects() {
+@@ -2639,15 +2629,6 @@ void XRSession::ReportInline3DRects() {
      }
    }
    widget->SetInline3DRects(rects);

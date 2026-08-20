@@ -1,7 +1,7 @@
-From 442e8f21996833565037c942254d45630a87300d Mon Sep 17 00:00:00 2001
+From 010d3aa022af4acdb377cd07a52a10c1e62109cb Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 02:56:11 -0700
-Subject: [PATCH] inline-3d(Phase 2): occlusion on by default, delete the
+Subject: [PATCH 65/71] inline-3d(Phase 2): occlusion on by default, delete the
  exclusion machinery
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -124,7 +124,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  46 files changed, 387 insertions(+), 1815 deletions(-)
 
 diff --git a/cc/mojo_embedder/viz_layer_context.cc b/cc/mojo_embedder/viz_layer_context.cc
-index 4aaa09b..edd159a 100644
+index 4aaa09b2414f9..edd159a7a9e67 100644
 --- a/cc/mojo_embedder/viz_layer_context.cc
 +++ b/cc/mojo_embedder/viz_layer_context.cc
 @@ -1474,8 +1474,7 @@ base::TimeTicks VizLayerContext::UpdateDisplayTreeFrom(
@@ -146,7 +146,7 @@ index 4aaa09b..edd159a 100644
    update->device_scale_factor = tree.device_scale_factor();
    DUMP_WILL_BE_CHECK_GT(update->device_scale_factor, 0.f);
 diff --git a/cc/mojo_embedder/viz_layer_context.h b/cc/mojo_embedder/viz_layer_context.h
-index c7d24e4..8cf4e1e 100644
+index c7d24e42dad4f..8cf4e1e509898 100644
 --- a/cc/mojo_embedder/viz_layer_context.h
 +++ b/cc/mojo_embedder/viz_layer_context.h
 @@ -54,8 +54,7 @@ class CC_MOJO_EMBEDDER_EXPORT VizLayerContext
@@ -160,7 +160,7 @@ index c7d24e4..8cf4e1e 100644
                           const Tile& tile,
                           viz::ClientResourceProvider& resource_provider,
 diff --git a/cc/test/fake_layer_context.cc b/cc/test/fake_layer_context.cc
-index 70eb002..d16c8b2 100644
+index 70eb002f91292..d16c8b2516beb 100644
 --- a/cc/test/fake_layer_context.cc
 +++ b/cc/test/fake_layer_context.cc
 @@ -25,8 +25,7 @@ base::TimeTicks FakeLayerContext::UpdateDisplayTreeFrom(
@@ -174,7 +174,7 @@ index 70eb002..d16c8b2 100644
  }
  
 diff --git a/cc/test/fake_layer_context.h b/cc/test/fake_layer_context.h
-index e7669a1..cbab66e 100644
+index e7669a1247cc9..cbab66e7edf8f 100644
 --- a/cc/test/fake_layer_context.h
 +++ b/cc/test/fake_layer_context.h
 @@ -31,8 +31,7 @@ class FakeLayerContext : public LayerContext {
@@ -188,7 +188,7 @@ index e7669a1..cbab66e 100644
    void UpdateDisplayTile(PictureLayerImpl& layer,
                           const Tile& tile,
 diff --git a/cc/test/test_layer_context.cc b/cc/test/test_layer_context.cc
-index 46a9089..fa1b5ad 100644
+index 46a9089923d1c..fa1b5ad0c1666 100644
 --- a/cc/test/test_layer_context.cc
 +++ b/cc/test/test_layer_context.cc
 @@ -24,8 +24,7 @@ base::TimeTicks TestLayerContext::UpdateDisplayTreeFrom(
@@ -202,7 +202,7 @@ index 46a9089..fa1b5ad 100644
  }
  
 diff --git a/cc/test/test_layer_context.h b/cc/test/test_layer_context.h
-index ba459ec..0829a8c 100644
+index ba459ec1e65c8..0829a8ccdc1fd 100644
 --- a/cc/test/test_layer_context.h
 +++ b/cc/test/test_layer_context.h
 @@ -31,8 +31,7 @@ class TestLayerContext : public LayerContext {
@@ -216,7 +216,7 @@ index ba459ec..0829a8c 100644
    void UpdateDisplayTile(PictureLayerImpl& layer,
                           const Tile& tile,
 diff --git a/cc/trees/commit_state.cc b/cc/trees/commit_state.cc
-index e5c719a..97abcea 100644
+index e5c719ab5e336..97abcea93cfa4 100644
 --- a/cc/trees/commit_state.cc
 +++ b/cc/trees/commit_state.cc
 @@ -20,8 +20,6 @@ CommitState::CommitState(const CommitState& prev)
@@ -229,7 +229,7 @@ index e5c719a..97abcea 100644
        event_listener_properties(prev.event_listener_properties),
        bottom_controls_shown_ratio(prev.bottom_controls_shown_ratio),
 diff --git a/cc/trees/commit_state.h b/cc/trees/commit_state.h
-index ecad443..ee8ac62 100644
+index ecad443cd1a39..ee8ac624955ec 100644
 --- a/cc/trees/commit_state.h
 +++ b/cc/trees/commit_state.h
 @@ -89,27 +89,15 @@ struct CC_EXPORT CommitState {
@@ -268,7 +268,7 @@ index ecad443..ee8ac62 100644
    // configuration, so after any scroll every rect was shifted by the FULL
    // historical offset forever — clipped to empty, and page chrome wove.
 diff --git a/cc/trees/layer_context.h b/cc/trees/layer_context.h
-index 498d1ea..a18aded 100644
+index 498d1eafb09eb..a18aded0e0240 100644
 --- a/cc/trees/layer_context.h
 +++ b/cc/trees/layer_context.h
 @@ -56,8 +56,7 @@ class CC_EXPORT LayerContext {
@@ -282,7 +282,7 @@ index 498d1ea..a18aded 100644
    // Pushes an update to a single tile in the context's display tree.
    virtual void UpdateDisplayTile(
 diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
-index 651c252..5dd8136 100644
+index 651c252bf6114..5dd81366c7bca 100644
 --- a/cc/trees/layer_tree_host.cc
 +++ b/cc/trees/layer_tree_host.cc
 @@ -1568,11 +1568,8 @@ void LayerTreeHost::SetBrowserControlsParams(
@@ -319,7 +319,7 @@ index 651c252..5dd8136 100644
    SetNeedsCommit();
  }
 diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
-index b4295c3..1cfef11 100644
+index b4295c357091b..1cfef11bf5cb6 100644
 --- a/cc/trees/layer_tree_host.h
 +++ b/cc/trees/layer_tree_host.h
 @@ -582,18 +582,11 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
@@ -347,7 +347,7 @@ index b4295c3..1cfef11 100644
    void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
    const OverscrollBehavior& overscroll_behavior() const {
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index 3b5a02d..dcddff1 100644
+index 3b5a02d828ed6..dcddff1016a0b 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
 @@ -2427,19 +2427,9 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
@@ -547,7 +547,7 @@ index 3b5a02d..dcddff1 100644
  
    // A flush update synchronizes state (e.g. tile evictions) to Viz but does not
 diff --git a/cc/trees/layer_tree_host_impl.h b/cc/trees/layer_tree_host_impl.h
-index 2a42669..9856c77 100644
+index 2a426699c44b9..9856c779e0df2 100644
 --- a/cc/trees/layer_tree_host_impl.h
 +++ b/cc/trees/layer_tree_host_impl.h
 @@ -430,7 +430,6 @@ class CC_EXPORT LayerTreeHostImpl : public TileManagerClient,
@@ -598,7 +598,7 @@ index 2a42669..9856c77 100644
    // Settings whether we dump generated compositor frame during DrawLayers.
    // They are for debug purposes for TreesInViz and TreeAnimationsInViz.
 diff --git a/cc/trees/layer_tree_impl.cc b/cc/trees/layer_tree_impl.cc
-index ac780b4..8d47ede 100644
+index ac780b42ef2b2..8d47edeb53dfe 100644
 --- a/cc/trees/layer_tree_impl.cc
 +++ b/cc/trees/layer_tree_impl.cc
 @@ -892,8 +892,6 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
@@ -622,7 +622,7 @@ index ac780b4..8d47ede 100644
  
    target_tree->set_overscroll_behavior(overscroll_behavior_);
 diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
-index fd931de..05fbaa9 100644
+index fd931de3ab976..05fbaa98a3e9f 100644
 --- a/cc/trees/layer_tree_impl.h
 +++ b/cc/trees/layer_tree_impl.h
 @@ -670,31 +670,17 @@ class CC_EXPORT LayerTreeImpl {
@@ -677,7 +677,7 @@ index fd931de..05fbaa9 100644
    OverscrollBehavior overscroll_behavior_;
  
 diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
-index ee41e26..692fe97 100644
+index ee41e26125d72..692fe971c6227 100644
 --- a/chrome/app/chrome_main_delegate.cc
 +++ b/chrome/app/chrome_main_delegate.cc
 @@ -1117,26 +1117,28 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
@@ -724,7 +724,7 @@ index ee41e26..692fe97 100644
    }
  #endif  // BUILDFLAG(IS_WIN)
 diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
-index adb1778..a349cc3 100644
+index adb1778477cb1..a349cc302f4e6 100644
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
 @@ -2860,10 +2860,15 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
@@ -748,7 +748,7 @@ index adb1778..a349cc3 100644
              "inline-3d-occlusion") &&
          !command_line->HasSwitch("inline-3d-occlusion")) {
 diff --git a/components/viz/common/quads/compositor_frame_metadata.cc b/components/viz/common/quads/compositor_frame_metadata.cc
-index ed3145f..ecbea7c 100644
+index ed3145f10e146..ecbea7cadfcc8 100644
 --- a/components/viz/common/quads/compositor_frame_metadata.cc
 +++ b/components/viz/common/quads/compositor_frame_metadata.cc
 @@ -122,8 +122,6 @@ void CompositorFrameMetadata::AsValueInto(
@@ -771,7 +771,7 @@ index ed3145f..ecbea7c 100644
      delegated_ink_metadata = std::make_unique<gfx::DelegatedInkMetadata>(
          *other.delegated_ink_metadata.get());
 diff --git a/components/viz/common/quads/compositor_frame_metadata.h b/components/viz/common/quads/compositor_frame_metadata.h
-index 85aa196..f813886 100644
+index 85aa1963e76e8..f813886de0b3c 100644
 --- a/components/viz/common/quads/compositor_frame_metadata.h
 +++ b/components/viz/common/quads/compositor_frame_metadata.h
 @@ -50,40 +50,6 @@ namespace viz {
@@ -845,7 +845,7 @@ index 85aa196..f813886 100644
    CompositorFrameMetadata(const CompositorFrameMetadata& other);
    CompositorFrameMetadata operator=(const CompositorFrameMetadata&) = delete;
 diff --git a/components/viz/common/surfaces/tracked_element_rects.h b/components/viz/common/surfaces/tracked_element_rects.h
-index 0b3f5e0..7941c60 100644
+index 0b3f5e0161e95..7941c6040eee9 100644
 --- a/components/viz/common/surfaces/tracked_element_rects.h
 +++ b/components/viz/common/surfaces/tracked_element_rects.h
 @@ -33,17 +33,6 @@ enum class TrackedElementFeature : int32_t {
@@ -867,7 +867,7 @@ index 0b3f5e0..7941c60 100644
    kTrackedElementFeatureMax = kTrackedElementFeatureEnd + 2,
  };
 diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
-index 4db03d6..c118447 100644
+index 4db03d6e91cfe..c1184476dc5a7 100644
 --- a/components/viz/service/display/aggregated_frame.h
 +++ b/components/viz/service/display/aggregated_frame.h
 @@ -99,20 +99,14 @@ class VIZ_SERVICE_EXPORT AggregatedFrame {
@@ -922,7 +922,7 @@ index 4db03d6..c118447 100644
  };
  
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index fa18be2..125abbb 100644
+index fa18be225ff9a..125abbb6553e5 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
 @@ -982,21 +982,23 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
@@ -1011,7 +1011,7 @@ index fa18be2..125abbb 100644
        renderer_->SetInline3dSuppressedResources(std::move(suppressed));
      }
 diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
-index 3916541..beda973 100644
+index 3916541cffb7d..beda9739c2fee 100644
 --- a/components/viz/service/display/skia_output_surface.h
 +++ b/components/viz/service/display/skia_output_surface.h
 @@ -220,9 +220,8 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
@@ -1052,7 +1052,7 @@ index 3916541..beda973 100644
  
    // DisplayXR inline-3D Phase 2 (plane split): the window-sized premultiplied
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 98fb5c6..18cc0ab 100644
+index 98fb5c649c12f..18cc0abb13559 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
 @@ -1486,18 +1486,18 @@ void SurfaceAggregator::CopyQuadsToPass(
@@ -1494,7 +1494,7 @@ index 98fb5c6..18cc0ab 100644
  }
  
 diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
-index 125c37b..3b1618d 100644
+index 125c37b928f4a..3b1618d7d4d1b 100644
 --- a/components/viz/service/display/surface_aggregator.h
 +++ b/components/viz/service/display/surface_aggregator.h
 @@ -485,8 +485,8 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
@@ -1606,7 +1606,7 @@ index 125c37b..3b1618d 100644
    std::vector<RootResourceQuad> root_resource_quads_;
  };
 diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
-index df9b56f..6dfbaa1 100644
+index df9b56f4cc653..6dfbaa14b14d2 100644
 --- a/components/viz/service/display_embedder/displayxr_weave_provider.h
 +++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
 @@ -175,12 +175,21 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
@@ -1638,7 +1638,7 @@ index df9b56f..6dfbaa1 100644
    virtual bool SetBatchOverlay(ID3D11Device* device,
                                 ID3D11Texture2D* atlas_tex,
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-index 9e9ff07..12b3721 100644
+index 9e9ff0757fb23..12b3721a6a21f 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
 @@ -1065,19 +1065,17 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
@@ -1666,7 +1666,7 @@ index 9e9ff07..12b3721 100644
                   /*need_framebuffer=*/false);
  }
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
-index d6a0cc6..4fcfbe3 100644
+index d6a0cc6a4d5aa..4fcfbe3779a49 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
 @@ -175,12 +175,12 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
@@ -1686,7 +1686,7 @@ index d6a0cc6..4fcfbe3 100644
  
    // ExternalUseClient implementation:
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index c6c5931..3f00285 100644
+index c6c59318d9de3..3f00285413344 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -2738,17 +2738,15 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
@@ -2441,7 +2441,7 @@ index c6c5931..3f00285 100644
    {
      auto atlas_rep =
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 14e2514..c3fe537 100644
+index 14e251484067b..c3fe5379c15d3 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 @@ -230,15 +230,14 @@ class SkiaOutputSurfaceImplOnGpu
@@ -2547,7 +2547,7 @@ index 14e2514..c3fe537 100644
    gfx::Size displayxr_weave_atlas_size_mac_;
  #endif  // BUILDFLAG(IS_APPLE)
 diff --git a/components/viz/service/layers/layer_context_impl.cc b/components/viz/service/layers/layer_context_impl.cc
-index 3207745..8973d8c 100644
+index 320774587f22d..8973d8c170f07 100644
 --- a/components/viz/service/layers/layer_context_impl.cc
 +++ b/components/viz/service/layers/layer_context_impl.cc
 @@ -2168,9 +2168,6 @@ base::expected<void, std::string> LayerContextImpl::DoUpdateDisplayTree(
@@ -2561,7 +2561,7 @@ index 3207745..8973d8c 100644
      if (latency.terminated()) {
        return base::unexpected("Received already-terminated LatencyInfo");
 diff --git a/components/viz/service/layers/viz_layer_context_unittest.cc b/components/viz/service/layers/viz_layer_context_unittest.cc
-index 91fb30d..02e2069 100644
+index 91fb30d2d9cb6..02e2069f2a324 100644
 --- a/components/viz/service/layers/viz_layer_context_unittest.cc
 +++ b/components/viz/service/layers/viz_layer_context_unittest.cc
 @@ -138,8 +138,7 @@ void VizLayerContextTest::UpdateDisplayTreeAndWait() {
@@ -2585,7 +2585,7 @@ index 91fb30d..02e2069 100644
    base::RunLoop run_loop;
    fake_layer_context_.on_update_display_tree_ = run_loop.QuitClosure();
 diff --git a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
-index 35dc799..0d93a98 100644
+index 35dc7992f09a6..0d93a983e87e6 100644
 --- a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
 +++ b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.cc
 @@ -83,8 +83,7 @@ bool StructTraits<viz::mojom::CompositorFrameMetadataDataView,
@@ -2599,7 +2599,7 @@ index 35dc799..0d93a98 100644
    }
  
 diff --git a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
-index a09d688..978c427 100644
+index a09d688079da1..978c4278db77b 100644
 --- a/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
 +++ b/services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h
 @@ -32,24 +32,6 @@
@@ -2640,7 +2640,7 @@ index a09d688..978c427 100644
                     viz::CompositorFrameMetadata* out);
  };
 diff --git a/services/viz/public/cpp/compositing/mojom_traits_unittest.cc b/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
-index 4ad0c7a..957ceff 100644
+index 4ad0c7aabe202..957ceff80d2fc 100644
 --- a/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
 +++ b/services/viz/public/cpp/compositing/mojom_traits_unittest.cc
 @@ -840,18 +840,6 @@ TEST_F(StructTraitsTest, CompositorFrameMetadata) {
@@ -2672,7 +2672,7 @@ index 4ad0c7a..957ceff 100644
  
  TEST_F(StructTraitsTest, CompositorFrameMetadataBadOffsetTagDefinition) {
 diff --git a/services/viz/public/mojom/BUILD.gn b/services/viz/public/mojom/BUILD.gn
-index ce51773..4221da1 100644
+index ce517736c7c7a..4221da1645e53 100644
 --- a/services/viz/public/mojom/BUILD.gn
 +++ b/services/viz/public/mojom/BUILD.gn
 @@ -232,12 +232,6 @@ mojom("mojom") {
@@ -2702,7 +2702,7 @@ index ce51773..4221da1 100644
        traits_headers = [ "//services/viz/public/cpp/compositing/compositor_frame_metadata_mojom_traits.h" ]
        traits_public_deps = [ "//components/viz/common" ]
 diff --git a/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom b/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
-index 85acca7..fcab519 100644
+index 85acca739f260..fcab519a0375f 100644
 --- a/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
 +++ b/services/viz/public/mojom/compositing/compositor_frame_metadata.mojom
 @@ -4,7 +4,6 @@
@@ -2742,7 +2742,7 @@ index 85acca7..fcab519 100644
 -  array<Inline3dExclusion> inline_3d_exclusion_rects;
  };
 diff --git a/services/viz/public/mojom/compositing/layer_context.mojom b/services/viz/public/mojom/compositing/layer_context.mojom
-index 2a6a78f..6c91a71 100644
+index 2a6a78ff885ec..6c91a7116bec9 100644
 --- a/services/viz/public/mojom/compositing/layer_context.mojom
 +++ b/services/viz/public/mojom/compositing/layer_context.mojom
 @@ -266,13 +266,6 @@ struct LayerTreeUpdate {
@@ -2760,7 +2760,7 @@ index 2a6a78f..6c91a71 100644
  
  // Drives updates to a GPU-side LayerTreeHostImpl from its corresponding
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-index b3adb7e..f6dacff 100644
+index b3adb7e103bcd..f6dacff81855f 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
 @@ -1745,15 +1745,12 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
@@ -2809,7 +2809,7 @@ index b3adb7e..f6dacff 100644
    // The input handler wants to know about navigation so that it can
    // suppress input until the newly navigated page has a committed frame.
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
-index 953d652..dd1afd5 100644
+index 953d6522e957a..dd1afd573a3c8 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
 @@ -242,11 +242,8 @@ class CORE_EXPORT WebFrameWidgetImpl
@@ -2827,7 +2827,7 @@ index 953d652..dd1afd5 100644
    void RequestAnimationAfterDelay(const base::TimeDelta&, bool urgent) final;
    void RequestAnimationAfterDelay(cc::BeginMainFrameReason,
 diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.cc b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
-index 8ed0599..0b57b3c 100644
+index 8ed0599cc913b..0b57b3c15dbeb 100644
 --- a/third_party/blink/renderer/modules/xr/xr_display_layer.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_display_layer.cc
 @@ -4,6 +4,7 @@
@@ -3018,7 +3018,7 @@ index 8ed0599..0b57b3c 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.h b/third_party/blink/renderer/modules/xr/xr_display_layer.h
-index 047d17d..b0fa370 100644
+index 047d17dd22607..b0fa3703cf233 100644
 --- a/third_party/blink/renderer/modules/xr/xr_display_layer.h
 +++ b/third_party/blink/renderer/modules/xr/xr_display_layer.h
 @@ -7,7 +7,6 @@
@@ -3116,7 +3116,7 @@ index 047d17d..b0fa370 100644
  
  }  // namespace blink
 diff --git a/third_party/blink/renderer/modules/xr/xr_display_layer.idl b/third_party/blink/renderer/modules/xr/xr_display_layer.idl
-index 6526dc1..914c0b6 100644
+index 6526dc1e68686..914c0b6907bd5 100644
 --- a/third_party/blink/renderer/modules/xr/xr_display_layer.idl
 +++ b/third_party/blink/renderer/modules/xr/xr_display_layer.idl
 @@ -22,11 +22,22 @@
@@ -3148,7 +3148,7 @@ index 6526dc1..914c0b6 100644
    undefined excludeElement(Element element,
                             optional XRDisplayLayerExclusionInit init = {});
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 7b2add4..9c6b569 100644
+index 7b2add4d04352..9c6b569faa534 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
 @@ -23,6 +23,7 @@
@@ -3388,7 +3388,7 @@ index 7b2add4..9c6b569 100644
  
  void XRSession::ReportInline3DDemand(bool wants_3d) {
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 67d214e..52ae0d1 100644
+index 67d214ee9ab52..52ae0d143a52b 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -339,15 +339,6 @@ class XRSession final : public EventTarget,
@@ -3432,7 +3432,7 @@ index 67d214e..52ae0d1 100644
  
    // browser#55: push this document's inline-3D DEMAND to the browser, but only
 diff --git a/third_party/blink/renderer/platform/widget/frame_widget.h b/third_party/blink/renderer/platform/widget/frame_widget.h
-index 5a6aa44..016db0e 100644
+index 5a6aa44d30a99..016db0e15d2bf 100644
 --- a/third_party/blink/renderer/platform/widget/frame_widget.h
 +++ b/third_party/blink/renderer/platform/widget/frame_widget.h
 @@ -305,25 +305,15 @@ class PLATFORM_EXPORT FrameWidget {

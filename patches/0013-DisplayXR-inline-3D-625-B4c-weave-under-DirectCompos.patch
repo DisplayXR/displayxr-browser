@@ -1,7 +1,7 @@
-From 485518796a94c439a77b7e98105e9eddb47c388d Mon Sep 17 00:00:00 2001
+From 7d63f4d273a03268e8f0c7d2c27b7cb9eb070a42 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 9 Jul 2026 09:13:45 -0700
-Subject: [PATCH 13/54] =?UTF-8?q?DisplayXR=20inline-3D=20(#625=20B4c):=20w?=
+Subject: [PATCH 13/71] =?UTF-8?q?DisplayXR=20inline-3D=20(#625=20B4c):=20w?=
  =?UTF-8?q?eave=20under=20DirectComposition=20=E2=80=94=20retire=20--disab?=
  =?UTF-8?q?le-direct-composition?=
 MIME-Version: 1.0
@@ -38,7 +38,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  2 files changed, 75 insertions(+), 16 deletions(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 6580ff09cf02b..30239ccafe5e8 100644
+index 93c60a3f15349..23bfd3d756071 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -745,6 +745,13 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintRenderPass(
@@ -71,7 +71,7 @@ index 6580ff09cf02b..30239ccafe5e8 100644
  #if BUILDFLAG(ENABLE_VULKAN)
    // Semaphores for release fences for vulkan should be created before flush.
    if (!return_release_fence_cb.is_null() && is_using_vulkan()) {
-@@ -2683,6 +2699,43 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2682,6 +2698,43 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
    if (inline_3d_rects_.empty()) {
      return;
    }
@@ -115,7 +115,7 @@ index 6580ff09cf02b..30239ccafe5e8 100644
    auto* provider = GetDisplayXRWeaveProvider();
    if (!provider) {
      return;
-@@ -2692,28 +2745,20 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2691,28 +2744,20 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
    if (!device_x) {
      return;
    }
@@ -153,10 +153,10 @@ index 6580ff09cf02b..30239ccafe5e8 100644
    // Prune woven state beyond the current rect count (canvas removed / count
    // shrank) before (re)sizing, so the woven SharedImages are not leaked.
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index ade0dd23235ee..78670455d090e 100644
+index 86c2f248c3378..f30ef7ea6499b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -498,6 +498,20 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -497,6 +497,20 @@ class SkiaOutputSurfaceImplOnGpu
    // fence, and draw the woven texture back over the output at that rect. GPU main
    // thread; mirrors the Step-A CEF host's external-compositor loop.
    void MaybeWeaveOutput();

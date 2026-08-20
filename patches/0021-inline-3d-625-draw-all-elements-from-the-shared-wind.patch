@@ -1,7 +1,7 @@
-From d6c174fc6f342148836c1248c3ce043560c19e29 Mon Sep 17 00:00:00 2001
+From ab9cd7d6af208602a86627de070ae76dbedfc951 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 22:26:13 -0700
-Subject: [PATCH 21/54] inline-3d(#625): draw all elements from the shared
+Subject: [PATCH 21/71] inline-3d(#625): draw all elements from the shared
  window-sized woven output
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -27,10 +27,10 @@ scroll lag; tracked separately.)
  2 files changed, 98 insertions(+), 87 deletions(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 520e6cd2f5f5a..d8135ec351725 100644
+index b8e724a192d8b..52eff2dd79b78 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3054,98 +3054,101 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3053,98 +3053,101 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      }
    }
  
@@ -213,7 +213,7 @@ index 520e6cd2f5f5a..d8135ec351725 100644
      const SkRect src_dst =
          SkRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height());
      SkPaint paint;
-@@ -3154,14 +3157,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3153,14 +3156,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                                SkSamplingOptions(SkFilterMode::kNearest), &paint,
                                SkCanvas::kStrict_SrcRectConstraint);
      drew_any = true;
@@ -230,7 +230,7 @@ index 520e6cd2f5f5a..d8135ec351725 100644
    if (drew_any) {
      std::vector<GrBackendSemaphore> empty_sem;
      FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
-@@ -3172,7 +3172,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3171,7 +3171,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        graphite_shared_context()->submit();
      }
    }
@@ -240,10 +240,10 @@ index 520e6cd2f5f5a..d8135ec351725 100644
  #endif  // BUILDFLAG(IS_WIN)
  
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 098b78cf95b02..3efb289c0eba4 100644
+index f91fd9fb98695..8ec26add4bdb5 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -692,6 +692,17 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -691,6 +691,17 @@ class SkiaOutputSurfaceImplOnGpu
    // most one target is submitted per frame; this rotates which one so all
    // targets refresh over successive frames (weave at reply cadence).
    size_t displayxr_next_submit_ = 0;

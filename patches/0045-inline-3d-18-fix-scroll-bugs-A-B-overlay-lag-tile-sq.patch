@@ -1,7 +1,7 @@
-From 30a7069b1f872e8a6f96f6d8ee91044392d9e9b2 Mon Sep 17 00:00:00 2001
+From d73c62895588be0fa435a53988523d7e9fff751b Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 17 Jul 2026 14:40:13 -0700
-Subject: [PATCH 45/54] inline-3d(#18): fix scroll bugs A+B (overlay lag + tile
+Subject: [PATCH 45/71] inline-3d(#18): fix scroll bugs A+B (overlay lag + tile
  squish)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -33,10 +33,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  2 files changed, 59 insertions(+), 21 deletions(-)
 
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index c3de37c98938b..a4967b6f91867 100644
+index aa10aa72882cb..4e12381f06a1f 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
-@@ -2386,10 +2386,17 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2387,10 +2387,17 @@ AggregatedFrame SurfaceAggregator::Aggregate(
    // bounds → near-identical). Require high overlap to avoid grabbing an
    // unrelated co-located quad. LAST match wins per rect (the topmost/most-recent
    // composited quad covering that element).
@@ -58,7 +58,7 @@ index c3de37c98938b..a4967b6f91867 100644
      for (const auto& [rid, qr] : quads) {
        if (qr.IsEmpty()) {
          continue;
-@@ -2402,19 +2409,19 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2403,19 +2410,19 @@ AggregatedFrame SurfaceAggregator::Aggregate(
            static_cast<int64_t>(target.width()) * target.height();
        const int64_t max_area = std::max(qa, ta);
        if (max_area > 0 && ia * 10 >= max_area * 7) {
@@ -84,10 +84,10 @@ index c3de37c98938b..a4967b6f91867 100644
    }
    if (!frame.inline_3d_overlays.empty() ||
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 8c66d3c3c732c..3c7c8eda92acc 100644
+index 90f8f81d80d07..884408b5f513e 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2841,20 +2841,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2840,20 +2840,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    // canvas is never woven, so there is no "woven overlay" artifact under a
    // translucent overlay. Returns a null mailbox when unmatched → fall back to
    // the composited sub-rect (today's behavior).
@@ -119,7 +119,7 @@ index 8c66d3c3c732c..3c7c8eda92acc 100644
      gfx::Rect rect = inline_3d_rects_[t];
      rect.Intersect(window_bounds);
      if (rect.IsEmpty()) {
-@@ -2862,7 +2870,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2861,7 +2869,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      }
      const int rw = rect.width();
      const int rh = rect.height();
@@ -130,7 +130,7 @@ index 8c66d3c3c732c..3c7c8eda92acc 100644
  
      // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the composited
      // sub-rect on the GPU instead of the readPixels roundtrip: Skia-copy it into
-@@ -2955,6 +2965,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2954,6 +2964,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>
                canvas_access;
            sk_sp<SkImage> src_img;
@@ -138,7 +138,7 @@ index 8c66d3c3c732c..3c7c8eda92acc 100644
            if (!clean_sbs_mailbox.IsZero()) {
              canvas_rep = shared_image_representation_factory_->ProduceSkia(
                  clean_sbs_mailbox, context_state_.get());
-@@ -2964,9 +2975,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2963,9 +2974,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                    canvas_rep->BeginScopedReadAccess(&cbegin, &cend);
                if (canvas_access) {
                  src_img = canvas_access->CreateSkImage(context_state_.get());
@@ -154,7 +154,7 @@ index 8c66d3c3c732c..3c7c8eda92acc 100644
                  }
                }
              }
-@@ -2978,14 +2992,31 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2977,14 +2991,31 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            if (!src_img) {
              return fail("makeImageSnapshot");
            }

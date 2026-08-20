@@ -1,7 +1,7 @@
-From 33a7971ff5fa85e71a29af922e70bf3b9bef6258 Mon Sep 17 00:00:00 2001
+From 6a5803121597131275709f9b1e9124344830143d Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 7 Jul 2026 14:06:04 -0700
-Subject: [PATCH 08/54] =?UTF-8?q?B4b:=20per-element=20inline-3D=20weave=20?=
+Subject: [PATCH 08/71] =?UTF-8?q?B4b:=20per-element=20inline-3D=20weave=20?=
  =?UTF-8?q?via=20CEF=20sub-rect=20model=20(#625)=20=E2=80=94=20WORKS=20in?=
  =?UTF-8?q?=20chrome?=
 MIME-Version: 1.0
@@ -103,10 +103,10 @@ index 9d885219f15f2..a1960bcc2e55c 100644
        event_listener_properties = {EventListenerProperties::kNone};
    float bottom_controls_shown_ratio = 0.f;
 diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
-index 4a740ff0ecbfe..cc753c14f1799 100644
+index 2aa7fe4c721b8..240abe874db5a 100644
 --- a/cc/trees/layer_tree_host.cc
 +++ b/cc/trees/layer_tree_host.cc
-@@ -1564,6 +1564,13 @@ void LayerTreeHost::SetBrowserControlsParams(
+@@ -1568,6 +1568,13 @@ void LayerTreeHost::SetBrowserControlsParams(
    SetNeedsCommit();
  }
  
@@ -121,10 +121,10 @@ index 4a740ff0ecbfe..cc753c14f1799 100644
                                                   float bottom_ratio) {
    if (pending_commit_state()->top_controls_shown_ratio == top_ratio &&
 diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
-index bb1b8edfe423e..42e40d58ebc42 100644
+index 7daa72a870d3a..c93094b95d5b4 100644
 --- a/cc/trees/layer_tree_host.h
 +++ b/cc/trees/layer_tree_host.h
-@@ -583,6 +583,11 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
+@@ -579,6 +579,11 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
    void SetBrowserControlsParams(const BrowserControlsParams& params);
    void SetBrowserControlsShownRatio(float top_ratio, float bottom_ratio);
  
@@ -137,10 +137,10 @@ index bb1b8edfe423e..42e40d58ebc42 100644
    const OverscrollBehavior& overscroll_behavior() const {
      return pending_commit_state()->overscroll_behavior;
 diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
-index a1371f56d4520..93419b319fca0 100644
+index da5ef55a51731..d8fd8a07577b6 100644
 --- a/cc/trees/layer_tree_host_impl.cc
 +++ b/cc/trees/layer_tree_host_impl.cc
-@@ -2445,6 +2445,16 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata() {
+@@ -2614,6 +2614,16 @@ viz::CompositorFrameMetadata LayerTreeHostImpl::MakeCompositorFrameMetadata(
    }
  
    metadata.capture_bounds = CollectRegionCaptureBounds();
@@ -158,10 +158,10 @@ index a1371f56d4520..93419b319fca0 100644
      metadata.tracked_element_rects = tracked_element_rects_from_client_;
    } else {
 diff --git a/cc/trees/layer_tree_impl.cc b/cc/trees/layer_tree_impl.cc
-index a5503832debc1..915b041222b28 100644
+index 25e9564d762a1..236ba40993ce2 100644
 --- a/cc/trees/layer_tree_impl.cc
 +++ b/cc/trees/layer_tree_impl.cc
-@@ -885,6 +885,7 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
+@@ -891,6 +891,7 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
                                commit_state.page_scale_factor_limits_set);
  
    SetBrowserControlsParams(commit_state.browser_controls_params);
@@ -169,7 +169,7 @@ index a5503832debc1..915b041222b28 100644
    set_overscroll_behavior(commit_state.overscroll_behavior);
    PushBrowserControlsFromMainThread(commit_state.top_controls_shown_ratio,
                                      commit_state.bottom_controls_shown_ratio);
-@@ -1011,6 +1012,7 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
+@@ -1017,6 +1018,7 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
    target_tree->SetExternalPageScaleFactor(external_page_scale_factor_);
  
    target_tree->SetBrowserControlsParams(browser_controls_params_);
@@ -178,7 +178,7 @@ index a5503832debc1..915b041222b28 100644
  
    target_tree->set_overscroll_behavior(overscroll_behavior_);
 diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
-index 63c1d15df8cb1..438ba4dd67ee5 100644
+index 26280591d83f7..02021cfb956f3 100644
 --- a/cc/trees/layer_tree_impl.h
 +++ b/cc/trees/layer_tree_impl.h
 @@ -669,6 +669,16 @@ class CC_EXPORT LayerTreeImpl {
@@ -393,10 +393,10 @@ index 8abfbf9f518cb..94b53d23601bc 100644
  
  }  // namespace viz
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index ecd530cd32994..56e7fbab76e43 100644
+index 2aa82e41436bc..ca5d3d360aa15 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
-@@ -983,6 +983,18 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -982,6 +982,18 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
      draw_timer.emplace();
      overlay_processor_->SetFrameSequenceNumber(frame_sequence_number_);
      overlay_processor_->SetIsPageFullscreen(frame.page_fullscreen_mode);
@@ -433,10 +433,10 @@ index 93ce03eeff30d..0a662c4c41fdf 100644
      BUILDFLAG(USE_V4L2_CODEC)
    virtual void DetileOverlay(gpu::Mailbox input,
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 437fad4542a4b..a88fac079e73e 100644
+index 5630e9f6105a7..88a5575257528 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
-@@ -2157,6 +2157,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2158,6 +2158,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
  
    root_surface_id_ = surface_id;
    tracked_element_rects_ = {};
@@ -444,7 +444,7 @@ index 437fad4542a4b..a88fac079e73e 100644
  
    ResolvedFrameData* resolved_frame = GetResolvedFrame(surface_id);
  
-@@ -2339,6 +2340,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2340,6 +2341,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
      frame_annotator_->AnnotateAggregatedFrame(&frame);
  
    frame.tracked_element_rects = std::move(tracked_element_rects_);
@@ -452,7 +452,7 @@ index 437fad4542a4b..a88fac079e73e 100644
  
    return frame;
  }
-@@ -2497,6 +2499,21 @@ void SurfaceAggregator::CollectTrackedElementRects(
+@@ -2498,6 +2500,21 @@ void SurfaceAggregator::CollectTrackedElementRects(
        tracked_element_rects_[feature].push_back(transformed_rect_data);
      }
    }
@@ -512,10 +512,10 @@ index c06e73f853b22..8484123537ce8 100644
  
  // Register / fetch the process-global provider (GPU process, GPU main thread).
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-index e0a3d2779dda4..03ec65aba481b 100644
+index 07e9bf51b4fde..4a0ec121739d0 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
-@@ -1070,6 +1070,19 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
+@@ -1063,6 +1063,19 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
  }
  #endif
  
@@ -536,10 +536,10 @@ index e0a3d2779dda4..03ec65aba481b 100644
      gfx::SurfaceOrigin output_surface_origin) {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
-index 0a80deff8dedd..af245cd95356f 100644
+index 483ee06785924..a970cdea1ca63 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
-@@ -176,6 +176,8 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
+@@ -175,6 +175,8 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
    void SetSharedImagePurgeable(const gpu::Mailbox& mailbox,
                                 bool purgeable) override;
    bool SupportsBGRA() const override;
@@ -549,7 +549,7 @@ index 0a80deff8dedd..af245cd95356f 100644
    // ExternalUseClient implementation:
    gpu::SyncToken ReleaseImageContexts(
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 845f7f26ecffc..c2533668bbc4b 100644
+index 212071de1c5d4..90d1cd0c7f01a 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -70,6 +70,7 @@
@@ -627,7 +627,7 @@ index 845f7f26ecffc..c2533668bbc4b 100644
      auto end_paint_semaphores =
          scoped_output_device_paint_->TakeEndPaintSemaphores();
      end_semaphores.insert(end_semaphores.end(), end_paint_semaphores.begin(),
-@@ -2666,11 +2675,31 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+@@ -2665,11 +2674,31 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
    return {};
  }
  
@@ -662,7 +662,7 @@ index 845f7f26ecffc..c2533668bbc4b 100644
    auto* provider = GetDisplayXRWeaveProvider();
    if (!provider) {
      return;
-@@ -2680,72 +2709,104 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+@@ -2679,72 +2708,104 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
    if (!device_x) {
      return;
    }
@@ -817,7 +817,7 @@ index 845f7f26ecffc..c2533668bbc4b 100644
      if (r.woven_handle) {
        if (!st.woven_mailbox.IsZero()) {
          shared_image_factory_->DestroySharedImage(st.woven_mailbox);
-@@ -2764,22 +2825,25 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+@@ -2763,22 +2824,25 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
                mailbox, si_info, gfx::GpuMemoryBufferHandle(std::move(dxgi)))) {
          st.woven_mailbox = mailbox;
        } else {
@@ -848,7 +848,7 @@ index 845f7f26ecffc..c2533668bbc4b 100644
        ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
      }
      if (st.fence) {
-@@ -2791,33 +2855,82 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+@@ -2790,33 +2854,82 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
        }
      }
  
@@ -955,7 +955,7 @@ index 845f7f26ecffc..c2533668bbc4b 100644
  }
  #endif  // BUILDFLAG(IS_WIN)
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 43115c4388c32..ade0dd23235ee 100644
+index f0ac9237e9fae..86c2f248c3378 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 @@ -43,6 +43,7 @@
@@ -966,7 +966,7 @@ index 43115c4388c32..ade0dd23235ee 100644
  #include "ui/gfx/gpu_fence_handle.h"
  
  #if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(IS_CHROMEOS) && \
-@@ -226,6 +227,12 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -225,6 +226,12 @@ class SkiaOutputSurfaceImplOnGpu
  
    bool was_context_lost() { return context_state_->context_lost(); }
  
@@ -979,7 +979,7 @@ index 43115c4388c32..ade0dd23235ee 100644
    void SetCapabilitiesForTesting(
        const OutputSurface::Capabilities& capabilities);
  
-@@ -483,14 +490,14 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -482,14 +489,14 @@ class SkiaOutputSurfaceImplOnGpu
    gpu::SkiaImageRepresentation* GetSkiaRepresentation(gpu::Mailbox mailbox);
  
  #if BUILDFLAG(IS_WIN)
@@ -1002,7 +1002,7 @@ index 43115c4388c32..ade0dd23235ee 100644
  #endif
  
    class ReleaseCurrent {
-@@ -628,19 +635,23 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -627,19 +634,23 @@ class SkiaOutputSurfaceImplOnGpu
    // destructor.
    base::flat_set<gpu::Mailbox> solid_color_images_;
  
@@ -1095,10 +1095,10 @@ index ba76572f8b5e8..fcab519a0375f 100644
 +  array<gfx.mojom.Rect> inline_3d_rects;
  };
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-index a536e2dbd65ac..5f6196c81b19d 100644
+index 3f7b1343df122..03cd2f044fa43 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
-@@ -1633,6 +1633,13 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
+@@ -1745,6 +1745,13 @@ void WebFrameWidgetImpl::SetOverscrollBehavior(
    widget_base_->LayerTreeHost()->SetOverscrollBehavior(overscroll_behavior);
  }
  
@@ -1113,10 +1113,10 @@ index a536e2dbd65ac..5f6196c81b19d 100644
    if (!View()->does_composite())
      return;
 diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
-index 1da01a03fc20b..c0c962548e953 100644
+index 962690a766aa6..b69d0f18124fa 100644
 --- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
 +++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
-@@ -232,6 +232,8 @@ class CORE_EXPORT WebFrameWidgetImpl
+@@ -241,6 +241,8 @@ class CORE_EXPORT WebFrameWidgetImpl
    cc::AnimationTimeline* ScrollAnimationTimeline() const final;
    void SetOverscrollBehavior(
        const cc::OverscrollBehavior& overscroll_behavior) final;
@@ -1126,10 +1126,10 @@ index 1da01a03fc20b..c0c962548e953 100644
    void RequestAnimationAfterDelay(const base::TimeDelta&, bool urgent) final;
    void RequestAnimationAfterDelay(cc::BeginMainFrameReason,
 diff --git a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
-index 8ff9258d5ff42..0466fd423ee5a 100644
+index 1740fe0794bab..0ccb4879fc408 100644
 --- a/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_frame_provider.cc
-@@ -508,11 +508,42 @@ void XRFrameProvider::ProcessScheduledFrame(
+@@ -512,11 +512,42 @@ void XRFrameProvider::ProcessScheduledFrame(
    TRACE_EVENT2("gpu", "XRFrameProvider::ProcessScheduledFrame", "frame",
                 frame_id_, "timestamp", high_res_now_ms);
  
@@ -1173,7 +1173,7 @@ index 8ff9258d5ff42..0466fd423ee5a 100644
      return;  // Not currently focused, so we won't expose poses (except to
               // immersive sessions).
    }
-@@ -628,6 +659,13 @@ void XRFrameProvider::OnPreDispatchInlineFrame(XRSession* session,
+@@ -632,6 +663,13 @@ void XRFrameProvider::OnPreDispatchInlineFrame(XRSession* session,
  
    // If we still have the session and don't have an immersive session, then we
    // should serve the frame.
@@ -1188,10 +1188,10 @@ index 8ff9258d5ff42..0466fd423ee5a 100644
  }
  
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index cc97fbac8a5d4..7ec4782aa8190 100644
+index a141cd204dfb5..7eab87e8ec94c 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -31,7 +31,11 @@
+@@ -33,7 +33,11 @@
  #include "third_party/blink/renderer/core/frame/frame.h"
  #include "third_party/blink/renderer/core/frame/local_dom_window.h"
  #include "third_party/blink/renderer/core/frame/local_frame.h"
@@ -1203,7 +1203,7 @@ index cc97fbac8a5d4..7ec4782aa8190 100644
  #include "third_party/blink/renderer/core/inspector/console_message.h"
  #include "third_party/blink/renderer/core/probe/async_task_context.h"
  #include "third_party/blink/renderer/core/resize_observer/resize_observer.h"
-@@ -1789,6 +1793,16 @@ void XRSession::MaybeRequestFrame() {
+@@ -1805,6 +1809,16 @@ void XRSession::MaybeRequestFrame() {
      }
    }
  
@@ -1220,7 +1220,7 @@ index cc97fbac8a5d4..7ec4782aa8190 100644
    // A page will not be allowed to get frames if its visibility state is hidden.
    bool page_allowed_frames = visibility_state_ != XRVisibilityState::HIDDEN;
  
-@@ -1822,6 +1836,16 @@ void XRSession::MaybeRequestFrame() {
+@@ -1838,6 +1852,16 @@ void XRSession::MaybeRequestFrame() {
    // and wants one.
    bool request_frame =
        !pending_frame_ && page_allowed_frames && page_can_process_frames;
@@ -1237,7 +1237,7 @@ index cc97fbac8a5d4..7ec4782aa8190 100644
    if (request_frame) {
      xr_->frameProvider()->RequestFrame(this);
      pending_frame_ = true;
-@@ -2221,6 +2245,33 @@ void XRSession::OnFrame(double timestamp,
+@@ -2237,6 +2261,33 @@ void XRSession::OnFrame(double timestamp,
    if (pending_frame_) {
      pending_frame_ = false;
  
@@ -1271,7 +1271,7 @@ index cc97fbac8a5d4..7ec4782aa8190 100644
      // Don't allow frames to be processed if there's no layers attached to the
      // session. That would allow tracking with no associated visuals.
      if (!render_state_->HasActiveLayer()) {
-@@ -2339,6 +2390,11 @@ void XRSession::OnFrame(double timestamp,
+@@ -2355,6 +2406,11 @@ void XRSession::OnFrame(double timestamp,
      callback_collection_->ExecuteCallbacks(this, timestamp, animation_frame_);
      page_animation_frame_timer_.StopTimer();
  
@@ -1283,7 +1283,7 @@ index cc97fbac8a5d4..7ec4782aa8190 100644
      // Calling OnFrameEnd() on the render state will trigger each layer to
      // submit its drawing data to be cached by the frame provider.
      render_state_->OnFrameEnd();
-@@ -2513,6 +2569,62 @@ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
+@@ -2538,6 +2594,62 @@ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
    display_layers_.erase(layer);
  }
  
@@ -1347,7 +1347,7 @@ index cc97fbac8a5d4..7ec4782aa8190 100644
  // off-axis (Kooima) projections + per-eye poses from the tracked eyes. The
  // element is treated as a physical window into the scene: the frustum edges are
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index 10392883b4d2f..20ed4c009c1f9 100644
+index 7d1cfe20ca559..41a9fa558ab9b 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -151,6 +151,8 @@ class XRSession final : public EventTarget,
@@ -1373,10 +1373,10 @@ index 10392883b4d2f..20ed4c009c1f9 100644
    void RemoveTransientInputSource(XRInputSource* input_source);
  
 diff --git a/third_party/blink/renderer/platform/widget/frame_widget.h b/third_party/blink/renderer/platform/widget/frame_widget.h
-index 33956395177f1..d44654c317aee 100644
+index 92340e7d547ca..aff83df50f7db 100644
 --- a/third_party/blink/renderer/platform/widget/frame_widget.h
 +++ b/third_party/blink/renderer/platform/widget/frame_widget.h
-@@ -302,6 +302,11 @@ class PLATFORM_EXPORT FrameWidget {
+@@ -304,6 +304,11 @@ class PLATFORM_EXPORT FrameWidget {
    // this widget, taking into account its transform to main frame space.
    virtual float GetCompositingScaleFactor() = 0;
  

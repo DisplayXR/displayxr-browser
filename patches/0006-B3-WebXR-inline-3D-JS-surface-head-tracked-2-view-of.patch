@@ -1,7 +1,7 @@
-From 37137183ee37f9fe4ba36ad363cbd9fd91265928 Mon Sep 17 00:00:00 2001
+From d8878d06158f70a692172467a1964dcfe945b0cb Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 5 Jul 2026 23:29:35 -0700
-Subject: [PATCH 06/54] B3: WebXR inline-3D JS surface + head-tracked 2-view
+Subject: [PATCH 06/71] B3: WebXR inline-3D JS surface + head-tracked 2-view
  off-axis session + teardown (#625)
 
 Checkpoint of the full B3 slice on the displayxr-inline-3d patch branch (mirrors
@@ -54,7 +54,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  .../bindings/generated_in_modules.gni         |   4 +
  .../renderer/bindings/idl_in_modules.gni      |   2 +
  .../core/html/canvas/html_canvas_element.cc   |  14 ++
- .../core/html/canvas/html_canvas_element.h    |  10 +
+ .../core/html/canvas/html_canvas_element.h    |   9 +
  .../blink/renderer/modules/xr/BUILD.gn        |   4 +
  .../renderer/modules/xr/xr_display_layer.cc   |  82 +++++++
  .../renderer/modules/xr/xr_display_layer.h    |  69 ++++++
@@ -66,7 +66,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  .../blink/renderer/modules/xr/xr_system.cc    |  86 ++++++-
  .../blink/renderer/modules/xr/xr_system.h     |  36 ++-
  .../platform/runtime_enabled_features.json5   |   8 +
- 35 files changed, 1050 insertions(+), 119 deletions(-)
+ 35 files changed, 1049 insertions(+), 119 deletions(-)
  create mode 100644 content/shell/browser/displayxr_service_impl.cc
  create mode 100644 content/shell/browser/displayxr_service_impl.h
  create mode 100644 third_party/blink/public/mojom/xr/displayxr_service.mojom
@@ -256,10 +256,10 @@ index f1be125de2ef8..f41dd2342728e 100644
  
    // If |maybe_concurrent_reads| is true then there can be concurrent reads to
 diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
-index f9e9a97eea2cf..95303895f289d 100644
+index 70b6cb63b0ea6..22dd31c85e8d4 100644
 --- a/components/viz/service/display/skia_renderer.cc
 +++ b/components/viz/service/display/skia_renderer.cc
-@@ -2688,15 +2688,22 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
+@@ -2763,15 +2763,22 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
      return;
  
  #if BUILDFLAG(IS_WIN)
@@ -290,10 +290,10 @@ index f9e9a97eea2cf..95303895f289d 100644
    }
  #endif
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index d3cd80a76e06d..845f7f26ecffc 100644
+index 6ec8957dcd46c..212071de1c5d4 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2675,112 +2675,150 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
+@@ -2674,112 +2674,150 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute(
    if (!provider) {
      return;
    }
@@ -540,10 +540,10 @@ index d3cd80a76e06d..845f7f26ecffc 100644
  #endif  // BUILDFLAG(IS_WIN)
  
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 02ca43fbc7fe4..43115c4388c32 100644
+index 518becd71f7e0..f0ac9237e9fae 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -629,12 +629,18 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -628,12 +628,18 @@ class SkiaOutputSurfaceImplOnGpu
    base::flat_set<gpu::Mailbox> solid_color_images_;
  
  #if BUILDFLAG(IS_WIN)
@@ -569,7 +569,7 @@ index 02ca43fbc7fe4..43115c4388c32 100644
  
    THREAD_CHECKER(thread_checker_);
 diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
-index 5e37a5fff624c..3bad6bb00b634 100644
+index 4fb7d6d8d091a..75e251f5e38a6 100644
 --- a/content/shell/BUILD.gn
 +++ b/content/shell/BUILD.gn
 @@ -200,6 +200,8 @@ static_library("content_shell_lib") {
@@ -964,10 +964,10 @@ index 4169c4cf760c9..e9613a87aeee7 100644
  
  struct TileQuadState {
 diff --git a/third_party/blink/public/mojom/BUILD.gn b/third_party/blink/public/mojom/BUILD.gn
-index d045fffd7825d..cabc0cb15b009 100644
+index c4a3eb2ff4419..116e339078b40 100644
 --- a/third_party/blink/public/mojom/BUILD.gn
 +++ b/third_party/blink/public/mojom/BUILD.gn
-@@ -1930,6 +1930,24 @@ mojom("color_scheme_mojo_bindings") {
+@@ -1946,6 +1946,24 @@ mojom("color_scheme_mojo_bindings") {
    export_header = "third_party/blink/public/common/common_export.h"
  }
  
@@ -1039,10 +1039,10 @@ index 0000000000000..89222ac4a1cf2
 +  GetLatestEyes() => (array<float> eyes, bool valid, DisplayXRDisplayInfo info);
 +};
 diff --git a/third_party/blink/renderer/bindings/generated_in_modules.gni b/third_party/blink/renderer/bindings/generated_in_modules.gni
-index 6e947a9177298..6fafee3bda3fc 100644
+index 68285acc9ad1b..0ade4ce0a2817 100644
 --- a/third_party/blink/renderer/bindings/generated_in_modules.gni
 +++ b/third_party/blink/renderer/bindings/generated_in_modules.gni
-@@ -1428,6 +1428,8 @@ generated_dictionary_sources_in_modules = [
+@@ -1436,6 +1436,8 @@ generated_dictionary_sources_in_modules = [
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_cylinder_layer_init.h",
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_state_init.cc",
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_state_init.h",
@@ -1051,7 +1051,7 @@ index 6e947a9177298..6fafee3bda3fc 100644
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_init.cc",
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_init.h",
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_equirect_layer_init.cc",
-@@ -3200,6 +3202,8 @@ generated_interface_sources_in_modules = [
+@@ -3221,6 +3223,8 @@ generated_interface_sources_in_modules = [
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_cpu_depth_information.h",
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_information.cc",
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_depth_information.h",
@@ -1061,10 +1061,10 @@ index 6e947a9177298..6fafee3bda3fc 100644
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_state.h",
    "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_xr_equirect_layer.cc",
 diff --git a/third_party/blink/renderer/bindings/idl_in_modules.gni b/third_party/blink/renderer/bindings/idl_in_modules.gni
-index 1228ae367d3b6..e13bc4c8fa197 100644
+index 296e7230642aa..2cdbe01d36506 100644
 --- a/third_party/blink/renderer/bindings/idl_in_modules.gni
 +++ b/third_party/blink/renderer/bindings/idl_in_modules.gni
-@@ -1231,6 +1231,8 @@ static_idl_files_in_modules = [
+@@ -1228,6 +1228,8 @@ static_idl_files_in_modules = [
    "//third_party/blink/renderer/modules/xr/xr_cylinder_layer.idl",
    "//third_party/blink/renderer/modules/xr/xr_depth_information.idl",
    "//third_party/blink/renderer/modules/xr/xr_depth_state_init.idl",
@@ -1074,10 +1074,10 @@ index 1228ae367d3b6..e13bc4c8fa197 100644
    "//third_party/blink/renderer/modules/xr/xr_dom_overlay_state.idl",
    "//third_party/blink/renderer/modules/xr/xr_equirect_layer.idl",
 diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-index ce8231f02d134..226fde99134c6 100644
+index 4c784e3285328..98b5774dc47e4 100644
 --- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 +++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-@@ -1648,10 +1648,24 @@ cc::TextureLayer* HTMLCanvasElement::GetOrCreateCcLayerForCanvas2DIfNeeded() {
+@@ -1620,10 +1620,24 @@ cc::TextureLayer* HTMLCanvasElement::GetOrCreateCcLayerForCanvas2DIfNeeded() {
      cc_layer_->SetHitTestable(true);
      cc_layer_->SetContentsOpaque(is_opaque_);
      cc_layer_->SetBlendBackgroundColor(!is_opaque_);
@@ -1130,7 +1130,7 @@ index 759b9d58f00d2..addecdaf395d3 100644
    bool is_displayed_ = false;
    unsigned frames_since_last_commit_ = 0;
 diff --git a/third_party/blink/renderer/modules/xr/BUILD.gn b/third_party/blink/renderer/modules/xr/BUILD.gn
-index e1dc92acea9ce..caa5f31329549 100644
+index a42b807aa265e..4b6c15e927cc0 100644
 --- a/third_party/blink/renderer/modules/xr/BUILD.gn
 +++ b/third_party/blink/renderer/modules/xr/BUILD.gn
 @@ -38,6 +38,8 @@ blink_modules_sources("xr") {
@@ -1142,7 +1142,7 @@ index e1dc92acea9ce..caa5f31329549 100644
      "xr_dom_overlay_state.cc",
      "xr_dom_overlay_state.h",
      "xr_enter_fullscreen_observer.cc",
-@@ -184,6 +186,8 @@ blink_modules_sources("xr") {
+@@ -189,6 +191,8 @@ blink_modules_sources("xr") {
    deps = [
      "//device/vr/buildflags",
      "//device/vr/public/mojom:vr_service_blink",
@@ -1364,7 +1364,7 @@ index 0000000000000..fc24a2d829651
 +  double pixelScale = 1.0;
 +};
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 99edb90a4f56f..cc97fbac8a5d4 100644
+index ab92ed6b9867a..a141cd204dfb5 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
 @@ -5,6 +5,7 @@
@@ -1375,7 +1375,7 @@ index 99edb90a4f56f..cc97fbac8a5d4 100644
  #include <memory>
  #include <string>
  #include <utility>
-@@ -58,6 +59,8 @@
+@@ -60,6 +61,8 @@
  #include "third_party/blink/renderer/modules/xr/xr_render_state.h"
  #include "third_party/blink/renderer/modules/xr/xr_session_event.h"
  #include "third_party/blink/renderer/modules/xr/xr_session_viewport_scaler.h"
@@ -1384,7 +1384,7 @@ index 99edb90a4f56f..cc97fbac8a5d4 100644
  #include "third_party/blink/renderer/modules/xr/xr_system.h"
  #include "third_party/blink/renderer/modules/xr/xr_transient_input_hit_test_source.h"
  #include "third_party/blink/renderer/modules/xr/xr_utils.h"
-@@ -363,7 +366,8 @@ XRSession::XRSession(
+@@ -365,7 +368,8 @@ XRSession::XRSession(
      device::mojom::blink::XRSessionDeviceConfigPtr device_config,
      bool sensorless_session,
      XRSessionFeatureSet enabled_feature_set,
@@ -1394,7 +1394,7 @@ index 99edb90a4f56f..cc97fbac8a5d4 100644
      : ActiveScriptWrappable<XRSession>({}),
        frame_tracked_images_(
            MakeGarbageCollected<FrozenArray<XRImageTrackingResult>>()),
-@@ -388,6 +392,7 @@ XRSession::XRSession(
+@@ -390,6 +394,7 @@ XRSession::XRSession(
        supports_viewport_scaling_(immersive() &&
                                   device_config_->supports_viewport_scaling),
        sensorless_session_(sensorless_session),
@@ -1402,7 +1402,7 @@ index 99edb90a4f56f..cc97fbac8a5d4 100644
        trace_id_(trace_id) {
    FrozenArray<IDLString>::VectorType enabled_features;
    for (const auto& feature : enabled_feature_set_) {
-@@ -1591,6 +1596,17 @@ void XRSession::ForceEnd(ShutdownPolicy shutdown_policy) {
+@@ -1607,6 +1612,17 @@ void XRSession::ForceEnd(ShutdownPolicy shutdown_policy) {
      canvas_input_provider_ = nullptr;
    }
  
@@ -1420,7 +1420,7 @@ index 99edb90a4f56f..cc97fbac8a5d4 100644
    xr_->ExitPresent(
        BindOnce(&XRSession::OnExitPresent, WrapWeakPersistent(this)));
  
-@@ -2426,6 +2442,27 @@ void XRSession::UpdateInlineView() {
+@@ -2451,6 +2467,27 @@ void XRSession::UpdateInlineView() {
      views_.clear();
      canvas_was_resized_ = false;
    }
@@ -1448,7 +1448,7 @@ index 99edb90a4f56f..cc97fbac8a5d4 100644
    if (views_.empty()) {
      views_.emplace_back(MakeGarbageCollected<XRViewData>(
          /*index=*/0, device::mojom::blink::XREye::kNone,
-@@ -2451,6 +2488,105 @@ void XRSession::UpdateInlineView() {
+@@ -2476,6 +2513,105 @@ void XRSession::UpdateInlineView() {
        render_state_->depthFar());
  }
  
@@ -1554,7 +1554,7 @@ index 99edb90a4f56f..cc97fbac8a5d4 100644
  // Called when the canvas element for this session's output context is resized.
  void XRSession::UpdateCanvasDimensions(Element* element) {
    DCHECK(element);
-@@ -2741,6 +2877,7 @@ void XRSession::OnTransferComplete(const Vector<device::LayerId>& layer_ids) {
+@@ -2766,6 +2902,7 @@ void XRSession::OnTransferComplete(const Vector<device::LayerId>& layer_ids) {
  
  void XRSession::Trace(Visitor* visitor) const {
    visitor->Trace(xr_);
@@ -1563,7 +1563,7 @@ index 99edb90a4f56f..cc97fbac8a5d4 100644
    visitor->Trace(world_light_probe_);
    visitor->Trace(pending_render_state_);
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index e0df056010dcf..10392883b4d2f 100644
+index 05ab92ac0ca5a..7d1cfe20ca559 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -12,6 +12,7 @@
@@ -1651,7 +1651,7 @@ index e0df056010dcf..10392883b4d2f 100644
  
    device::LayerId::Generator layer_id_generator_;
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.idl b/third_party/blink/renderer/modules/xr/xr_session.idl
-index 97b1caab3d1fb..cc5fd8777180b 100644
+index c465648fa9a90..417dc9e6eb255 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.idl
 +++ b/third_party/blink/renderer/modules/xr/xr_session.idl
 @@ -8,6 +8,10 @@ enum XRSessionMode {
@@ -1852,7 +1852,7 @@ index 4ad2f0739d346..05335c02119e5 100644
    visitor->Trace(fullscreen_exit_observer_);
    Supplement<Navigator>::Trace(visitor);
 diff --git a/third_party/blink/renderer/modules/xr/xr_system.h b/third_party/blink/renderer/modules/xr/xr_system.h
-index f3c6b42ee335f..2041618bf740f 100644
+index b68ad33dda26f..88932e3ebe4c4 100644
 --- a/third_party/blink/renderer/modules/xr/xr_system.h
 +++ b/third_party/blink/renderer/modules/xr/xr_system.h
 @@ -10,6 +10,7 @@
@@ -1863,7 +1863,7 @@ index f3c6b42ee335f..2041618bf740f 100644
  #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
  #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
  #include "third_party/blink/renderer/bindings/modules/v8/v8_xr_dom_overlay_init.h"
-@@ -103,6 +104,12 @@ class XRSystem final : public EventTarget,
+@@ -105,6 +106,12 @@ class XRSystem final : public EventTarget,
  
    device::mojom::blink::VRService* BrowserService();
  
@@ -1876,7 +1876,7 @@ index f3c6b42ee335f..2041618bf740f 100644
    // VRServiceClient overrides.
    void OnDeviceChanged() override;
  
-@@ -276,6 +283,11 @@ class XRSystem final : public EventTarget,
+@@ -278,6 +285,11 @@ class XRSystem final : public EventTarget,
  
      bool MatchDepthView() const { return match_depth_view_; }
  
@@ -1888,7 +1888,7 @@ index f3c6b42ee335f..2041618bf740f 100644
      uint64_t TraceId() const { return trace_id_; }
  
      void Trace(Visitor*) const;
-@@ -310,6 +322,7 @@ class XRSystem final : public EventTarget,
+@@ -312,6 +324,7 @@ class XRSystem final : public EventTarget,
      Vector<device::mojom::XRDepthDataFormat> preferred_format_;
      Vector<device::mojom::XRDepthType> depth_type_request_;
      bool match_depth_view_;
@@ -1896,7 +1896,7 @@ index f3c6b42ee335f..2041618bf740f 100644
    };
  
    static device::mojom::blink::XRSessionOptionsPtr XRSessionOptionsFromQuery(
-@@ -411,6 +424,12 @@ class XRSystem final : public EventTarget,
+@@ -413,6 +426,12 @@ class XRSystem final : public EventTarget,
    void FinishSessionCreation(
        PendingRequestSessionQuery*,
        device::mojom::blink::RequestSessionResultPtr result);
@@ -1909,7 +1909,7 @@ index f3c6b42ee335f..2041618bf740f 100644
    void OnSupportsSessionReturned(PendingSupportsSessionQuery*,
                                   bool supports_session);
    void ResolveSessionRequest(
-@@ -432,9 +451,10 @@ class XRSystem final : public EventTarget,
+@@ -434,9 +453,10 @@ class XRSystem final : public EventTarget,
        device::mojom::blink::XRSessionDeviceConfigPtr device_config,
        XRSessionFeatureSet enabled_features,
        uint64_t trace_id,
@@ -1922,7 +1922,7 @@ index f3c6b42ee335f..2041618bf740f 100644
  
    enum class DisposeType {
      kContextDestroyed = 0,
-@@ -463,12 +483,24 @@ class XRSystem final : public EventTarget,
+@@ -465,12 +485,24 @@ class XRSystem final : public EventTarget,
    HeapHashSet<Member<PendingRequestSessionQuery>> outstanding_request_queries_;
    bool has_outstanding_immersive_request_ = false;
  
@@ -1948,10 +1948,10 @@ index f3c6b42ee335f..2041618bf740f 100644
        device::mojom::blink::XREnvironmentIntegrationProvider>
        environment_provider_;
 diff --git a/third_party/blink/renderer/platform/runtime_enabled_features.json5 b/third_party/blink/renderer/platform/runtime_enabled_features.json5
-index 5e580db63b6a4..e456cc8198668 100644
+index 2a689dd0a8bf3..3f653e0d62e74 100644
 --- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
 +++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
-@@ -2336,6 +2336,14 @@
+@@ -2420,6 +2420,14 @@
        base_feature: "none",
        public: true,
      },

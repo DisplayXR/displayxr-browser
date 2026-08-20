@@ -1,7 +1,7 @@
-From 44d39f2d939bad69e151b0bf34effe6d7ee7c2b4 Mon Sep 17 00:00:00 2001
+From 0ede8e4d2a428ba0424dbdcd3712990a0e9e326e Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Thu, 9 Jul 2026 16:50:07 -0700
-Subject: [PATCH 15/54] =?UTF-8?q?inline-3d(#625)=20B4d:=20GPU-resident=20w?=
+Subject: [PATCH 15/71] =?UTF-8?q?inline-3d(#625)=20B4d:=20GPU-resident=20w?=
  =?UTF-8?q?eave=20=E2=80=94=20skip=20the=20per-frame=20CPU=20readback=20(D?=
  =?UTF-8?q?Comp)?=
 MIME-Version: 1.0
@@ -51,7 +51,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  6 files changed, 302 insertions(+), 46 deletions(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 93e3a629589f1..8ed4872ea2a9b 100644
+index 3068d778f5e1b..3a19ab1566cb3 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -109,6 +109,7 @@
@@ -62,7 +62,7 @@ index 93e3a629589f1..8ed4872ea2a9b 100644
  #include "ui/gl/direct_composition_support.h"
  #endif
  
-@@ -2709,7 +2710,9 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+@@ -2708,7 +2709,9 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
    if (!output || !out_canvas) {
      return;
    }
@@ -73,7 +73,7 @@ index 93e3a629589f1..8ed4872ea2a9b 100644
  }
  
  void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
-@@ -2731,11 +2734,17 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+@@ -2730,11 +2733,17 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
              << surface->width() << "x" << surface->height()
              << " rects=" << inline_3d_rects_.size();
    }
@@ -93,7 +93,7 @@ index 93e3a629589f1..8ed4872ea2a9b 100644
    auto* provider = GetDisplayXRWeaveProvider();
    if (!provider) {
      return;
-@@ -2773,6 +2782,19 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2772,6 +2781,19 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    }
    displayxr_woven_state_.resize(inline_3d_rects_.size());
  
@@ -113,7 +113,7 @@ index 93e3a629589f1..8ed4872ea2a9b 100644
    // (D) Per rect: weave the composited sub-rect and draw the woven result back
    // over the output. Serialized (the provider reuses one keyed-mutex input +
    // one woven output), mirroring the CEF host's per-element loop.
-@@ -2808,52 +2830,209 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2807,52 +2829,209 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        continue;
      }
  
@@ -365,10 +365,10 @@ index 93e3a629589f1..8ed4872ea2a9b 100644
        continue;
      }
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 78670455d090e..50dce6fd8e90f 100644
+index f30ef7ea6499b..d4cbfa11bb13b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -510,8 +510,15 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -509,8 +509,15 @@ class SkiaOutputSurfaceImplOnGpu
  
    // Shared weave loop for both output paths: for each inline_3d_rects_ entry,
    // read the composited sub-rect out of |output|, weave it, and draw the woven
@@ -386,7 +386,7 @@ index 78670455d090e..50dce6fd8e90f 100644
  #endif
  
    class ReleaseCurrent {
-@@ -666,6 +673,19 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -665,6 +672,19 @@ class SkiaOutputSurfaceImplOnGpu
      scoped_refptr<gfx::D3DSharedFence> fence;
    };
    std::vector<DisplayXRWovenState> displayxr_woven_state_;
@@ -485,7 +485,7 @@ index efa9b5af0509b..4422c45111df0 100644
      const Mailbox& mailbox,
      MemoryTypeTracker* tracker) {
 diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.h b/gpu/command_buffer/service/shared_image/shared_image_manager.h
-index f871108f5afeb..62ecba1d8f867 100644
+index 66f83b95d49df..1324be7101cf1 100644
 --- a/gpu/command_buffer/service/shared_image/shared_image_manager.h
 +++ b/gpu/command_buffer/service/shared_image/shared_image_manager.h
 @@ -117,6 +117,18 @@ class GPU_GLES2_EXPORT SharedImageManager

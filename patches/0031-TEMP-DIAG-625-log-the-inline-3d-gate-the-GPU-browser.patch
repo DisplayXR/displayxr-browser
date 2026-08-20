@@ -1,7 +1,7 @@
-From 38f88771248efb84c7af3ae4be052264cd2d2410 Mon Sep 17 00:00:00 2001
+From 2e545dca56d2d5cafac5ec4bb851500ce3c12198 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Tue, 14 Jul 2026 17:06:40 -0700
-Subject: [PATCH 31/54] TEMP DIAG (#625): log the inline-3d gate + the
+Subject: [PATCH 31/71] TEMP DIAG (#625): log the inline-3d gate + the
  GPU->browser eye feed
 
 Throwaway instrumentation to find why the inline-3d 2-view path stays off
@@ -53,10 +53,10 @@ index 86915f2cb3627..93145169df9b8 100644
      return;
    }
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index 1c0afb7437ae0..08eeaf98d6c0e 100644
+index 56befb5bcdddb..0aebca04dfade 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -2496,6 +2496,18 @@ void XRSession::UpdateInlineView() {
+@@ -2521,6 +2521,18 @@ void XRSession::UpdateInlineView() {
    // negative control: no service -> stays mono, inert).
    if (is_inline_3d_) {
      RequestInline3DState();

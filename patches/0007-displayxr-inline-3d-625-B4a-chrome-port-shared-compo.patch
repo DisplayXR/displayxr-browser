@@ -1,7 +1,7 @@
-From c1753d518a77be2f32eca4a52c01c5e1ab71f371 Mon Sep 17 00:00:00 2001
+From ca8af0cd9d3c046200c6dc99729b22823b87cc7d Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 6 Jul 2026 09:36:12 -0700
-Subject: [PATCH 07/54] [displayxr inline-3d #625 B4a] chrome port: shared
+Subject: [PATCH 07/71] [displayxr inline-3d #625 B4a] chrome port: shared
  component + hooks; per-element weave premise disproven
 
 Extract the six content/shell-only weave files into a shared components/displayxr/
@@ -73,10 +73,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  rename {content/shell => components/displayxr}/gpu/displayxr_weave_gpu.h (89%)
 
 diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
-index 311a3dfebc076..29bdd8e0cf74c 100644
+index bfc8555485593..d80284bb2cd01 100644
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
-@@ -894,6 +894,13 @@ source_set("core") {
+@@ -1123,6 +1123,13 @@ source_set("core") {
      "//components/data_sharing/public:features",
      "//components/desktop_to_mobile_promos",
      "//components/device_event_log",
@@ -91,7 +91,7 @@ index 311a3dfebc076..29bdd8e0cf74c 100644
      "//components/dom_distiller/content/common/mojom",
      "//components/embedder_support",
 diff --git a/chrome/browser/chrome_browser_interface_binders.cc b/chrome/browser/chrome_browser_interface_binders.cc
-index 249444ea27a2b..4108113c99312 100644
+index 14ee8fd6b0942..f703fca88d019 100644
 --- a/chrome/browser/chrome_browser_interface_binders.cc
 +++ b/chrome/browser/chrome_browser_interface_binders.cc
 @@ -6,6 +6,7 @@
@@ -118,7 +118,7 @@ index 249444ea27a2b..4108113c99312 100644
  #include "third_party/blink/public/mojom/payments/secure_payment_confirmation_service.mojom.h"
  #include "third_party/blink/public/mojom/persistent_renderer_prefs.mojom.h"
  #include "third_party/blink/public/mojom/prerender/prerender.mojom.h"
-@@ -436,6 +439,20 @@ void BindCredentialManager(
+@@ -442,6 +445,20 @@ void BindCredentialManager(
    content_credential_manager->BindRequest(frame_host, std::move(receiver));
  }
  
@@ -139,7 +139,7 @@ index 249444ea27a2b..4108113c99312 100644
  }  // namespace
  
  void PopulateChromeFrameBinders(
-@@ -443,6 +460,12 @@ void PopulateChromeFrameBinders(
+@@ -449,6 +466,12 @@ void PopulateChromeFrameBinders(
      content::RenderFrameHost* render_frame_host) {
    map->Add<image_annotation::mojom::Annotator>(&BindImageAnnotator);
  
@@ -153,10 +153,10 @@ index 249444ea27a2b..4108113c99312 100644
        &actor::ActorScriptToolReceiver::Create);
  
 diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
-index 057be98e715c6..8e2d74ba5d98c 100644
+index a32949ed044f1..2d779026666e1 100644
 --- a/chrome/browser/chrome_browser_main.cc
 +++ b/chrome/browser/chrome_browser_main.cc
-@@ -96,6 +96,10 @@
+@@ -95,6 +95,10 @@
  #include "chrome/installer/util/google_update_settings.h"
  #include "components/color/color_mixers.h"
  #include "components/device_event_log/device_event_log.h"
@@ -167,7 +167,7 @@ index 057be98e715c6..8e2d74ba5d98c 100644
  #include "components/embedder_support/origin_trials/component_updater_utils.h"
  #include "components/embedder_support/origin_trials/origin_trials_settings_storage.h"
  #include "components/heap_profiling/in_process/heap_profiler_controller.h"
-@@ -1690,6 +1694,23 @@ void ChromeBrowserMainParts::PostBrowserStart() {
+@@ -1698,6 +1702,23 @@ void ChromeBrowserMainParts::PostBrowserStart() {
    // We setup to observe to the initial page load here to defer running
    // task posted via PostAfterStartupTask until its complete.
    AfterStartupTaskUtils::StartMonitoringStartup();
@@ -192,10 +192,10 @@ index 057be98e715c6..8e2d74ba5d98c 100644
  
  int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
 diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
-index edab63d18ffd0..d791d1896ac5b 100644
+index cbac8ed6171b7..51267aeaed16a 100644
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
-@@ -2831,6 +2831,15 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+@@ -2844,6 +2844,15 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
      base::CommandLine* command_line,
      int child_process_id) {
    crash_keys::AppendStringAnnotationsCommandLineSwitch(command_line);
@@ -888,7 +888,7 @@ index 207a743a02f72..f984f91ff473d 100644
 -#endif  // CONTENT_SHELL_GPU_DISPLAYXR_WEAVE_GPU_H_
 +#endif  // COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_H_
 diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
-index 3bad6bb00b634..b7acdec95f7cd 100644
+index 75e251f5e38a6..567789b416ce5 100644
 --- a/content/shell/BUILD.gn
 +++ b/content/shell/BUILD.gn
 @@ -175,35 +175,12 @@ inspector_protocol_generate("protocol_sources") {
@@ -963,7 +963,7 @@ index 3bad6bb00b634..b7acdec95f7cd 100644
    }
  
    if (is_linux) {
-@@ -1202,16 +1172,6 @@ mojom("shell_controller_mojom") {
+@@ -1218,16 +1188,6 @@ mojom("shell_controller_mojom") {
    public_deps = [ "//mojo/public/mojom/base" ]
  }
  
@@ -981,7 +981,7 @@ index 3bad6bb00b634..b7acdec95f7cd 100644
    testonly = true
    sources = [ "common/rust_test.test-mojom" ]
 diff --git a/content/shell/browser/shell_browser_main_parts.cc b/content/shell/browser/shell_browser_main_parts.cc
-index 25c70f474ed55..65681c4c62f01 100644
+index 72794720a449c..ad210e561fe0a 100644
 --- a/content/shell/browser/shell_browser_main_parts.cc
 +++ b/content/shell/browser/shell_browser_main_parts.cc
 @@ -31,7 +31,7 @@

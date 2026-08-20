@@ -1,8 +1,8 @@
-From 36ae8e87cd1ab0eeefb1a7754ca2260a17787cc5 Mon Sep 17 00:00:00 2001
+From d56d8d0e9bfb7c44122d63b2997e912489b8fa09 Mon Sep 17 00:00:00 2001
 From: DisplayXR <noreply@anthropic.com>
 Date: Wed, 19 Aug 2026 16:22:52 -0700
-Subject: [PATCH] inline-3d(#88): stop browser-UI popups ghosting over a woven
- page
+Subject: [PATCH 69/71] inline-3d(#88): stop browser-UI popups ghosting over a
+ woven page
 
 Phase 3 Stage 4 item B. The omnibox dropdown, autofill popups and every menu
 are separate OWNED top-level HWNDs that DWM composites ABOVE the browser
@@ -88,7 +88,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  create mode 100644 chrome/browser/displayxr/displayxr_popup_occluder_tracker.h
 
 diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
-index 40af24a..1cb576e 100644
+index 40af24a7ed70c..1cb576e644a22 100644
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
 @@ -1411,6 +1411,15 @@ source_set("core") {
@@ -128,7 +128,7 @@ index 40af24a..1cb576e 100644
  
      all_dependent_configs = [ ":browser_win_linker_flags" ]
 diff --git a/chrome/browser/displayxr/displayxr_display_mode_controller.cc b/chrome/browser/displayxr/displayxr_display_mode_controller.cc
-index c2843b6..8c215c5 100644
+index c2843b6d4775f..8c215c50c3581 100644
 --- a/chrome/browser/displayxr/displayxr_display_mode_controller.cc
 +++ b/chrome/browser/displayxr/displayxr_display_mode_controller.cc
 @@ -103,6 +103,13 @@ DisplayXRDisplayModeController::DisplayXRDisplayModeController() {
@@ -232,7 +232,7 @@ index c2843b6..8c215c5 100644
  
  void DisplayXRDisplayModeController::OnBrowserActivated(
 diff --git a/chrome/browser/displayxr/displayxr_display_mode_controller.h b/chrome/browser/displayxr/displayxr_display_mode_controller.h
-index cb26b4d..3f3093f 100644
+index cb26b4d5dcf97..3f3093f01f93b 100644
 --- a/chrome/browser/displayxr/displayxr_display_mode_controller.h
 +++ b/chrome/browser/displayxr/displayxr_display_mode_controller.h
 @@ -44,24 +44,39 @@
@@ -316,7 +316,7 @@ index cb26b4d..3f3093f 100644
    bool applied_3d_ = false;
 diff --git a/chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc b/chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc
 new file mode 100644
-index 0000000..d3d8eab
+index 0000000000000..d3d8eabad1b29
 --- /dev/null
 +++ b/chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc
 @@ -0,0 +1,352 @@
@@ -674,7 +674,7 @@ index 0000000..d3d8eab
 +}  // namespace displayxr
 diff --git a/chrome/browser/displayxr/displayxr_popup_occluder_tracker.h b/chrome/browser/displayxr/displayxr_popup_occluder_tracker.h
 new file mode 100644
-index 0000000..fbf3072
+index 0000000000000..fbf3072ad75ee
 --- /dev/null
 +++ b/chrome/browser/displayxr/displayxr_popup_occluder_tracker.h
 @@ -0,0 +1,169 @@
@@ -848,7 +848,7 @@ index 0000000..fbf3072
 +
 +#endif  // CHROME_BROWSER_DISPLAYXR_DISPLAYXR_POPUP_OCCLUDER_TRACKER_H_
 diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
-index cd20e49..8586359 100644
+index cd20e4968102a..8586359d4e2df 100644
 --- a/components/displayxr/browser/displayxr_weave_client.cc
 +++ b/components/displayxr/browser/displayxr_weave_client.cc
 @@ -85,6 +85,14 @@ struct WeaveClientState {
@@ -996,7 +996,7 @@ index cd20e49..8586359 100644
  void DisplayXRWeaveClient::PreSandboxInitializeForGpuProcess() {
  #if BUILDFLAG(IS_WIN)
 diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
-index f4f6d0e..418b7a0 100644
+index f4f6d0e8582d1..418b7a0b49e2c 100644
 --- a/components/displayxr/browser/displayxr_weave_client.h
 +++ b/components/displayxr/browser/displayxr_weave_client.h
 @@ -82,8 +82,10 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
@@ -1047,7 +1047,7 @@ index f4f6d0e..418b7a0 100644
  
  }  // namespace displayxr
 diff --git a/components/displayxr/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
-index 43fd440..102fe58 100644
+index 43fd44061909f..102fe5827e425 100644
 --- a/components/displayxr/common/displayxr_weave.mojom
 +++ b/components/displayxr/common/displayxr_weave.mojom
 @@ -83,4 +83,22 @@ interface DisplayXRDisplayMode {
@@ -1074,7 +1074,7 @@ index 43fd440..102fe58 100644
 +  SetPopupOccluders(array<gfx.mojom.Rect> screen_rects);
  };
 diff --git a/components/displayxr/gpu/displayxr_display_mode_impl.cc b/components/displayxr/gpu/displayxr_display_mode_impl.cc
-index 8fbdd6a..68bd4bb 100644
+index 8fbdd6af1bd49..68bd4bbadbfab 100644
 --- a/components/displayxr/gpu/displayxr_display_mode_impl.cc
 +++ b/components/displayxr/gpu/displayxr_display_mode_impl.cc
 @@ -31,4 +31,23 @@ void DisplayXRDisplayModeImpl::SetDisplayMode(bool three_d) {
@@ -1102,7 +1102,7 @@ index 8fbdd6a..68bd4bb 100644
 +
  }  // namespace displayxr
 diff --git a/components/displayxr/gpu/displayxr_display_mode_impl.h b/components/displayxr/gpu/displayxr_display_mode_impl.h
-index 33fd0cc..8be6385 100644
+index 33fd0cc38b6b1..8be63853304ff 100644
 --- a/components/displayxr/gpu/displayxr_display_mode_impl.h
 +++ b/components/displayxr/gpu/displayxr_display_mode_impl.h
 @@ -13,9 +13,18 @@

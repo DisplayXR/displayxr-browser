@@ -1,7 +1,7 @@
-From 2ff0cda6f9405fe88fe80e0078beb2b094c673e1 Mon Sep 17 00:00:00 2001
+From ca82b135396b35de79d0003871fe0bd0cad27d64 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Mon, 13 Jul 2026 09:53:31 -0700
-Subject: [PATCH 23/54] =?UTF-8?q?inline-3d(#625):=20GPU-process=20SYNCHRON?=
+Subject: [PATCH 23/71] =?UTF-8?q?inline-3d(#625):=20GPU-process=20SYNCHRON?=
  =?UTF-8?q?OUS=20weave=20=E2=80=94=20zero-lag,=20browser-owned?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -49,10 +49,10 @@ label, mainloop mid-connect-abort hardening, tagged-handle transport.
  9 files changed, 451 insertions(+), 75 deletions(-)
 
 diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
-index 59563cbd9dcdd..1d8a18772f641 100644
+index 3abe501d2731b..29cff701fc978 100644
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
-@@ -2840,6 +2840,13 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+@@ -2853,6 +2853,13 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
      if (!command_line->HasSwitch("enable-inline-3d")) {
        command_line->AppendSwitch("enable-inline-3d");
      }
@@ -810,10 +810,10 @@ index 6aaa56ecadcb5..eea2c4667724b 100644
    // target's in-flight flag and stores the woven handles for |target_id|.
    void OnWeaveReply(uint32_t target_id, mojom::DisplayXRWeaveResultPtr result);
 diff --git a/content/gpu/BUILD.gn b/content/gpu/BUILD.gn
-index 3a31d22435aff..2c7c4c85c3347 100644
+index b4e000bbe202f..ac8e87e84b439 100644
 --- a/content/gpu/BUILD.gn
 +++ b/content/gpu/BUILD.gn
-@@ -110,6 +110,13 @@ target(link_target_type, "gpu_sources") {
+@@ -111,6 +111,13 @@ target(link_target_type, "gpu_sources") {
      deps += [ "//sandbox" ]
    }
  

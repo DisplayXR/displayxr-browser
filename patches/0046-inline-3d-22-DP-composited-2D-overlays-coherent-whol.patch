@@ -1,7 +1,7 @@
-From 5cdcf51c516647674e874f3bda8bb872c42aa584 Mon Sep 17 00:00:00 2001
+From 0fde290122f5d7de50603562a99256bf051397b8 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Fri, 17 Jul 2026 23:46:01 -0700
-Subject: [PATCH 46/54] inline-3d(#22): DP-composited 2D overlays + coherent
+Subject: [PATCH 46/71] inline-3d(#22): DP-composited 2D overlays + coherent
  whole-window present
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -343,10 +343,10 @@ index ab0f0b6f224bf..8e5e7bc8d6cef 100644
  
  // Register / fetch the process-global provider (GPU process, GPU main thread).
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 3c7c8eda92acc..5edc4da1aa2e6 100644
+index 884408b5f513e..48e5e3c7c3584 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3174,18 +3174,167 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3173,18 +3173,167 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        displayxr_drawn_rect_[t] = gfx::Rect();
      }
    }
@@ -520,7 +520,7 @@ index 3c7c8eda92acc..5edc4da1aa2e6 100644
    uint64_t latest_fence_value = 0;
    bool got_result = false;
    for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
-@@ -3271,95 +3420,39 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3270,95 +3419,39 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                   /*deleteSemaphoresAfterWait=*/false);
    }
  
@@ -642,10 +642,10 @@ index 3c7c8eda92acc..5edc4da1aa2e6 100644
    // Ensure the woven draws land in (and are submitted to) the output surface
    // before |woven_access| releases — otherwise Ganesh reads the released woven
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 388ad41f9a039..d7b7676c8f83d 100644
+index 6864cd2a200df..599183fbd4fec 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -700,6 +700,15 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -699,6 +699,15 @@ class SkiaOutputSurfaceImplOnGpu
    };
    std::vector<DisplayXRScratchState> displayxr_scratch_state_;
  

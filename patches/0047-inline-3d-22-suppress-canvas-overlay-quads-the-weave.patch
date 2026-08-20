@@ -1,7 +1,7 @@
-From 479b2243f3b13ec7195cd71f8018cb5d8d342ddf Mon Sep 17 00:00:00 2001
+From 3f864b27c3197a188fe86488fea0c0546bff1ffb Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 19 Jul 2026 18:34:44 +0900
-Subject: [PATCH 47/54] inline-3d(#22): suppress canvas + overlay quads the
+Subject: [PATCH 47/71] inline-3d(#22): suppress canvas + overlay quads the
  weave draw-back owns
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -43,10 +43,10 @@ Claude-Session: https://claude.ai/code/session_016XbEsBfb96NRCqZYindyzP
  3 files changed, 47 insertions(+)
 
 diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
-index 3307656809c78..5635cd946b685 100644
+index dc776c68b7519..7b5287084e268 100644
 --- a/components/viz/service/display/direct_renderer.cc
 +++ b/components/viz/service/display/direct_renderer.cc
-@@ -503,8 +503,23 @@ gfx::Rect DirectRenderer::OutputSurfaceRectInDrawSpace() const {
+@@ -514,8 +514,23 @@ gfx::Rect DirectRenderer::OutputSurfaceRectInDrawSpace() const {
    }
  }
  
@@ -71,7 +71,7 @@ index 3307656809c78..5635cd946b685 100644
      return true;
  
 diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
-index cdffcb6fc0787..6417c5fda27c7 100644
+index b52be5c36eb99..cc76e5c5824b0 100644
 --- a/components/viz/service/display/direct_renderer.h
 +++ b/components/viz/service/display/direct_renderer.h
 @@ -18,6 +18,7 @@
@@ -99,7 +99,7 @@ index cdffcb6fc0787..6417c5fda27c7 100644
    void ReallocatedFrameBuffers();
    void DecideRenderPassAllocationsForFrame(
        const AggregatedRenderPassList& render_passes_in_draw_order,
-@@ -372,6 +383,10 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+@@ -374,6 +385,10 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
    // Track skipped non-root render passes in DrawRenderPass.
    base::flat_set<AggregatedRenderPassId> skipped_render_pass_ids_;
  
@@ -111,10 +111,10 @@ index cdffcb6fc0787..6417c5fda27c7 100644
    bool disable_color_checks_for_testing_ = false;
  
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index 64e41be8633e7..f86420065c9de 100644
+index 9c8fa028e4fbb..53210b2a00375 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
-@@ -1008,6 +1008,23 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1007,6 +1007,23 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
                                               resolve(frame.inline_3d_overlays),
                                               resolve(frame.inline_3d_canvas_resources));
      }

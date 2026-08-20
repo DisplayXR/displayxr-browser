@@ -1,7 +1,7 @@
-From ed2be3cc1d00f4e44e47cc71d2de103aba4f0bc3 Mon Sep 17 00:00:00 2001
+From 6343cb2ce5601ba8680a293050215ecec11c06e8 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Sun, 12 Jul 2026 20:53:41 -0700
-Subject: [PATCH 20/54] =?UTF-8?q?inline-3d(#625):=20async=20weave=20submit?=
+Subject: [PATCH 20/71] =?UTF-8?q?inline-3d(#625):=20async=20weave=20submit?=
  =?UTF-8?q?=20=E2=80=94=20drop=20banned=20GPU-process=20[Sync]=20mojo=20ca?=
  =?UTF-8?q?ll?=
 MIME-Version: 1.0
@@ -517,10 +517,10 @@ index 8484123537ce8..3f60859165eb9 100644
  
  // Register / fetch the process-global provider (GPU process, GPU main thread).
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 8ed4872ea2a9b..520e6cd2f5f5a 100644
+index 3a19ab1566cb3..b8e724a192d8b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2759,18 +2759,24 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2758,18 +2758,24 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      return;
    }
  
@@ -557,7 +557,7 @@ index 8ed4872ea2a9b..520e6cd2f5f5a 100644
    if (displayxr_woven_state_.size() > inline_3d_rects_.size()) {
      for (size_t i = inline_3d_rects_.size(); i < displayxr_woven_state_.size();
           ++i) {
-@@ -2794,11 +2800,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2793,11 +2799,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      }
    }
    displayxr_scratch_state_.resize(inline_3d_rects_.size());
@@ -574,7 +574,7 @@ index 8ed4872ea2a9b..520e6cd2f5f5a 100644
    // Graphite has no synchronous SkSurface::readPixels, so the Graphite readback
    // uses the blocking-async path (asyncRescaleAndReadPixelsAndSubmit, which
    // submits + waits) into this context; mirrors
-@@ -2816,35 +2823,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2815,35 +2822,28 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      }
    };
  
@@ -623,7 +623,7 @@ index 8ed4872ea2a9b..520e6cd2f5f5a 100644
          // If any step fails we fall back to the WeavePixels CPU readback (still
          // correct), logging the first reason once at VLOG(1) so a future
          // regression is diagnosable without spamming default chrome.
-@@ -2857,7 +2857,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2856,7 +2856,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            }
            return false;
          };
@@ -632,7 +632,7 @@ index 8ed4872ea2a9b..520e6cd2f5f5a 100644
          // (1) Ensure an owned DISPLAY_READ/WRITE (NON-SCANOUT) D3DImageBacking
          // scratch sized to |rect|. Non-scanout is deliberate: a SCANOUT backing
          // on Windows becomes a DComp visual (want_dcomp_texture in
-@@ -2967,127 +2967,166 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -2966,127 +2966,166 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          }
  
          // (4) GPU-resident weave: CopySubresourceRegion scratch -> keyed-mutex
@@ -895,10 +895,10 @@ index 8ed4872ea2a9b..520e6cd2f5f5a 100644
          st.woven_mailbox, context_state_.get());
      if (!woven_rep) {
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-index 50dce6fd8e90f..098b78cf95b02 100644
+index d4cbfa11bb13b..f91fd9fb98695 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
-@@ -686,6 +686,12 @@ class SkiaOutputSurfaceImplOnGpu
+@@ -685,6 +685,12 @@ class SkiaOutputSurfaceImplOnGpu
      gfx::Size size;
    };
    std::vector<DisplayXRScratchState> displayxr_scratch_state_;
