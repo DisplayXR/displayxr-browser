@@ -37,7 +37,7 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 |---|---|
 | Latest preview | [**0.1.11**](https://github.com/DisplayXR/displayxr-browser/releases/latest) — occlusion by draw order |
 | Chromium pin | **151.0.7922.77** (stable) — `scripts/config.env` |
-| Patch series | 70 patches over the pinned tag, ~100 files of real integration surface |
+| Patch series | 71 patches over the pinned tag, ~100 files of real integration surface |
 | Platform | Windows — D3D11 + DirectComposition |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
@@ -60,6 +60,19 @@ be known, so a missed weave used to draw the tile from neither side and flash it
 ([#99](https://github.com/DisplayXR/displayxr-browser/issues/99)). On such a frame the GPU thread now
 paints the tile itself from the resource it already holds, as a flat mono frame — the same fallback
 the SDK shows when 3D is unavailable — and is invisible at frame rate.
+
+Startup can also race the runtime's service. If `displayxr-service` happens to be restarting when the
+browser negotiates, the weave client used to be stuck with whatever it got for the rest of the browser
+session: in the GPU process, where the session is created once before the sandbox closes and can never
+be created again, that quietly demoted every page to a one-rect-per-call submit path
+([#92](https://github.com/DisplayXR/displayxr-browser/issues/92)) — the shape behind the scroll trails
+and the predictor stalls; in the browser process it left inline-3D scenes **mono** forever, because the
+view-rig extensions had been dropped to save the weave and nothing ever asked again. Neither sticks now.
+A transient failure is retried rather than latched, the batched submit shape is a function of the
+negotiated weave-extension version and nothing else, and a client that did come up without the rig
+climbs back to a full session on a bounded backoff (seconds, then minutes) — while a runtime that
+genuinely does not have those extensions is detected once and left alone. Grep `[DisplayXR][weave-mode]`
+in the browser log for which mode a session is in and when it recovered.
 
 The design and rationale live in the runtime repo:
 [`webxr-support.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-support.md)
