@@ -1,0 +1,793 @@
+From 49e29836397917452204adb15945520b7cc502aa Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 16:24:41 -0700
+Subject: [PATCH 78/78] inline-3d(#103): adopt the brokered connection in the
+ GPU process
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Branch B of the design of record, half two: the sandboxed side. 0077-B taught the
+browser to hand out a connection; this teaches the GPU process to take one, put
+its weave session back on it, and hand the new service a GPU-side world it has
+never seen before but can make sense of.
+
+THE LADDER, ON THE SEQUENCE THAT SUBMITS
+
+Every step runs on the GPU-MAIN sequence — the one that owns the D3D device, the
+weaver_ remote, and the client's State(). No worker thread and no blocking wait
+anywhere: the only asynchrony is the mojo hop, whose reply is marshalled back
+here exactly as OnWeaveReply's already is. That is a design constraint, not a
+convenience — State() is single-sequence per process and the reconnect rebuilds
+it, so a worker thread would reintroduce the cross-thread hazard 0071's swap
+comment exists to rule out. Cost is a ~10-20 ms hitch on one frame, at most once
+per rung, on a frame that was already lost.
+
+Rungs come from DisplayXRWeaveClient::ReconnectDelaySeconds — the SAME 2/5/15/60/
+300s ladder 0071 uses and 0077-B exposed, so there is one set of numbers in the
+codebase rather than two that can drift. The first rung must not go below 2s:
+displayxr-service takes ~2000 ms to exit for relaunch and the runtime client's
+own connect ladder already covers landing inside that window.
+
+ADOPT, THEN CREATE — AND DESTROY BEFORE BOTH
+
+DisplayXRWeaveClient::AdoptAndReconnect is destroy, adopt, create:
+
+  * DESTROY is mandatory, not tidy. E0's second probe answered
+    XR_ERROR_LIMIT_REACHED — the runtime's one-live-instance-per-process guard —
+    so an overlapping create cannot work even where we would prefer the safety.
+  * ADOPT goes through the runtime DLL's EXPORTED
+    ipc_client_connection_adopt_handle, resolved with GetModuleHandle +
+    GetProcAddress on DisplayXRClient.dll, which the Khronos loader already
+    mapped into this process pre-sandbox. Never LoadLibrary — that would be a
+    genuinely new privileged act from a Low-integrity process — and never the
+    DXR_IPC_HANDLE environment form the same runtime patch also accepts: that
+    DLL's static-CRT environment snapshot was taken at load time, so a
+    SetEnvironmentVariable now is invisible to the getenv that reads it. Same
+    trap XRT_FORCE_MODE documents. The env form serves its Android twin, where
+    the value exists before the process starts.
+  * CREATE consumes the adopted endpoint instead of dialling the pipe, which is
+    the entire point: after LowerToken() this process cannot dial.
+
+The handle is duplicated by the runtime, so the caller still owns its copy — and
+a ScopedHandle owns it from the moment mojo hands it over to the end of the
+reply, on every path. A flapping service must not leak one pipe INSTANCE per
+attempt: the service's count is finite and exhausting it would deny service to
+every DisplayXR client on the box, not just this browser.
+
+THE SWAP-OVER (§6.3/§6.4)
+
+  * shared_input_ and overlay_input_ are force-REALLOCATED through the existing
+    ResetInput + EnsureInput. Both are keyed-mutex textures, and a service that
+    died holding the mutex leaves it ABANDONED — the next AcquireSync answers
+    WAIT_ABANDONED, which today means zero copies for the rest of the process's
+    life. Reallocating beats special-casing WAIT_ABANDONED because it is also
+    correct for the other half: the new service has never seen these textures.
+  * batch_last_copied_ needs no explicit clear — it is cleared WHOLESALE when
+    shared_input_.input_tex is reallocated (the header's contract, enforced by
+    the identity check in EnsureBatchInputAndAcquire). "Keep previous" must never
+    claim pixels the new service has never been shown.
+  * results_ is closed via CloseResultHandles. The new session's runtime-side
+    `exported` flag starts clear, so the first post-reconnect submit re-exports
+    and Viz re-imports through the existing first-submit/resize path. Keeping the
+    old handles would show a FROZEN 3D frame, which is worse than black because
+    it looks like it is working.
+  * Sticky state is re-asserted verbatim: snap reset to INT32_MIN (the new DP has
+    never been told where this window is), latched_screen_flat re-sent (a lost
+    latch is a PERMANENTLY ghosted popup over live 3D), requested_3d re-asserted,
+    PFNs / ref_space / weave spec re-resolved from the fresh enumeration.
+
+RESET BY SURVIVAL, NOT BY CONNECTING (§6.8)
+
+The ladder resets only after the new session has survived a 60 s stability window
+of successful submits. A service crash-looping every three seconds would
+otherwise hand out a connection each time, reset the ladder each time, and turn
+an outage into a reconnect storm. Losing the session inside that window logs
+`flapping` with the generation and the lifetime — the two numbers triage wants —
+and explicitly does NOT reset. The generation lives in the client, so both
+processes' lines quote one number instead of two that can disagree.
+
+VERSION SKEW AND A RUNTIME THAT CANNOT BROKER
+
+kVersionSkew: one loud unthrottled line naming the remedy, then straight to the
+5-minute tail. Never permanent. kUnsupported (a runtime predating spec v9):
+terminal for the browser session, ladder stopped, said once — and said honestly,
+because SCENES still recover on that runtime (they read the browser's session,
+which needs no broker); only the GPU's TILES are stuck mono.
+
+THE renegotiable FLIP (§6.5 bonus)
+
+0071 could only re-negotiate a degraded rig in the browser process, because
+re-negotiating meant creating another instance. Brokering removes that
+constraint, so a GPU session that came up degraded now climbs the same ladder —
+on the 5-minute tail, deliberately, because this side cannot run 0071's
+probe-before-swap and every rig attempt therefore tears down a working weave.
+|renegotiable| itself keeps its exact meaning ("can create an instance
+unaided", still false here) rather than being redefined; the GPU's equivalent is
+this rung.
+
+A pipe disconnect while a request is outstanding drops the reply callback, so the
+Bind() disconnect handler now also unwedges kInFlight — otherwise a browser-side
+hiccup would leave the ladder silent for the process lifetime.
+
+0070's mono recovery draw is untouched, and keeps running for the whole outage
+because 0075's latch keeps BatchMode() true. InitOutcome::kUnavailable still
+keeps everything dormant: no ladder, no timers, no logs.
+
+Files: gpu/displayxr_weave_gpu.{h,cc}, browser/displayxr_weave_client.{h,cc}.
+Zero upstream-Chromium files.
+---
+ .../browser/displayxr_weave_client.cc         | 151 +++++++++
+ .../browser/displayxr_weave_client.h          |  49 +++
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 316 ++++++++++++++++++
+ .../displayxr/gpu/displayxr_weave_gpu.h       |  57 +++-
+ 4 files changed, 571 insertions(+), 2 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index b68d095..9029753 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -2480,6 +2480,128 @@ DisplayXRWeaveClient::ReconnectStatus BrokerIpcConnectionWin(
+   return ReconnectStatus::kOk;
+ }
+ 
++// ---------------------------------------------------------------------------
++// browser#103 (0078-B): the ADOPT half, in the sandboxed process. Design §5-B,
++// §6.2, §6.4.
++// ---------------------------------------------------------------------------
++
++// Resolve the runtime DLL's exported adopt entry point, once.
++//
++// GetModuleHandle, not LoadLibrary: the Khronos loader already mapped
++// DisplayXRClient.dll into this process pre-sandbox (it is what the weave
++// session runs on), so the module is simply there and no new privileged act is
++// needed to reach a symbol in it. A LoadLibrary here would be a genuinely new
++// capability request from a Low-integrity process, and an unnecessary one.
++using AdoptHandleFn = void(__cdecl*)(void*);
++
++AdoptHandleFn ResolveAdoptHandle() {
++  static AdoptHandleFn cached = nullptr;
++  static bool resolved = false;
++  if (resolved) {
++    return cached;
++  }
++  resolved = true;
++  const HMODULE dll = ::GetModuleHandleW(kRuntimeClientDll);
++  if (!dll) {
++    LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: the DisplayXR runtime DLL "
++                  "is not loaded in this process — cannot adopt a brokered "
++                  "connection (expected "
++               << "DisplayXRClient.dll, mapped by the OpenXR loader "
++                  "pre-sandbox)";
++    return nullptr;
++  }
++  cached = reinterpret_cast<AdoptHandleFn>(
++      reinterpret_cast<void*>(::GetProcAddress(dll, kAdoptHandleExport)));
++  if (!cached) {
++    LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: this runtime's "
++                  "DisplayXRClient.dll does not export "
++               << kAdoptHandleExport
++               << " — it predates the browser#103 broker contract (runtime "
++                  "RC-4 / PR #1108). Inline-3D tiles stay MONO until the "
++                  "browser is relaunched against a newer runtime.";
++  }
++  return cached;
++}
++
++bool AdoptAndReconnectWin(uintptr_t pipe_handle) {
++  WeaveClientState& s = State();
++  // Negative control: a process with no weave session has nothing to rebuild,
++  // and must not start creating instances because a message arrived.
++  if (!s.sync_session_established || !pipe_handle) {
++    return false;
++  }
++  const AdoptHandleFn adopt = ResolveAdoptHandle();
++  if (!adopt) {
++    return false;
++  }
++  // The window binding survives a reconnect by construction — same window, same
++  // process, and EnumWindows is not needed again (the GPU process already reads
++  // it every batch frame through ClientToScreen).
++  const HWND hwnd = s.hwnd;
++  if (!hwnd) {
++    LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: no bound window to "
++                  "re-create the weave session against";
++    return false;
++  }
++
++  // Sticky state to carry across (design §6.4), snapshotted BEFORE the teardown.
++  const std::vector<DisplayXRWeaveClient::WeaveRect> flat =
++      s.latched_screen_flat;
++  const bool had_mode = s.requested_3d_valid;
++  const bool want_3d = s.requested_3d;
++
++  // DESTROY, then ADOPT, then CREATE.
++  //
++  // The destroy is not optional and not merely tidy: E0's second probe answered
++  // XR_ERROR_LIMIT_REACHED (-10), the runtime's one-live-instance-per-process
++  // guard, so an overlapping create cannot work even if we wanted the safety of
++  // keeping the old session until the new one is up.
++  //
++  // The adopt lands in the gap. It parks a DUPLICATE of the endpoint that the
++  // next ipc_client_connection_init() — inside xrCreateInstance — consumes
++  // instead of dialling the pipe. If the create below fails before reaching
++  // that point, the parked duplicate simply waits and is replaced by the next
++  // attempt's (the runtime's contract: consumed once, replaced by a later
++  // adopt), so a failed rung costs nothing beyond the rung.
++  ResetForRetry(s);
++  adopt(reinterpret_cast<void*>(pipe_handle));
++
++  const InitOutcome outcome = InitializeCore(hwnd);
++  if (outcome != InitOutcome::kOk || s.session == XR_NULL_HANDLE) {
++    LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: adopt+create failed "
++                  "(outcome="
++               << static_cast<int>(outcome)
++               << ") — handle closed, staying disconnected";
++    return false;
++  }
++
++  // Re-assert the sticky state on the NEW session. |last_snap_x/y| were reset to
++  // INT32_MIN by ResetForRetry, so the next SnapWindowIfMoved re-establishes the
++  // DP's phase reference even though the window has not moved a pixel — the new
++  // service's display processor has never been told where this window is.
++  //
++  // |latched_screen_flat| is the one that must not be dropped: the runtime's
++  // copy died with the session, this process's copy is authoritative, and a lost
++  // latch is a PERMANENTLY ghosted popup over live 3D.
++  if (!flat.empty()) {
++    SetScreenFlatRegionsWin(flat);
++  }
++  if (had_mode) {
++    RequestDisplayModeWin(want_3d);
++  }
++
++  // End the detection episode explicitly rather than waiting for the first
++  // successful call to do it: a report raised just before the swap must not be
++  // pushed to the browser after the swap already fixed it.
++  s.weave_fail_streak = 0;
++  s.weave_fail_total = 0;
++  s.session_lost_pending = false;
++  s.session_lost_reported = false;
++  ++s.weave_generation;
++  s.weave_mode = s.degraded ? WeaveMode::kDegraded : WeaveMode::kLive;
++  return true;
++}
++
+ // #625 phase-snap (CEF parity): poll the bound window's client-area screen
+ // origin; when it changes (the user dragged/repositioned the browser window),
+ // drive xrWeaveSnapWindowRectDXR so the DP re-locks the interlace lattice to the
+@@ -2845,6 +2967,35 @@ DisplayXRWeaveClient::ReconnectStatus DisplayXRWeaveClient::BrokerIpcConnection(
+ #endif
+ }
+ 
++// static
++bool DisplayXRWeaveClient::AdoptAndReconnect(uintptr_t pipe_handle) {
++#if BUILDFLAG(IS_WIN)
++  return AdoptAndReconnectWin(pipe_handle);
++#else
++  (void)pipe_handle;
++  return false;
++#endif
++}
++
++// static
++bool DisplayXRWeaveClient::NeedsRigRenegotiation() {
++#if BUILDFLAG(IS_WIN)
++  const WeaveClientState& s = State();
++  return s.degraded && !s.renegotiate_disabled && s.session != XR_NULL_HANDLE;
++#else
++  return false;
++#endif
++}
++
++// static
++uint32_t DisplayXRWeaveClient::WeaveGeneration() {
++#if BUILDFLAG(IS_WIN)
++  return State().weave_generation;
++#else
++  return 0;
++#endif
++}
++
+ // static
+ int DisplayXRWeaveClient::ReconnectDelaySeconds(int attempt) {
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index b0d295a..66dc720 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -283,6 +283,55 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   static ReconnectStatus BrokerIpcConnection(uintptr_t* out_pipe_handle,
+                                              std::string* out_service_tag);
+ 
++  // browser#103 (0078-B), GPU PROCESS. Adopt a brokered endpoint and rebuild
++  // this process's weave session on it. The other half of BrokerIpcConnection.
++  //
++  // |pipe_handle| is the connected pipe HANDLE the browser exported and mojo
++  // duplicated in. It is NOT consumed: the runtime duplicates it again, so the
++  // caller still owns (and must still close) what it passed.
++  //
++  // Order is DESTROY, ADOPT, CREATE, and each step is there for a reason:
++  //   destroy — the runtime allows one live XrInstance per process
++  //             (XR_ERROR_LIMIT_REACHED, observed in E0), so the old one has to
++  //             go first even though it is the working-looking one;
++  //   adopt   — through the runtime DLL's EXPORTED
++  //             ipc_client_connection_adopt_handle, resolved with
++  //             GetModuleHandle
++  //             + GetProcAddress on the ALREADY-LOADED runtime DLL. Never
++  //             LoadLibrary (a new privileged act post-LowerToken) and never
++  //             the DXR_IPC_HANDLE environment form: that DLL was loaded
++  //             pre-sandbox, so its static-CRT environment snapshot was taken
++  //             then and a SetEnvironmentVariable now would be invisible to the
++  //             getenv that reads it — the same trap XRT_FORCE_MODE documents;
++  //   create  — xrCreateInstance consumes the adopted endpoint instead of
++  //             dialling one, which is the whole point: this process cannot
++  //             dial.
++  //
++  // Re-asserts the full sticky list on the new session (design §6.4) and bumps
++  // the weave generation. Returns true iff a live session came back.
++  //
++  // Answers false without doing anything in a process where no weave session
++  // was ever established — the same negative control as everywhere else.
++  static bool AdoptAndReconnect(uintptr_t pipe_handle);
++
++  // browser#103 (0078-B, design §6.5 bonus): did the session that just came up
++  // come up DEGRADED — weave live, rig refused — with re-negotiation still
++  // worth trying on this runtime?
++  //
++  // 0071 could only ask this in the browser process, because "re-negotiate"
++  // meant "create another instance" and the GPU process could not. Brokering
++  // removes exactly that constraint, so the GPU's ladder can now climb the rig
++  // axis too — through the broker, on the 5-minute tail, since it has no way to
++  // run 0071's probe-before-swap and must not churn a working weave
++  // impatiently.
++  static bool NeedsRigRenegotiation();
++
++  // browser#103: how many times this process has re-established the weave after
++  // an outage. Read by both the GPU ladder and the log lines, so there is ONE
++  // number rather than two that can disagree. Always 0 in the browser process
++  // under sync weave, which is truthful: that session does not weave.
++  static uint32_t WeaveGeneration();
++
+   // browser#103: THE backoff ladder — 2s, 5s, 15s, 60s, then every 5 min.
+   //
+   // Exposed rather than duplicated: 0071's degraded-rig re-negotiation and
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index caa8d63..60207bc 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -9,11 +9,13 @@
+ #include <dxgi1_2.h>
+ 
+ #include <algorithm>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/win/scoped_handle.h"
+ #include "components/displayxr/browser/displayxr_weave_client.h"
+@@ -24,6 +26,27 @@ namespace displayxr {
+ 
+ using Microsoft::WRL::ComPtr;
+ 
++namespace {
++
++// browser#103 (0078-B), design §6.8: how long a reconnected session must SURVIVE
++// before the ladder is allowed to reset.
++//
++// A bare successful connect is not evidence of recovery — a service crash-looping
++// every three seconds would hand out a connection each time, reset the ladder
++// each time, and produce a reconnect storm that is worse than the outage. Sixty
++// seconds of frames is evidence.
++constexpr base::TimeDelta kStabilityWindow = base::Seconds(60);
++
++// The [DisplayXR][weave-mode] gate 0070 established and 0076 reused: first 3,
++// then 1-in-300. Counted rather than capped, so a session that starts failing an
++// hour in still leaves a trace.
++bool WeaveModeLogGate(uint64_t& counter) {
++  const uint64_t n = counter++;
++  return n < 3 || (n % 300) == 0;
++}
++
++}  // namespace
++
+ DisplayXRWeaveGpu::DisplayXRWeaveGpu() = default;
+ 
+ DisplayXRWeaveGpu::~DisplayXRWeaveGpu() {
+@@ -52,6 +75,15 @@ void DisplayXRWeaveGpu::Bind() {
+         for (auto& [id, in] : self->inputs_) {
+           in.in_flight = false;
+         }
++        // browser#103 (0078-B): a RequestWeaveReconnect that was outstanding
++        // when the pipe dropped has had its reply callback discarded, and
++        // |kInFlight| would otherwise be terminal — the ladder would never post
++        // another rung and the weave would stay mono for the process lifetime
++        // on a browser-side hiccup. Fall back to DISCONNECTED and re-arm.
++        if (self->reconnect_state_ == ReconnectState::kInFlight) {
++          self->reconnect_state_ = ReconnectState::kDisconnected;
++          self->ScheduleReconnect();
++        }
+       },
+       base::Unretained(this)));
+ }
+@@ -102,6 +134,286 @@ void DisplayXRWeaveGpu::ReportWeaveSessionLostIfDetected() {
+   // in displayxr_weaver_impl.cc, which fails the same build if either drifts.
+   weaver_->WeaveSessionLost(static_cast<mojom::WeaveSessionLostReason>(reason),
+                             last_result, fail_count);
++  // 0078-B: and start climbing. Same take-and-clear edge as the report, so this
++  // arms exactly once per outage no matter how many frames notice.
++  EnterDisconnected();
++}
++
++// ---------------------------------------------------------------------------
++// browser#103 (0078-B): the GPU-side reconnect ladder. Design §6.3-§6.8.
++// ---------------------------------------------------------------------------
++
++void DisplayXRWeaveGpu::EnterDisconnected() {
++  if (reconnect_disabled_) {
++    return;  // this runtime cannot broker; nothing to climb toward
++  }
++  // FLAPPING (design §6.8, point 2). Losing the session INSIDE the stability
++  // window is the signature of a crash-looping service, and the ladder must NOT
++  // be reset for it — that is precisely what walks a 3-second crash loop out to
++  // the 5-minute tail instead of turning it into a reconnect storm. The
++  // generation and the lifetime are the two numbers triage wants.
++  if (stability_pending_) {
++    const base::TimeDelta lasted =
++        base::TimeTicks::Now() - (stability_deadline_ - kStabilityWindow);
++    stability_pending_ = false;
++    if (WeaveModeLogGate(flapping_log_count_)) {
++      LOG(ERROR) << "[DisplayXR][weave-mode] flapping: session lost "
++                 << lasted.InSeconds() << "s after reconnect (generation "
++                 << DisplayXRWeaveClient::WeaveGeneration()
++                 << ") — ladder NOT reset (next delay "
++                 << DisplayXRWeaveClient::ReconnectDelaySeconds(
++                        reconnect_attempts_)
++                 << "s)";
++    }
++  }
++  if (reconnect_state_ != ReconnectState::kIdle) {
++    return;  // already climbing
++  }
++  reconnect_state_ = ReconnectState::kDisconnected;
++  reconnect_for_rig_ = false;
++  disconnected_since_ = base::TimeTicks::Now();
++  ScheduleReconnect();
++}
++
++void DisplayXRWeaveGpu::ScheduleReconnect() {
++  if (reconnect_disabled_ || reconnect_armed_ ||
++      reconnect_state_ != ReconnectState::kDisconnected) {
++    return;
++  }
++  // THE ladder, shared with 0071's rig re-negotiation and with the browser's own
++  // half of this one: 2s, 5s, 15s, 60s, then every 5 min. One set of numbers in
++  // the codebase, so there is nothing to drift.
++  //
++  // The first rung is 2s and must not go below it: displayxr-service takes
++  // ~2000 ms (DXR_DEVICE_REMOVED_EXIT_MS) to exit for relaunch, and the runtime
++  // client's own connect ladder already handles landing inside that window.
++  const int secs =
++      DisplayXRWeaveClient::ReconnectDelaySeconds(reconnect_attempts_);
++  reconnect_armed_ = true;
++  VLOG(1) << "[DisplayXR][weave-mode] RECONNECTING: attempt "
++          << reconnect_attempts_ + 1 << " in " << secs << "s"
++          << (reconnect_for_rig_ ? " (rig axis)" : "");
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&DisplayXRWeaveGpu::RequestReconnect,
++                     weak_factory_.GetWeakPtr()),
++      base::Seconds(secs));
++}
++
++void DisplayXRWeaveGpu::RequestReconnect() {
++  reconnect_armed_ = false;
++  if (reconnect_state_ != ReconnectState::kDisconnected) {
++    return;
++  }
++  if (!weaver_.is_bound()) {
++    // Sync mode never calls WeaveSubmit, but Bind() is unconditional under
++    // --enable-inline-3d, so this is a browser-side anomaly rather than a
++    // configuration. Keep the ladder alive: the remote may be rebound.
++    LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: the browser bridge is not "
++                  "bound — cannot request a brokered connection";
++    ScheduleReconnect();
++    return;
++  }
++  reconnect_state_ = ReconnectState::kInFlight;
++  weaver_->RequestWeaveReconnect(
++      base::BindOnce(&DisplayXRWeaveGpu::OnReconnectReply,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void DisplayXRWeaveGpu::OnReconnectReply(mojom::ReconnectResultPtr result) {
++  ++reconnect_attempts_;
++  const int attempt = reconnect_attempts_;
++  reconnect_state_ = ReconnectState::kDisconnected;
++
++  if (!result) {
++    if (WeaveModeLogGate(reconnect_fail_log_count_)) {
++      LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: broker returned nothing "
++                    "(attempt "
++                 << attempt << ")";
++    }
++    ScheduleReconnect();
++    return;
++  }
++
++  // HANDLE HYGIENE (design §6.8). |pipe| owns whatever mojo duplicated in, from
++  // this line to the end of the function, on EVERY path. Nothing below leaks it
++  // and nothing below double-closes it: the adopt duplicates again, so we still
++  // own ours afterwards and the destructor is the right place for it. A flapping
++  // service must not leak one pipe INSTANCE per attempt — the service's count is
++  // finite and exhausting it denies service to every DisplayXR client on the box.
++  base::win::ScopedHandle pipe = result->pipe.TakeHandle();
++
++  switch (result->status) {
++    case mojom::ReconnectStatus::kUnsupported:
++      // Terminal for this browser session: the installed runtime predates the
++      // broker contract, so no amount of laddering can produce an endpoint.
++      // Scenes still recover (they read the BROWSER's session, which needs no
++      // broker) — only the GPU's tiles are stuck mono.
++      reconnect_disabled_ = true;
++      LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: the runtime cannot "
++                    "broker a connection (no xrWeaveExportIpcConnectionDXR) — "
++                    "inline-3D TILES stay MONO until this browser is relaunched "
++                    "against a runtime carrying XR_DXR_weave spec 9. Ladder "
++                    "stopped; scenes are unaffected.";
++      return;
++    case mojom::ReconnectStatus::kVersionSkew:
++      // Design §6.7: once, loudly, unthrottled, naming the remedy — then the
++      // 5-minute tail. Never permanent: an installer that finishes writing, or
++      // a rollback, recovers this without a relaunch.
++      if (!skew_logged_) {
++        skew_logged_ = true;
++        LOG(ERROR)
++            << "[DisplayXR][weave-mode] SKEW: the DisplayXR client library and "
++               "the running displayxr-service are different builds"
++            << (result->service_tag.empty()
++                    ? std::string(
++                          " (both git tags are in the runtime's own client "
++                          "log; the OpenXR surface does not expose them)")
++                    : " (service " + result->service_tag + ")")
++            << " — the runtime was upgraded under a running browser; relaunch "
++               "DisplayXR Browser. Inline-3D tiles render MONO meanwhile. "
++               "Re-probing every 5 min.";
++      }
++      reconnect_attempts_ = std::max(attempt, 4);  // straight to the tail
++      ScheduleReconnect();
++      return;
++    case mojom::ReconnectStatus::kNotReady:
++      if (WeaveModeLogGate(reconnect_fail_log_count_)) {
++        LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: connect failed — the "
++                      "browser could not recover its own session (attempt "
++                   << attempt << ", next delay "
++                   << DisplayXRWeaveClient::ReconnectDelaySeconds(attempt)
++                   << "s); displayxr-service still unreachable";
++      }
++      ScheduleReconnect();
++      return;
++    case mojom::ReconnectStatus::kOk:
++      break;
++  }
++
++  if (!pipe.is_valid()) {
++    if (WeaveModeLogGate(reconnect_fail_log_count_)) {
++      LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: broker reported success "
++                    "with no endpoint (attempt "
++                 << attempt << ")";
++    }
++    ScheduleReconnect();
++    return;
++  }
++
++  if (!DisplayXRWeaveClient::AdoptAndReconnect(
++          reinterpret_cast<uintptr_t>(pipe.get()))) {
++    // The client already logged what failed. |pipe| closes on the way out, which
++    // is the "handle closed, staying disconnected" half of design §9's line.
++    if (WeaveModeLogGate(reconnect_fail_log_count_)) {
++      LOG(ERROR) << "[DisplayXR][weave-mode] reconnect: adopt+create failed "
++                    "(attempt "
++                 << attempt << ") — handle closed, staying disconnected";
++    }
++    ScheduleReconnect();
++    return;
++  }
++
++  SwapOverAfterReconnect();
++
++  const base::TimeDelta outage =
++      disconnected_since_.is_null() ? base::TimeDelta()
++                                    : base::TimeTicks::Now() -
++                                          disconnected_since_;
++  total_outage_ += outage;
++  disconnected_since_ = base::TimeTicks();
++  reconnect_state_ = ReconnectState::kIdle;
++  // NOT a ladder reset. |reconnect_attempts_| stays where it is until the new
++  // session has survived kStabilityWindow of successful submits — see
++  // NoteSubmitSucceeded and design §6.8.
++  stability_pending_ = true;
++  stability_deadline_ = base::TimeTicks::Now() + kStabilityWindow;
++
++  LOG(INFO) << "[DisplayXR][weave-mode] RECONNECTED: weave live after "
++            << outage.InSeconds() << "s disconnected (" << attempt
++            << " attempts, generation "
++            << DisplayXRWeaveClient::WeaveGeneration()
++            << ") — inline-3D tiles are woven again (cumulative outage "
++            << total_outage_.InSeconds() << "s this browser session)";
++
++  // Design §6.5 bonus. 0071 could only re-negotiate the rig in the BROWSER
++  // process, because re-negotiating meant creating another instance and this
++  // process could not. Brokering removes exactly that constraint, so a GPU
++  // session that came up degraded is no longer degraded for the rest of the
++  // process's life — it climbs the same ladder, on the 5-minute tail.
++  //
++  // The tail, not the fast rungs: this side has no way to run 0071's
++  // probe-before-swap, so every rig attempt tears down a WORKING weave on
++  // spec. Once per five minutes is the same cost 0071 already accepts in the
++  // browser, and a rig that never enables simply keeps costing that.
++  if (DisplayXRWeaveClient::NeedsRigRenegotiation()) {
++    reconnect_state_ = ReconnectState::kDisconnected;
++    reconnect_for_rig_ = true;
++    reconnect_attempts_ = std::max(reconnect_attempts_, 4);
++    ScheduleReconnect();
++  }
++}
++
++// Design §6.3 + §6.4: everything GPU-side that belonged to the OLD service and
++// that the new one has never seen. All of it uses machinery that already exists;
++// none of it is a special case bolted on for reconnect.
++void DisplayXRWeaveGpu::SwapOverAfterReconnect() {
++  // A batch that was open when the service died must not leave the shared
++  // input's keyed mutex held across the realloc below.
++  if (batch_mutex_held_ && shared_input_.input_mutex) {
++    shared_input_.input_mutex->ReleaseSync(0);
++  }
++  batch_mutex_held_ = false;
++  batch_open_ = false;
++  batch_entries_.clear();
++  overlay_set_this_batch_ = false;
++
++  // FORCE REALLOCATION of the batch input and the overlay atlas.
++  //
++  // Both are D3D11 KEYED-MUTEX textures. A service that died holding the mutex
++  // leaves it ABANDONED, and the next AcquireSync answers WAIT_ABANDONED — which
++  // today surfaces as "batch weave: AcquireSync(0) failed" and zero copies for
++  // the rest of the process's life. Reallocating is better than special-casing
++  // WAIT_ABANDONED because it is also CORRECT for the other half of the problem:
++  // the new service has never seen these textures, and "keep previous" must
++  // never claim pixels it has never been shown.
++  //
++  // |batch_last_copied_| needs no explicit clear: it is cleared WHOLESALE the
++  // moment |shared_input_.input_tex| is reallocated (the header's contract,
++  // enforced by the identity check in EnsureBatchInputAndAcquire), because the
++  // pixels it describes died with the old texture. Resetting here and letting
++  // EnsureInput rebuild on the next frame is exactly what trips that check.
++  ResetInput(shared_input_);
++  ResetInput(overlay_input_);
++  for (auto& [id, in] : inputs_) {
++    ResetInput(in);
++    in.in_flight = false;
++  }
++
++  // The woven texture and the fence belonged to a service that is gone; their
++  // handles name nothing now. Closing them is not merely hygiene — the new
++  // session's runtime-side `exported` flag starts CLEAR, so the first
++  // post-reconnect submit re-exports and Viz re-imports through the existing
++  // first-submit/resize path. Keeping the old ones would show a frozen 3D frame
++  // rather than a black one, which is a worse failure because it looks like it
++  // is working.
++  for (auto& [id, pending] : results_) {
++    if (pending.have) {
++      CloseResultHandles(pending.result);
++    }
++  }
++  results_.clear();
++}
++
++void DisplayXRWeaveGpu::NoteSubmitSucceeded() {
++  if (!stability_pending_ || base::TimeTicks::Now() < stability_deadline_) {
++    return;
++  }
++  stability_pending_ = false;
++  reconnect_attempts_ = 0;
++  VLOG(1) << "[DisplayXR][weave-mode] reconnect: stability window survived "
++             "(generation "
++          << DisplayXRWeaveClient::WeaveGeneration() << ") — ladder reset";
+ }
+ 
+ // static
+@@ -883,6 +1195,10 @@ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+     }
+     return false;
+   }
++  // browser#103 (0078-B): the ladder is reset by SURVIVAL, not by connecting.
++  // This is the only evidence that exists for it — a frame that actually wove.
++  NoteSubmitSucceeded();
++
+   // Throttled batch-cost telemetry: this ONE call replaced n serialized ~1 ms
+   // submits — the number that lifts the visible-element ceiling.
+   static base::TimeTicks s_last_log;
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index d82d2e0..da7d417 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -19,6 +19,7 @@
+ 
+ #include "base/containers/flat_map.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
+ #include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -190,12 +191,64 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   // side is take-and-clear, so this sends exactly ONE message per outage no
+   // matter how often it is called.
+   //
+-  // OBSERVABILITY ONLY (0076). It arms nothing, retries nothing, and waits for
+-  // no reply; the reconnect ladder is 0077 and is gated on the E0 experiment.
++  // 0078-B: it also ENTERS the disconnected state and arms the broker ladder
++  // below, on the same take-and-clear edge — one report, one ladder, per
++  // outage.
+   void ReportWeaveSessionLostIfDetected();
+ 
++  // browser#103 (0078-B): the GPU half of the reconnect ladder. Design §6.3.
++  //
++  // Everything here runs on the GPU-MAIN sequence — the one that submits, owns
++  // the D3D device, and owns |weaver_|. That is deliberate and is the whole
++  // reason the design refuses a worker thread: the client's State() is
++  // single-sequence per process, and the reconnect rebuilds it. The only
++  // asynchrony is the mojo hop, whose reply is marshalled back here exactly as
++  // OnWeaveReply's is. Nothing ever blocks.
++  enum class ReconnectState {
++    kIdle,          // weaving, or never weaving
++    kDisconnected,  // waiting out a ladder delay
++    kInFlight,      // a RequestWeaveReconnect is outstanding
++  };
++
++  // Enter DISCONNECTED (or note flapping if we are still inside the stability
++  // window) and arm the first rung.
++  void EnterDisconnected();
++  // Post the next rung, unless one is already posted or we are not
++  // disconnected.
++  void ScheduleReconnect();
++  // A rung: ask the browser to broker an endpoint.
++  void RequestReconnect();
++  // The reply, back on this sequence.
++  void OnReconnectReply(mojom::ReconnectResultPtr result);
++  // Design §6.3/§6.4: everything GPU-side that the OLD service owned and the
++  // new one has never seen. Called only after a successful adopt+create.
++  void SwapOverAfterReconnect();
++  // Called on every successful batch submit: the 60 s stability window is what
++  // resets the ladder, never a bare successful connect (design §6.8 — a service
++  // crash-looping every 3 s must walk OUT to the 5-minute tail, not reset).
++  void NoteSubmitSucceeded();
++
+   mojo::Remote<mojom::DisplayXRWeaver> weaver_;
+ 
++  ReconnectState reconnect_state_ = ReconnectState::kIdle;
++  bool reconnect_armed_ = false;  // a rung is already posted
++  int reconnect_attempts_ = 0;    // index into the shared 2/5/15/60/300s ladder
++  // Set when the runtime turns out to predate the broker contract. Terminal for
++  // this browser session: no ladder, no timers, no further asking.
++  bool reconnect_disabled_ = false;
++  // Design §6.5 bonus: this rung is climbing the RIG axis (weave live, rig
++  // refused) rather than the connection one. Only affects wording and cadence.
++  bool reconnect_for_rig_ = false;
++  base::TimeTicks disconnected_since_;
++  base::TimeDelta total_outage_;
++  // The stability window: a reconnect is not "successful" until it has
++  // SURVIVED.
++  base::TimeTicks stability_deadline_;
++  bool stability_pending_ = false;
++  uint64_t reconnect_fail_log_count_ = 0;
++  uint64_t flapping_log_count_ = 0;
++  bool skew_logged_ = false;
++
+   // Async weave state. Latest completed woven result per target id (index of the
+   // inline-3d rect), owning its handles until Viz takes it via TryTakeWovenResult.
+   // All touched only on the GPU main thread.
