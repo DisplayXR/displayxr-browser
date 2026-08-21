@@ -24,3 +24,4 @@ _signed/
 # Secrets / local machine coordinates (never committed)
 .secrets/
 .env.local
+.android-port-wip.tgz
