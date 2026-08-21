@@ -1,0 +1,468 @@
+From dede3597b2c001be86cd9b36bc92353044e6db11 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 21 Aug 2026 12:38:59 -0700
+Subject: [PATCH] inline-3d(#117): join the tile by identity, and stop the 70%
+ bar meaning 70% visible
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A 3D tile scrolled less than roughly 70% into the viewport rendered as raw
+SBS — the packed side-by-side buffer drawn as ordinary page content — and
+snapped back to correct woven stereo above that. Deterministic, reversible
+with scroll position, and present on 0.1.14 as well as the 79-patch
+candidate, i.e. pre-existing rather than introduced by 0075-0079.
+
+Two stacked defects, both now fixed.
+
+DEFECT 1 — the identity join has never worked for a real SDK tile.
+
+The GPU id-miss counter climbed roughly per frame (misses=4201 in the
+report) even while tiles were weaving CORRECTLY, which means the whole
+pipeline was running on the geometric fallback the Phase-1 join was supposed
+to demote to a rarity. The reported cause is the duplicate-id line:
+
+  ID-MATCH FALLBACK: reason=duplicate id id=..0001 layer_ids=28/17 kept=28
+
+Patch 0060 diagnosed that split correctly — a kInline3dWeave rect that rides
+the element's BACKGROUND paint chunk merges into the enclosing PictureLayer,
+while the canvas PIXELS are a ForeignLayer that PendingLayer::RequiresOwnLayer
+always keeps separate, so the id cc stamps on the rect can never equal the id
+in the SharedQuadState of the quad that draws the canvas. It fixed only half
+of it. 0060 stopped ReplacedPainter FORCING a background display item into
+existence for an inline-3d-only canvas; it did not stop the item being
+recorded when it exists for some OTHER reason, and then
+BoxPainter::RecordTrackedElementAndRegionCaptureData hands the chunk the
+element's whole TrackedElementSubRects map, kInline3dWeave included.
+
+Which is the normal case, not a corner one. Every tile the inline-3D SDK
+creates gets, from Viewer._bindOrbit (displayxr-web js/inline3d-viewer.js):
+
+  el.style.touchAction = 'none';
+  el.addEventListener('pointerdown'|'pointermove'|'pointerup'|'pointercancel')
+  el.addEventListener('wheel', this._onWheel, { passive: false })
+
+An explicit touch-action makes HasEffectiveAllowedTouchAction() true and the
+non-passive wheel listener makes InsideBlockingWheelEventHandler() true, so
+ReplacedPainter::ShouldPaintBoxDecorationBackground's earlier conditions paint
+the background regardless of 0060's guard — on a canvas with no CSS
+decoration at all, as in the model sample (`canvas.tile` is bare: display,
+width, aspect-ratio, cursor). Every interactive tile therefore emitted its
+tracked rect TWICE, with two layer ids, every frame.
+
+Viz then had to arbitrate, and its arbitration was order-dependent: it kept
+the incumbent whenever both copies id-matched or neither did. The rects are
+ordered by `std::ranges::sort`, which is NOT stable, and the two copies of one
+element differ only in near-identical geometry — so "the incumbent" was
+effectively arbitrary, and when the quad-less PictureLayer copy won, the join
+died for that element for the whole frame.
+
+Fix: suppress the duplicate AT SOURCE. ReplacedPainter now omits
+kInline3dWeave (and only that feature — region capture and everything else is
+untouched) from the background chunk exactly when HTMLCanvasPainter will
+register it on the canvas's own layer instead, mirroring that painter's
+foreign-layer conditions so an unaccelerated / printing / omit-compositing
+canvas, where the chunk copy is the ONLY copy, keeps it.
+
+The Viz-side collapse stays, as a should-never-fire guard for an older
+renderer or a future painter that re-splits the registration, but it no longer
+arbitrates by list order: it ranks the copies (no identity < identity with no
+quad < identity whose quad actually covers the tracked rect) and keeps the
+best, so even in the degraded case the pixel-owning layer wins.
+
+DEFECT 2 — the geometric fallback was a visibility threshold.
+
+The two halves of that comparison are clipped differently by construction. A
+tracked rect reaches the aggregator through EmitSurfaceContent, which
+intersects it with the embedding surface's root-target clip, so a tile scrolled
+half off the window arrives ALREADY cut down to its visible strip (the report's
+1043x412 of a 1043x1043 tile). A candidate quad rect is
+`MapEnclosingClippedRect(to_root, quad->rect)` — the layer's FULL unclipped
+bounds. best_match normalised the intersection by max(quad_area, target_area),
+which for that pair is the quad area, so the score WAS the visible fraction:
+412/1043 = 0.395 against a 0.7 bar. No match, no entry in
+inline_3d_canvas_resources, so Display::DrawAndSwap suppressed nothing and the
+weave had no clean source — the page's own raw SBS quad is what you saw, and
+direct_renderer's plane split reported it as tiles_without_k=1.
+
+Fix: score on the COMMON visible space. Both rects are clipped to the root
+pass footprint (the browser#94 rect, hoisted above the lambda) before the
+ratio, so a 40%-visible tile scores ~1000 against its own quad and the 70% bar
+goes back to meaning "is this the same element".
+
+The GPU-side join in canvas_mailbox_for had the same asymmetry — |r| already
+window-clipped, |c.rect| the unclipped tile — but there the denominator is the
+TARGET area, i.e. a containment test, so it did not reproduce the bug. It is
+made symmetric anyway (candidate clipped to window_bounds) and now takes the
+BEST candidate rather than the first over the bar, matching the aggregator's
+browser#22 tie policy.
+
+Net effect: the id-join succeeds, so the fallback becomes the rare path it was
+designed to be, and when it does run it no longer confuses "partly visible"
+with "different element". A tile at 10% visibility weaves its visible strip;
+the weave already handles window-clipped rects, so nothing new clips it.
+
+Files:
+  third_party/blink/renderer/core/paint/replaced_painter.cc
+  components/viz/service/display/surface_aggregator.cc
+  components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+---
+ .../viz/service/display/surface_aggregator.cc | 124 +++++++++++++-----
+ .../skia_output_surface_impl_on_gpu.cc        |  35 ++++-
+ .../renderer/core/paint/replaced_painter.cc   |  76 ++++++++++-
+ 3 files changed, 191 insertions(+), 44 deletions(-)
+
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index cbf38ef..432ac77 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2430,8 +2430,50 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   // (not the target) is what keeps the tile glued during a scroll (browser#18
+   // bug A). Still live: this is the geometric fallback under the canvas
+   // ID-MATCH join below.
+-  auto best_match = [](const gfx::Rect& target,
+-                       const std::vector<RootResourceQuad>& quads)
++  //
++  // browser#94: the root pass's own footprint, expressed in the SAME
++  // root-target space as both the tracked rects and |root_resource_quads_|
++  // (identical idiom to the color-usage full-damage rect above). A tracked rect
++  // that does not touch this rect belongs to an element that is entirely off
++  // the viewport this frame. browser#117 also makes it the COMMON CLIP the
++  // geometric comparisons below are taken in — see |overlap_score|.
++  const gfx::Rect root_output_rect =
++      cc::MathUtil::MapEnclosedRectWith2dAxisAlignedTransform(
++          root_surface_transform_, gfx::Rect(viewport_bounds));
++  // browser#117: score two root-space rects on the SAME visible space.
++  //
++  // The two halves of this comparison are clipped differently by construction.
++  // A tracked rect reaches us through EmitSurfaceContent, which intersects it
++  // with the embedding surface's root-target clip, so a tile scrolled half off
++  // the window arrives ALREADY cut down to its visible strip. A candidate quad
++  // rect is `MapEnclosingClippedRect(to_root, quad->rect)` — the layer's FULL
++  // unclipped bounds. Normalising the intersection by the larger of those two
++  // therefore yields exactly the element's VISIBLE FRACTION, which turned the
++  // 70% overlap bar into a 70%-VISIBILITY bar: below it the tile matched
++  // nothing, was neither suppressed nor woven, and the page drew its raw SBS
++  // buffer. Clipping BOTH rects to the root pass footprint first removes the
++  // asymmetry: a 40%-visible tile now scores ~1000 against its own quad, and
++  // the bar goes back to meaning "is this the same element".
++  auto overlap_score = [](const gfx::Rect& a, const gfx::Rect& b,
++                          const gfx::Rect& clip) -> int64_t {
++    gfx::Rect ca = a;
++    ca.Intersect(clip);
++    gfx::Rect cb = b;
++    cb.Intersect(clip);
++    gfx::Rect inter = ca;
++    inter.Intersect(cb);
++    const int64_t ia = static_cast<int64_t>(inter.width()) * inter.height();
++    const int64_t aa = static_cast<int64_t>(ca.width()) * ca.height();
++    const int64_t ba = static_cast<int64_t>(cb.width()) * cb.height();
++    const int64_t max_area = std::max(aa, ba);
++    if (max_area <= 0) {
++      return -1;
++    }
++    return (ia * 1000) / max_area;
++  };
++  auto best_match = [&overlap_score](const gfx::Rect& target,
++                                     const std::vector<RootResourceQuad>& quads,
++                                     const gfx::Rect& clip)
+       -> std::optional<RootResourceQuad> {
+     std::optional<RootResourceQuad> found;
+     // Score = intersection area normalised by the larger of the two rects, in
+@@ -2449,14 +2491,10 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       if (qr.IsEmpty()) {
+         continue;
+       }
+-      gfx::Rect inter = qr;
+-      inter.Intersect(target);
+-      const int64_t ia = static_cast<int64_t>(inter.width()) * inter.height();
+-      const int64_t qa = static_cast<int64_t>(qr.width()) * qr.height();
+-      const int64_t ta =
+-          static_cast<int64_t>(target.width()) * target.height();
+-      const int64_t max_area = std::max(qa, ta);
+-      if (max_area <= 0 || ia * 10 < max_area * 7) {
++      // browser#117: both rects clipped to |clip| before the ratio, so partial
++      // visibility can never read as a mismatch.
++      const int64_t score = overlap_score(qr, target, clip);
++      if (score < 700) {
+         continue;
+       }
+       // NOTE: do NOT reject a candidate because its dimensions differ from the
+@@ -2466,7 +2504,6 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       // guard here rejected exactly those valid matches. The oversize is handled
+       // downstream by clipping the composite rect to the visible fraction, not
+       // by dropping the match.
+-      const int64_t score = (ia * 1000) / max_area;
+       if (score >= best_score) {
+         best_score = score;
+         found = cand;
+@@ -2507,37 +2544,57 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     }
+     return found;
+   };
+-  // Phase-1 identity, risk L2 — DUPLICATE ID. One element can emit more than
++  // Phase-1 identity, risk L2 — DUPLICATE ID. One element could emit more than
+   // one tracked rect in a frame: HTMLCanvasPainter registers the rect on the
+-  // canvas's ForeignLayer, and a canvas that ALSO records a background paint
++  // canvas's ForeignLayer, and a canvas that ALSO recorded a background paint
+   // chunk (it has a background colour, a touch-action region, or a wheel
+-  // handler) emits a second copy that merges into the enclosing PictureLayer.
++  // handler) emitted a second copy that merged into the enclosing PictureLayer.
+   // Same token, different layer ids — and the GPU keys per-target state by
+-  // token, so it cannot hold both. Collapse them, keeping the copy whose layer
+-  // id actually names a root resource quad, i.e. the layer holding the pixels.
++  // token, so it cannot hold both.
++  //
++  // browser#117: that second copy is now suppressed AT SOURCE — ReplacedPainter
++  // omits kInline3dWeave from the background chunk whenever HTMLCanvasPainter
++  // will register it on the canvas's own layer — so on a current renderer this
++  // block should never fire. It is kept as a SHOULD-NEVER-FIRE guard (an older
++  // renderer, or a future painter that re-introduces the split, still has to
++  // degrade rather than mis-join) and its arbitration is now decisive rather
++  // than order-dependent: it used to keep the incumbent whenever both copies
++  // id-matched or neither did, and since std::ranges::sort is NOT stable and
++  // the two copies of one element carry near-identical geometry, "the
++  // incumbent" was effectively arbitrary — which is how the quad-less
++  // PictureLayer copy could win and kill the join for the whole frame.
++  // Score instead: an id-matched copy beats an unmatched one, and between two
++  // matched copies the one whose quad actually COVERS the tracked rect wins.
+   // The id-primary sort above has already made duplicates adjacent.
+   {
++    // Rank a copy: -1 no identity, 0 identity but no root quad claims it, and
++    // 1..1001 the clip-normalised overlap of its matched quad with its own
++    // tracked rect. Higher is more likely to be the layer holding the pixels.
++    auto dup_rank = [&](const Inline3dTrackedRect& r) -> int64_t {
++      if (r.sqs_layer_id == 0) {
++        return -1;
++      }
++      std::optional<RootResourceQuad> m = id_match(r, root_resource_quads_);
++      if (!m) {
++        return 0;
++      }
++      return 1 + std::max<int64_t>(
++                     0, overlap_score(m->rect, r.rect, root_output_rect));
++    };
+     std::vector<Inline3dTrackedRect> deduped;
+     deduped.reserve(inline_3d_rects_.size());
+     for (const Inline3dTrackedRect& r : inline_3d_rects_) {
+       if (!r.id.is_zero() && !deduped.empty() && deduped.back().id == r.id) {
+-        // Deliberately NOT a DCHECK: this is reachable on a perfectly ordinary
+-        // page (any inline-3d canvas with a background colour), so it must
+-        // degrade, not crash. Prefer the copy that id-matches a root resource
+-        // quad; failing that, prefer one that carries an identity at all.
++        // Deliberately NOT a DCHECK: it must degrade, not crash.
+         const uint32_t incumbent_layer_id = deduped.back().sqs_layer_id;
+-        const bool incumbent_matches =
+-            id_match(deduped.back(), root_resource_quads_).has_value();
+-        const bool new_matches = id_match(r, root_resource_quads_).has_value();
+-        if ((new_matches && !incumbent_matches) ||
+-            (new_matches == incumbent_matches && incumbent_layer_id == 0 &&
+-             r.sqs_layer_id != 0)) {
++        if (dup_rank(r) > dup_rank(deduped.back())) {
+           deduped.back() = r;
+         }
+         static int dup_dbg = 0;
+         if ((dup_dbg++ % 60) == 0) {
+           VLOG(1) << "[DisplayXR] inline-3D ID-MATCH FALLBACK: reason="
+-                     "duplicate id id="
++                     "duplicate id (browser#117: should no longer be "
++                     "reachable) id="
+                   << r.id.ToString() << " layer_ids=" << incumbent_layer_id
+                   << "/" << r.sqs_layer_id
+                   << " kept=" << deduped.back().sqs_layer_id;
+@@ -2558,14 +2615,6 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     frame.inline_3d_rects.push_back(
+         {r.rect, r.id, r.sqs_layer_id, r.layer_namespace_id});
+   }
+-  // browser#94: the root pass's own footprint, expressed in the SAME
+-  // root-target space as both the tracked rects and |root_resource_quads_|
+-  // (identical idiom to the color-usage full-damage rect above). A tracked rect
+-  // that does not touch this rect belongs to an element that is entirely off
+-  // the viewport this frame.
+-  const gfx::Rect root_output_rect =
+-      cc::MathUtil::MapEnclosedRectWith2dAxisAlignedTransform(
+-          root_surface_transform_, gfx::Rect(viewport_bounds));
+   // Phase-1 identity: match each inline-3d canvas rect to the resource quad
+   // that draws it by IDENTITY first, geometry only as a fallback.
+   for (const Inline3dTrackedRect& canvas : inline_3d_rects_) {
+@@ -2633,7 +2682,10 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+                 << " target=" << canvas.rect.ToString() << " among "
+                 << root_resource_quads_.size() << " root quads";
+       }
+-      m = best_match(canvas.rect, root_resource_quads_);
++      // browser#117: the fallback compares on the COMMON visible space, so a
++      // tile that is only partly on screen scores against its own quad exactly
++      // as a fully visible one does.
++      m = best_match(canvas.rect, root_resource_quads_, root_output_rect);
+     }
+     if (m) {
+       frame.inline_3d_canvas_resources.push_back(
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 3ece7cc..0df6183 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3056,14 +3056,41 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                    << (n + 1) << ")";
+       }
+     }
++    // browser#117: score both rects in the SAME visible space and take the
++    // BEST, not the first over the bar.
++    //
++    // |r| arrives already clipped to |window_bounds| (attempt_submit intersects
++    // it) while |c.rect| is the tile's UNCLIPPED root-space quad rect, so the
++    // two halves were being compared across different clips — the identical
++    // asymmetry that made the aggregator-side fallback degenerate into a
++    // visibility threshold. Here the denominator is the TARGET area, so the
++    // ratio was already a containment test rather than a visibility one and the
++    // partial-visibility bug did not reproduce at this site; clipping the
++    // candidate to the window all the same removes the asymmetry for good and
++    // stops a stale off-window layer rect from out-reaching a live one.
++    // First-over-the-bar also becomes best-over-the-bar, matching the
++    // aggregator's tie policy (browser#22) so two nearly co-located tiles
++    // cannot be resolved by list order.
++    const SkiaOutputSurface::Inline3dLayerMailbox* best = nullptr;
++    int64_t best_score = -1;
++    const int64_t ta = static_cast<int64_t>(r.width()) * r.height();
+     for (const auto& c : inline_3d_canvas_layers_) {
+-      gfx::Rect inter = c.rect;
++      gfx::Rect cr = c.rect;
++      cr.Intersect(window_bounds);
++      gfx::Rect inter = cr;
+       inter.Intersect(r);
+       const int64_t ia = static_cast<int64_t>(inter.width()) * inter.height();
+-      const int64_t ta = static_cast<int64_t>(r.width()) * r.height();
+-      if (ta > 0 && ia * 10 >= ta * 7) {
+-        return c;
++      if (ta <= 0 || ia * 10 < ta * 7) {
++        continue;
+       }
++      const int64_t score = (ia * 1000) / ta;
++      if (score >= best_score) {
++        best_score = score;
++        best = &c;
++      }
++    }
++    if (best) {
++      return *best;
+     }
+     // (web#12) The null return was logged NOWHERE — the single most
+     // consequential silence in this path, because it is what routed the tile
+diff --git a/third_party/blink/renderer/core/paint/replaced_painter.cc b/third_party/blink/renderer/core/paint/replaced_painter.cc
+index f0e781b..7cfc928 100644
+--- a/third_party/blink/renderer/core/paint/replaced_painter.cc
++++ b/third_party/blink/renderer/core/paint/replaced_painter.cc
+@@ -16,6 +16,7 @@
+ #include "third_party/blink/renderer/core/layout/layout_view.h"
+ #include "third_party/blink/renderer/core/layout/svg/layout_svg_root.h"
+ #include "third_party/blink/renderer/core/mobile_metrics/mobile_friendliness_checker.h"
++#include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
+ #include "third_party/blink/renderer/core/paint/border_shape_utils.h"
+ #include "third_party/blink/renderer/core/paint/box_background_paint_context.h"
+ #include "third_party/blink/renderer/core/paint/box_decoration_data.h"
+@@ -37,7 +38,9 @@
+ #include "third_party/blink/renderer/platform/graphics/graphics_context_state_saver.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/display_item_cache_skipper.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/drawing_recorder.h"
++#include "third_party/blink/renderer/platform/graphics/paint/paint_controller.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/scoped_paint_chunk_properties.h"
++#include "third_party/blink/renderer/platform/graphics/paint/tracked_element_data.h"
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ 
+ namespace blink {
+@@ -121,7 +124,10 @@ ScopedReplacedContentPaintState::ScopedReplacedContentPaintState(
+ //
+ // Note this only removes the FORCED background item on an otherwise
+ // undecorated canvas; a canvas with a real background, a touch-action region,
+-// or a wheel handler still paints one through the earlier conditions.
++// or a wheel handler still paints one through the earlier conditions — and
++// every SDK-created inline-3D tile has a wheel handler, so that was the common
++// case, not the corner one (browser#117). The recording site below drops
++// kInline3dWeave from the chunk in exactly those frames instead.
+ bool HasNonInline3dTrackedElementSubRect(const Element& element) {
+   const TrackedElementSubRects* sub_rects = element.GetTrackedElementSubRects();
+   if (!sub_rects) {
+@@ -135,6 +141,43 @@ bool HasNonInline3dTrackedElementSubRect(const Element& element) {
+   return false;
+ }
+ 
++// DisplayXR browser#117: true iff HTMLCanvasPainter will register this
++// element's kInline3dWeave rect on the canvas's OWN cc layer during this same
++// paint — the ForeignLayer path.
++//
++// Patch 0060 stopped ReplacedPainter FORCING a background display item into
++// existence for an inline-3d-only canvas, and that killed the duplicate for a
++// BARE canvas. It did not kill it for the canvas the inline-3D SDK actually
++// creates: the viewer attaches a non-passive `wheel` listener plus pointer
++// handlers to every tile, so InsideBlockingWheelEventHandler() /
++// HasEffectiveAllowedTouchAction() make the background item exist anyway
++// (ShouldPaintBoxDecorationBackground's earlier conditions, above). The chunk
++// it produces then carries a SECOND copy of the same TrackedElementId, merged
++// into the enclosing PictureLayer — a different LayerImpl with a different
++// stable_id_for_shared_quad_state(). Viz saw the element twice with two layer
++// ids every frame, had to arbitrate, and when it kept the PictureLayer copy
++// (which draws no canvas quad) the identity join could not succeed at all: the
++// whole weave silently ran on the geometric overlap fallback, whose ratio is
++// the element's visible fraction, so a tile below ~70% visibility matched
++// nothing and the page drew its raw SBS buffer.
++//
++// So: when the pixels ride their own layer, that layer owns the rect and the
++// chunk must not carry a copy. When they do NOT — an unaccelerated canvas,
++// printing, or a paint that omits compositing info — HTMLCanvasPainter takes
++// the DrawingRecorder path, registers nothing, and the chunk-borne copy is the
++// only one there is; it must survive untouched.
++bool Inline3dWeaveRectRidesOwnLayer(const LayoutReplaced& layout_replaced,
++                                    const PaintInfo& paint_info) {
++  const auto* canvas = DynamicTo<HTMLCanvasElement>(layout_replaced.GetNode());
++  if (!canvas || !canvas->GetTrackedElementSubRect(
++                     viz::TrackedElementFeature::kInline3dWeave)) {
++    return false;
++  }
++  // Mirrors HTMLCanvasPainter::PaintReplaced's foreign-layer conditions.
++  return canvas->ContentsCcLayer() && !paint_info.ShouldOmitCompositingInfo() &&
++         !canvas->IsPrinting();
++}
++
+ }  // anonymous namespace
+ 
+ bool ReplacedPainter::ShouldPaintBoxDecorationBackground(
+@@ -370,9 +413,34 @@ void ReplacedPainter::PaintBoxDecorationBackground(
+   ObjectPainter(layout_replaced_)
+       .RecordHitTestData(paint_info, ToPixelSnappedRect(paint_rect),
+                          *background_client);
+-  BoxPainter(layout_replaced_)
+-      .RecordTrackedElementAndRegionCaptureData(paint_info, paint_rect,
+-                                                *background_client);
++  if (Inline3dWeaveRectRidesOwnLayer(layout_replaced_, paint_info)) {
++    // browser#117: exactly what BoxPainter::RecordTrackedElementAndRegionCapture
++    // Data does, minus the ONE feature the canvas's own layer already carries.
++    // Region capture and every other tracking feature are untouched.
++    const auto* element = To<Element>(layout_replaced_.GetNode());
++    const gfx::Rect snapped_paint_rect = ToPixelSnappedRect(paint_rect);
++    PaintController& controller = paint_info.context.GetPaintController();
++    if (const RegionCaptureCropId* crop_id =
++            element->GetRegionCaptureCropId()) {
++      controller.RecordRegionCaptureData(*background_client, *crop_id,
++                                         snapped_paint_rect);
++    }
++    TrackedElementSubRects other_features;
++    for (const auto& [feature, sub_rect] :
++         *element->GetTrackedElementSubRects()) {
++      if (feature != viz::TrackedElementFeature::kInline3dWeave) {
++        other_features.insert({feature, sub_rect});
++      }
++    }
++    if (!other_features.empty()) {
++      controller.RecordTrackedElementData(*background_client,
++                                          snapped_paint_rect, other_features);
++    }
++  } else {
++    BoxPainter(layout_replaced_)
++        .RecordTrackedElementAndRegionCaptureData(paint_info, paint_rect,
++                                                  *background_client);
++  }
+ 
+   // Record the scroll hit test after the non-scrolling background so
+   // background squashing is not affected. Hit test order would be equivalent
+-- 
+2.42.0.windows.2
+
