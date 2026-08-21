@@ -44,26 +44,37 @@ GPU thread post-paint / pre-swap.
   `services/viz/public/mojom/compositing/{compositor_frame_metadata,layer_context}.mojom` +
   `.../cpp/compositing/compositor_frame_metadata_mojom_traits.{cc,h}`
 - ⚠ **Edit:** `viz/service/display/{display.cc,surface_aggregator.{cc,h},aggregated_frame.h,`
-  `skia_output_surface.h,skia_renderer.cc,external_use_client.h}`,
+  `direct_renderer.{cc,h},skia_output_surface.h,skia_renderer.cc,external_use_client.h}`,
   `viz/service/layers/layer_context_impl.cc`
 - **The weave core:** `viz/service/display_embedder/skia_output_surface_impl_on_gpu.{h,cc}` —
   `WeaveCompositedSurface` (+ `prefer_zero_copy`), `MaybeWeaveOutput` (GL path), `MaybeWeaveRootRenderPass`
   (DComp root render-pass path). Also `skia_output_surface_impl.{cc,h}`.
 
-  **Canvas resource join.** The page flattens into ONE render pass here, so the aggregator records
-  every ROOT resource-bearing quad `{ResourceId, root-space rect, uv, SQS layer id}` and joins each
-  inline-3D canvas to its quad by **layer identity**, with a 70%-overlap geometric `best_match` as
-  the fallback. `Display` resolves `ResourceId → gpu::Mailbox`
+  **Canvas resource join.** The aggregator records every resource-bearing quad
+  `{ResourceId, root-space rect, uv, SQS layer id, pass id}` and joins each inline-3D canvas to its
+  quad by **layer identity**, with a 70%-overlap geometric `best_match` as the fallback. **Not just
+  root-pass quads** (0081): a canvas inside the render surface a `backdrop-filter` forces onto its
+  enclosing effect node (`RenderSurfaceReason::kBackdropScope`) draws into a CHILD pass, so a
+  root-only search could never find it. A child-pass match is only accepted if the pass reaches the
+  root through trivially composited `RenderPassDrawQuad`s (opacity 1, `kSrcOver`, no filters/mask,
+  axis-aligned) — the weave draw-back is a root-space blit and cannot reproduce anything else.
+  **Submission is in lockstep with preparation** (0081): a tile with no resolved canvas resource is
+  not suppressed from the page raster, so its rect is withheld from the weave submission entirely —
+  weaving it would interlace whatever page content happens to be there. `Display` resolves `ResourceId → gpu::Mailbox`
   (`DisplayResourceProvider::GetMailbox`) and hands the GPU stage `{mailbox, rect}`;
   `WeaveCompositedSurface` sources the weave INPUT from that canvas resource (clean SBS — falls
   back to the composited output sub-rect). Root-space rect = quad SQS `quad_to_target_transform`
   then `transform_to_root_target`.
 
   **2D-over-3D by DRAW ORDER.** Page content over a woven tile is occluded correctly with nothing
-  declared. `DirectRenderer::ComputeInline3dPlaneSplit` walks the live root `quad_list` at DRAW time
+  declared. `DirectRenderer::ComputeInline3dPlaneSplit` walks the live `quad_list` at DRAW time
   — never the aggregation-time ordinals, which `RemoveOverdrawQuads()` and `ProcessForOverlays()`
   erase and reorder — finds each tile's canvas quad at index `k`, and takes the intersecting quads
-  in front of it as the OVER set (`[0, k)`; index 0 is frontmost).
+  in front of it as the OVER set (`[0, k)`; index 0 is frontmost). It descends from the root into
+  child passes that touch a tile (0081); a tile whose home pass is not the root gets **no**
+  over-plane — lifting a quad out of a child pass changes what it composites against — and instead
+  gets the D-prime treatment for every quad in front of it, in its own pass and up the ancestor
+  spine: those rects are clipped out of the woven draw-back and wished flat.
   `SkiaRenderer::MaybeDrawInline3dOverPlane` paints that set into a window-sized transparent premul
   RGBA8 plane through the root pass's target-to-device transform, so each quad lands in identical
   device pixels; a difference clip punches the tile rects out of the page draw; and phase (B) of

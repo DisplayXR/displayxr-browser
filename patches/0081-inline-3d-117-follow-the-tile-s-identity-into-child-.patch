@@ -1,0 +1,1147 @@
+From 17a2d4f3da3e7d13f2562f2e18a193d382daa76d Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 21 Aug 2026 15:29:16 -0700
+Subject: [PATCH] inline-3d(#117): follow the tile's identity into child render
+ passes, and never weave a region the page still owns
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The third and last mechanism behind #117's raw-SBS symptom, reported from
+hardware against the 0080 build: 0080's two defects are fixed (the duplicate-id
+guard is silent and id-miss is ~0 in steady state), but a tile crossing the TOP
+of the viewport still renders raw side-by-side — and, worse, the gallery's own
+sticky header title came back INTERLACED above it. Unlike the first two defects
+this one is positional in a specific way: it reproduces only where the tile
+slides under the frosted header, and the bottom sweep weaves correctly.
+
+The live marker names the shape exactly, every frame:
+
+  ID-MATCH FALLBACK: reason=layer_id stamped but no root quad carries it
+    id=..0007 layer_id=92 target=60,218 1900x198 among 23 root quads
+  NO match for target=60,218 1900x198 among 23 root quads
+  plane-split: tiles=3 … tiles_without_k=1 excluded{… rpdq=1 …} flat{… frosted=1 …}
+
+MECHANISM — THE QUAD IS NOT IN THE ROOT PASS.
+
+A CSS backdrop-filter cannot be evaluated without a defined backdrop, so Blink
+forces a render surface onto the effect node ENCLOSING the filtered element:
+
+  third_party/blink/renderer/platform/graphics/compositing/property_tree_manager.cc
+    PropertyTreeManager::SynthesizeCcEffectsForClipsIfNeeded()
+      // An effect node can't omit render surface if it has child with backdrop
+      // effect, in order to define the scope of the backdrop.
+      effect_tree_.MutableNode(current_.effect_id).render_surface_reason =
+          cc::RenderSurfaceReason::kBackdropScope;
+
+kBackdropScope is NOT in IsConditionalRenderSurfaceReason() (that list is
+kBlendModeDstIn / kOpacity / kOpacityAnimation only), so unlike an opacity
+surface it is never dropped again for controlling too few layers: once a
+backdrop-filter is in play, the enclosing scope ALWAYS materialises. Every
+layer inside that scope — including an inline-3D canvas's ForeignLayer —
+therefore draws into a CHILD aggregated pass and reaches the root only through
+a RenderPassDrawQuad.
+
+Both join sites searched root-pass quads and nothing else:
+
+  * SurfaceAggregator::CopyQuadsToPass recorded a candidate only under
+    `if (resolved_pass.is_root() && …)`;
+  * DirectRenderer::ComputeInline3dPlaneSplit built its front-to-back candidate
+    list from `root->quad_list`.
+
+So the identity join was STRUCTURALLY unable to find this tile — no scoring
+improvement could ever have reached it, which is why 0080 fixed the two defects
+it did and left this one standing. No match → no canvas resource → no
+suppression → the page drew its raw SBS buffer, and the draw-time split
+reported the same fact from the other end as tiles_without_k=1.
+
+Which effect node becomes the scope is page-dependent (it is whichever cc
+effect is open when the frosted chunk is emitted), which is exactly why one
+tile of three lost its join while the other two kept theirs and kept weaving.
+This patch therefore does not try to PREDICT the isolation; it follows the
+identity wherever it went and reports where that was.
+
+MECHANISM 3b — AND THE HEADER WAS WOVEN.
+
+The interlaced title is a second, independent defect that the same scroll
+position exposes, and it is the more serious half because it corrupts content
+that has nothing to do with inline-3D. Display::DrawAndSwap submitted a weave
+rect for EVERY tracked rect, unconditionally, including tiles it had just
+failed to resolve and therefore had NOT suppressed from the page raster. Those
+rects still hold ordinary page pixels; for a tile straddling the top of the
+viewport, clipped to a 198px strip, those pixels are the site's sticky header.
+The runtime was told to weave it, and did.
+
+That is the exact inverse of web#12's "never weave the hole" law, and it slips
+past that law's own guard: the GPU-side check refuses to SNAPSHOT such a tile,
+but 0074's keep-previous rescue then re-submits the rect from inside that very
+branch, so the rect reached the runtime's batch anyway.
+
+FIX, IN THREE PARTS.
+
+(1) THE JOIN FOLLOWS THE IDENTITY (surface_aggregator).
+
+root_resource_quads_ becomes resource_quads_ — the old name was load-bearing
+documentation and is now false — and records from every dest pass, each entry
+tagged with its AggregatedRenderPassId. The root-space mapping is unchanged and
+already correct for a child pass: transform_to_root_target is defined for every
+pass, not just root ones. Both joins gain the same admissibility filter and a
+root-pass preference on ties. Non-root recording is capped (1024) so a
+pathological page degrades a child-pass tile to its pre-#117 behaviour rather
+than to an unbounded per-frame allocation; the root recording is uncapped, as
+before.
+
+WHICH PASSES MAY OWN WOVEN PIXELS. Matching a quad is a promise: the resource
+joins the suppression set, its quad leaves the page raster, and the weave
+draw-back — one whole-window kSrcOver blit in ROOT space — is what puts pixels
+back. That trade is sound only if the pass reaches the root through
+RenderPassDrawQuads that do nothing a root-space blit cannot reproduce. So a
+pass is WEAVABLE iff it is the root, or it is drawn by exactly one trivially
+composited RPDQ (opacity 1, kSrcOver, no filters / backdrop-filters / mask, no
+sorting context, 2d-axis-aligned) from a weavable parent. Refusing HERE rather
+than downstream is deliberate: this is the one place that sees the whole pass
+list, and a refusal propagates by itself — no match, so no canvas resource, so
+no suppression, so no weave rect, so no k at draw time. Every stage agrees
+without a second channel. A pass drawn twice is refused outright.
+
+The residual is named, not hidden: a tile inside a non-trivially composited
+group (an opacity or filter ancestor) still draws raw SBS, as it did before,
+and the fallback marker now says so in its own words rather than blaming a
+child pass. Fixing THAT needs a mono draw primitive in the renderer, not a
+better join. The frosted-header case is trivial by construction —
+kBackdropScope is a plain isolation — which is why it is the case that gets
+fixed.
+
+(2) WEAVE SUBMISSION MOVES IN LOCKSTEP WITH PAGE PREPARATION (display).
+
+A rect is submitted only if this frame prepared it: the tile has a resolved
+canvas layer, OR nothing resolved at all this frame (in which case no canvas
+quad was suppressed and snapshotting the page is the legitimate pre-#18 weave
+source). That is precisely the predicate the GPU stage already applies one
+stage later; moving it EARLIER is what stops the rect reaching the runtime's
+batch, which the GPU-side skip could not do on its own. The tile loses nothing
+it had — unsuppressed, the page draws it exactly as a page with no inline-3D
+would. Withholding is counted at LOG(ERROR) on 0073's discipline; it is the
+correct outcome but also the moment a tile stops weaving, so it may not be
+silent.
+
+(3) THE DRAW-TIME SPLIT FOLLOWS THE TILE, AND D-PRIME GENERALISES
+    (direct_renderer).
+
+ComputeInline3dPlaneSplit now takes the whole draw-order list and collects
+candidates by DESCENT from the root — identity accumulated transform there, so
+the root pass's own numbers are bit-identical to what it produced before, and
+every child expressed relative to exactly that convention rather than to a
+second one read out of transform_to_root_target. It descends only into passes
+that touch a tile, and is capped at 32 passes / 8192 quads.
+
+A tile whose home pass is not the root gets NO over-plane: lifting a quad out
+of a child pass changes what it composites against, the same reason the v1
+exclusions refuse a non-kSrcOver blend. What it gets instead is D-prime
+(browser#88), generalised. D-prime already knows how to leave a region to the
+page — clip the woven draw-back out of it and put the same rect in the flat
+list so a capable panel switches its 3D element off there — and that is exactly
+the treatment every quad in front of the tile needs. Both the tile's own pass
+and the ANCESTOR SPINE are walked, since a quad drawn after this pass's RPDQ in
+the parent is in front of the tile just as surely as one after k here; walking
+the spine is also what makes the fix independent of which effect node became
+the surface.
+
+WHY THIS KEEPS THE D-PRIME CONTRACT. D-prime says the frost samples PRE-weave
+page pixels and reads flat behind the glass. Under this patch the frost band is
+withheld from the draw-back, so the page's own frosted glass survives crisp,
+and what it blurred is the page behind the suppressed canvas — a flat patch of
+the scene, which is D-prime's stated and accepted loss, not a new one. It is
+not a hole: the canvas quad's suppression exposes the page background still
+drawn beneath it. So the tile reads woven 3D below the header band and non-SBS
+2D within it, with the header itself untouched — the two unacceptable outcomes,
+raw SBS anywhere and a black band, are both excluded by construction.
+
+Withheld rects are exact — never merged, never truncated (under-punching weaves
+over 2D; a bounding box punches pixels the tile should have woven) — deduped
+losslessly by containment, and BOUNDED: each is one kDifference clip on the
+draw-back's single blit, so over 64 per tile the tile withholds its whole rect
+for that frame. That reads as a flat card, which is a degradation and not a
+corruption.
+
+INSTRUMENTATION, so the next hardware run NAMES the mechanism instead of
+inferring it: an "inline-3D CHILD-PASS join" marker carrying the pass id (a
+non-root id here IS the backdrop-scope isolation, observed rather than
+assumed), the fallback marker split into "no quad anywhere" vs "found but
+inadmissible", and tiles_in_child_pass / tiles_withheld_whole / passes /
+passes_over_cap on the plane-split line.
+
+Files:
+  components/viz/service/display/surface_aggregator.{h,cc}
+  components/viz/service/display/display.cc
+  components/viz/service/display/direct_renderer.{h,cc}
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../viz/service/display/direct_renderer.cc    | 295 ++++++++++++++++--
+ .../viz/service/display/direct_renderer.h     |  15 +-
+ components/viz/service/display/display.cc     |  57 ++++
+ .../viz/service/display/surface_aggregator.cc | 278 ++++++++++++++---
+ .../viz/service/display/surface_aggregator.h  |  55 +++-
+ 5 files changed, 624 insertions(+), 76 deletions(-)
+
+diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
+index f8c259c..96f6c67 100644
+--- a/components/viz/service/display/direct_renderer.cc
++++ b/components/viz/service/display/direct_renderer.cc
+@@ -8,6 +8,7 @@
+ #include <stddef.h>
+ 
+ #include <algorithm>
++#include <limits>
+ #include <optional>
+ #include <string>
+ #include <utility>
+@@ -538,7 +539,8 @@ void DirectRenderer::DrawFrame(
+     //    queued ahead of the page's (and ahead of the weave that rides on the
+     //    root pass's FinishPaintRenderPass). Risk guard R7.
+     if (IsInline3dOcclusionEnabled()) {
+-      ComputeInline3dPlaneSplit(root_render_pass);
++      ComputeInline3dPlaneSplit(current_frame()->render_passes_in_draw_order,
++                                root_render_pass);
+       MaybeDrawInline3dOverPlane(root_render_pass);
+     }
+     DrawRenderPassAndExecuteCopyRequests(root_render_pass,
+@@ -627,6 +629,7 @@ bool DirectRenderer::IsInline3dOcclusionEnabled() {
+ }
+ 
+ void DirectRenderer::ComputeInline3dPlaneSplit(
++    const AggregatedRenderPassList* passes,
+     const AggregatedRenderPass* root) {
+   inline3d_over_clips_.clear();
+   inline3d_flat_rects_.clear();
+@@ -635,7 +638,7 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+     return;
+   }
+ 
+-  // Snapshot the root pass in FRONT-TO-BACK order (index 0 == frontmost, see
++  // Snapshot each pass in FRONT-TO-BACK order (index 0 == frontmost, see
+   // the ordering note on the declaration) together with each quad's rect in
+   // root target space — the space the tile rects are already in. The rect
+   // mapping mirrors DirectRenderer::ShouldSkipQuad so "does this quad touch the
+@@ -653,24 +656,149 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+     // of raw page around the frosted element.
+     gfx::Rect own_rect;
+   };
+-  std::vector<Candidate> quads;
+-  quads.reserve(root->quad_list.size());
+-  for (const DrawQuad* quad : root->quad_list) {
+-    const SharedQuadState* quad_sqs = quad->shared_quad_state;
+-    gfx::Rect own_rect = cc::MathUtil::MapEnclosingClippedRect(
+-        quad_sqs->quad_to_target_transform, quad->visible_rect);
+-    gfx::Rect target_rect = own_rect;
+-    if (auto* rpdq = quad->DynamicCast<AggregatedRenderPassDrawQuad>()) {
+-      target_rect = cc::MathUtil::MapEnclosingClippedRect(
+-          quad_sqs->quad_to_target_transform,
+-          GetExpandedRectForPixelMovingFilters(*rpdq));
++  // browser#117 (third mechanism): ONE COLLECTED PASS, and how it hangs off its
++  // parent.
++  //
++  // This function used to look at the root pass and nothing else. That is the
++  // draw-time half of the same blind spot the aggregator had: a canvas inside
++  // the render surface a backdrop-filter forces onto its enclosing effect node
++  // (RenderSurfaceReason::kBackdropScope) draws into a CHILD pass, so no root
++  // quad carries its resource, k was never found, and the tile was reported as
++  // tiles_without_k and skipped. Skipping was harmless while the tile was not
++  // woven either. It stops being harmless the moment the aggregator's join
++  // starts succeeding for such a tile: the weave draw-back would then blit
++  // woven pixels over the very frosted header that caused the isolation.
++  //
++  // So the collection follows the tile. |accum| maps this pass's TARGET space
++  // to root target space, built by descent from the root (identity there, so
++  // the root pass's own numbers are bit-identical to what this function
++  // produced before), composing each RenderPassDrawQuad's
++  // quad_to_target_transform on the way down. Deriving it by descent rather
++  // than reading transform_to_root_target keeps one convention: the root pass's
++  // quads are mapped by quad_to_target_transform alone here, and every child is
++  // expressed relative to exactly that.
++  struct PassQuads {
++    AggregatedRenderPassId id;
++    std::vector<Candidate> quads;
++    size_t parent = std::numeric_limits<size_t>::max();  // index into per_pass
++    size_t index_in_parent = 0;  // the RPDQ's front-to-back index there
++  };
++  // Bounds. A page can nest passes arbitrarily and this runs every frame on the
++  // draw thread; over any of these the extra passes are simply not collected
++  // and the tiles inside them degrade to exactly the pre-#117 behaviour.
++  constexpr size_t kMaxCollectedPasses = 32;
++  constexpr size_t kMaxCollectedQuads = 8192;
++  std::vector<PassQuads> per_pass;
++  size_t collected_quads = 0;
++  size_t passes_skipped_over_cap = 0;
++
++  auto collect = [&](const AggregatedRenderPass* pass,
++                     const gfx::Transform& accum,
++                     const std::optional<gfx::Rect>& inherited_clip,
++                     size_t parent, size_t index_in_parent) {
++    PassQuads pq;
++    pq.id = pass->id;
++    pq.parent = parent;
++    pq.index_in_parent = index_in_parent;
++    pq.quads.reserve(pass->quad_list.size());
++    for (const DrawQuad* quad : pass->quad_list) {
++      const SharedQuadState* quad_sqs = quad->shared_quad_state;
++      gfx::Transform to_root = accum;
++      to_root.PreConcat(quad_sqs->quad_to_target_transform);
++      gfx::Rect own_rect =
++          cc::MathUtil::MapEnclosingClippedRect(to_root, quad->visible_rect);
++      gfx::Rect target_rect = own_rect;
++      if (auto* rpdq = quad->DynamicCast<AggregatedRenderPassDrawQuad>()) {
++        target_rect = cc::MathUtil::MapEnclosingClippedRect(
++            to_root, GetExpandedRectForPixelMovingFilters(*rpdq));
++      }
++      if (quad_sqs->clip_rect) {
++        // The SQS clip is in this pass's TARGET space; map it the same way.
++        const gfx::Rect mapped_clip =
++            cc::MathUtil::MapEnclosingClippedRect(accum, *quad_sqs->clip_rect);
++        target_rect.Intersect(mapped_clip);
++        own_rect.Intersect(mapped_clip);
++      }
++      if (inherited_clip) {
++        target_rect.Intersect(*inherited_clip);
++        own_rect.Intersect(*inherited_clip);
++      }
++      pq.quads.push_back({quad, target_rect, own_rect});
+     }
+-    if (quad_sqs->clip_rect) {
+-      target_rect.Intersect(*quad_sqs->clip_rect);
+-      own_rect.Intersect(*quad_sqs->clip_rect);
++    collected_quads += pq.quads.size();
++    per_pass.push_back(std::move(pq));
++  };
++
++  collect(root, gfx::Transform(), std::nullopt,
++          /*parent=*/std::numeric_limits<size_t>::max(),
++          /*index_in_parent=*/0);
++  // Breadth-first from the root, descending ONLY into passes that could carry a
++  // tile. Most pages have render passes for reasons that have nothing to do
++  // with inline-3D; walking into them would cost real work for a list nothing
++  // ever queries.
++  if (passes) {
++    auto pass_by_id =
++        [passes](AggregatedRenderPassId id) -> const AggregatedRenderPass* {
++      for (const auto& p : *passes) {
++        if (p->id == id) {
++          return p.get();
++        }
++      }
++      return nullptr;
++    };
++    // |accum| per collected pass, kept alongside so the descent can compose.
++    // Index-parallel to |per_pass| — appended in lockstep with it, right after
++    // each collect().
++    std::vector<gfx::Transform> accum(1);
++    for (size_t p = 0; p < per_pass.size(); ++p) {
++      for (size_t i = 0; i < per_pass[p].quads.size(); ++i) {
++        // Read everything needed out of the candidate BEFORE collect() can
++        // reallocate |per_pass| and dangle a reference into it.
++        AggregatedRenderPassId child_id;
++        gfx::Rect child_clip;
++        gfx::Transform child_accum;
++        {
++          const Candidate& c = per_pass[p].quads[i];
++          const auto* rpdq =
++              c.quad->DynamicCast<AggregatedRenderPassDrawQuad>();
++          if (!rpdq) {
++            continue;
++          }
++          bool touches_tile = false;
++          for (const Inline3dTile& tile : inline_3d_tiles_) {
++            if (!tile.rect.IsEmpty() && c.target_rect.Intersects(tile.rect)) {
++              touches_tile = true;
++              break;
++            }
++          }
++          if (!touches_tile) {
++            continue;
++          }
++          if (per_pass.size() >= kMaxCollectedPasses ||
++              collected_quads >= kMaxCollectedQuads) {
++            ++passes_skipped_over_cap;
++            continue;
++          }
++          child_id = rpdq->render_pass_id;
++          // The child's pixels land inside the RPDQ's own rect, so that rect is
++          // the clip every quad it contains inherits.
++          child_clip = c.own_rect;
++          child_accum = accum[p];
++          child_accum.PreConcat(
++              c.quad->shared_quad_state->quad_to_target_transform);
++        }
++        const AggregatedRenderPass* child = pass_by_id(child_id);
++        if (!child) {
++          continue;
++        }
++        collect(child, child_accum, child_clip, p, i);
++        accum.push_back(child_accum);
++      }
+     }
+-    quads.push_back({quad, target_rect, own_rect});
+   }
++  // The root pass's candidate list, under the name the rest of this function
++  // has always used it by.
++  const std::vector<Candidate>& quads = per_pass[0].quads;
+ 
+   // The canvas resources of ALL registered tiles: a tile's own canvas quad is
+   // never in any over set, not even another tile's.
+@@ -689,6 +817,14 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+   size_t excl_tile_canvas = 0;
+   size_t excl_suppressed = 0;
+   size_t tiles_without_k = 0;
++  // browser#117: tiles whose canvas quad was found, but in a NON-root pass.
++  // Non-zero here IS the backdrop-scope isolation, reported rather than
++  // inferred; it pairs with the aggregator's "CHILD-PASS join" marker.
++  size_t tiles_in_child_pass = 0;
++  // browser#117: child-pass tiles that had more distinct in-front regions than
++  // the draw-back's clip budget and so withheld their whole rect for a frame.
++  // Expected to stay 0; non-zero names a page that needs a real region merge.
++  size_t tiles_withheld_whole = 0;
+   std::string per_tile_k;
+ 
+   // Phase 3 Stage 2 (browser#88): the FLAT list, accumulated raw here and
+@@ -710,10 +846,18 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+     // than quads that really are in front of it being silently dropped from the
+     // plane and left to bury the tile. Risk guard R1.
+     std::optional<size_t> k;
++    // browser#117: WHICH collected pass draws this tile. per_pass[0] is the
++    // root, so |home == 0| is the pre-#117 world and takes the pre-#117 path
++    // below, unchanged.
++    size_t home = 0;
+     if (tile.canvas_resource_id != kInvalidResourceId) {
+-      for (size_t i = 0; i < quads.size(); ++i) {
+-        if (quads[i].quad->resource_id == tile.canvas_resource_id) {
+-          k = i;
++      for (size_t p = 0; p < per_pass.size() && !k.has_value(); ++p) {
++        for (size_t i = 0; i < per_pass[p].quads.size(); ++i) {
++          if (per_pass[p].quads[i].quad->resource_id ==
++              tile.canvas_resource_id) {
++            k = i;
++            home = p;
++          }
+         }
+       }
+     }
+@@ -725,6 +869,106 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+       ++tiles_without_k;
+       continue;
+     }
++    if (home != 0) {
++      // ---- browser#117: THE TILE IS INSIDE A RENDER SURFACE ----
++      //
++      // Everything below this block lifts page quads OUT of the page and onto
++      // a root-space over-plane. That is sound only for quads the root pass
++      // draws directly: a quad inside a child pass composites against that
++      // pass's own contents, and moving it to an empty plane changes its
++      // result — the same reason the v1 exclusions refuse a non-kSrcOver blend
++      // or a 3D sorting context. So a tile whose canvas lives in a child pass
++      // gets NO over-plane at all.
++      //
++      // What it gets instead is D' (browser#88), generalised. D' already knows
++      // how to leave a region to the page: clip the woven draw-back out of it
++      // (SkClipOp::kDifference) and put the same rect in the flat list so a
++      // capable panel switches its 3D element off there. That is exactly the
++      // treatment every quad in front of this tile needs — the page has
++      // already drawn it correctly, and the weave must not paint over it.
++      //
++      // This is the geometric form of the same law display.cc enforces on the
++      // submission: NEVER WEAVE WHAT YOU DID NOT PREPARE. The failure mode it
++      // exists to stop is not subtle — with the tile's rect clipped to a strip
++      // at the top of the viewport, the strip lies under the site's sticky
++      // frosted header, and weaving it pushed the header's title text through
++      // the interlace lattice while the rest of the tile showed raw SBS.
++      //
++      // The rects are EXACT, never coarsened per rect: under-punching weaves
++      // over 2D (corruption), and merging two rects into their bounding box
++      // punches page pixels the tile SHOULD have woven. So the list is neither
++      // truncated nor merged, exactly as 0068 left the frosted rects.
++      //
++      // It is, however, BOUNDED — every rect is one SkClipOp::kDifference on
++      // the draw-back's single blit, and a page is free to stack hundreds of
++      // quads over a tile. Over |kMaxWithheldPerTile| the tile withholds its
++      // WHOLE rect instead. That is a real degradation (the tile reads as the
++      // flat page pixels behind it for that frame) but it is not a corruption
++      // and it is not a hole: the canvas quad's suppression exposes the page's
++      // own background, which is still drawn beneath it. Losing 3D beats both
++      // weaving the site's chrome and blacking the tile out.
++      //
++      // Both the tile's OWN pass and the ancestor spine above it are walked: a
++      // quad drawn after this pass's RenderPassDrawQuad in the parent is in
++      // front of the tile just as surely as one after k here. Walking the spine
++      // is also what makes the fix independent of WHICH effect node the
++      // backdrop-filter turned into a render surface — a page-dependent choice
++      // this patch deliberately does not have to predict.
++      constexpr size_t kMaxWithheldPerTile = 64;
++      std::vector<gfx::Rect> withheld;
++      auto withhold = [&](const Candidate& c) {
++        gfx::Rect r = c.own_rect;
++        r.Intersect(tile.rect);
++        if (r.IsEmpty()) {
++          return;
++        }
++        // Lossless containment dedupe on the way in: a difference clip does not
++        // care about duplicates, but the COUNT is what costs, and a rect
++        // already covered by one in the list contributes nothing at all.
++        for (const gfx::Rect& have : withheld) {
++          if (have.Contains(r)) {
++            return;
++          }
++        }
++        withheld.push_back(r);
++      };
++      size_t level = home;
++      size_t front_of = *k;
++      while (true) {
++        for (size_t i = 0; i < front_of; ++i) {
++          const Candidate& c = per_pass[level].quads[i];
++          if (c.target_rect.Intersects(tile.rect)) {
++            withhold(c);
++          }
++        }
++        const size_t parent = per_pass[level].parent;
++        if (parent == std::numeric_limits<size_t>::max()) {
++          break;
++        }
++        front_of = per_pass[level].index_in_parent;
++        level = parent;
++      }
++      if (withheld.size() > kMaxWithheldPerTile) {
++        ++tiles_withheld_whole;
++        withheld.assign(1, tile.rect);
++      }
++      for (const gfx::Rect& r : withheld) {
++        inline3d_frosted_rects_.push_back(r);
++        // Flat too, and NOT gated on opacity — 0068's argument applies to every
++        // rect here for the same reason it applied to a frosted one: the clip
++        // has removed the woven 3D from underneath, so there is no working 3D
++        // left for the wish to flatten. The two effects are one decision and
++        // must never be separated.
++        raw_flat.push_back(r);
++      }
++      ++tiles_in_child_pass;
++      per_tile_k += base::StringPrintf(
++          " {id=%s k=%zu pass=%llu rect=%s CHILD-PASS}",
++          tile.id.ToString().c_str(), *k,
++          static_cast<unsigned long long>(per_pass[home].id.GetUnsafeValue()),
++          tile.rect.ToString().c_str());
++      continue;
++    }
+     per_tile_k +=
+         base::StringPrintf(" {id=%s k=%zu rect=%s}", tile.id.ToString().c_str(),
+                            *k, tile.rect.ToString().c_str());
+@@ -862,13 +1106,18 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+             << inline_3d_tiles_.size() << " quads=" << quads.size()
+             << " over_set=" << inline3d_over_clips_.size()
+             << " tiles_without_k=" << tiles_without_k
++            << " tiles_in_child_pass=" << tiles_in_child_pass
++            << " tiles_withheld_whole=" << tiles_withheld_whole
++            << " passes=" << per_pass.size()
++            << " passes_over_cap=" << passes_skipped_over_cap
+             << " excluded{sorting=" << excl_sorting_context
+             << " blend=" << excl_blend_mode << " rpdq=" << excl_render_pass_quad
+             << " overlay=" << excl_requires_overlay
+             << " tile_canvas=" << excl_tile_canvas
+-            << " suppressed=" << excl_suppressed << "}"
+-            // Phase 3 Stage 2 wish accounting. |dropped| > 0 means the frame had
+-            // more than kInline3dMaxFlatRects distinct flat regions and the
++            << " suppressed=" << excl_suppressed
++            << "}"
++            // Phase 3 Stage 2 wish accounting. |dropped| > 0 means the frame
++            // had more than kInline3dMaxFlatRects distinct flat regions and the
+             // smallest ones were discarded, so those areas stay 3D (pre-v8
+             // ghosting) rather than being merged into a bounding box that would
+             // flatten working 3D.
+diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
+index 398daa8..11d4be3 100644
+--- a/components/viz/service/display/direct_renderer.h
++++ b/components/viz/service/display/direct_renderer.h
+@@ -367,7 +367,20 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+   // ordinals are invalidated before drawing by Display::RemoveOverdrawQuads()
+   // and by OverlayProcessor::ProcessForOverlays(), both of which erase/reorder
+   // quads.
+-  void ComputeInline3dPlaneSplit(const AggregatedRenderPass* root);
++  //
++  // browser#117 (third mechanism): |passes| is the whole draw-order list, so
++  // the split can follow a tile whose canvas quad is NOT in |root| — an
++  // inline-3D canvas inside the render surface a backdrop-filter forces onto
++  // its enclosing effect node (RenderSurfaceReason::kBackdropScope) draws into
++  // a CHILD pass and reaches the root only through a RenderPassDrawQuad. Such a
++  // tile gets no over-plane (lifting a quad out of a child pass would change
++  // what it composites against) but it does get the D' treatment for every quad
++  // in front of it, in its own pass and up the ancestor spine: those rects are
++  // clipped out of the woven draw-back and wished flat, so the weave can never
++  // paint over 2D the page already drew. |passes| may be null, which reduces
++  // this to the pre-#117 root-only behaviour.
++  void ComputeInline3dPlaneSplit(const AggregatedRenderPassList* passes,
++                                 const AggregatedRenderPass* root);
+ 
+   // Paint the OVER set (as computed above) into a separate transparent plane,
+   // so a consumer can composite it above the woven tiles. Default no-op;
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index d652a9f..f31982f 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1055,11 +1055,68 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+     if (skia_output_surface_) {
+       // Phase-1 identity: the GPU stage keys its per-target weave state by the
+       // element token, so carry {rect, id} rather than bare rects.
++      //
++      // (browser#117) NEVER WEAVE A REGION YOU DID NOT PREPARE. This list used
++      // to be every tracked rect, unconditionally. That is the inverse of
++      // web#12's "never weave the hole" law and it is just as damaging: a tile
++      // whose canvas quad could not be resolved this frame is NOT suppressed
++      // from the page raster, so its rect still holds ordinary page pixels —
++      // and on a tile straddling the top of the viewport those pixels are the
++      // site's own sticky header. Submitting the rect anyway told the runtime
++      // to weave the header: the title came back interlaced (2D chrome pushed
++      // through the lenticular lattice) while the unsuppressed remainder of the
++      // tile below showed its raw side-by-side buffer. Doubly wrong, and the
++      // half that corrupts UNRELATED content is the worse half.
++      //
++      // So weave submission and page preparation move in LOCKSTEP: a rect is
++      // submitted only if this frame prepared it. "Prepared" is exactly the
++      // predicate the GPU stage already applies one stage later
++      // (skia_output_surface_impl_on_gpu.cc, "NEVER WEAVE THE HOLE") — the tile
++      // has a resolved canvas layer, OR nothing at all resolved this frame, in
++      // which case no canvas quad was suppressed and snapshotting the page is
++      // the legitimate pre-browser#18 weave source. Moving the same test
++      // EARLIER is what stops the rect reaching the runtime's batch at all,
++      // which the GPU-side skip could not do on its own: 0074's keep-previous
++      // rescue re-submits the rect from that very branch.
++      //
++      // The tile loses nothing it had. It is not suppressed, so the page draws
++      // it exactly as a page with no inline-3D would — the same "strictly
++      // better failure" web#12 chose, now applied to the submission too.
+       std::vector<SkiaOutputSurface::Inline3dRect> weave_rects;
+       weave_rects.reserve(frame.inline_3d_rects.size());
++      int unprepared = 0;
+       for (const auto& r : frame.inline_3d_rects) {
++        bool prepared = resolved_canvas.empty();
++        for (const auto& layer : resolved_canvas) {
++          // Identity where there is one; the legacy zero-id channel has only
++          // geometry, and Display's own tile join above uses the same pair of
++          // tests in the same order.
++          if (!r.id.is_zero() ? layer.id == r.id : layer.rect == r.rect) {
++            prepared = true;
++            break;
++          }
++        }
++        if (!prepared) {
++          ++unprepared;
++          continue;
++        }
+         weave_rects.push_back({r.rect, r.id});
+       }
++      if (unprepared > 0) {
++        // LOG(ERROR) on 0073's discipline (first 3, then 1-in-300): withholding
++        // a rect is the correct outcome but it is also the moment the tile
++        // stops weaving, so it must never be silent.
++        static int s_unprepared = 0;
++        const int n = s_unprepared++;
++        if (n < 3 || (n % 300) == 0) {
++          LOG(ERROR) << "[DisplayXR] inline-3D withheld " << unprepared
++                     << " of " << frame.inline_3d_rects.size()
++                     << " weave rects: no canvas resource resolved, so the page"
++                        " still owns those pixels and the weave must not touch"
++                        " them (withheld="
++                     << (n + 1) << ")";
++        }
++      }
+       skia_output_surface_->SetInline3DRects(std::move(weave_rects),
+                                              std::move(resolved_canvas));
+     }
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 432ac77..1e31e0f 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -1485,14 +1485,47 @@ void SurfaceAggregator::CopyQuadsToPass(
+       }
+       if (dest_quad) {
+         dest_quad->resource_id = quad_data.remapped_resource_id;
+-        // DisplayXR (browser#18): record every ROOT-pass resource-bearing quad
+-        // as {parent-space ResourceId, root-space rect}. In the single-pass
+-        // weave config an inline-3D canvas promoted to its own composited layer
+-        // emits such a quad whose SharedImage is that layer's isolated content.
+-        // At Aggregate() end the ones matching an inline-3D canvas rect are the
++        // DisplayXR (browser#18): record every resource-bearing quad as
++        // {parent-space ResourceId, root-space rect}. In the single-pass weave
++        // config an inline-3D canvas promoted to its own composited layer emits
++        // such a quad whose SharedImage is that layer's isolated content. At
++        // Aggregate() end the ones matching an inline-3D canvas rect are the
+         // isolated canvas resources the weave stage feeds as weave INPUT.
+-        if (resolved_pass.is_root() &&
+-            quad_data.remapped_resource_id != kInvalidResourceId) {
++        //
++        // browser#117 (third mechanism): this condition used to open with
++        // `resolved_pass.is_root()`, and that single term is the whole of the
++        // third raw-SBS defect. A CSS backdrop-filter cannot be evaluated
++        // without a defined backdrop, so PropertyTreeManager forces a render
++        // surface onto the effect node ENCLOSING the filtered element
++        // (property_tree_manager.cc, RenderSurfaceReason::kBackdropScope — "in
++        // order to define the scope of the backdrop"). kBackdropScope is not in
++        // IsConditionalRenderSurfaceReason(), so unlike kOpacity it is never
++        // dropped again for controlling too few layers: the surface always
++        // materialises. Everything inside that scope — including an inline-3D
++        // canvas's ForeignLayer — is therefore drawn into a CHILD pass and
++        // reaches the root only via a RenderPassDrawQuad. Filtering to root
++        // passes meant the identity join could not see the quad AT ALL, no
++        // matter how good the scoring got (0080), so the tile was neither
++        // suppressed nor woven and the page drew its raw side-by-side buffer.
++        // Which cell of the effect tree becomes the scope is page-dependent,
++        // which is exactly why one tile of three could lose its join while the
++        // others kept theirs.
++        //
++        // The mapping below is unchanged and already correct for a child pass:
++        // |dest_pass->transform_to_root_target| is defined for every pass, not
++        // just the root one.
++        //
++        // The non-root recording is CAPPED. Root-pass recording keeps its
++        // pre-#117 unconditional behaviour; over the cap a child-pass quad is
++        // simply not recorded, so the tile it belongs to degrades to exactly
++        // what it did before this patch rather than to anything new.
++        constexpr size_t kMaxChildPassResourceQuads = 1024;
++        if (quad_data.remapped_resource_id != kInvalidResourceId &&
++            (resolved_pass.is_root() ||
++             child_pass_resource_quads_ < kMaxChildPassResourceQuads)) {
++          if (!resolved_pass.is_root()) {
++            ++child_pass_resource_quads_;
++          }
+           // Map quad->rect (quad content space) to ROOT space: first the quad's
+           // SharedQuadState quad_to_target_transform (→ dest pass target), then
+           // the dest pass's transform_to_root_target. Without the SQS transform
+@@ -1526,14 +1559,15 @@ void SurfaceAggregator::CopyQuadsToPass(
+           // aggregator assigned to the client — together the exact join key
+           // against a tracked element rect.
+           const SharedQuadState* dest_sqs = dest_quad->shared_quad_state;
+-          root_resource_quads_.push_back(
++          resource_quads_.push_back(
+               {quad_data.remapped_resource_id,
+                cc::MathUtil::MapEnclosingClippedRect(to_root, quad->rect),
+                cc::MathUtil::MapEnclosingClippedRect(to_root,
+                                                      quad->visible_rect),
+                uv, dest_sqs ? dest_sqs->layer_id : 0u,
+                dest_sqs ? dest_sqs->layer_namespace_id
+-                        : std::pair<uint32_t, uint32_t>()});
++                        : std::pair<uint32_t, uint32_t>(),
++               dest_pass->id});
+         }
+       }
+     }
+@@ -2212,7 +2246,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   root_surface_id_ = surface_id;
+   tracked_element_rects_ = {};
+   inline_3d_rects_ = {};
+-  root_resource_quads_ = {};
++  resource_quads_ = {};
++  child_pass_resource_quads_ = 0;
+ 
+   ResolvedFrameData* resolved_frame = GetResolvedFrame(surface_id);
+ 
+@@ -2432,7 +2467,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   // ID-MATCH join below.
+   //
+   // browser#94: the root pass's own footprint, expressed in the SAME
+-  // root-target space as both the tracked rects and |root_resource_quads_|
++  // root-target space as both the tracked rects and |resource_quads_|
+   // (identical idiom to the color-usage full-damage rect above). A tracked rect
+   // that does not touch this rect belongs to an element that is entirely off
+   // the viewport this frame. browser#117 also makes it the COMMON CLIP the
+@@ -2440,6 +2475,92 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   const gfx::Rect root_output_rect =
+       cc::MathUtil::MapEnclosedRectWith2dAxisAlignedTransform(
+           root_surface_transform_, gfx::Rect(viewport_bounds));
++  // browser#117 (third mechanism): WHICH PASSES MAY OWN WOVEN PIXELS.
++  //
++  // The join may now match a quad in a child pass (see the recording site in
++  // CopyQuadsToPass), but matching a quad is a promise: the matched resource is
++  // added to Display::DrawAndSwap's suppression set, so its quad is removed
++  // from the page raster, and the weave draw-back — one whole-window kSrcOver
++  // blit in ROOT space — is what puts pixels back. That trade is only sound if
++  // the pass carrying the quad reaches the root through RenderPassDrawQuads
++  // that do nothing a root-space blit cannot reproduce. An RPDQ with opacity,
++  // a mask, a filter, an exotic blend or a rotation composites its whole
++  // subtree differently from a straight blit, so a tile underneath it must NOT
++  // be suppressed: the page would lose the quad and the draw-back would replace
++  // it with pixels that ignore the group's compositing.
++  //
++  // So: a pass is WEAVABLE iff it is the root pass, or it is drawn by exactly
++  // one RPDQ, that RPDQ is trivially composited, and the pass drawing it is
++  // itself weavable. Refusing here rather than downstream is deliberate — this
++  // is the one place that sees the whole pass list, and a refusal here
++  // propagates automatically: no match → no canvas resource → no suppression
++  // (Display) → no weave rect (the lockstep rule) → no k (the draw-time plane
++  // split). Every stage stays in agreement without a second channel.
++  //
++  // The residual case is honest and named: a tile inside a non-trivially
++  // composited group still draws its raw SBS buffer, exactly as it did before
++  // this patch. Fixing THAT needs a mono draw primitive in the renderer, not a
++  // better join. The frosted-header case this patch is about is trivial by
++  // construction (kBackdropScope is a plain isolation: opacity 1, kSrcOver, no
++  // filters, identity transform), which is why it is the case that gets fixed.
++  const AggregatedRenderPassId root_pass_id =
++      frame.render_pass_list.empty() ? AggregatedRenderPassId()
++                                     : frame.render_pass_list.back()->id;
++  std::vector<AggregatedRenderPassId> weavable_passes;
++  if (!inline_3d_rects_.empty() && !frame.render_pass_list.empty()) {
++    // A trivially composited RPDQ: nothing about it that a root-space kSrcOver
++    // blit of the same rect could not reproduce.
++    auto trivial_rpdq = [](const AggregatedRenderPassDrawQuad* rpdq) {
++      const SharedQuadState* sqs = rpdq->shared_quad_state;
++      return rpdq->filters.IsEmpty() && rpdq->backdrop_filters.IsEmpty() &&
++             rpdq->resource_id == kInvalidResourceId &&  // no mask
++             sqs->opacity == 1.f && sqs->blend_mode == SkBlendMode::kSrcOver &&
++             sqs->mask_filter_info.IsEmpty() && sqs->sorting_context_id == 0 &&
++             sqs->quad_to_target_transform.Preserves2dAxisAlignment();
++    };
++    struct PassEdge {
++      AggregatedRenderPassId child;
++      AggregatedRenderPassId parent;
++      bool trivial;
++    };
++    std::vector<PassEdge> edges;
++    for (const auto& pass : frame.render_pass_list) {
++      for (const DrawQuad* q : pass->quad_list) {
++        if (const auto* rpdq = q->DynamicCast<AggregatedRenderPassDrawQuad>()) {
++          edges.push_back({rpdq->render_pass_id, pass->id, trivial_rpdq(rpdq)});
++        }
++      }
++    }
++    auto is_weavable = [&weavable_passes](AggregatedRenderPassId id) {
++      return std::ranges::find(weavable_passes, id) != weavable_passes.end();
++    };
++    weavable_passes.push_back(root_pass_id);
++    // |render_pass_list| is in dependency order (a child pass precedes the
++    // parent that draws it), so walking it BACKWARDS visits every pass after
++    // all of its ancestors — one linear sweep is enough to propagate.
++    for (auto it = frame.render_pass_list.rbegin();
++         it != frame.render_pass_list.rend(); ++it) {
++      const AggregatedRenderPassId id = (*it)->id;
++      if (id == root_pass_id || is_weavable(id)) {
++        continue;
++      }
++      // Exactly one incoming edge, trivial, from a weavable parent. A pass
++      // drawn TWICE is refused outright: its subtree appears at two places on
++      // screen and a single woven region cannot serve both.
++      size_t in_edges = 0;
++      bool ok = false;
++      for (const PassEdge& e : edges) {
++        if (e.child != id) {
++          continue;
++        }
++        ++in_edges;
++        ok = e.trivial && is_weavable(e.parent);
++      }
++      if (in_edges == 1 && ok) {
++        weavable_passes.push_back(id);
++      }
++    }
++  }
+   // browser#117: score two root-space rects on the SAME visible space.
+   //
+   // The two halves of this comparison are clipped differently by construction.
+@@ -2471,11 +2592,19 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     }
+     return (ia * 1000) / max_area;
+   };
+-  auto best_match = [&overlap_score](const gfx::Rect& target,
+-                                     const std::vector<RootResourceQuad>& quads,
+-                                     const gfx::Rect& clip)
+-      -> std::optional<RootResourceQuad> {
+-    std::optional<RootResourceQuad> found;
++  // browser#117 (third mechanism): a candidate is admissible iff the pass that
++  // carries it may own woven pixels (see |weavable_passes| above). Shared by
++  // both joins so they can never disagree about which quads exist.
++  auto quad_is_admissible = [&](const ResourceQuad& cand) {
++    return cand.pass_id == root_pass_id ||
++           std::ranges::find(weavable_passes, cand.pass_id) !=
++               weavable_passes.end();
++  };
++  auto best_match = [&overlap_score, &quad_is_admissible, root_pass_id](
++                        const gfx::Rect& target,
++                        const std::vector<ResourceQuad>& quads,
++                        const gfx::Rect& clip) -> std::optional<ResourceQuad> {
++    std::optional<ResourceQuad> found;
+     // Score = intersection area normalised by the larger of the two rects, in
+     // 1/1000ths. Pick the BEST-overlapping quad, not merely the last one over
+     // the bar (browser#22): because `target` is the main-thread rect trailing
+@@ -2486,17 +2615,30 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     // header. Ties keep the later (topmost) quad, preserving the old behaviour
+     // when exactly one candidate qualifies — the slow-scroll/steady case.
+     int64_t best_score = -1;
+-    for (const RootResourceQuad& cand : quads) {
++    for (const ResourceQuad& cand : quads) {
+       const gfx::Rect& qr = cand.rect;
+       if (qr.IsEmpty()) {
+         continue;
+       }
++      // browser#117: the candidate list now spans child passes too, so a
++      // candidate the weave may not own has to be dropped BEFORE it can win.
++      if (!quad_is_admissible(cand)) {
++        continue;
++      }
+       // browser#117: both rects clipped to |clip| before the ratio, so partial
+       // visibility can never read as a mismatch.
+       const int64_t score = overlap_score(qr, target, clip);
+       if (score < 700) {
+         continue;
+       }
++      // browser#117: a ROOT-pass candidate outranks a child-pass one at equal
++      // score. The geometric fallback is a guess by construction, and between
++      // two equally plausible guesses the quad that needs no reasoning about a
++      // compositing group is the safer one to adopt.
++      if (found && found->pass_id == root_pass_id &&
++          cand.pass_id != root_pass_id && score == best_score) {
++        continue;
++      }
+       // NOTE: do NOT reject a candidate because its dimensions differ from the
+       // target's. The target is visible_bounds (ALREADY window-clipped) while
+       // the quad rect is UNCLIPPED, so a partly-scrolled-off element legitimately
+@@ -2514,7 +2656,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       if ((miss_dbg++ % 60) == 0) {
+         VLOG(1) << "[DisplayXR] inline-3D NO match for target="
+                 << target.ToString() << " among " << quads.size()
+-                << " root quads — overlay left to the page this frame";
++                << " candidate quads — overlay left to the page this frame";
+       }
+     }
+     return found;
+@@ -2526,21 +2668,38 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   // (namespace, layer id) names the quads that draw this element's pixels —
+   // no overlap score, no scroll-lag sensitivity, no ambiguity between
+   // co-located quads. Returns nullopt when the rect carries no identity
+-  // (legacy channel) or when nothing in the root pass claims it.
+-  auto id_match = [](const Inline3dTrackedRect& target,
+-                     const std::vector<RootResourceQuad>& quads)
+-      -> std::optional<RootResourceQuad> {
++  // (legacy channel) or when no admissible pass claims it.
++  //
++  // browser#117 (third mechanism): |quads| now spans every aggregated pass, not
++  // just root ones, which is what finally lets this join answer for a canvas
++  // isolated into a kBackdropScope child pass by a frosted header above it.
++  // Identity does not care which pass a quad landed in — a layer id is a layer
++  // id — so the only additions are the admissibility filter and a root-pass
++  // preference for the (pathological) case where one layer emits quads in two
++  // different passes.
++  auto id_match = [&quad_is_admissible, root_pass_id](
++                      const Inline3dTrackedRect& target,
++                      const std::vector<ResourceQuad>& quads)
++      -> std::optional<ResourceQuad> {
+     if (target.sqs_layer_id == 0) {
+       return std::nullopt;
+     }
+-    std::optional<RootResourceQuad> found;
+-    for (const RootResourceQuad& cand : quads) {
+-      if (cand.sqs_layer_id == target.sqs_layer_id &&
+-          cand.layer_namespace_id == target.layer_namespace_id) {
+-        // LAST match wins, matching best_match's tie policy: one layer can
+-        // emit several quads and the later one is the topmost.
+-        found = cand;
++    std::optional<ResourceQuad> found;
++    for (const ResourceQuad& cand : quads) {
++      if (cand.sqs_layer_id != target.sqs_layer_id ||
++          cand.layer_namespace_id != target.layer_namespace_id) {
++        continue;
++      }
++      if (!quad_is_admissible(cand)) {
++        continue;
++      }
++      if (found && found->pass_id == root_pass_id &&
++          cand.pass_id != root_pass_id) {
++        continue;
+       }
++      // LAST match wins within a rank, matching best_match's tie policy: one
++      // layer can emit several quads and the later one is the topmost.
++      found = cand;
+     }
+     return found;
+   };
+@@ -2574,7 +2733,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       if (r.sqs_layer_id == 0) {
+         return -1;
+       }
+-      std::optional<RootResourceQuad> m = id_match(r, root_resource_quads_);
++      std::optional<ResourceQuad> m = id_match(r, resource_quads_);
+       if (!m) {
+         return 0;
+       }
+@@ -2618,7 +2777,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   // Phase-1 identity: match each inline-3d canvas rect to the resource quad
+   // that draws it by IDENTITY first, geometry only as a fallback.
+   for (const Inline3dTrackedRect& canvas : inline_3d_rects_) {
+-    std::optional<RootResourceQuad> m = id_match(canvas, root_resource_quads_);
++    std::optional<ResourceQuad> m = id_match(canvas, resource_quads_);
+     if (!m) {
+       // browser#94 — the OFFSCREEN-BUT-REGISTERED tile: an expected absence,
+       // not an anomaly, and neither the log nor the geometric fallback below
+@@ -2668,26 +2827,72 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       // different follow-ups, and telling them apart from a log is the whole
+       // value of the marker. Throttled: a persistent fallback would otherwise
+       // spam at frame rate.
++      //
++      // browser#117 (third mechanism): the second reason used to say "no ROOT
++      // quad carries it" and listed a child pass among the guesses. Child
++      // passes are now searched, so reaching this line means the id is claimed
++      // by NO admissible pass at all — either nothing carries it (occluded /
++      // resource not ready), or the only quad that does sits behind a
++      // non-trivially composited RenderPassDrawQuad and the weave is not
++      // allowed to own those pixels. |inadmissible| tells the two apart from
++      // the log alone, which is the difference between "wait for the resource"
++      // and "this page nests the tile in an opacity/filter group".
++      size_t inadmissible = 0;
++      if (canvas.sqs_layer_id != 0) {
++        for (const ResourceQuad& cand : resource_quads_) {
++          if (cand.sqs_layer_id == canvas.sqs_layer_id &&
++              cand.layer_namespace_id == canvas.layer_namespace_id &&
++              !quad_is_admissible(cand)) {
++            ++inadmissible;
++          }
++        }
++      }
+       const char* reason =
+           canvas.sqs_layer_id == 0
+               ? "no layer_id stamped (legacy/TreesInViz channel or pre-Phase-1 "
+                 "renderer)"
+-              : "layer_id stamped but no root quad carries it (canvas quad "
+-                "occluded, in a child pass, or resource not ready)";
++          : inadmissible > 0
++              ? "layer_id stamped and found, but only in a pass the weave may "
++                "not own (opacity/filter/mask/blend/rotation between it and "
++                "the root)"
++              : "layer_id stamped but no quad in any pass carries it (canvas "
++                "quad occluded or resource not ready)";
+       static int fallback_dbg = 0;
+       if ((fallback_dbg++ % 60) == 0) {
+         VLOG(1) << "[DisplayXR] inline-3D ID-MATCH FALLBACK: reason=" << reason
+                 << " id=" << canvas.id.ToString()
+                 << " layer_id=" << canvas.sqs_layer_id
+                 << " target=" << canvas.rect.ToString() << " among "
+-                << root_resource_quads_.size() << " root quads";
++                << resource_quads_.size() << " candidate quads ("
++                << child_pass_resource_quads_ << " in child passes, "
++                << weavable_passes.size() << " weavable passes, "
++                << inadmissible << " inadmissible id hits)";
+       }
+       // browser#117: the fallback compares on the COMMON visible space, so a
+       // tile that is only partly on screen scores against its own quad exactly
+       // as a fully visible one does.
+-      m = best_match(canvas.rect, root_resource_quads_, root_output_rect);
++      m = best_match(canvas.rect, resource_quads_, root_output_rect);
+     }
+     if (m) {
++      // browser#117 (third mechanism): NAME THE PASS. This is the line that
++      // turns "the canvas is probably isolated by the frosted header" into a
++      // fact from the field — a non-root pass id here IS the backdrop-scope
++      // isolation, observed rather than inferred. Throttled to ~5 s; on a page
++      // with no isolation it never fires at all.
++      if (m->pass_id != root_pass_id) {
++        static int child_pass_dbg = 0;
++        if ((child_pass_dbg++ % 300) == 0) {
++          VLOG(1) << "[DisplayXR] inline-3D CHILD-PASS join: id="
++                  << canvas.id.ToString() << " layer_id=" << canvas.sqs_layer_id
++                  << " target=" << canvas.rect.ToString()
++                  << " quad=" << m->rect.ToString()
++                  << " pass=" << m->pass_id.GetUnsafeValue()
++                  << " (root=" << root_pass_id.GetUnsafeValue()
++                  << ") — the canvas is inside a render surface, most likely "
++                     "the kBackdropScope one a backdrop-filter forces onto its "
++                     "enclosing effect node";
++        }
++      }
+       frame.inline_3d_canvas_resources.push_back(
+           {m->resource_id, m->rect, m->visible_rect, m->uv, canvas.id});
+     }
+@@ -2697,7 +2902,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     if ((canvas_res_dbg++ % 300) == 0) {
+       VLOG(1) << "[DisplayXR] inline-3D layers: canvas_res="
+               << frame.inline_3d_canvas_resources.size() << " (from "
+-              << root_resource_quads_.size() << " root resource quads)";
++              << resource_quads_.size() << " resource quads, "
++              << child_pass_resource_quads_ << " of them in child passes)";
+     }
+   }
+ 
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index 3b1618d..6fe2e22 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -485,7 +485,7 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+   // TrackedElementId — a real token, stable for the element's lifetime, which
+   // is what the GPU stage keys its per-target weave state by. |sqs_layer_id| +
+   // |layer_namespace_id| are the within-frame join key against
+-  // RootResourceQuad, with the geometric best-overlap match kept only as the
++  // ResourceQuad, with the geometric best-overlap match kept only as the
+   // fallback. Both are zero on the legacy main-thread metadata channel.
+   struct Inline3dTrackedRect {
+     gfx::Rect rect;
+@@ -495,20 +495,30 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+   };
+   std::vector<Inline3dTrackedRect> inline_3d_rects_;
+ 
+-  // DisplayXR (browser#18): every resource-bearing quad in the ROOT pass,
+-  // recorded as {parent-space ResourceId, root-space rect} during
+-  // CopyQuadsToPass, then matched at Aggregate() end against inline_3d_rects_
+-  // (→ canvas resources). Recorded (not matched inline) so the list is complete
+-  // before matching, independent of per-surface collection order. DisplayXR
+-  // (browser#73): a root-pass resource-bearing quad, recorded with the mapping
+-  // from its RESOURCE to |rect| rather than just |rect|. |uv| is the normalized
+-  // sub-rect of the resource that |rect| displays — (0,0,1,1) for a quad
+-  // drawing the whole image, and something else for a TextureDrawQuad with
+-  // explicit UVs. The weave stage used to assume the resource always covered
+-  // the whole tile; when a tile is clipped that over-reaches past the image and
+-  // Skia clamps, replicating the last row downward (the #73 "tail" smear).
+-  // Carrying the real UVs is what lets it sub-region a clipped tile correctly.
+-  struct RootResourceQuad {
++  // DisplayXR (browser#18): every resource-bearing quad, recorded as
++  // {parent-space ResourceId, root-space rect} during CopyQuadsToPass, then
++  // matched at Aggregate() end against inline_3d_rects_ (→ canvas resources).
++  // Recorded (not matched inline) so the list is complete before matching,
++  // independent of per-surface collection order. DisplayXR (browser#73): each
++  // entry carries the mapping from its RESOURCE to |rect| rather than just
++  // |rect|. |uv| is the normalized sub-rect of the resource that |rect|
++  // displays — (0,0,1,1) for a quad drawing the whole image, and something else
++  // for a TextureDrawQuad with explicit UVs. The weave stage used to assume the
++  // resource always covered the whole tile; when a tile is clipped that
++  // over-reaches past the image and Skia clamps, replicating the last row
++  // downward (the #73 "tail" smear). Carrying the real UVs is what lets it
++  // sub-region a clipped tile correctly.
++  //
++  // browser#117 (third mechanism): this used to be root_resource_quads_ and it
++  // used to hold only quads copied out of a surface's ROOT resolved pass. That
++  // name was load-bearing documentation and it is now false: an inline-3D
++  // canvas whose element sits inside ANY compositing group — most commonly the
++  // kBackdropScope render surface a sticky frosted header forces onto its
++  // enclosing effect node — draws its TextureDrawQuad into a CHILD aggregated
++  // pass and reaches the root only through a RenderPassDrawQuad. Searching only
++  // root-pass quads made the identity join structurally unable to find it. The
++  // list is now every pass's, and |pass_id| is what tells them apart.
++  struct ResourceQuad {
+     ResourceId resource_id;
+     gfx::Rect rect;          // root space, UNCLIPPED quad rect
+     gfx::Rect visible_rect;  // root space, the quad's visible_rect
+@@ -523,8 +533,21 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+     // renderer did not stamp one (legacy channel / older renderer).
+     uint32_t sqs_layer_id = 0;
+     std::pair<uint32_t, uint32_t> layer_namespace_id;
++    // browser#117: the AGGREGATED pass this quad was copied into. Equal to the
++    // frame's root pass id for the overwhelming majority; anything else means
++    // the quad's pixels reach the screen through a RenderPassDrawQuad, which
++    // the join has to reason about explicitly (both for the root-space rect and
++    // for whether the weave may own those pixels at all).
++    AggregatedRenderPassId pass_id;
+   };
+-  std::vector<RootResourceQuad> root_resource_quads_;
++  std::vector<ResourceQuad> resource_quads_;
++  // browser#117: how many entries in |resource_quads_| came from a NON-root
++  // resolved pass, i.e. how many are new with this patch. Capped
++  // (kMaxChildPassResourceQuads in the .cc) so a pathological page cannot turn
++  // a per-frame join into an unbounded allocation; the root-pass recording is
++  // never capped, so exceeding it degrades a child-pass tile to exactly the
++  // pre-#117 behaviour and nothing else.
++  size_t child_pass_resource_quads_ = 0;
+ };
+ 
+ }  // namespace viz
