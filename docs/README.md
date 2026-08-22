@@ -17,6 +17,10 @@
   rebase is mechanical.
 - **[release-and-distribution.md](release-and-distribution.md)** — the release flow (build → sign →
   GitHub Release), the website download, and the lightweight version-check-not-auto-update mechanism.
+- **[oidc-build-lane.md](oidc-build-lane.md)** — the credential-free CI build lane: GitHub OIDC →
+  a least-privilege IAM role → SSM RunCommand on the EC2 build box, with **no stored AWS secret**.
+  The trust policy (and why its `sub` condition is the whole security story), the workflow skeleton,
+  the remote-driver/marker protocol, and a porting checklist for a Linux/Android twin.
 - **[remote-build.md](remote-build.md)** — build on the remote signing/build box (`$DXR_SIGN_REPO`) to
   free the local machine from the multi-hour compile; the one-time box provisioning + caveats.
 
