@@ -44,7 +44,7 @@ GPU thread post-paint / pre-swap.
   `services/viz/public/mojom/compositing/{compositor_frame_metadata,layer_context}.mojom` +
   `.../cpp/compositing/compositor_frame_metadata_mojom_traits.{cc,h}`
 - ⚠ **Edit:** `viz/service/display/{display.cc,surface_aggregator.{cc,h},aggregated_frame.h,`
-  `skia_output_surface.h,skia_renderer.cc,external_use_client.h}`,
+  `direct_renderer.{cc,h},skia_output_surface.h,skia_renderer.cc,external_use_client.h}`,
   `viz/service/layers/layer_context_impl.cc`
 - **The weave core:** `viz/service/display_embedder/skia_output_surface_impl_on_gpu.{h,cc}` —
   `WeaveCompositedSurface` (+ `prefer_zero_copy`), `MaybeWeaveOutput` (GL path), `MaybeWeaveRootRenderPass`
@@ -53,14 +53,20 @@ GPU thread post-paint / pre-swap.
   **Canvas resource join.** The page flattens into ONE render pass here, so the aggregator records
   every ROOT resource-bearing quad `{ResourceId, root-space rect, uv, SQS layer id}` and joins each
   inline-3D canvas to its quad by **layer identity**, with a 70%-overlap geometric `best_match` as
-  the fallback. `Display` resolves `ResourceId → gpu::Mailbox`
+  the fallback. Quads outside that pool are recorded too but are **diagnostic only** (0081) — they
+  never win a join; they exist so the `ID-MATCH FALLBACK` marker can say whether an unmatched
+  element is drawn *somewhere the join does not look* or is **not drawn at all** (no
+  `SharedQuadState` anywhere), which need opposite follow-ups.
+  **Submission is in lockstep with preparation** (0081): a tile with no resolved canvas resource is
+  not suppressed from the page raster, so its rect is withheld from the weave submission entirely —
+  weaving it would interlace whatever page content happens to be there. `Display` resolves `ResourceId → gpu::Mailbox`
   (`DisplayResourceProvider::GetMailbox`) and hands the GPU stage `{mailbox, rect}`;
   `WeaveCompositedSurface` sources the weave INPUT from that canvas resource (clean SBS — falls
   back to the composited output sub-rect). Root-space rect = quad SQS `quad_to_target_transform`
   then `transform_to_root_target`.
 
   **2D-over-3D by DRAW ORDER.** Page content over a woven tile is occluded correctly with nothing
-  declared. `DirectRenderer::ComputeInline3dPlaneSplit` walks the live root `quad_list` at DRAW time
+  declared. `DirectRenderer::ComputeInline3dPlaneSplit` walks the live `quad_list` at DRAW time
   — never the aggregation-time ordinals, which `RemoveOverdrawQuads()` and `ProcessForOverlays()`
   erase and reorder — finds each tile's canvas quad at index `k`, and takes the intersecting quads
   in front of it as the OVER set (`[0, k)`; index 0 is frontmost).
