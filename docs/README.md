@@ -1,5 +1,12 @@
 # Docs
 
+- **[android-port.md](android-port.md)** — the Android weave port: design (written before
+  implementation) plus an "As built" section covering what actually shipped through device bring-up
+  (fd bootstrap, texture extraction, loader bundling, pre-rotation, SurfaceControl gate, runtime
+  dependencies, scroll/frosted parity, known gaps).
+- **[android-pitfalls.md](android-pitfalls.md)** — standing checklist of traps specific to the
+  Android arm (R8/JNI, backend probing, fencing, the runtime's rig/geometry contracts). Read before
+  touching `components/displayxr/android` or any `*_android.*` backend file.
 - **[maintenance-policy.md](maintenance-policy.md)** — the load-bearing decision: monthly-milestone
   rebase cadence + the (mandatory) preview/security disclaimer + version-check-not-auto-update. Mirrors
   §6 of the runtime packaging plan (source of truth).

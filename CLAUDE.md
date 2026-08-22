@@ -91,15 +91,27 @@ terminated** (terminating loses the multi-hour Chromium checkout).
 
 ## Android port status
 
-- Runtime contract: **`XR_DXR_weave` spec v7** + **`DXR_IPC_FD`** fd-adoption (browser-process Java
-  connects, passes the socket fd over Mojo, GPU process adopts). Specs live in the
-  **`displayxr-runtime` sibling repo** — read them there, don't infer from the Windows patches.
+- Design doc (written before implementation): **[`docs/android-port.md`](docs/android-port.md)**.
+  Its **"As built (2026-08-21)"** section is the ground truth for what actually shipped through
+  first light and the samples-suite pass on device — read that section, not just the design
+  sections above it, before touching the Android arm.
+- Standing pitfalls checklist for the Android arm (R8/JNI, Ganesh-vs-Graphite, pre-rotation, fencing,
+  the runtime's rig/geometry contracts): **[`docs/android-pitfalls.md`](docs/android-pitfalls.md)**.
+  Inject it into any implementation prompt that touches `components/displayxr/android` or the
+  `*_android.*` backends.
+- **The Android code is not yet in `patches/`.** It lives on a local branch on the (stopped) EC2
+  Linux builder; capturing it as `patches/0075+` and opening a PR is blocked on **#122** (a
+  `patches/` recapture refresh) landing first — tracked in the epic, **#100**.
+- Runtime contract: **`XR_DXR_weave` spec v8** + **`DXR_IPC_FD`** fd-adoption (browser-process Java
+  connects, passes the socket fd via `base::GlobalDescriptors` into the GPU process's
+  `PreSandboxStartup`, which adopts it). Specs live in the **`displayxr-runtime` sibling repo** —
+  read them there, don't infer from the Windows patches.
 - Submit rides AHardwareBuffer handles (`xrWeaveSubmitHandlesDXR`); window geometry comes from the
   browser's Java UI (`xrWeaveBindWindow2DXR`). **HWND/DComp machinery does not port** — the mac
   backend already proved an identity window-snap is sufficient, so patches 0016/0017/0019/0024/0025
   have no Android counterpart.
-- Test target: the **`displayxr-web` samples** (`samples/windows`). Device: **NP02J, serial
-  `327343950099`**.
+- Test target: the **`displayxr-web` samples** (`samples/windows`) — human-verified passing, all
+  seven tiles woven in head-tracked stereo, 2026-08-21. Device: **NP02J, serial `327343950099`**.
 
 ## Conventions
 

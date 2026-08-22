@@ -311,3 +311,226 @@ display-mode controller. Call it a low four figures of new code and zero lines o
    real frame-time cost until the runtime's `sync_file` follow-up lands.
 5. `chrome/browser/displayxr/` is desktop-shaped in three patches now and the pattern is growing —
    every new browser-UI-aware patch adds Android work.
+
+---
+
+## As built (2026-08-21)
+
+Everything above is the **design**, written before a line of Android code existed. This section
+records what bring-up on real hardware (NP02J, human-eyeballed 2026-08-20 and 2026-08-21) actually
+produced, and where it diverged from the plan. It does not rewrite the sections above — read them
+first for the intended shape, then this section for the correction layer. Standing traps this work
+surfaced are pulled out separately into **[`docs/android-pitfalls.md`](android-pitfalls.md)**; this
+section only covers what shipped and what's still open.
+
+**Where the code lives.** None of it is in `patches/` yet. The whole Android arm — M1, M2, M3, and
+the device-bring-up fixes below — exists only on a local branch on the (stopped) EC2 Linux builder,
+snapshotted to `.android-port-wip.tgz` (`m2snap/`, gitignored) and mirrored off-box. Capturing it as
+`patches/0075+` and opening a PR against this repo is blocked on **#122** (the 0072-0074 web#12
+recapture refresh) landing first — coordinated in **#100**'s milestone tracker, which stays the
+authoritative open/closed state. Treat this section as validated-on-device engineering knowledge, not
+as a description of anything currently `git log`-able in this repo.
+
+### M2 — fd bootstrap, as shipped
+
+The mechanism matches the design's three steps, with one routing change and a lot of hardening:
+
+- **Java connector.** `DisplayXrRuntimeConnector` reflectively loads
+  `org.freedesktop.monado.ipc.Client` out of the installed runtime package and warms up on
+  `PostBrowserStart`, gated on `--enable-inline-3d`. Foreign-APK reflection like this is safe under
+  R8 (see below) because R8 only renames classes inside *this* APK.
+- **Fd → GPU process.** The design's text preferred the Mojo route for this hop; **as shipped it goes
+  the other way**: `GetAdditionalMappedFilesForChildProcess()` maps the fd into
+  `base::GlobalDescriptors` under a `kAndroidDisplayXrIpcDescriptor` key, and
+  `ContentSandboxHelper::PreSandboxStartup` reads it back out and `setenv`s `DXR_IPC_FD` before the
+  GPU process's first OpenXR call. Android's one-bionic-libc-per-process model means `setenv` here
+  genuinely works — there is no static-CRT snapshot trap like Windows has.
+- **One connection per browser process**, exactly as designed: the browser opens the runtime IPC
+  connection once and keeps the `Client` object alive for the process lifetime; dropping it unbinds
+  the service and frees the `PRESENT_OWNER` slot.
+- **Close + discard on GPU loss.** A GPU-process crash leaves the browser's dup alive (slot ownership
+  and the death-link both attribute to the *connector*, not the adopter — `SO_PEERCRED` names the
+  browser), so a naive reconnect leaves a ghost `PRESENT_OWNER` behind. Two ghosts exhaust the
+  system-wide quota of 2 and every subsequent `xrCreateInstance` fails with
+  `XR_ERROR_LIMIT_REACHED`. The shipped fix explicitly closes and discards the old `Client` before
+  reconnecting.
+- Device bring-up needed two more fixes before any of this could run at all: `xrInitializeLoaderKHR`
+  needs a real JNI `VM`+`Context` reached through the app classloader (not `FindClass` from a native
+  thread — that hits the bootstrap classloader and returns null), plus a manifest `<queries>` block
+  for the runtime broker/provider on Android 11+.
+- `displayxr_weave_client_android.cc` / `displayxr_weave_gpu_android.cc` are the third dispatcher arm
+  patch 0052 established — same shape as the `_mac` pair, no re-architecture.
+
+### M1 — texture extraction, as shipped
+
+- Scratch/atlas SharedImages allocate with **`SCANOUT` usage + `kRGBA_8888`** (not BGRA — BGRA
+  silently selects a non-AHB backing factory) so the backing routes to
+  `AHardwareBufferImageBackingFactory`.
+- **This device class fails Dawn adapter validation, so it never gets Graphite — Skia runs Ganesh.**
+  M1's first cut assumed Graphite-first and dereferenced a null recorder; the shipped extraction and
+  fence code branches on the actual backend (`gr_context_type`) rather than assuming one.
+- `SetCleared()` is called explicitly on the staging SharedImage after each write. `ScopedWriteAccess`
+  does not auto-mark the cleared-state gate, and an uncleared read is silently refused
+  (`access == NULL`, no per-frame log). The macOS path has the identical latent bug
+  (`EnsureScratchClearedMac`) — filed as a known issue there too, not fixed here.
+- AHB extraction reads through `GetAHardwareBufferFenceSync()->buffer()`, never the base
+  `OverlayImageRepresentation::GetAHardwareBuffer()` (which is `NOTREACHED()` on this path).
+- **No provider-side blit, as designed**: the staging AHB *is* the weave input, drawn directly at
+  window position — there is no extra copy into a second buffer before `xrWeaveSubmitDXR`.
+- **Same-frame draw-back:** the woven output `AHardwareBuffer` is imported straight back as a
+  SharedImage and drawn in the same frame's compositing path — `XrWeaveOutputDXR::weavedTexture` is
+  cached and only re-imported when the runtime hands back a new one (first submit, or a reallocation
+  on resize), with the old buffer `AHardwareBuffer_release()`d at that point.
+- Fencing follows the design's CPU-wait branch: `gr->submit(GrSyncCpu::kYes)` (the Ganesh arm) before
+  every `xrWeaveSubmitDXR`, since the runtime has no acquire fence yet on this platform.
+
+### Loader bundling — Khronos loader only, no vendored runtime
+
+The APK bundles the **Khronos `openxr_loader_for_android` AAR (pinned 1.1.62)** as arm64
+`libopenxr_loader.so` — nothing else OpenXR-shaped ships in the APK. There is deliberately **no
+vendored runtime `.so` and no import library**, unlike the Windows lane's patch 0001. The reason is
+the **git-tag gate**: `ipc_client_check_git_tag()` `strncmp`s the client library's compiled-in
+`u_git_tag` against the running `displayxr-service`'s, and fails `xrCreateInstance` on any mismatch.
+Bundling a runtime `.so` in the browser APK would fix that `.so`'s tag at build time and break the
+gate against whatever runtime happens to be installed on the device. Instead, the loader resolves and
+loads the **device's installed runtime package's** `.so` at runtime, exactly as any other OpenXR app
+on the device does — so the browser always speaks to whatever runtime the device actually has,
+tag-matched by construction.
+
+### R8 / JNI bridge
+
+Release `chrome_public_apk` builds run through R8, which renames this APK's own classes/methods
+(confirmable in the R8 mapping file — a StrictMode stack showing `.a`/`.b` is the tell). Any
+by-name Java reflection on **our own** classes silently breaks. The fix is a generated-JNI
+(`@CalledByNative`) bridge for anything in-APK that needs to be reached from native code or looked up
+by name, instead of reflection. Reflection into the runtime's `org.freedesktop.monado.ipc.Client`
+(a **foreign** APK's class, reached via `createPackageContext`) is unaffected — R8 cannot rename code
+it doesn't own — and stays the mechanism M2 uses for the connector.
+
+### Pre-rotation: the kLogic opt-in
+
+First light shipped with a 90° bug: the browser rendered landscape, but woven elements came out
+portrait. Root cause: Android surface pre-rotation — Viz renders the root pass in the panel's
+**natural** (portrait, on this device) orientation with a transform hint attached, and
+`Reshape()` historically ignored that hint on the paths this port touches, so the staging buffer and
+published geometry ended up portrait (1540×2560) under a landscape browser. The shipped fix opts
+`SkiaOutputDeviceBufferQueue` into `orientation_mode = kLogic` whenever `--enable-inline-3d` is set,
+so Viz rotates the root pass itself before the weave ever sees it. (Android-Vulkan already ships
+`kLogic` by default; the GL device was the only site still using `kHardware`.) **This sidesteps the
+bug rather than fixing it** — a durable transform-aware path through `Reshape()` is still a TODO (see
+Known gaps). If a genuinely non-identity transform hint ever reaches the weave code under this
+opt-in, the existing latched-error path fires rather than silently mis-rendering.
+
+### SurfaceControl gate (the 0041 analogue)
+
+Design risk #2 asked whether Android's `SkiaOutputDevice` reaches the weave through
+`MaybeWeaveOutput()` or `MaybeWeaveRootRenderPass()`; bring-up touched
+`SkiaOutputDeviceBufferQueue` machinery, which suggests the buffer-queue/GL entry is live on this
+device class, but the question was never formally closed against source — treat it as still open.
+
+What *is* settled: SurfaceControl / overlay promotion is the Android hazard 0041 predicted. A
+promoted WebGL canvas quad — the SDK's only WebGL canvases; video paints into a plain 2D canvas —
+leaves the root render pass entirely, so `WeaveCompositedSurface()` finds a hole where the tile
+should be and the keep-tile gate falls back to showing the raw, unwoven side-by-side source. This was
+first proven with the runtime feature disabled ad hoc
+(`--disable-features=AndroidSurfaceControl`); the durable fix mirrors 0041 exactly — a
+force-disable of overlay promotion in `ChromeMainDelegate::BasicStartupComplete()` under
+`--enable-inline-3d`, landed in the 2026-08-21 Windows-parity round.
+
+### Rig locate over mojo to the GPU session — and why not headless
+
+The three.js live-scene tile needs render-ready stereo views (`LocateViewsForRect`), which on
+Windows the browser process answers from its **own** present-owner session. Android has no such
+second session — per M2, there is exactly **one** runtime IPC connection for the whole browser,
+owned by the browser process and adopted by the GPU process; publishing a second, independent
+connection is refused by the runtime (one connection per process). So the rig-locate query is instead
+**relayed over the existing `displayxr_weave.mojom` pipe to the GPU process's weave session** — the
+only OpenXR session that exists on Android — and answered there.
+
+The alternative that was explicitly rejected: standing up a local `XR_MND_headless` session in the
+browser to answer rig queries without touching the GPU process. Headless sessions are **bridge
+relays** — their rig/zone descriptors are inert and their reported eyes are raw/verbatim, not
+DP-tracked (this is now standing knowledge, see `docs/android-pitfalls.md` item 13). Answering a
+scene's rig query from a headless session would silently produce plausible-looking but wrong
+geometry — the exact same failure class runtime PR #1118 later had to fix generally for weave-only
+sessions (see below). Routing the query to the real weave session avoids reproducing that bug
+locally. The Android arm also swaps `XR_KHR_win32_convert_performance_counter_time` for
+`XR_KHR_convert_timespec_time` (design doc's "0036, the one-liner") to supply the `displayTime` the
+rig query needs.
+
+### Runtime-side dependencies (#1116 / #1118)
+
+Wiring the rig locate through the real weave session exposed a runtime gap, not a browser bug.
+**A weave-only present-owner session — no swapchain, no `session_render` — got no window metrics at
+all**, because `multi_compositor_get_window_metrics()` gated every one of its branches (vendor DP,
+Win32 client rect, Android present-target extent) on `session_render.initialized`. Silently, that made
+every such session read as "owns the whole panel": the device-px `XrDisplayZoneDXR` rect the app had
+correctly chained under `XrDisplayRigDXR` got dropped at the zone gate, and the Kooima frustum was
+built display-scoped over the panel's **natural** (portrait) orientation instead of the app's
+landscape window — human-verified wrong aspect *and* wrong frustum centre on the NP02J. Filed as
+runtime **#1116**.
+
+The fix landed as two commits on runtime **PR #1118** (open as of this writing, not yet merged; the
+verified device pass ran against runtime `9c83df864` / `v1.21.1-785-g9c83df864`):
+
+1. A fourth, last-priority branch in `get_window_metrics()` that reads `mc->weave.win_*` — the rect
+   `xrWeaveBindWindow2DXR` / `xrWeaveSetWindowGeometryDXR` already publishes, previously consumed only
+   by the DP's per-window phase slot. It runs strictly after the vendor-DP, Win32-HWND, and
+   Android-present-target branches, so any session with a richer geometry source is untouched; this
+   only fills the hole none of the others can reach. It also transposes the panel baseline when the
+   published rect overflows the natural ordering, on the theory that a window is always a sub-rect of
+   its panel, so an overflow proves the panel is being held rotated. macOS's
+   `comp_multi_weave_set_window_geometry()` was changed to **store** the rect instead of discarding
+   it, closing the same hole there even though nothing yet reads it back into a phase.
+2. Render-less weave sessions now get **DP-tracked eyes** from `mc->weave.dp` in
+   `multi_compositor_get_predicted_eye_positions`, instead of falling back to nominal/static eyes. The
+   nominal fallback was silently eating parallax while the weave channel itself was tracking
+   correctly — the tell that caught it: the weave steered with head movement, but no parallax
+   appeared. This is what produced the confirmed "true head-tracked stereo with correct zone Kooima
+   and parallax" result on 2026-08-21.
+
+### Scroll / frosted / flat-region parity work
+
+The samples-suite pass surfaced the same defect family the Windows lane hit under `fix/12`
+(patches 0072-0074, web#12): 2D page elements occasionally got woven during scroll. The
+Windows-parity round (2026-08-21) ported the fix forward:
+
+- Scroll protections: 0072-0074 hand-merged onto the Android branch, plus the `#87`/`#99` protection
+  paths un-gated from `IS_WIN` so they run on Android too. Fixed an Android-specific per-rect draw-back
+  stamping bug (a rect was being stamped with `kSrc` into the wrong destination) by tracking a
+  distinct `drawn_rect`. Tightened the rect union to cardinality + greedy join.
+- Frosted/exclusion rects: a per-rect blit was *deleting* frosted-glass regions instead of subtracting
+  them from the woven content; fixed by subtracting them with a `kDifference` clip.
+- Flat-region wish: `SetBatchWish` now wires to the runtime's weave spec v8
+  (`xrWeaveSetScreenFlatRegionsDXR` / `XrWeaveSubmitFlatRegionsDXR`), closing design doc Known Risk #1
+  (spec v8 landed on runtime `main` the same day the design doc was written). The Android DP path
+  (`comp_multi_weave_android.c`) accepts the wish but still only advisory-no-ops it — wiring the wish
+  through to an actual per-zone hardware lens change on Android remains the runtime follow-up the
+  design doc already called out, unchanged by this work.
+- A `--inline-3d-dp-overlay` opt-in flag was added for a "v4 DP overlay atlas" path, but the
+  overlay-atlas *mechanism* itself was retired on every platform back in Phase 2 (0063-0065,
+  plane-split occlusion). Android already used the over-plane mechanism before this flag existed, so
+  treat the flag as legacy/inert, not load-bearing.
+
+### Known gaps
+
+1. **One-frame scroll lag.** Woven content lags real content by one frame during scroll; the fix in
+   flight ports Windows patch 0023's same-frame sync weave ordering to Android.
+2. **Durable pre-rotation transform path.** The `kLogic` opt-in above avoids the 90° bug by forcing an
+   orientation mode; it does not make `Reshape()` transform-aware. A real fix belongs upstream of the
+   opt-in.
+3. **Display-mode Android arm.** `chrome/browser/displayxr/displayxr_display_mode_controller.*`
+   (0054/0066/0069 — foreground-tab demand, navigation retraction, popup occluders) is built entirely
+   on desktop types (`BrowserWindowInterface`, `views::Widget`) and is excluded from
+   `chrome_public_apk`'s source list rather than ported. A parallel controller on
+   `TabModelSelector`/`TabModel` observers over JNI, expressing the same three edges, has not been
+   built — foreground-tab demand was only exercised manually during the samples-suite test, not
+   through a real per-tab controller.
+4. **Freeform geometry feed.** Geometry publication was proven against the samples-suite's
+   full-screen/single-window shape. The general Android multi-window / freeform case (see
+   `XR_DXR_android_surface_binding` in the runtime repo) is unexercised here.
+5. **L11 sync coupling.** A pending vendor CNSDK GPU-sync change (a semaphore-pair contract replacing
+   the current CPU fence wait) will change the runtime's weave-completion contract. When it lands, the
+   runtime's sync-return-is-completion contract for Android weave *and* this port's Ganesh
+   `submit(SyncToCpu)` fencing (M1) need to be revisited together — filed as a coordinated follow-up,
+   not yet scheduled.
