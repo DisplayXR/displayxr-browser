@@ -1,0 +1,84 @@
+From 019bc3c23eb1b44ade03e03bff0cff8a6926122f Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 02:12:11 +0000
+Subject: [PATCH] feat(android): auto-disable SurfaceControl when inline-3D is
+ requested
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The durable half of what has been a manual /data/local/tmp/chrome-command-line
+flag on the device.
+
+Same mechanism and same reasoning as the Windows DelegatedCompositing block
+directly above it (patch 0041, displayxr-browser#16): a system compositor that
+promotes page content into its own overlay planes takes that content OUT of the
+root render pass, and the inline-3D weave can only see, suppress and weave what
+is in the root render pass. On Android that compositor is SurfaceControl, and
+with promotion on the two halves of the weave disagree about what is on screen
+— viz suppresses a canvas quad it no longer owns, or draws woven pixels back
+into a root pass the promoted layer is composited OVER.
+
+Appended in ChromeMainDelegate::BasicStartupComplete, the earliest callback and
+before the FeatureList is created, so the override lands in the browser
+FeatureList and is serialized to the GPU process — which is where
+IsAndroidSurfaceControlEnabled() is evaluated.
+
+Gated on --enable-inline-3d rather than on the build flag, because inline-3D is
+not yet on by default on Android (the block above is IS_WIN-only). The switch
+is on the command line by this point: Android's command-line file is parsed
+into base::CommandLine before ContentMain runs.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ chrome/app/chrome_main_delegate.cc | 36 ++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+index 692fe971c6227..4481cd6028f2e 100644
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -1143,6 +1143,42 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
+   }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_ANDROID)
++  // DisplayXR inline-3D on Android: the durable half of what has been a manual
++  // /data/local/tmp/chrome-command-line flag on the device. Same shape and same
++  // reasoning as the Windows DelegatedCompositing block above — a system
++  // compositor that promotes page content into its own overlay planes takes
++  // that content OUT of the root render pass, and the inline-3D weave can only
++  // see, suppress and weave what is in the root render pass.
++  //
++  // On Android that system compositor is SurfaceControl. With overlay promotion
++  // on, a tile (or the 2D content around it) can be lifted into a separate
++  // SurfaceControl layer, and the two halves of the weave then disagree about
++  // what is on screen: viz suppresses a canvas quad it no longer owns, or draws
++  // woven pixels back into a root pass the promoted layer is composited over.
++  //
++  // Disabled here, in the earliest callback, before the FeatureList is created,
++  // so the override lands in the BROWSER FeatureList and is serialized to the
++  // GPU process — which is where IsAndroidSurfaceControlEnabled() is evaluated.
++  // Gated on the switch rather than on a build flag because inline-3D is not
++  // yet on by default on Android (the Windows block above is IS_WIN-only); the
++  // switch is on the command line by this point because Android's command-line
++  // file is parsed into base::CommandLine before ContentMain runs.
++  if (!command_line.HasSwitch(switches::kProcessType) &&
++      command_line.HasSwitch("enable-inline-3d")) {
++    auto* mutable_command_line = base::CommandLine::ForCurrentProcess();
++    std::string disabled =
++        mutable_command_line->GetSwitchValueASCII("disable-features");
++    if (disabled.find("AndroidSurfaceControl") == std::string::npos) {
++      if (!disabled.empty()) {
++        disabled += ",";
++      }
++      disabled += "AndroidSurfaceControl";
++      mutable_command_line->AppendSwitchASCII("disable-features", disabled);
++    }
++  }
++#endif  // BUILDFLAG(IS_ANDROID)
++
+   // The DevTools remote debugging pipe file descriptors need to be checked
+   // before any other files are opened, see https://crbug.com/40259890.
+   const bool is_browser = !command_line.HasSwitch(switches::kProcessType);

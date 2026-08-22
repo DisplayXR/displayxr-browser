@@ -1,0 +1,530 @@
+From 56e02e762fd2bb966105253d5878bb498830dedb Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 08:10:10 +0000
+Subject: [PATCH] feat(android): third weave dispatcher arm, compile-clean
+ skeleton
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+M2 step 3 (docs/android-port.md). Patch 0052 turned DisplayXRWeaveClient and the
+GPU-side provider into platform dispatchers with Windows and macOS arms; this
+adds the Android arm in the same shape, with no re-architecture.
+
+displayxr_weave_client_android.{h,cc} mirrors the mac pair and is deliberately
+inert: InitializeCoreAndroid() checks that the seam is present (an adopted
+DXR_IPC_FD plus a dlopen-able libopenxr_loader.so) and stops. IsSupportedAndroid
+returns false — the WebXR contract is authoritative on a succeeding
+requestSession('inline-3d'), so claiming support we cannot deliver would only
+fail later. SubmitBatchAndroid logs once and fails gracefully.
+
+Nothing is linked on Android, and that is the point: the client library's
+compiled-in u_git_tag has to match the running displayxr-service, which it does
+automatically as long as the runtime .so comes out of the installed runtime
+package via the Khronos loader. So the Android analogue of patch 0001 vendors the
+LOADER only, never a runtime copy.
+
+displayxr_weave_gpu_android.{h,cc} is not yet a viz::DisplayXRWeaveProvider
+subclass — that interface is IS_WIN||IS_APPLE and its per-platform arm takes the
+platform texture type. Widening it with WeaveCanvasAndroid(AHardwareBuffer*) is
+M1 work, where ProduceOverlayForWeave() starts yielding AHardwareBuffers. The
+header records what M1 must own: one SCANOUT-backed shared window-sized AHB
+input, the two fences the missing acquire fence forces, PruneTarget, and the
+first-submit-only woven handle.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ components/displayxr/browser/BUILD.gn         |  13 ++
+ .../browser/displayxr_weave_client.cc         |  25 ++++
+ .../browser/displayxr_weave_client_android.cc | 141 ++++++++++++++++++
+ .../browser/displayxr_weave_client_android.h  |  57 +++++++
+ components/displayxr/gpu/BUILD.gn             |   6 +
+ .../gpu/displayxr_weave_gpu_android.cc        |  65 ++++++++
+ .../gpu/displayxr_weave_gpu_android.h         |  82 ++++++++++
+ 7 files changed, 389 insertions(+)
+ create mode 100644 components/displayxr/browser/displayxr_weave_client_android.cc
+ create mode 100644 components/displayxr/browser/displayxr_weave_client_android.h
+ create mode 100644 components/displayxr/gpu/displayxr_weave_gpu_android.cc
+ create mode 100644 components/displayxr/gpu/displayxr_weave_gpu_android.h
+
+diff --git a/components/displayxr/browser/BUILD.gn b/components/displayxr/browser/BUILD.gn
+index 22f1421f99e1d..50e659521707c 100644
+--- a/components/displayxr/browser/BUILD.gn
++++ b/components/displayxr/browser/BUILD.gn
+@@ -47,6 +47,19 @@ component("weave_client") {
+       "Metal.framework",
+       "QuartzCore.framework",
+     ]
++  } else if (is_android) {
++    # Android (docs/android-port.md M2): NOTHING is linked. The OpenXR loader is
++    # dlopen'd by soname at runtime and the runtime .so comes out of the
++    # INSTALLED runtime package via the Khronos loader — which is what keeps the
++    # client library's compiled-in git tag matched to the running
++    # displayxr-service. The Android analogue of patch 0001 therefore vendors the
++    # LOADER only (libopenxr_loader.so, from openxr_loader_for_android), never a
++    # runtime copy. Headers are not needed yet either: the M2 skeleton makes no
++    # OpenXR call.
++    sources += [
++      "displayxr_weave_client_android.cc",
++      "displayxr_weave_client_android.h",
++    ]
+   }
+ }
+ 
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index 9029753948b87..6b9c01382f556 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -49,6 +49,12 @@
+ #include "components/displayxr/browser/displayxr_weave_client_mac.h"
+ #endif
+ 
++#if BUILDFLAG(IS_ANDROID)
++// The third dispatcher arm (docs/android-port.md M2). Same shape as the mac
++// header: OpenXR-free, so this TU stays platform-agnostic.
++#include "components/displayxr/browser/displayxr_weave_client_android.h"
++#endif
++
+ namespace displayxr {
+ 
+ namespace {
+@@ -2882,6 +2888,14 @@ DisplayXRWeaveClient::WeaveSubmitResult DisplayXRWeaveClient::SubmitBatch(
+   // makes ignoring it conformant — the panel is simply 3D where the caller asked
+   // for flat, which is what ships today.
+   return SubmitBatchMac(input_handle, rects, input_is_dxgi, overlay_handle);
++#elif BUILDFLAG(IS_ANDROID)
++  // |input_is_dxgi| is meaningless here (no DXGI); |input_handle| is an
++  // AHardwareBuffer* and the submit must declare
++  // XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR. |flat_rects| (v8) is accepted and
++  // ignored: the Android weave path takes flat regions and ignores them
++  // ((void)flat_rects in comp_multi_weave_android.c), and the wish being
++  // advisory makes that conformant.
++  return SubmitBatchAndroid(input_handle, rects, overlay_handle);
+ #else
+   return {};
+ #endif
+@@ -2893,6 +2907,8 @@ uint32_t DisplayXRWeaveClient::WeaveSpecVersion() {
+   return State().weave_spec_version;
+ #elif BUILDFLAG(IS_MAC)
+   return WeaveSpecVersionMac();
++#elif BUILDFLAG(IS_ANDROID)
++  return WeaveSpecVersionAndroid();
+ #else
+   return 0;
+ #endif
+@@ -2904,6 +2920,8 @@ bool DisplayXRWeaveClient::IsSupported() {
+   return IsSupportedWin();
+ #elif BUILDFLAG(IS_MAC)
+   return IsSupportedMac();
++#elif BUILDFLAG(IS_ANDROID)
++  return IsSupportedAndroid();
+ #else
+   return false;
+ #endif
+@@ -3034,6 +3052,8 @@ DisplayXRWeaveClient::LocateViewsForRect(const WeaveRect& rect,
+   return LocateViewsForRectWin(rect, virtual_display_height);
+ #elif BUILDFLAG(IS_MAC)
+   return LocateViewsForRectMac(rect, virtual_display_height);
++#elif BUILDFLAG(IS_ANDROID)
++  return LocateViewsForRectAndroid(rect, virtual_display_height);
+ #else
+   return {};
+ #endif
+@@ -3100,6 +3120,11 @@ void DisplayXRWeaveClient::MaybeInitializeFromCommandLine() {
+   // retry — the runtime stores window id 0 and the snap is identity). Dormant
+   // when the runtime/loader is absent.
+   InitializeCoreMac();
++#elif BUILDFLAG(IS_ANDROID)
++  // The session itself belongs to the GPU process on Android (it is the process
++  // that was handed the runtime socket), so this browser-process entry only
++  // checks the seam. See displayxr_weave_client_android.cc.
++  InitializeCoreAndroid();
+ #else
+   LOG(ERROR) << "[DisplayXR] inline-3D is not supported on this platform yet";
+ #endif
+diff --git a/components/displayxr/browser/displayxr_weave_client_android.cc b/components/displayxr/browser/displayxr_weave_client_android.cc
+new file mode 100644
+index 0000000000000..d30cfca0101a7
+--- /dev/null
++++ b/components/displayxr/browser/displayxr_weave_client_android.cc
+@@ -0,0 +1,141 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/displayxr/browser/displayxr_weave_client_android.h"
++
++#include <dlfcn.h>
++#include <stdlib.h>
++
++#include "base/logging.h"
++#include "base/memory/raw_ptr_exclusion.h"
++
++namespace displayxr {
++
++namespace {
++
++// The Khronos OpenXR loader, as installed on the device. Not vendored: unlike
++// Windows (patch 0001 vendors openxr_loader.dll + .lib) there is no prebuilt
++// Android loader in third_party/displayxr, and there must not be a bundled
++// RUNTIME copy either — see the git-tag note in EnsureLoader().
++constexpr char kLoaderSoName[] = "libopenxr_loader.so";
++
++struct AndroidWeaveState {
++  bool tried_loader = false;
++  // Not raw_ptr: these are a dlopen() module handle and a function pointer out
++  // of it, neither of which is a PartitionAlloc allocation.
++  RAW_PTR_EXCLUSION void* loader = nullptr;
++  RAW_PTR_EXCLUSION void* get_instance_proc_addr = nullptr;
++  bool logged_submit = false;
++  uint32_t weave_spec_version = 0;
++};
++
++AndroidWeaveState& State() {
++  static AndroidWeaveState state;
++  return state;
++}
++
++// The adopted runtime socket, published by gpu_main.cc's
++// MaybePublishDisplayXRAdoptedFd(). Its presence is the M2 signal that the
++// browser-side connector worked and this process can talk to the runtime at all;
++// without it there is no point loading anything.
++bool HaveAdoptedRuntimeSocket() {
++  const char* fd = getenv("DXR_IPC_FD");
++  return fd != nullptr && fd[0] != '\0';
++}
++
++// Load the OpenXR loader, but ONLY when the seam is actually present. A vanilla
++// device has no loader and no runtime; dlopen simply fails and we stay dormant
++// rather than crashing.
++//
++// THE GIT-TAG GATE (device bring-up concern, not solved here):
++// ipc_client_check_git_tag() strncmps the runtime CLIENT library's compiled-in
++// u_git_tag against the running displayxr-service's and fails xrCreateInstance
++// on any mismatch. The client library is the runtime .so the Khronos loader
++// pulls out of the INSTALLED runtime package, so the match is automatic as long
++// as nothing here ships its own copy. That is the whole reason this file
++// dlopen()s the system loader by soname instead of linking a vendored runtime:
++// the Android analogue of patch 0001 must vendor the LOADER only, never the
++// runtime.
++bool EnsureLoader() {
++  AndroidWeaveState& s = State();
++  if (s.tried_loader) {
++    return s.loader != nullptr;
++  }
++  s.tried_loader = true;
++
++  if (!HaveAdoptedRuntimeSocket()) {
++    LOG(WARNING) << "[DisplayXR] no adopted runtime socket (DXR_IPC_FD); "
++                    "inline-3D stays dormant in this process";
++    return false;
++  }
++
++  s.loader = dlopen(kLoaderSoName, RTLD_NOW | RTLD_LOCAL);
++  if (s.loader == nullptr) {
++    LOG(WARNING) << "[DisplayXR] " << kLoaderSoName
++                 << " not present; inline-3D stays dormant: " << dlerror();
++    return false;
++  }
++  s.get_instance_proc_addr = dlsym(s.loader, "xrGetInstanceProcAddr");
++  if (s.get_instance_proc_addr == nullptr) {
++    LOG(ERROR) << "[DisplayXR] " << kLoaderSoName
++               << " has no xrGetInstanceProcAddr; refusing to continue";
++    dlclose(s.loader);
++    s.loader = nullptr;
++    return false;
++  }
++  return true;
++}
++
++}  // namespace
++
++void InitializeCoreAndroid() {
++  if (!EnsureLoader()) {
++    return;
++  }
++  // M2 ends here on purpose. The next step (M3) is
++  // xrInitializeLoaderKHR(applicationVM/applicationContext) ->
++  // xrCreateInstance with XR_KHR_android_create_instance + XR_DXR_weave +
++  // XR_DXR_display_info + XR_DXR_view_rig, then the present-owner session and
++  // xrWeaveBindWindow2DXR with a chained XrWeaveWindowGeometryDXR (required on
++  // Android — ADR-036 D6). Doing that here would need the OpenXR headers and a
++  // VM/Context this browser-process TU does not have; the GPU-process backend
++  // (displayxr_weave_gpu_android) is where the session will live.
++  LOG(WARNING) << "[DisplayXR] Android weave seam is present (loader + adopted "
++                  "socket); session bring-up is M3";
++}
++
++bool IsSupportedAndroid() {
++  // No session yet, so nothing to report as supported. Deliberately does NOT
++  // report the mere presence of the loader: the WebXR detection contract is
++  // authoritative on a succeeding requestSession('inline-3d'), and claiming
++  // support we cannot deliver would make that fail late instead of early.
++  return false;
++}
++
++uint32_t WeaveSpecVersionAndroid() {
++  return State().weave_spec_version;
++}
++
++std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectAndroid(
++    const DisplayXRWeaveClient::WeaveRect& rect,
++    float virtual_display_height) {
++  return {};
++}
++
++DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchAndroid(
++    uintptr_t input_handle,
++    const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
++    uintptr_t overlay_handle) {
++  AndroidWeaveState& s = State();
++  if (!s.logged_submit) {
++    s.logged_submit = true;
++    LOG(WARNING) << "[DisplayXR] SubmitBatchAndroid is not implemented yet (M1: "
++                    "AHardwareBuffer extraction + XR_WEAVE_HANDLE_KIND_"
++                    "AHARDWAREBUFFER_DXR submit); " << rects.size()
++                 << " rect(s) dropped, and this is logged once";
++  }
++  return {};
++}
++
++}  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_weave_client_android.h b/components/displayxr/browser/displayxr_weave_client_android.h
+new file mode 100644
+index 0000000000000..e10265548ac77
+--- /dev/null
++++ b/components/displayxr/browser/displayxr_weave_client_android.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_ANDROID_H_
++#define COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_ANDROID_H_
++
++// Android platform impl of the DisplayXRWeaveClient statics — the THIRD arm of
++// the dispatchers in displayxr_weave_client.cc (patch 0052 made them
++// dispatchers; Windows and macOS are the other two). Same shape as
++// displayxr_weave_client_mac.h, and deliberately OpenXR-free so the C++
++// dispatcher TU can include it.
++//
++// M2 SCOPE (docs/android-port.md): this is a compile-clean skeleton. It proves
++// the seam — the adopted socket is visible, the OpenXR loader is reachable —
++// and stops there. The session, the AHardwareBuffer submit path and the
++// per-frame geometry publication are M1/M3.
++//
++// Unlike Windows and macOS, the runtime is NOT reached through a vendored
++// import library here. See InitializeCoreAndroid() for the loader seam and the
++// note on the git-tag gate.
++
++#include <cstdint>
++#include <vector>
++
++#include "components/displayxr/browser/displayxr_weave_client.h"
++
++namespace displayxr {
++
++// Bring up the weave session (idempotent). Dormant — logs and returns — when
++// the runtime seam is absent, so a vanilla device is unaffected.
++void InitializeCoreAndroid();
++
++// True once the weave session is live (backs WebXR isSessionSupported).
++bool IsSupportedAndroid();
++
++// The runtime-reported XR_DXR_weave spec version (0 until initialized).
++uint32_t WeaveSpecVersionAndroid();
++
++// Off-axis (Kooima) views of one inline-3D element. Empty until the rig is
++// live (M3).
++std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectAndroid(
++    const DisplayXRWeaveClient::WeaveRect& rect,
++    float virtual_display_height);
++
++// Batched synchronous weave. On Android |input_handle| will be an
++// AHardwareBuffer* and the submit must chain XrWeaveSubmitHandlesDXR with
++// inputKind = XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR (PLATFORM_DEFAULT is
++// wrong here). Not implemented in M2: logs once and fails gracefully.
++DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchAndroid(
++    uintptr_t input_handle,
++    const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
++    uintptr_t overlay_handle);
++
++}  // namespace displayxr
++
++#endif  // COMPONENTS_DISPLAYXR_BROWSER_DISPLAYXR_WEAVE_CLIENT_ANDROID_H_
+diff --git a/components/displayxr/gpu/BUILD.gn b/components/displayxr/gpu/BUILD.gn
+index e7717b6677d6e..c214f7c21cfc1 100644
+--- a/components/displayxr/gpu/BUILD.gn
++++ b/components/displayxr/gpu/BUILD.gn
+@@ -46,5 +46,11 @@ source_set("gpu") {
+       "CoreFoundation.framework",
+     ]
+   }
++  if (is_android) {
++    sources += [
++      "displayxr_weave_gpu_android.cc",
++      "displayxr_weave_gpu_android.h",
++    ]
++  }
+ 
+ }
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.cc b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+new file mode 100644
+index 0000000000000..252c44923b893
+--- /dev/null
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+@@ -0,0 +1,65 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/displayxr/gpu/displayxr_weave_gpu_android.h"
++
++#if BUILDFLAG(IS_ANDROID)
++
++#include "base/logging.h"
++#include "components/displayxr/browser/displayxr_weave_client_android.h"
++
++namespace displayxr {
++
++DisplayXRWeaveGpuAndroid::DisplayXRWeaveGpuAndroid() {
++  // Same shape as the mac provider: the GPU-process weave session is brought up
++  // in the constructor. On Android that is only possible because the browser
++  // process already handed this process a connected runtime socket and
++  // gpu_main.cc published it as DXR_IPC_FD before we got here.
++  InitializeCoreAndroid();
++}
++
++DisplayXRWeaveGpuAndroid::~DisplayXRWeaveGpuAndroid() = default;
++
++bool DisplayXRWeaveGpuAndroid::IsLive() const {
++  return IsSupportedAndroid();
++}
++
++void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
++  batch_open_ = true;
++  batch_size_ = window_size;
++}
++
++bool DisplayXRWeaveGpuAndroid::WeaveCanvasAndroid(uintptr_t ahardware_buffer,
++                                                  const gfx::Rect& src_rect,
++                                                  const gfx::Rect& window_rect,
++                                                  uint32_t target_id) {
++  if (!logged_unimplemented_) {
++    logged_unimplemented_ = true;
++    LOG(WARNING) << "[DisplayXR] Android weave input assembly is M1 "
++                    "(AHardwareBuffer blit into the shared window-sized input); "
++                    "logged once";
++  }
++  return false;
++}
++
++bool DisplayXRWeaveGpuAndroid::SubmitBatchSync() {
++  if (!batch_open_) {
++    return false;
++  }
++  batch_open_ = false;
++  // The real submit is SubmitBatchAndroid(input AHB, rects, overlay), which
++  // fails gracefully for now.
++  return SubmitBatchAndroid(/*input_handle=*/0, /*rects=*/{},
++                            /*overlay_handle=*/0)
++      .ok;
++}
++
++void DisplayXRWeaveGpuAndroid::PruneTarget(uint32_t target_id) {
++  // Nothing per-target is held yet. M1 releases this target's AHB + fence state
++  // here (patch 0061's contract) BEFORE the caller reuses the id.
++}
++
++}  // namespace displayxr
++
++#endif  // BUILDFLAG(IS_ANDROID)
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.h b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+new file mode 100644
+index 0000000000000..30b7d34922801
+--- /dev/null
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_ANDROID_H_
++#define COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_ANDROID_H_
++
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_ANDROID)
++
++#include <cstdint>
++#include <vector>
++
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace displayxr {
++
++// Android GPU-process weave backend — the third arm of the patch-0052
++// dispatcher, mirroring DisplayXRWeaveGpuMac.
++//
++// M2 SCOPE: a compile-clean skeleton with the real method shape and no GPU work.
++// It is deliberately NOT yet a viz::DisplayXRWeaveProvider subclass: that
++// interface is #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) and its per-platform
++// arm takes the platform texture type (ID3D11Texture2D* / IOSurfaceRef). Adding
++// the Android arm — WeaveCanvasAndroid(AHardwareBuffer*, ...) plus widening the
++// header guard — belongs to M1, which is where ProduceOverlayForWeave() starts
++// yielding AHardwareBuffers and there is something real to hand it. Registering
++// a provider that returns false for every call would only make Viz do pointless
++// work every frame.
++//
++// What the M1/M3 implementation has to own, recorded here so it is not
++// rediscovered:
++//   * ONE shared window-sized AHB weave input (SCANOUT usage so the SharedImage
++//     backing routes to the AHardwareBuffer path), blitted per visible element.
++//   * Two fences per frame, because the runtime has NO acquire fence on Android:
++//     wait the producer's ScopedHardwareBufferFenceSync::TakeFence() inbound,
++//     and wait our own blit's VkFence before xrWeaveSubmitDXR.
++//   * PruneTarget(target_id) (patch 0061) releasing whatever per-target AHB /
++//     fence state this ends up holding — seven lines if it copies mac's single-
++//     shared-input design.
++//   * The woven AHardwareBuffer comes back non-NULL on the FIRST submit and on
++//     every reallocation only; cache it and AHardwareBuffer_release() the old
++//     one when it is replaced.
++//
++// Created + called on the GPU main thread.
++class DisplayXRWeaveGpuAndroid {
++ public:
++  DisplayXRWeaveGpuAndroid();
++  DisplayXRWeaveGpuAndroid(const DisplayXRWeaveGpuAndroid&) = delete;
++  DisplayXRWeaveGpuAndroid& operator=(const DisplayXRWeaveGpuAndroid&) = delete;
++  ~DisplayXRWeaveGpuAndroid();
++
++  // True once the weave session in this process is live. False for all of M2.
++  bool IsLive() const;
++
++  // Batch bracket, matching the mac provider's contract:
++  //   BeginBatchSync(window_size);
++  //   WeaveCanvasAndroid(...) per visible target;   // copy-only
++  //   SubmitBatchSync();                            // one synchronous submit
++  void BeginBatchSync(const gfx::Size& window_size);
++  bool WeaveCanvasAndroid(uintptr_t ahardware_buffer,
++                          const gfx::Rect& src_rect,
++                          const gfx::Rect& window_rect,
++                          uint32_t target_id);
++  bool SubmitBatchSync();
++
++  // Drop everything held for one target id (patch 0061's PruneTarget).
++  void PruneTarget(uint32_t target_id);
++
++ private:
++  bool logged_unimplemented_ = false;
++  bool batch_open_ = false;
++  gfx::Size batch_size_;
++};
++
++}  // namespace displayxr
++
++#endif  // BUILDFLAG(IS_ANDROID)
++
++#endif  // COMPONENTS_DISPLAYXR_GPU_DISPLAYXR_WEAVE_GPU_ANDROID_H_

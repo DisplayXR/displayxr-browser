@@ -1,0 +1,356 @@
+From 80d05c26a7cc390982188af08447f6ae3cd1c283 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Fri, 21 Aug 2026 07:21:02 +0000
+Subject: [PATCH] feat(android): serve the rig locate from the weaving session
+ over mojo
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The locate has to run where the compositor-owning session is, and on
+Android that is the GPU process. So route it there instead of trying to
+grow a second session in the browser.
+
+This is the argument DisplayXRDisplayMode was created for, applied to a
+second message. browser#55 already established that the panel's hardware
+element must be driven from the weaving session while only the browser
+can decide — policy in the browser, execution where the session lives.
+The rig locate has exactly that shape: DisplayXRServiceImpl answers the
+renderer, and it runs in the browser; the session that can actually
+service a zone-chained, rig-chained xrLocateViews runs in the GPU
+process. Same hop, same interface, one more method.
+
+Adds mojom::DisplayXRRigView + LocateViews (Android-only), implements it
+GPU-side as a straight pass-through to LocateViewsForRectAndroid, and
+has the browser bind the remote lazily with reset_on_disconnect so a GPU
+restart just re-binds. Views stay VERBATIM across both hops: pose and
+fov are copied field-for-field, no projection math anywhere on the way.
+
+The GPU-side binder registration and its includes were
+`IS_WIN || IS_MAC`; Android joins them. The GN deps were already
+unconditional.
+
+Known cost, left as a TODO on the mojom method: one
+browser->GPU->browser round trip per element per frame. If it shows up
+in a profile, the GPU side should push views for the known rects each
+frame and let the browser answer from a cache.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ chrome/gpu/browser_exposed_gpu_interfaces.cc  |  9 ++--
+ components/displayxr/browser/BUILD.gn         |  7 ++-
+ .../browser/displayxr_service_impl.cc         | 54 +++++++++++++++++++
+ .../browser/displayxr_service_impl.h          | 13 +++++
+ .../displayxr/common/displayxr_weave.mojom    | 41 ++++++++++++++
+ .../gpu/displayxr_display_mode_impl.cc        | 38 +++++++++++++
+ .../gpu/displayxr_display_mode_impl.h         |  7 +++
+ 7 files changed, 163 insertions(+), 6 deletions(-)
+
+diff --git a/chrome/gpu/browser_exposed_gpu_interfaces.cc b/chrome/gpu/browser_exposed_gpu_interfaces.cc
+index bd029e6a44691..728c7ba9fe088 100644
+--- a/chrome/gpu/browser_exposed_gpu_interfaces.cc
++++ b/chrome/gpu/browser_exposed_gpu_interfaces.cc
+@@ -13,8 +13,9 @@
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC)
+-// DisplayXR inline-3D (browser#55): browser -> GPU display-mode hop.
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID)
++// DisplayXR inline-3D (browser#55): browser -> GPU display-mode hop. Android
++// also serves the rig locate over this interface (LocateViews).
+ #include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "components/displayxr/gpu/displayxr_display_mode_impl.h"
+ #endif
+@@ -104,7 +105,7 @@ void ExposeChromeGpuInterfacesToBrowser(
+     const gpu::GpuPreferences& gpu_preferences,
+     const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
+     mojo::BinderMap* binders) {
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID)
+   // DisplayXR inline-3D (browser#55): let the browser drive the panel's
+   // hardware 2D/3D element. It has to be executed here rather than in the
+   // browser process — the weave session lives in this process and the vendor's
+@@ -115,7 +116,7 @@ void ExposeChromeGpuInterfacesToBrowser(
+   binders->Add<::displayxr::mojom::DisplayXRDisplayMode>(
+       base::BindRepeating(&displayxr::DisplayXRDisplayModeImpl::Create),
+       base::SingleThreadTaskRunner::GetCurrentDefault());
+-#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC)
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID)
+ 
+ #if BUILDFLAG(IS_CHROMEOS) && BUILDFLAG(USE_LINUX_VIDEO_ACCELERATION)
+   binders->Add<::arc::mojom::VideoDecodeAccelerator>(
+diff --git a/components/displayxr/browser/BUILD.gn b/components/displayxr/browser/BUILD.gn
+index ef3cff9066a3a..8b38ed414d108 100644
+--- a/components/displayxr/browser/BUILD.gn
++++ b/components/displayxr/browser/BUILD.gn
+@@ -90,14 +90,17 @@ source_set("browser") {
+   # directly (to initialize the client), so consumers of :browser must see it.
+   # browser#55: displayxr_service_impl.h exposes content::GlobalRenderFrameHostId
+   # (the demand report's frame identity), so consumers must see content/public.
++  # Android rig locate: displayxr_service_impl.h holds a
++  # mojo::Remote<mojom::DisplayXRDisplayMode>, so the weave mojom and the mojo
++  # bindings are part of this target's public surface too.
+   public_deps = [
+     ":weave_client",
++    "//components/displayxr/common:displayxr_weave_mojom",
+     "//content/public/browser",
++    "//mojo/public/cpp/bindings",
+   ]
+   deps = [
+     "//base",
+-    "//components/displayxr/common:displayxr_weave_mojom",
+-    "//mojo/public/cpp/bindings",
+     "//third_party/blink/public/mojom:displayxr_service_mojo_bindings",
+     "//ui/gfx",
+     "//ui/gfx/geometry",
+diff --git a/components/displayxr/browser/displayxr_service_impl.cc b/components/displayxr/browser/displayxr_service_impl.cc
+index a57b018f0afde..9b42620b4de3d 100644
+--- a/components/displayxr/browser/displayxr_service_impl.cc
++++ b/components/displayxr/browser/displayxr_service_impl.cc
+@@ -4,6 +4,16 @@
+ 
+ #include "components/displayxr/browser/displayxr_service_impl.h"
+ 
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_ANDROID)
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "content/public/browser/gpu_service_registry.h"
++#endif
++
+ #include <memory>
+ #include <utility>
+ #include <vector>
+@@ -98,6 +108,49 @@ void DisplayXRServiceImpl::IsInline3DSupported(
+   DisplayXRWeaveClient::RequestSupportWhenKnown(std::move(callback));
+ }
+ 
++#if BUILDFLAG(IS_ANDROID)
++void DisplayXRServiceImpl::GetLatestViews(const gfx::Rect& element_window_rect,
++                                          float virtual_display_height,
++                                          GetLatestViewsCallback callback) {
++  // On Android the weave session lives in the GPU process, so the locate has to
++  // be asked there — see mojom::DisplayXRDisplayMode::LocateViews for why a
++  // browser-local (or headless) session cannot answer this.
++  if (!gpu_display_mode_) {
++    content::BindInterfaceInGpuProcess(
++        gpu_display_mode_.BindNewPipeAndPassReceiver());
++    gpu_display_mode_.reset_on_disconnect();
++  }
++  if (!gpu_display_mode_) {
++    std::move(callback).Run({});
++    return;
++  }
++  gpu_display_mode_->LocateViews(
++      element_window_rect, virtual_display_height,
++      base::BindOnce(
++          [](GetLatestViewsCallback cb,
++             std::vector<mojom::DisplayXRRigViewPtr> views) {
++            std::vector<blink::mojom::DisplayXRViewPtr> out;
++            out.reserve(views.size());
++            for (const mojom::DisplayXRRigViewPtr& v : views) {
++              auto mv = blink::mojom::DisplayXRView::New();
++              mv->pos_x = v->pos_x;
++              mv->pos_y = v->pos_y;
++              mv->pos_z = v->pos_z;
++              mv->orient_x = v->orient_x;
++              mv->orient_y = v->orient_y;
++              mv->orient_z = v->orient_z;
++              mv->orient_w = v->orient_w;
++              mv->fov_left = v->fov_left;
++              mv->fov_right = v->fov_right;
++              mv->fov_up = v->fov_up;
++              mv->fov_down = v->fov_down;
++              out.push_back(std::move(mv));
++            }
++            std::move(cb).Run(std::move(out));
++          },
++          std::move(callback)));
++}
++#else
+ void DisplayXRServiceImpl::GetLatestViews(const gfx::Rect& element_window_rect,
+                                           float virtual_display_height,
+                                           GetLatestViewsCallback callback) {
+@@ -131,5 +184,6 @@ void DisplayXRServiceImpl::GetLatestViews(const gfx::Rect& element_window_rect,
+   }
+   std::move(callback).Run(std::move(out));
+ }
++#endif  // BUILDFLAG(IS_ANDROID)
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_service_impl.h b/components/displayxr/browser/displayxr_service_impl.h
+index 0b9d1a2ae2933..46efeead736b0 100644
+--- a/components/displayxr/browser/displayxr_service_impl.h
++++ b/components/displayxr/browser/displayxr_service_impl.h
+@@ -14,10 +14,16 @@
+ #include <cstdint>
+ 
+ #include "base/functional/callback.h"
++#include "build/build_config.h"
+ #include "content/public/browser/global_routing_id.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "third_party/blink/public/mojom/xr/displayxr_service.mojom.h"
+ 
++#if BUILDFLAG(IS_ANDROID)
++#include "components/displayxr/common/displayxr_weave.mojom.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#endif
++
+ namespace displayxr {
+ 
+ class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
+@@ -62,6 +68,13 @@ class DisplayXRServiceImpl : public blink::mojom::DisplayXRService {
+   void SetInline3DDemand(bool wants_3d) override;
+ 
+  private:
++#if BUILDFLAG(IS_ANDROID)
++  // The GPU process's weaving session, where the rig locate has to run (the
++  // browser has no session of its own on Android). Bound lazily on first use
++  // and reset on disconnect, so a GPU restart just re-binds.
++  mojo::Remote<mojom::DisplayXRDisplayMode> gpu_display_mode_;
++#endif
++
+   // The frame that bound this pipe. Kept as an ID, not a pointer: the receiver
+   // is self-owned and outlives nothing in particular, so the embedder resolves
+   // the ID to a live RenderFrameHost at handling time or drops the report.
+diff --git a/components/displayxr/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
+index fbd7b6874299e..46579febbf486 100644
+--- a/components/displayxr/common/displayxr_weave.mojom
++++ b/components/displayxr/common/displayxr_weave.mojom
+@@ -102,6 +102,24 @@ struct ReconnectResult {
+   string service_tag;
+ };
+ 
++// One render-ready view from the runtime's XR_DXR_view_rig, for a single
++// inline-3D element. Pose and FOV VERBATIM — the runtime owns all of the
++// off-axis/Kooima and m2v math, and Blink builds view.projectionMatrix /
++// view.transform straight from these.
++struct DisplayXRRigView {
++  float pos_x;
++  float pos_y;
++  float pos_z;
++  float orient_x;
++  float orient_y;
++  float orient_z;
++  float orient_w;
++  float fov_left;
++  float fov_right;
++  float fov_up;
++  float fov_down;
++};
++
+ interface DisplayXRWeaver {
+   // Weave one window sub-rect. |texture| is the pre-weave SBS keyed-mutex shared
+   // texture; |rect| is its window-relative device-pixel placement. Replies with
+@@ -204,4 +222,27 @@ interface DisplayXRDisplayMode {
+   // to nothing for free. Advisory — it moves the panel's 3D element only and
+   // never gates, masks or reorders content.
+   SetPopupOccluders(array<gfx.mojom.Rect> screen_rects);
++
++  // Android: locate this element's stereo pair on the WEAVING session.
++  //
++  // Same argument as SetDisplayMode above, for the same reason. On Windows and
++  // macOS the browser keeps its own query-only session and locates locally, but
++  // on Android it cannot: the runtime is reached through a single binder
++  // connection owned by the browser and handed to the GPU process, so the
++  // browser has no second session to ask — and a HEADLESS one would not help
++  // even if it had a socket. XR_MND_headless sessions are bridge relays in the
++  // runtime (oxr_session.c): rig_route_native requires `sess->xcn != NULL` and
++  // `!sess->is_bridge_relay`, so chained rig descriptors AND zone rects are
++  // both inert there and xrLocateViews returns raw eyes verbatim, not the
++  // per-element off-axis views a scene needs.
++  //
++  // So the locate goes where the compositor-owning session already is. Async,
++  // like everything else on this hop; the renderer already awaits it.
++  //
++  // TODO(displayxr): this is one browser->GPU->browser round trip per element
++  // per frame. If it shows up in profiles, have the GPU side push views for the
++  // known rects each frame and answer from a browser-side cache.
++  [EnableIf=is_android]
++  LocateViews(gfx.mojom.Rect element_window_rect, float virtual_display_height)
++      => (array<DisplayXRRigView> views);
+ };
+diff --git a/components/displayxr/gpu/displayxr_display_mode_impl.cc b/components/displayxr/gpu/displayxr_display_mode_impl.cc
+index 68bd4bbadbfab..3dea0d879d249 100644
+--- a/components/displayxr/gpu/displayxr_display_mode_impl.cc
++++ b/components/displayxr/gpu/displayxr_display_mode_impl.cc
+@@ -6,6 +6,9 @@
+ 
+ #include <memory>
+ #include <utility>
++#include <vector>
++
++#include "build/build_config.h"
+ 
+ #include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+@@ -50,4 +53,39 @@ void DisplayXRDisplayModeImpl::SetPopupOccluders(
+   DisplayXRWeaveClient::SetScreenFlatRegions(rects);
+ }
+ 
++#if BUILDFLAG(IS_ANDROID)
++void DisplayXRDisplayModeImpl::LocateViews(const gfx::Rect& element_window_rect,
++                                           float virtual_display_height,
++                                           LocateViewsCallback callback) {
++  // Straight pass-through to the weaving session's rig locate. The rect the
++  // renderer sent is already the window-client device-px rect the runtime's
++  // zone canvas is defined in — the same rect the weave submits — so there is
++  // nothing to rebase, exactly as in DisplayXRServiceImpl::GetLatestViews.
++  DisplayXRWeaveClient::WeaveRect rect;
++  rect.x = element_window_rect.x();
++  rect.y = element_window_rect.y();
++  rect.w = element_window_rect.width();
++  rect.h = element_window_rect.height();
++
++  std::vector<mojom::DisplayXRRigViewPtr> out;
++  for (const DisplayXRWeaveClient::RigView& v :
++       DisplayXRWeaveClient::LocateViewsForRect(rect, virtual_display_height)) {
++    auto mv = mojom::DisplayXRRigView::New();
++    mv->pos_x = v.pos_x;
++    mv->pos_y = v.pos_y;
++    mv->pos_z = v.pos_z;
++    mv->orient_x = v.orient_x;
++    mv->orient_y = v.orient_y;
++    mv->orient_z = v.orient_z;
++    mv->orient_w = v.orient_w;
++    mv->fov_left = v.fov_left;
++    mv->fov_right = v.fov_right;
++    mv->fov_up = v.fov_up;
++    mv->fov_down = v.fov_down;
++    out.push_back(std::move(mv));
++  }
++  std::move(callback).Run(std::move(out));
++}
++#endif  // BUILDFLAG(IS_ANDROID)
++
+ }  // namespace displayxr
+diff --git a/components/displayxr/gpu/displayxr_display_mode_impl.h b/components/displayxr/gpu/displayxr_display_mode_impl.h
+index 8be63853304ff..a756ac112fd11 100644
+--- a/components/displayxr/gpu/displayxr_display_mode_impl.h
++++ b/components/displayxr/gpu/displayxr_display_mode_impl.h
+@@ -22,6 +22,8 @@
+ 
+ #include <vector>
+ 
++#include "build/build_config.h"
++
+ #include "components/displayxr/common/displayxr_weave.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "ui/gfx/geometry/rect.h"
+@@ -43,6 +45,11 @@ class DisplayXRDisplayModeImpl : public mojom::DisplayXRDisplayMode {
+   void SetDisplayMode(bool three_d) override;
+   void SetPopupOccluders(
+       const std::vector<gfx::Rect>& screen_rects) override;
++#if BUILDFLAG(IS_ANDROID)
++  void LocateViews(const gfx::Rect& element_window_rect,
++                   float virtual_display_height,
++                   LocateViewsCallback callback) override;
++#endif
+ };
+ 
+ }  // namespace displayxr

@@ -1,0 +1,252 @@
+From 592a88c4b376f835746f9c17b52f3abe0670eb50 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 08:08:23 +0000
+Subject: [PATCH] feat(android): plumb the runtime IPC fd to the GPU process at
+ launch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+M2 step 2 (docs/android-port.md). The fd travels the descriptor-table route
+Chromium already runs for the mojo channel, the crash signal fd and the pak
+files:
+
+  browser  ChromeContentBrowserClient::GetAdditionalMappedFilesForChildProcess
+           -> PosixFileDescriptorInfo::Transfer(kAndroidDisplayXrIpcDescriptor)
+  launcher -> FileDescriptorInfo[] over binder to ChildProcessService
+  child    -> base::android::RegisterFileDescriptors -> base::GlobalDescriptors
+  gpu      MaybePublishDisplayXRAdoptedFd() in ContentSandboxHelper::
+           PreSandboxStartup -> setenv("DXR_IPC_FD", n)
+
+The reserved key lives in content/public/common/content_descriptors.h rather
+than chrome_descriptors_android.h because content/gpu/gpu_main.cc is the adopter
+and cannot include chrome/.
+
+DXR_IPC_FD is the right one of the two adoption routes here: it has no
+symbol-resolution ordering constraint, where ipc_client_connection_adopt_fd only
+resolves after the Khronos loader has dlopen'd the runtime .so RTLD_LOCAL.
+setenv genuinely works on Android (one bionic libc per process).
+
+PreSandboxStartup is the same slot the Windows patches use, and Android does
+reach it — gpu_init.cc sets gpu_sandbox_start_early = true off-Linux.
+
+Transfer, not Share: the launcher owns and closes the dup once the binder
+transaction carrying it has completed.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ chrome/browser/BUILD.gn                       |  5 ++
+ chrome/browser/chrome_browser_main.cc         | 19 ++++++++
+ .../browser/chrome_content_browser_client.cc  | 30 ++++++++++++
+ content/gpu/gpu_main.cc                       | 47 +++++++++++++++++++
+ content/public/common/content_descriptors.h   |  9 ++++
+ 5 files changed, 110 insertions(+)
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 5a8e30e52b558..4b6eb1f7a7551 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -3091,6 +3091,11 @@ source_set("browser") {
+   if (is_android) {
+     deps += [
+       "//chrome/browser/android",
++
++      # DisplayXR inline-3D (runtime #1056): the browser-process runtime
++      # connector whose socket GetAdditionalMappedFilesForChildProcess hands to
++      # the GPU process.
++      "//components/displayxr/android",
+       "//components/webxr/android",
+ 
+       # Targets containing Android-specific implementations that have to be
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index cdd8c375d77e7..2b245f58011f8 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -100,6 +100,10 @@
+ #include "chrome/browser/displayxr/displayxr_display_mode_controller.h"
+ #include "components/displayxr/browser/displayxr_weave_client.h"
+ #endif
++#if BUILDFLAG(IS_ANDROID)
++// DisplayXR inline-3D (runtime #1056): the browser-process runtime connector.
++#include "components/displayxr/android/displayxr_runtime_connector_android.h"
++#endif
+ #include "components/embedder_support/origin_trials/component_updater_utils.h"
+ #include "components/embedder_support/origin_trials/origin_trials_settings_storage.h"
+ #include "components/heap_profiling/in_process/heap_profiler_controller.h"
+@@ -1726,6 +1730,21 @@ void ChromeBrowserMainParts::PostBrowserStart() {
+     displayxr::DisplayXRDisplayModeController::CreateForBrowserProcess();
+   }
+ #endif
++
++#if BUILDFLAG(IS_ANDROID)
++  // DisplayXR inline-3D (runtime #1056, docs/android-port.md M2): warm the
++  // runtime connect NOW so the ~300 ms blockingConnect is off the process
++  // launcher's critical path. GetAdditionalMappedFilesForChildProcess will block
++  // on it if a GPU process launches first, which is correct but slower.
++  //
++  // Also start watching for GPU-process loss: slot ownership stays with this
++  // process, so recovery is just "drop the socket, re-connect, hand the next GPU
++  // launch a fresh fd".
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    displayxr::WarmUpRuntimeConnection();
++    displayxr::StartObservingGpuProcessForReconnect();
++  }
++#endif
+ }
+ 
+ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index a349cc302f4e6..3935baf0003aa 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -536,6 +536,9 @@
+ #include "chrome/browser/ui/android/tab_model/tab_model.h"
+ #include "chrome/browser/ui/android/tab_model/tab_model_list.h"
+ #include "chrome/common/chrome_descriptors_android.h"
++// DisplayXR inline-3D (runtime #1056): the browser-process runtime connector,
++// whose socket is handed to the GPU process below.
++#include "components/displayxr/android/displayxr_runtime_connector_android.h"
+ #include "components/browser_ui/accessibility/android/font_size_prefs_android.h"
+ #include "components/crash/content/browser/child_exit_observer_android.h"
+ #include "components/crash/content/browser/crash_memory_metrics_collector_android.h"
+@@ -5394,6 +5397,33 @@ void ChromeContentBrowserClient::GetAdditionalMappedFilesForChildProcess(
+   }
+ #endif  // BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_LINUX) ||
+         // BUILDFLAG(IS_CHROMEOS)
++
++#if BUILDFLAG(IS_ANDROID)
++  // DisplayXR inline-3D (runtime #1056, docs/android-port.md M2): hand the GPU
++  // process an ALREADY-CONNECTED runtime IPC socket. On Windows the GPU process
++  // opens the runtime pipe itself in PreSandboxStartup; Android has no such
++  // window — the GPU process cannot bind the runtime service at all — so the
++  // browser process connects (Java, Context, bindService, cross-apk class load)
++  // and passes a dup of the socket down the descriptor table. gpu_main.cc picks
++  // it out of base::GlobalDescriptors and publishes it as DXR_IPC_FD.
++  //
++  // |command_line| is the CHILD's, so kProcessType selects the GPU process.
++  // Dormant unless --enable-inline-3d: a vanilla build never touches the
++  // runtime package.
++  if (command_line.GetSwitchValueASCII(switches::kProcessType) ==
++          switches::kGpuProcess &&
++      base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
++    base::ScopedFD runtime_fd = displayxr::TakeRuntimeIpcFdForChildProcess();
++    if (runtime_fd.is_valid()) {
++      // Transfer, not Share: the launcher closes it once the binder transaction
++      // that carries it to the child has completed.
++      mappings->Transfer(kAndroidDisplayXrIpcDescriptor, std::move(runtime_fd));
++    } else {
++      LOG(ERROR) << "[DisplayXR] no runtime socket to hand the GPU process; "
++                    "inline-3D will be inert in this GPU process";
++    }
++  }
++#endif  // BUILDFLAG(IS_ANDROID)
+ }
+ #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
+ 
+diff --git a/content/gpu/gpu_main.cc b/content/gpu/gpu_main.cc
+index f99ecf68ce23d..c68cacf891c43 100644
+--- a/content/gpu/gpu_main.cc
++++ b/content/gpu/gpu_main.cc
+@@ -17,6 +17,7 @@
+ #include "base/feature_list.h"
+ #include "base/files/scoped_file.h"
+ #include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/message_loop/message_pump_type.h"
+ #include "base/message_loop/message_pump_wakeup_counter.h"
+@@ -24,6 +25,7 @@
+ #include "base/numerics/clamped_math.h"
+ #include "base/process/current_process.h"
+ #include "base/process/process_metrics.h"
++#include "base/posix/global_descriptors.h"
+ #include "base/rand_util.h"
+ #include "base/run_loop.h"
+ #include "base/strings/string_number_conversions.h"
+@@ -49,6 +51,7 @@
+ #include "content/common/skia_utils.h"
+ #include "content/gpu/gpu_child_thread.h"
+ #include "content/public/common/content_client.h"
++#include "content/public/common/content_descriptors.h"
+ #include "content/public/common/content_features.h"
+ #include "content/public/common/content_switches.h"
+ #include "content/public/common/main_function_params.h"
+@@ -164,6 +167,42 @@ bool IsInline3DGpuProcess() {
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_ANDROID)
++// DisplayXR inline-3D (runtime #1056, docs/android-port.md M2): publish the
++// runtime IPC socket the browser process handed us in our descriptor table, so
++// the next xrCreateInstance adopts it instead of trying the Java connect this
++// process is not allowed to make.
++//
++// DXR_IPC_FD (rather than the exported ipc_client_connection_adopt_fd) is the
++// right route here precisely because it has no symbol-resolution ordering
++// constraint: the adopt symbol only resolves after the Khronos loader has
++// dlopen'd the runtime .so (RTLD_LOCAL, so RTLD_DEFAULT misses it), whereas the
++// environment is read inside ipc_client_socket_connect. setenv() genuinely works
++// on Android — one bionic libc per process — unlike the Windows static-CRT trap
++// around XRT_FORCE_MODE.
++//
++// The runtime validates what it adopts (open, socket, AF_UNIX,
++// SOCK_STREAM/SEQPACKET, connected), dups it and consumes it exactly once, so
++// leaving the descriptor in place is correct: on a GPU restart the browser hands
++// down a fresh one.
++void MaybePublishDisplayXRAdoptedFd() {
++  const base::CommandLine& cl = *base::CommandLine::ForCurrentProcess();
++  if (!cl.HasSwitch("enable-inline-3d")) {
++    return;
++  }
++  const int fd = base::GlobalDescriptors::GetInstance()->MaybeGet(
++      kAndroidDisplayXrIpcDescriptor);
++  if (fd < 0) {
++    LOG(ERROR) << "[DisplayXR] inline-3D requested but no runtime socket was "
++                  "passed to the GPU process";
++    return;
++  }
++  setenv("DXR_IPC_FD", base::NumberToString(fd).c_str(), /*overwrite=*/1);
++  LOG(WARNING) << "[DisplayXR] adopting runtime socket fd " << fd
++               << " (DXR_IPC_FD)";
++}
++#endif  // BUILDFLAG(IS_ANDROID)
++
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+ bool StartSandboxLinux(gpu::GpuWatchdogThread*,
+                        const gpu::GPUInfo*,
+@@ -238,6 +277,14 @@ class ContentSandboxHelper : public gpu::GpuSandboxHelper {
+       displayxr::DisplayXRWeaveClient::PreSandboxInitializeForGpuProcess();
+     }
+ #endif
++
++#if BUILDFLAG(IS_ANDROID)
++    // DisplayXR inline-3D (runtime #1056): same slot in the lifecycle as the
++    // Windows pre-sandbox connect above, and for the same reason — it must
++    // happen before ANY OpenXR call. Android reaches PreSandboxStartup through
++    // gpu_init.cc's gpu_sandbox_start_early == true path.
++    MaybePublishDisplayXRAdoptedFd();
++#endif
+   }
+ 
+   bool EnsureSandboxInitialized(gpu::GpuWatchdogThread* watchdog_thread,
+diff --git a/content/public/common/content_descriptors.h b/content/public/common/content_descriptors.h
+index 9542306fd8c58..2f33039de3922 100644
+--- a/content/public/common/content_descriptors.h
++++ b/content/public/common/content_descriptors.h
+@@ -18,6 +18,15 @@ enum {
+ #if BUILDFLAG(IS_ANDROID)
+   kAndroidPropertyDescriptor,
+   kAndroidICUDataDescriptor,
++
++  // DisplayXR inline-3D (runtime #1056, docs/android-port.md M2): an
++  // already-connected DisplayXR runtime IPC socket, connected in the browser
++  // process (where the Context, <queries> visibility and bindService rights
++  // live) and adopted by the GPU process, which publishes it as DXR_IPC_FD
++  // before its first OpenXR call. Lives in content/ rather than
++  // chrome_descriptors_android.h because content/gpu/gpu_main.cc is the adopter
++  // and cannot include chrome/.
++  kAndroidDisplayXrIpcDescriptor,
+ #endif
+ 
+   kHistogramSharedMemoryDescriptor,

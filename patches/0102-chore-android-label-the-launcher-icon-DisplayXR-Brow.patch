@@ -1,0 +1,39 @@
+From 06c22db8faac1151fe49ded1b4cf88012020930f Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 07:45:06 +0000
+Subject: [PATCH] chore(android): label the launcher icon "DisplayXR Browser"
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Branding, not mechanism: chrome/android/java/res_chromium_base/values/
+channel_constants.xml carries the launcher label the Android APK ships with,
+and an unmodified chrome_public_apk installs as plain "Chromium". A device
+with both the stock Chromium and this fork installed shows two identical
+entries, which made every bring-up round on the pad ambiguous about which APK
+was actually launched.
+
+Kept as its own commit so it is trivially droppable by anyone building the
+series for upstream comparison, and so the M6 branding pass (icons, splash,
+about-page strings, package id) has an obvious place to land — this one line
+is the only branding in the Android arm today.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ .../android/java/res_chromium_base/values/channel_constants.xml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/chrome/android/java/res_chromium_base/values/channel_constants.xml b/chrome/android/java/res_chromium_base/values/channel_constants.xml
+index cc1f2a30cb3c5..318e549301d26 100644
+--- a/chrome/android/java/res_chromium_base/values/channel_constants.xml
++++ b/chrome/android/java/res_chromium_base/values/channel_constants.xml
+@@ -7,7 +7,7 @@ found in the LICENSE file.
+ 
+ <resources xmlns:android="http://schemas.android.com/apk/res/android">
+     <!-- The application name displayed to the user. -->
+-    <string name="app_name" translatable="false">Chromium</string>
++    <string name="app_name" translatable="false">DisplayXR Browser</string>
+     <string name="bookmark_widget_title" translatable="false">Chromium bookmarks</string>
+     <string name="search_widget_title" translatable="false">Chromium search</string>
+     <string name="quick_action_search_widget_title" translatable="false">Chromium quick action search</string>

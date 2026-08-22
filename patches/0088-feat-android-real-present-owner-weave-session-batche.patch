@@ -1,0 +1,1085 @@
+From 6fb29b543a45fb5d1310e43ec729bafcfdb0afc9 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 12:02:23 +0000
+Subject: [PATCH] feat(android): real present-owner weave session + batched
+ AHardwareBuffer submit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+M1 turns the M2 seam skeleton into a working weave client. It is the mac client
+one-for-one, on a different substrate:
+
+  * dlopen libopenxr_loader.so + libvulkan.so by SONAME. Nothing is linked and
+    nothing is bundled, because ipc_client_check_git_tag() strncmps the runtime
+    CLIENT library's compiled-in u_git_tag against the running service's — so
+    the client .so must be the one the Khronos loader pulls out of the INSTALLED
+    runtime package. The Android analogue of patch 0001 vendors the LOADER only.
+  * xrInitializeLoaderKHR(VM, Context) then xrCreateInstance with
+    XR_KHR_android_create_instance + XR_KHR_vulkan_enable2 + XR_DXR_weave, plus
+    display_info and view_rig when advertised (rig rejection retries weave-only
+    rather than killing inline-3D, as on mac).
+  * A Vulkan-bound present-owner session: no xrBeginSession, no xrWaitFrame, no
+    swapchain. The VkDevice exists ONLY to satisfy xrCreateSession — no weave
+    pixel moves through it. Input and output are AHardwareBuffers crossing to
+    the runtime service, and the browser-side copy is Skia in Viz.
+  * xrWeaveBindWindow2DXR with a chained XrWeaveWindowGeometryDXR. REQUIRED on
+    Android: no window handle to read a position off, and a pure move raises no
+    resize (ADR-036 D6). SetWindowGeometryAndroid() is the seam M3's
+    Choreographer feed replaces; the GPU provider publishes the fullscreen
+    placeholder until then.
+  * Batched submit: XrWeaveSubmitInfoDXR -> XrWeaveSubmitRectsDXR (<=32) ->
+    XrWeaveSubmitHandlesDXR with inputKind =
+    XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR. Declaring the kind is mandatory —
+    PLATFORM_DEFAULT would have the service dereference a non-pointer.
+    firstChunk on the frame's first chunk (v5 transparent-gap clear).
+
+Spec v7 is a hard floor: the handle kind, xrWeaveBindWindow2DXR and the geometry
+chain are all load-bearing, so a pre-v7 runtime cannot serve this path at all
+and we say so once instead of failing per frame.
+
+Everything stays dormant without DXR_IPC_FD — a device with no runtime loads no
+loader, creates no instance, and reports inline-3D unsupported.
+
+Refs #1056, docs/android-port.md M1
+
+Two device-loop fixes are folded in here, because they are what makes this
+commit's xrInitializeLoaderKHR call actually succeed:
+
+  * A REAL application Context. The GPU process first reached
+    xrInitializeLoaderKHR with a null applicationContext, so the Khronos loader
+    bailed out of LoaderInitData::initialize() and every later xr* call failed
+    ("AddManifestFilesAndroid unable to add manifest files / LoaderInitData not
+    initialized", then "RuntimeInterface::LoadRuntime cannot run because
+    xrInitializeLoaderKHR was not successfully called"). The cause was
+    env->FindClass(): InitializeCoreAndroid() runs on a natively created
+    Chromium thread with no Java frames on its stack, so JNI FindClass resolves
+    against the BOOTSTRAP class loader and cannot see ANY application class. It
+    returned null, the exception was cleared, and the loader got a null Context.
+    The failure was invisible because the XrResult was discarded — it is now
+    checked, and the path bails loudly instead of proceeding into a
+    guaranteed-failing xrEnumerateInstanceExtensionProperties.
+
+  * GENERATED JNI, not a name lookup. base::android::GetClass() fixes the
+    class-loader problem but still resolves org.chromium.base.ContextUtils by
+    SOURCE NAME, and chrome_public_apk is a release (is_debug=false) build: R8
+    shrinks and obfuscates our Java, so that name does not exist at run time
+    ("org.chromium.base.ContextUtils not resolvable" / "no JavaVM/Context for
+    xrInitializeLoaderKHR ... inline-3D disabled"). DisplayXrContextBridge is a
+    @CalledByNative shim returning ContextUtils.getApplicationContextUnsafe();
+    jni_zero emits the matching -keep rules, so the reference survives
+    shrinking — the R8 mapping shows the class and its method mapping to
+    THEMSELVES, while a plain field in the sibling connector class maps
+    RUNTIME_PACKAGES -> a. That contrast is the whole point: generated JNI is
+    the only R8-proof way for native to name our own Java.
+    getApplicationContextUnsafe() deliberately — a null Context is something
+    the caller reports and disables inline-3D over, not a CHECK failure.
+
+    The remaining reflection in DisplayXrRuntimeConnector.connectTo() is safe
+    and audited: its targets (org.freedesktop.monado.ipc.Client, its
+    blockingConnect method, its fd field) all live in the INSTALLED runtime
+    apk, and R8 shrinks only ours.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ components/displayxr/android/BUILD.gn         |  10 +-
+ .../displayxr/DisplayXrContextBridge.java     |  42 +
+ components/displayxr/browser/BUILD.gn         |  26 +-
+ .../browser/displayxr_weave_client_android.cc | 722 ++++++++++++++++--
+ .../browser/displayxr_weave_client_android.h  |  49 +-
+ 5 files changed, 772 insertions(+), 77 deletions(-)
+ create mode 100644 components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrContextBridge.java
+
+diff --git a/components/displayxr/android/BUILD.gn b/components/displayxr/android/BUILD.gn
+index fd099b3be1a93..559bdb90d72fb 100644
+--- a/components/displayxr/android/BUILD.gn
++++ b/components/displayxr/android/BUILD.gn
+@@ -11,11 +11,17 @@ import("//build/config/android/rules.gni")
+ import("//third_party/jni_zero/jni_zero.gni")
+ 
+ generate_jni("jni_headers") {
+-  sources = [ "java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java" ]
++  sources = [
++    "java/src/org/chromium/components/displayxr/DisplayXrContextBridge.java",
++    "java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java",
++  ]
+ }
+ 
+ android_library("java") {
+-  sources = [ "java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java" ]
++  sources = [
++    "java/src/org/chromium/components/displayxr/DisplayXrContextBridge.java",
++    "java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java",
++  ]
+   srcjar_deps = [ ":jni_headers" ]
+   deps = [
+     "//base:base_java",
+diff --git a/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrContextBridge.java b/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrContextBridge.java
+new file mode 100644
+index 0000000000000..c6aa6a6a67bbe
+--- /dev/null
++++ b/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrContextBridge.java
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.components.displayxr;
++
++import android.content.Context;
++
++import org.jni_zero.CalledByNative;
++import org.jni_zero.JNINamespace;
++
++import org.chromium.base.ContextUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++/**
++ * Hands the application Context to native DisplayXR code (the GPU process's OpenXR loader init).
++ *
++ * <p>Why this class exists at all: the Khronos loader's {@code xrInitializeLoaderKHR} needs a real
++ * {@code XrLoaderInitInfoAndroidKHR{applicationVM, applicationContext}} before ANY other {@code
++ * xr*} call, and it rejects a null Context outright — leaving LoaderInitData uninitialized, after
++ * which runtime discovery never runs and inline-3D is dead.
++ *
++ * <p>Native used to reach the Context by resolving {@code org.chromium.base.ContextUtils} by NAME
++ * (FindClass / ClassLoader.loadClass). That cannot work in a release APK: R8 renames our Java, so
++ * the source name does not exist at run time and the lookup returns null. Generated JNI is the
++ * R8-proof route — jni_zero emits the matching {@code -keep} rules and rewrites the class/method
++ * references alongside the obfuscation, so this survives shrinking.
++ *
++ * <p>Deliberately {@link ContextUtils#getApplicationContextUnsafe()}: a null Context is a condition
++ * the caller reports and disables inline-3D over, not one worth aborting the process for.
++ */
++@JNINamespace("displayxr")
++@NullMarked
++public class DisplayXrContextBridge {
++    private DisplayXrContextBridge() {}
++
++    @CalledByNative
++    private static @Nullable Context getApplicationContext() {
++        return ContextUtils.getApplicationContextUnsafe();
++    }
++}
+diff --git a/components/displayxr/browser/BUILD.gn b/components/displayxr/browser/BUILD.gn
+index 50e659521707c..ef3cff9066a3a 100644
+--- a/components/displayxr/browser/BUILD.gn
++++ b/components/displayxr/browser/BUILD.gn
+@@ -48,18 +48,28 @@ component("weave_client") {
+       "QuartzCore.framework",
+     ]
+   } else if (is_android) {
+-    # Android (docs/android-port.md M2): NOTHING is linked. The OpenXR loader is
+-    # dlopen'd by soname at runtime and the runtime .so comes out of the
+-    # INSTALLED runtime package via the Khronos loader — which is what keeps the
+-    # client library's compiled-in git tag matched to the running
+-    # displayxr-service. The Android analogue of patch 0001 therefore vendors the
+-    # LOADER only (libopenxr_loader.so, from openxr_loader_for_android), never a
+-    # runtime copy. Headers are not needed yet either: the M2 skeleton makes no
+-    # OpenXR call.
++    # Android (docs/android-port.md M1/M2): NOTHING is linked. The OpenXR loader
++    # AND libvulkan are dlopen'd by soname at runtime, and the runtime .so comes
++    # out of the INSTALLED runtime package via the Khronos loader — which is
++    # what keeps the client library's compiled-in git tag matched to the running
++    # displayxr-service. The Android analogue of patch 0001 therefore vendors
++    # the LOADER only (libopenxr_loader.so), never a runtime copy. Headers only,
++    # exactly like mac.
+     sources += [
+       "displayxr_weave_client_android.cc",
+       "displayxr_weave_client_android.h",
+     ]
++    # Reference the vendored OpenXR headers' include dir DIRECTLY rather than
++    # the //third_party/displayxr:openxr_headers config — that BUILD.gn imports
++    # visual_studio_version.gni at file scope and only loads on Windows.
++    include_dirs = [ "//third_party/displayxr/include" ]
++    deps += [
++      # The application Context for xrInitializeLoaderKHR, via generated JNI —
++      # the only R8-proof way to reach it (a by-name class lookup cannot survive
++      # obfuscation in a release APK).
++      "//components/displayxr/android:jni_headers",
++      "//third_party/vulkan-headers/src:vulkan_headers",
++    ]
+   }
+ }
+ 
+diff --git a/components/displayxr/browser/displayxr_weave_client_android.cc b/components/displayxr/browser/displayxr_weave_client_android.cc
+index d30cfca0101a7..a13033096cf9e 100644
+--- a/components/displayxr/browser/displayxr_weave_client_android.cc
++++ b/components/displayxr/browser/displayxr_weave_client_android.cc
+@@ -2,14 +2,76 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++// Android inline-3D weave client (docs/android-port.md M1/M2) — the third arm
++// of the displayxr_weave_client.cc dispatchers, sibling of
++// displayxr_weave_client_mac.mm.
++//
++// Same contract (the DisplayXRWeaveClient statics), different substrate:
++//
++//   * The OpenXR loader is dlopen'd by SONAME, never linked and never bundled.
++//     ipc_client_check_git_tag() strncmps the runtime CLIENT library's
++//     compiled-in u_git_tag against the running displayxr-service's and fails
++//     xrCreateInstance on any mismatch; the client library is whatever .so the
++//     Khronos loader pulls out of the INSTALLED runtime package, so the match is
++//     automatic as long as nothing here ships its own copy. That is the whole
++//     reason the Android analogue of patch 0001 vendors the LOADER only.
++//   * The session binds Vulkan (XR_KHR_vulkan_enable2) exactly as the reference
++//     client test_apps/weave/weave_client_vk_android does. Note this VkDevice
++//     exists ONLY to satisfy xrCreateSession: no weave pixel ever moves through
++//     it. The weave input and output are AHardwareBuffers that cross to the
++//     runtime SERVICE process, and the browser side of the copy is Skia
++//     (Graphite-Dawn) in Viz, not this device. Creating a second, idle
++//     VkDevice is cheaper and far less invasive than trying to hand Dawn's.
++//   * A present-owner never calls xrBeginSession / xrWaitFrame / xrEndFrame and
++//     creates no swapchain: it owns its present loop and drives the weave
++//     service directly.
++//
++// This lives in the GPU process. On Windows patch 0023 could create the session
++// pre-sandbox in the GPU process because the sandbox blocks OPENING the runtime
++// pipe, not I/O on an open handle; Android has no such window, so the browser
++// process connects and hands the connected socket down (#1056) and gpu_main.cc
++// publishes it as DXR_IPC_FD before anything here runs.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// Bring-up code over the vendored OpenXR / Vulkan C APIs (fixed-size name
++// buffers, extension-string arrays), matching the mac client and the
++// source_set's no_chromium_code relaxation.
++#pragma allow_unsafe_buffers
++#endif
++
+ #include "components/displayxr/browser/displayxr_weave_client_android.h"
+ 
+ #include <dlfcn.h>
++#include <jni.h>
+ #include <stdlib.h>
+ 
++#include <algorithm>
++#include <cstring>
++#include <string_view>
++#include <vector>
++
++#include "base/android/jni_android.h"
++#include "base/android/scoped_java_ref.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr_exclusion.h"
+ 
++// vulkan.h MUST precede openxr_platform.h: under XR_USE_GRAPHICS_API_VULKAN the
++// platform header references VkDevice/VkInstance/VkResult and expects them
++// already declared. jni.h likewise, for XR_USE_PLATFORM_ANDROID's JavaVM*.
++#include <vulkan/vulkan.h>
++
++#define XR_USE_GRAPHICS_API_VULKAN
++#define XR_USE_PLATFORM_ANDROID
++#include <openxr/openxr.h>
++#include <openxr/openxr_platform.h>
++
++#include <openxr/XR_DXR_display_info.h>
++#include <openxr/XR_DXR_view_rig.h>
++#include <openxr/XR_DXR_weave.h>
++
++// Must come after the other includes (jni_zero convention).
++#include "components/displayxr/android/jni_headers/DisplayXrContextBridge_jni.h"
++
+ namespace displayxr {
+ 
+ namespace {
+@@ -17,50 +79,68 @@ namespace {
+ // The Khronos OpenXR loader, as installed on the device. Not vendored: unlike
+ // Windows (patch 0001 vendors openxr_loader.dll + .lib) there is no prebuilt
+ // Android loader in third_party/displayxr, and there must not be a bundled
+-// RUNTIME copy either — see the git-tag note in EnsureLoader().
++// RUNTIME copy either — see the git-tag note in the file header.
+ constexpr char kLoaderSoName[] = "libopenxr_loader.so";
++constexpr char kVulkanSoName[] = "libvulkan.so";
+ 
+ struct AndroidWeaveState {
+   bool tried_loader = false;
+-  // Not raw_ptr: these are a dlopen() module handle and a function pointer out
+-  // of it, neither of which is a PartitionAlloc allocation.
+-  RAW_PTR_EXCLUSION void* loader = nullptr;
+-  RAW_PTR_EXCLUSION void* get_instance_proc_addr = nullptr;
+-  bool logged_submit = false;
++  bool initialized = false;
++
++  // Not raw_ptr: dlopen() module handles, not PartitionAlloc allocations.
++  RAW_PTR_EXCLUSION void* xr_lib = nullptr;
++  RAW_PTR_EXCLUSION void* vk_lib = nullptr;
++
++  PFN_xrGetInstanceProcAddr xr_get_proc = nullptr;
++  PFN_vkGetInstanceProcAddr vk_get_proc = nullptr;
++
++  XrInstance instance = XR_NULL_HANDLE;
++  XrSystemId system_id = XR_NULL_SYSTEM_ID;
++  XrSession session = XR_NULL_HANDLE;
++
++  VkInstance vk_instance = VK_NULL_HANDLE;
++  VkPhysicalDevice vk_phys = VK_NULL_HANDLE;
++  VkDevice vk_device = VK_NULL_HANDLE;
++  uint32_t vk_queue_family = 0;
++
++  bool has_weave = false;
+   uint32_t weave_spec_version = 0;
++
++  PFN_xrWeaveBindWindow2DXR bind_window2 = nullptr;
++  PFN_xrWeaveSubmitDXR submit = nullptr;
++
++  // Window geometry (ADR-036 D6). |geometry_dirty| forces a re-bind; the
++  // runtime dedupes, so re-binding often is free.
++  int32_t geom_x = 0;
++  int32_t geom_y = 0;
++  int32_t geom_w = 0;
++  int32_t geom_h = 0;
++  int32_t geom_display = 0;
++  bool geometry_dirty = true;
++  bool ever_bound = false;
+ };
+ 
+ AndroidWeaveState& State() {
+-  static AndroidWeaveState state;
+-  return state;
++  static AndroidWeaveState* s = new AndroidWeaveState();
++  return *s;
+ }
+ 
+ // The adopted runtime socket, published by gpu_main.cc's
+-// MaybePublishDisplayXRAdoptedFd(). Its presence is the M2 signal that the
+-// browser-side connector worked and this process can talk to the runtime at all;
+-// without it there is no point loading anything.
++// MaybePublishDisplayXRAdoptedFd(). Its presence is the signal that the
++// browser-side connector worked and this process can talk to the runtime at
++// all; without it there is no point loading anything.
+ bool HaveAdoptedRuntimeSocket() {
+   const char* fd = getenv("DXR_IPC_FD");
+   return fd != nullptr && fd[0] != '\0';
+ }
+ 
+-// Load the OpenXR loader, but ONLY when the seam is actually present. A vanilla
+-// device has no loader and no runtime; dlopen simply fails and we stay dormant
+-// rather than crashing.
+-//
+-// THE GIT-TAG GATE (device bring-up concern, not solved here):
+-// ipc_client_check_git_tag() strncmps the runtime CLIENT library's compiled-in
+-// u_git_tag against the running displayxr-service's and fails xrCreateInstance
+-// on any mismatch. The client library is the runtime .so the Khronos loader
+-// pulls out of the INSTALLED runtime package, so the match is automatic as long
+-// as nothing here ships its own copy. That is the whole reason this file
+-// dlopen()s the system loader by soname instead of linking a vendored runtime:
+-// the Android analogue of patch 0001 must vendor the LOADER only, never the
+-// runtime.
+-bool EnsureLoader() {
++// Load the OpenXR loader + libvulkan, but ONLY when the seam is actually
++// present. A vanilla device has no loader and no runtime; dlopen simply fails
++// and we stay dormant rather than crashing.
++bool EnsureLoaders() {
+   AndroidWeaveState& s = State();
+   if (s.tried_loader) {
+-    return s.loader != nullptr;
++    return s.xr_lib != nullptr && s.vk_lib != nullptr;
+   }
+   s.tried_loader = true;
+ 
+@@ -70,56 +150,483 @@ bool EnsureLoader() {
+     return false;
+   }
+ 
+-  s.loader = dlopen(kLoaderSoName, RTLD_NOW | RTLD_LOCAL);
+-  if (s.loader == nullptr) {
++  s.xr_lib = dlopen(kLoaderSoName, RTLD_NOW | RTLD_LOCAL);
++  if (s.xr_lib == nullptr) {
+     LOG(WARNING) << "[DisplayXR] " << kLoaderSoName
+                  << " not present; inline-3D stays dormant: " << dlerror();
+     return false;
+   }
+-  s.get_instance_proc_addr = dlsym(s.loader, "xrGetInstanceProcAddr");
+-  if (s.get_instance_proc_addr == nullptr) {
+-    LOG(ERROR) << "[DisplayXR] " << kLoaderSoName
+-               << " has no xrGetInstanceProcAddr; refusing to continue";
+-    dlclose(s.loader);
+-    s.loader = nullptr;
++  s.vk_lib = dlopen(kVulkanSoName, RTLD_NOW | RTLD_LOCAL);
++  if (s.vk_lib == nullptr) {
++    LOG(WARNING) << "[DisplayXR] " << kVulkanSoName
++                 << " not loadable; inline-3D dormant: " << dlerror();
++    return false;
++  }
++  s.xr_get_proc = reinterpret_cast<PFN_xrGetInstanceProcAddr>(
++      dlsym(s.xr_lib, "xrGetInstanceProcAddr"));
++  s.vk_get_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++      dlsym(s.vk_lib, "vkGetInstanceProcAddr"));
++  if (!s.xr_get_proc || !s.vk_get_proc) {
++    LOG(ERROR) << "[DisplayXR] loader present but proc-address getter missing "
++                  "(xr="
++               << (s.xr_get_proc ? "ok" : "NULL")
++               << " vk=" << (s.vk_get_proc ? "ok" : "NULL") << ")";
+     return false;
+   }
+   return true;
+ }
+ 
++template <typename Fn>
++Fn GetXr(XrInstance instance, const char* name) {
++  PFN_xrVoidFunction p = nullptr;
++  if (State().xr_get_proc) {
++    State().xr_get_proc(instance, name, &p);
++  }
++  return reinterpret_cast<Fn>(p);
++}
++
++// The application Context, fetched reflectively out of org.chromium.base.
++// XR_KHR_android_create_instance wants a VM + an Activity/Context; the GPU
++// process has no Activity, and the runtime only uses the object to reach the
++// package manager / asset loader, so the application Context is the right (and
++// only available) answer here.
++//
++// This is NOT best-effort: the Khronos loader's xrInitializeLoaderKHR rejects a
++// null applicationContext outright, leaving LoaderInitData uninitialized, after
++// which every xr* call fails ("cannot run because xrInitializeLoaderKHR was not
++// successfully called"). So a null here kills inline-3D entirely.
++//
++// Resolving this by NAME is not an option — not env->FindClass() (a natively
++// created Chromium thread has no Java frames, so FindClass sees only the
++// bootstrap class loader), and not base::android::GetClass() either: a release
++// chrome_public_apk is R8-shrunk, so "org.chromium.base.ContextUtils" simply
++// does not exist at run time and the lookup returns null. Generated JNI is the
++// R8-proof route — jni_zero emits the -keep rules and rewrites the references
++// in step with the obfuscation. See DisplayXrContextBridge.java.
++jobject GetApplicationContextOrNull(JNIEnv* env) {
++  if (!env) {
++    LOG(ERROR) << "[DisplayXR] no JNIEnv — cannot reach the application Context";
++    return nullptr;
++  }
++  base::android::ScopedJavaLocalRef<jobject> ctx =
++      Java_DisplayXrContextBridge_getApplicationContext(env);
++  if (ctx.is_null()) {
++    LOG(ERROR) << "[DisplayXR] application Context is null (ContextUtils not "
++                  "initialized in this process?)";
++    return nullptr;
++  }
++  // Global-ref it: this outlives the current JNI frame by the whole session.
++  return env->NewGlobalRef(ctx.obj());
++}
++
++// Create the VkInstance/VkDevice the XR session binds to, via
++// XR_KHR_vulkan_enable2 (xrCreateVulkanInstanceKHR / xrCreateVulkanDeviceKHR),
++// mirroring the reference client. No surface/swapchain extensions: unlike the
++// reference client we do NOT present through Vulkan — Viz presents.
++bool CreateVulkanDevice(AndroidWeaveState& s) {
++  auto get_reqs = GetXr<PFN_xrGetVulkanGraphicsRequirements2KHR>(
++      s.instance, "xrGetVulkanGraphicsRequirements2KHR");
++  auto create_vk_instance = GetXr<PFN_xrCreateVulkanInstanceKHR>(
++      s.instance, "xrCreateVulkanInstanceKHR");
++  auto get_phys = GetXr<PFN_xrGetVulkanGraphicsDevice2KHR>(
++      s.instance, "xrGetVulkanGraphicsDevice2KHR");
++  auto create_vk_device = GetXr<PFN_xrCreateVulkanDeviceKHR>(
++      s.instance, "xrCreateVulkanDeviceKHR");
++  if (!get_reqs || !create_vk_instance || !get_phys || !create_vk_device) {
++    LOG(ERROR) << "[DisplayXR] XR_KHR_vulkan_enable2 PFNs missing";
++    return false;
++  }
++
++  XrGraphicsRequirementsVulkanKHR reqs = {
++      XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
++  if (XR_FAILED(get_reqs(s.instance, s.system_id, &reqs))) {
++    LOG(ERROR) << "[DisplayXR] xrGetVulkanGraphicsRequirements2KHR failed";
++    return false;
++  }
++
++  VkApplicationInfo app_info = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
++  app_info.pApplicationName = "DisplayXRBrowser";
++  app_info.apiVersion =
++      VK_MAKE_VERSION(XR_VERSION_MAJOR(reqs.minApiVersionSupported),
++                      XR_VERSION_MINOR(reqs.minApiVersionSupported), 0);
++  VkInstanceCreateInfo vk_ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++  vk_ici.pApplicationInfo = &app_info;
++
++  XrVulkanInstanceCreateInfoKHR xr_vk_ici = {
++      XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR};
++  xr_vk_ici.systemId = s.system_id;
++  xr_vk_ici.pfnGetInstanceProcAddr = s.vk_get_proc;
++  xr_vk_ici.vulkanCreateInfo = &vk_ici;
++  VkResult vk_result = VK_SUCCESS;
++  if (XR_FAILED(create_vk_instance(s.instance, &xr_vk_ici, &s.vk_instance,
++                                   &vk_result)) ||
++      vk_result != VK_SUCCESS) {
++    LOG(ERROR) << "[DisplayXR] xrCreateVulkanInstanceKHR failed (vk="
++               << vk_result << ")";
++    return false;
++  }
++
++  XrVulkanGraphicsDeviceGetInfoKHR dev_get = {
++      XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
++  dev_get.systemId = s.system_id;
++  dev_get.vulkanInstance = s.vk_instance;
++  if (XR_FAILED(get_phys(s.instance, &dev_get, &s.vk_phys))) {
++    LOG(ERROR) << "[DisplayXR] xrGetVulkanGraphicsDevice2KHR failed";
++    return false;
++  }
++
++  auto vkGetQF = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
++      s.vk_get_proc(s.vk_instance,
++                    "vkGetPhysicalDeviceQueueFamilyProperties"));
++  if (!vkGetQF) {
++    return false;
++  }
++  uint32_t qf_count = 0;
++  vkGetQF(s.vk_phys, &qf_count, nullptr);
++  std::vector<VkQueueFamilyProperties> qfs(qf_count);
++  vkGetQF(s.vk_phys, &qf_count, qfs.data());
++  s.vk_queue_family = UINT32_MAX;
++  for (uint32_t i = 0; i < qf_count; ++i) {
++    if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++      s.vk_queue_family = i;
++      break;
++    }
++  }
++  if (s.vk_queue_family == UINT32_MAX) {
++    LOG(ERROR) << "[DisplayXR] no graphics queue family";
++    return false;
++  }
++
++  // VK_ANDROID_external_memory_android_hardware_buffer is what makes the
++  // AHardwareBuffer handoff legal in both directions; the rest are its
++  // dependency chain. VK_KHR_swapchain is deliberately absent — we never
++  // present through this device.
++  const char* dev_exts[] = {
++      VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
++      VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
++      VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
++      VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
++      VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
++      VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
++      VK_KHR_BIND_MEMORY_2_EXTENSION_NAME,
++      VK_KHR_MAINTENANCE1_EXTENSION_NAME,
++  };
++  const float priority = 1.0f;
++  VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++  qci.queueFamilyIndex = s.vk_queue_family;
++  qci.queueCount = 1;
++  qci.pQueuePriorities = &priority;
++  VkPhysicalDeviceFeatures features = {};
++  VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++  dci.queueCreateInfoCount = 1;
++  dci.pQueueCreateInfos = &qci;
++  dci.pEnabledFeatures = &features;
++  dci.enabledExtensionCount = std::size(dev_exts);
++  dci.ppEnabledExtensionNames = dev_exts;
++
++  XrVulkanDeviceCreateInfoKHR xr_dci = {XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
++  xr_dci.systemId = s.system_id;
++  xr_dci.pfnGetInstanceProcAddr = s.vk_get_proc;
++  xr_dci.vulkanPhysicalDevice = s.vk_phys;
++  xr_dci.vulkanCreateInfo = &dci;
++  vk_result = VK_SUCCESS;
++  if (XR_FAILED(create_vk_device(s.instance, &xr_dci, &s.vk_device,
++                                 &vk_result)) ||
++      vk_result != VK_SUCCESS) {
++    LOG(ERROR) << "[DisplayXR] xrCreateVulkanDeviceKHR failed (vk=" << vk_result
++               << ")";
++    return false;
++  }
++  return true;
++}
++
++// (Re)publish the window geometry. Required on Android — a bind with no
++// geometry chain leaves the DP weaving display-scoped (ADR-036 D6).
++void EnsureBound(AndroidWeaveState& s) {
++  if (!s.bind_window2 || s.session == XR_NULL_HANDLE) {
++    return;
++  }
++  if (!s.geometry_dirty && s.ever_bound) {
++    return;
++  }
++  if (s.geom_w <= 0 || s.geom_h <= 0) {
++    return;  // nothing sensible to publish yet
++  }
++  XrWeaveWindowGeometryDXR geom = {XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR};
++  geom.windowOriginOnScreen = {s.geom_x, s.geom_y};
++  geom.clientSize = {s.geom_w, s.geom_h};
++  geom.displayId = s.geom_display;
++
++  XrWeaveBindWindowInfoDXR bind = {XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
++  bind.next = &geom;
++  bind.windowHandle = nullptr;  // Android: the Surface is ours, never the
++                                // runtime's; the geometry chain is everything.
++  const XrResult r = s.bind_window2(s.session, &bind);
++  s.geometry_dirty = false;
++  if (XR_FAILED(r)) {
++    static int fails = 0;
++    if (fails < 3) {
++      ++fails;
++      LOG(ERROR) << "[DisplayXR] xrWeaveBindWindow2DXR failed: " << r;
++    }
++    return;
++  }
++  if (!s.ever_bound) {
++    s.ever_bound = true;
++    LOG(WARNING) << "[DisplayXR] weave window bound: origin " << s.geom_x << ","
++                 << s.geom_y << " client " << s.geom_w << "x" << s.geom_h
++                 << " display " << s.geom_display;
++  }
++}
++
+ }  // namespace
+ 
++// ---- Public Android entry points (called from the client.cc dispatchers) ----
++
+ void InitializeCoreAndroid() {
+-  if (!EnsureLoader()) {
+-    return;
+-  }
+-  // M2 ends here on purpose. The next step (M3) is
+-  // xrInitializeLoaderKHR(applicationVM/applicationContext) ->
+-  // xrCreateInstance with XR_KHR_android_create_instance + XR_DXR_weave +
+-  // XR_DXR_display_info + XR_DXR_view_rig, then the present-owner session and
+-  // xrWeaveBindWindow2DXR with a chained XrWeaveWindowGeometryDXR (required on
+-  // Android — ADR-036 D6). Doing that here would need the OpenXR headers and a
+-  // VM/Context this browser-process TU does not have; the GPU-process backend
+-  // (displayxr_weave_gpu_android) is where the session will live.
+-  LOG(WARNING) << "[DisplayXR] Android weave seam is present (loader + adopted "
+-                  "socket); session bring-up is M3";
++  AndroidWeaveState& s = State();
++  if (s.initialized) {
++    return;
++  }
++  s.initialized = true;
++
++  if (!EnsureLoaders()) {
++    return;  // runtime absent — stay dormant
++  }
++
++  // Force the runtime onto the IPC path (the weave service is IPC-only). Android
++  // has ONE bionic libc per process, so setenv genuinely reaches the runtime .so
++  // — unlike the Windows static-CRT trap that made this unreliable there.
++  setenv("XRT_FORCE_MODE", "ipc", /*overwrite=*/0);
++
++  JNIEnv* env = base::android::AttachCurrentThread();
++  JavaVM* vm = base::android::GetVM();
++  jobject app_context = GetApplicationContextOrNull(env);
++  if (!vm || !app_context) {
++    LOG(ERROR) << "[DisplayXR] no JavaVM/Context for xrInitializeLoaderKHR "
++                  "(vm=" << static_cast<void*>(vm)
++               << " ctx=" << static_cast<void*>(app_context)
++               << ") — inline-3D disabled";
++    return;
++  }
++
++  // The Android loader needs the VM/Context before ANY other call, and it is
++  // the gate on runtime discovery: until it succeeds the loader refuses to
++  // query the org.khronos.openxr.runtime_broker ContentProvider, so every
++  // later xr* call fails. Never fire-and-forget this.
++  auto initialize_loader =
++      GetXr<PFN_xrInitializeLoaderKHR>(XR_NULL_HANDLE, "xrInitializeLoaderKHR");
++  if (!initialize_loader) {
++    LOG(ERROR) << "[DisplayXR] loader has no xrInitializeLoaderKHR — the "
++                  "Android loader cannot discover a runtime without it";
++    return;
++  }
++  XrLoaderInitInfoAndroidKHR init = {XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR};
++  init.applicationVM = vm;
++  init.applicationContext = app_context;
++  const XrResult lr = initialize_loader(
++      reinterpret_cast<const XrLoaderInitInfoBaseHeaderKHR*>(&init));
++  if (XR_FAILED(lr)) {
++    LOG(ERROR) << "[DisplayXR] xrInitializeLoaderKHR failed: " << lr;
++    return;
++  }
++  LOG(WARNING) << "[DisplayXR] xrInitializeLoaderKHR ok (vm="
++               << static_cast<void*>(vm) << " ctx="
++               << static_cast<void*>(app_context) << ")";
++
++  auto xrEnumExt = GetXr<PFN_xrEnumerateInstanceExtensionProperties>(
++      XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties");
++  auto xrCreateInstance =
++      GetXr<PFN_xrCreateInstance>(XR_NULL_HANDLE, "xrCreateInstance");
++  if (!xrEnumExt || !xrCreateInstance) {
++    LOG(ERROR) << "[DisplayXR] loader present but core PFNs missing";
++    return;
++  }
++
++  uint32_t ext_count = 0;
++  if (XR_FAILED(xrEnumExt(nullptr, 0, &ext_count, nullptr))) {
++    LOG(ERROR) << "[DisplayXR] xrEnumerateInstanceExtensionProperties failed";
++    return;
++  }
++  std::vector<XrExtensionProperties> exts(ext_count,
++                                          {XR_TYPE_EXTENSION_PROPERTIES});
++  if (XR_FAILED(xrEnumExt(nullptr, ext_count, &ext_count, exts.data()))) {
++    return;
++  }
++  bool has_vk2 = false, has_android_ci = false, has_display_info = false,
++       has_view_rig = false;
++  for (const auto& e : exts) {
++    std::string_view n(e.extensionName);
++    if (n == XR_DXR_WEAVE_EXTENSION_NAME) {
++      s.has_weave = true;
++      s.weave_spec_version = e.extensionVersion;
++    } else if (n == XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) {
++      has_vk2 = true;
++    } else if (n == XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME) {
++      has_android_ci = true;
++    } else if (n == XR_DXR_DISPLAY_INFO_EXTENSION_NAME) {
++      has_display_info = true;
++    } else if (n == XR_DXR_VIEW_RIG_EXTENSION_NAME) {
++      has_view_rig = true;
++    }
++  }
++  if (!s.has_weave || !has_vk2) {
++    LOG(WARNING) << "[DisplayXR] runtime lacks weave/vulkan_enable2 — inline-3D "
++                    "unsupported (weave="
++                 << s.has_weave << " vk2=" << has_vk2 << ")";
++    return;
++  }
++  // v7 introduced the AHardwareBuffer handle kind, xrWeaveBindWindow2DXR and the
++  // explicit window geometry — all three are load-bearing here, so a pre-v7
++  // runtime cannot serve the Android path at all.
++  if (s.weave_spec_version < 7) {
++    LOG(WARNING) << "[DisplayXR] runtime XR_DXR_weave spec=" << s.weave_spec_version
++                 << " (<7, #1036) — Android inline-3D needs v7";
++    return;
++  }
++
++  std::vector<const char*> enabled = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
++                                      XR_DXR_WEAVE_EXTENSION_NAME};
++  if (has_android_ci) {
++    enabled.push_back(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
++  }
++  if (has_display_info) {
++    enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
++  }
++  // The weave is core; the rig only improves scene geometry. Track the boundary
++  // so a rig-side rejection retries weave-only rather than killing inline-3D.
++  const size_t weave_ext_count = enabled.size();
++  if (has_view_rig) {
++    enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
++  }
++
++  XrInstanceCreateInfoAndroidKHR android_info = {
++      XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
++  android_info.applicationVM = vm;
++  android_info.applicationActivity = app_context;
++
++  XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
++  if (has_android_ci) {
++    ici.next = &android_info;
++  }
++  std::snprintf(ici.applicationInfo.applicationName,
++                sizeof(ici.applicationInfo.applicationName), "%s",
++                "DisplayXRBrowser");
++  ici.applicationInfo.applicationVersion = 1;
++  std::snprintf(ici.applicationInfo.engineName,
++                sizeof(ici.applicationInfo.engineName), "%s", "Chromium");
++  ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
++  ici.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
++  ici.enabledExtensionNames = enabled.data();
++
++  XrResult ir = xrCreateInstance(&ici, &s.instance);
++  if (XR_FAILED(ir) && has_view_rig) {
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance with rig ext failed (" << ir
++               << ") — retrying weave-only (scenes stay mono)";
++    enabled.resize(weave_ext_count);
++    ici.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
++    ici.enabledExtensionNames = enabled.data();
++    ir = xrCreateInstance(&ici, &s.instance);
++  }
++  if (XR_FAILED(ir)) {
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance failed: " << ir;
++    return;
++  }
++
++  auto xrGetSystem = GetXr<PFN_xrGetSystem>(s.instance, "xrGetSystem");
++  XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
++  sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
++  XrResult sr = xrGetSystem ? xrGetSystem(s.instance, &sgi, &s.system_id)
++                            : XR_ERROR_FUNCTION_UNSUPPORTED;
++  if (XR_FAILED(sr) && xrGetSystem) {
++    sgi.formFactor = XR_FORM_FACTOR_HANDHELD_DISPLAY;
++    sr = xrGetSystem(s.instance, &sgi, &s.system_id);
++  }
++  if (XR_FAILED(sr)) {
++    LOG(ERROR) << "[DisplayXR] xrGetSystem failed: " << sr;
++    return;
++  }
++
++  if (!CreateVulkanDevice(s)) {
++    return;
++  }
++
++  // Present-owner weave session. NO xrBeginSession / xrWaitFrame / xrEndFrame
++  // and NO swapchain: we own the present loop and drive the weave directly.
++  auto xrCreateSession =
++      GetXr<PFN_xrCreateSession>(s.instance, "xrCreateSession");
++  XrGraphicsBindingVulkanKHR vk_binding = {
++      XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
++  vk_binding.instance = s.vk_instance;
++  vk_binding.physicalDevice = s.vk_phys;
++  vk_binding.device = s.vk_device;
++  vk_binding.queueFamilyIndex = s.vk_queue_family;
++  vk_binding.queueIndex = 0;
++  XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
++  sci.next = &vk_binding;
++  sci.systemId = s.system_id;
++  XrResult cr = xrCreateSession
++                    ? xrCreateSession(s.instance, &sci, &s.session)
++                    : XR_ERROR_FUNCTION_UNSUPPORTED;
++  if (XR_FAILED(cr)) {
++    // XR_ERROR_LIMIT_REACHED here means a leaked PRESENT_OWNER session: the
++    // quota is 2 system-wide (#1056), so a previous GPU process that died
++    // without releasing its slot shows up exactly like this.
++    LOG(ERROR) << "[DisplayXR] xrCreateSession (weave present-owner) failed: "
++               << cr;
++    return;
++  }
++
++  s.bind_window2 =
++      GetXr<PFN_xrWeaveBindWindow2DXR>(s.instance, "xrWeaveBindWindow2DXR");
++  s.submit = GetXr<PFN_xrWeaveSubmitDXR>(s.instance, "xrWeaveSubmitDXR");
++  if (!s.bind_window2 || !s.submit) {
++    LOG(ERROR) << "[DisplayXR] weave PFNs unresolved (bind2="
++               << (s.bind_window2 ? "ok" : "NULL")
++               << " submit=" << (s.submit ? "ok" : "NULL") << ")";
++    return;
++  }
++
++  LOG(WARNING) << "[DisplayXR] inline-3D weave client ready on Android "
++                  "(Vulkan-bound IPC present-owner session, weave_spec="
++               << s.weave_spec_version << " rig=" << has_view_rig << ")";
+ }
+ 
+ bool IsSupportedAndroid() {
+-  // No session yet, so nothing to report as supported. Deliberately does NOT
+-  // report the mere presence of the loader: the WebXR detection contract is
+-  // authoritative on a succeeding requestSession('inline-3d'), and claiming
+-  // support we cannot deliver would make that fail late instead of early.
+-  return false;
++  AndroidWeaveState& s = State();
++  return s.session != XR_NULL_HANDLE && s.has_weave && s.submit != nullptr;
+ }
+ 
+ uint32_t WeaveSpecVersionAndroid() {
+   return State().weave_spec_version;
+ }
+ 
++void SetWindowGeometryAndroid(int32_t origin_x,
++                              int32_t origin_y,
++                              int32_t client_width,
++                              int32_t client_height,
++                              int32_t display_id) {
++  AndroidWeaveState& s = State();
++  if (s.geom_x == origin_x && s.geom_y == origin_y &&
++      s.geom_w == client_width && s.geom_h == client_height &&
++      s.geom_display == display_id && s.ever_bound) {
++    return;
++  }
++  s.geom_x = origin_x;
++  s.geom_y = origin_y;
++  s.geom_w = client_width;
++  s.geom_h = client_height;
++  s.geom_display = display_id;
++  s.geometry_dirty = true;
++}
++
+ std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectAndroid(
+     const DisplayXRWeaveClient::WeaveRect& rect,
+     float virtual_display_height) {
++  // M3: the rig locate needs XR_DXR_display_zones + XR_DXR_local_3d_zone +
++  // a reference space + XR_KHR_convert_timespec_time, exactly as
++  // LocateViewsForRectMac does. Until then scenes render mono, which is the
++  // same degradation a rig-less runtime already produces on the other arms.
+   return {};
+ }
+ 
+@@ -127,15 +634,112 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchAndroid(
+     uintptr_t input_handle,
+     const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,
+     uintptr_t overlay_handle) {
++  DisplayXRWeaveClient::WeaveSubmitResult result;
+   AndroidWeaveState& s = State();
+-  if (!s.logged_submit) {
+-    s.logged_submit = true;
+-    LOG(WARNING) << "[DisplayXR] SubmitBatchAndroid is not implemented yet (M1: "
+-                    "AHardwareBuffer extraction + XR_WEAVE_HANDLE_KIND_"
+-                    "AHARDWAREBUFFER_DXR submit); " << rects.size()
+-                 << " rect(s) dropped, and this is logged once";
++  const size_t rect_count = rects.size();
++  if (s.session == XR_NULL_HANDLE || !s.submit || rect_count == 0 ||
++      input_handle == 0) {
++    return result;
+   }
+-  return {};
++
++  // Phase is locked to ABSOLUTE SCREEN position, so the geometry must be live
++  // before the first submit and re-published whenever it moves.
++  EnsureBound(s);
++
++  XrRect2Di xr_rects[XR_WEAVE_SUBMIT_MAX_RECTS_DXR];
++  size_t done = 0;
++  while (done < rect_count) {
++    const size_t n =
++        std::min<size_t>(rect_count - done, XR_WEAVE_SUBMIT_MAX_RECTS_DXR);
++    for (size_t i = 0; i < n; ++i) {
++      const DisplayXRWeaveClient::WeaveRect& r = rects[done + i];
++      XrRect2Di& xr = xr_rects[i];
++      xr.offset.x = r.x;
++      xr.offset.y = r.y;
++      xr.extent.width = r.w;
++      xr.extent.height = r.h;
++    }
++
++    // v7: SAY what the handles are. PLATFORM_DEFAULT is wrong on Android — an
++    // AHardwareBuffer is neither an NT handle nor an IOSurface, and a runtime
++    // that guesses wrong dereferences it.
++    XrWeaveSubmitHandlesDXR kinds = {XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR};
++    kinds.inputKind = XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR;
++    kinds.overlayKind = overlay_handle != 0
++                            ? XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR
++                            : XR_WEAVE_HANDLE_KIND_PLATFORM_DEFAULT_DXR;
++
++    // v3 batch: window-sized input, each rect's squeezed SBS at its own window
++    // position. The fixed ~1 ms is per SUBMIT, not per rect — batching is the
++    // whole point.
++    XrWeaveSubmitRectsDXR batch = {XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
++    batch.next = &kinds;
++    batch.rectCount = static_cast<uint32_t>(n);
++    batch.rects = xr_rects;
++
++    XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
++    in.next = &batch;
++    in.inputTexture = reinterpret_cast<void*>(input_handle);
++    in.inputIsDxgi = XR_FALSE;  // meaningless on Android; kinds is authoritative
++    // v5: clear the woven output to premultiplied transparent on the frame's
++    // FIRST chunk, so the gaps between tiles come out transparent instead of
++    // stale and the caller can composite the output whole-window.
++    in.firstChunk = (done == 0) ? XR_TRUE : XR_FALSE;
++
++    XrWeaveSubmitOverlaysDXR overlays = {XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
++    const bool last_chunk = (done + n) >= rect_count;
++    if (overlay_handle != 0 && last_chunk && s.weave_spec_version >= 4) {
++      overlays.overlayTexture = reinterpret_cast<void*>(overlay_handle);
++      overlays.overlayIsDxgi = XR_FALSE;
++      overlays.rectCount = 0;  // whole-atlas composite (premul alpha wins)
++      overlays.next = &batch;
++      in.next = &overlays;
++    }
++
++    XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
++    const XrResult xr = s.submit(s.session, &in, &out);
++    if (XR_FAILED(xr)) {
++      static int fails = 0;
++      if (fails < 3) {
++        ++fails;
++        LOG(ERROR) << "[DisplayXR] xrWeaveSubmitDXR(android batch n=" << n
++                   << ") failed: " << xr;
++      }
++      result.ok = false;
++      return result;
++    }
++
++    result.ok = true;
++    // The woven AHardwareBuffer arrives on the FIRST submit and again on every
++    // reallocation; 0 on steady-state frames (the runtime re-weaves in place).
++    // Ownership transfers to us — the caller AHardwareBuffer_release()s the one
++    // it is replacing.
++    if (out.weavedTexture) {
++      result.woven_handle = reinterpret_cast<uintptr_t>(out.weavedTexture);
++    }
++    // out.fence stays NULL on Android by contract: completion is SYNCHRONOUS,
++    // so there is nothing to wait on after this returns. fenceValue is a plain
++    // monotonic counter.
++    result.fence_value = out.fenceValue;
++    result.width = out.width;
++    result.height = out.height;
++    result.eyes_valid = (out.eyesValid == XR_TRUE);
++    result.eyes.clear();
++    if (result.eyes_valid && out.eyeCount > 0) {
++      const uint32_t en = out.eyeCount > XR_WEAVE_MAX_EYES_DXR
++                              ? XR_WEAVE_MAX_EYES_DXR
++                              : out.eyeCount;
++      result.eyes.reserve(en * 3u);
++      for (uint32_t i = 0; i < en; ++i) {
++        const XrVector3f& eye = out.eyes[i];
++        result.eyes.push_back(eye.x);
++        result.eyes.push_back(eye.y);
++        result.eyes.push_back(eye.z);
++      }
++    }
++    done += n;
++  }
++  return result;
+ }
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/browser/displayxr_weave_client_android.h b/components/displayxr/browser/displayxr_weave_client_android.h
+index e10265548ac77..5122d41445d5f 100644
+--- a/components/displayxr/browser/displayxr_weave_client_android.h
++++ b/components/displayxr/browser/displayxr_weave_client_android.h
+@@ -11,10 +11,13 @@
+ // displayxr_weave_client_mac.h, and deliberately OpenXR-free so the C++
+ // dispatcher TU can include it.
+ //
+-// M2 SCOPE (docs/android-port.md): this is a compile-clean skeleton. It proves
+-// the seam — the adopted socket is visible, the OpenXR loader is reachable —
+-// and stops there. The session, the AHardwareBuffer submit path and the
+-// per-frame geometry publication are M1/M3.
++// M1 SCOPE (docs/android-port.md): the present-owner weave session is real —
++// loader dlopen, xrInitializeLoaderKHR, xrCreateInstance with
++// XR_KHR_android_create_instance + XR_KHR_vulkan_enable2 + XR_DXR_weave (+
++// display_info + view_rig when advertised), a Vulkan-bound session, and a
++// batched xrWeaveSubmitDXR carrying an AHardwareBuffer input. It runs in the
++// GPU process, which is the process the browser handed a connected runtime
++// socket (#1056); everything stays dormant when that socket is absent.
+ //
+ // Unlike Windows and macOS, the runtime is NOT reached through a vendored
+ // import library here. See InitializeCoreAndroid() for the loader seam and the
+@@ -37,16 +40,46 @@ bool IsSupportedAndroid();
+ // The runtime-reported XR_DXR_weave spec version (0 until initialized).
+ uint32_t WeaveSpecVersionAndroid();
+ 
++// Publish the present-owner's CLIENT-AREA geometry in absolute screen pixels.
++// REQUIRED on Android: there is no window handle for the runtime to read a
++// position off, and a pure window MOVE raises no resize (ADR-036 D6), so the
++// interlace phase is display-scoped — i.e. correct only for a full-screen
++// window at the panel origin — until this is called with real numbers.
++//
++// M1 publishes the fullscreen placeholder (0,0,window size,display 0) from the
++// GPU provider, which is exactly right for the fullscreen Android browser
++// window and wrong for nothing that ships today. M3 replaces it with the
++// Choreographer-sampled View.getLocationOnScreen() feed over
++// displayxr_weave.mojom — THIS FUNCTION IS THAT SEAM; nothing else has to move.
++// Cheap + deduped, so calling it every frame is supported.
++void SetWindowGeometryAndroid(int32_t origin_x,
++                              int32_t origin_y,
++                              int32_t client_width,
++                              int32_t client_height,
++                              int32_t display_id);
++
+ // Off-axis (Kooima) views of one inline-3D element. Empty until the rig is
+ // live (M3).
+ std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectAndroid(
+     const DisplayXRWeaveClient::WeaveRect& rect,
+     float virtual_display_height);
+ 
+-// Batched synchronous weave. On Android |input_handle| will be an
+-// AHardwareBuffer* and the submit must chain XrWeaveSubmitHandlesDXR with
+-// inputKind = XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR (PLATFORM_DEFAULT is
+-// wrong here). Not implemented in M2: logs once and fails gracefully.
++// Batched synchronous weave. |input_handle| is an AHardwareBuffer* sized to the
++// bound window's client area, carrying every rect's squeezed SBS content AT ITS
++// OWN WINDOW POSITION (spec v3 batch layout). The submit chains
++// XrWeaveSubmitHandlesDXR with inputKind =
++// XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR — PLATFORM_DEFAULT is wrong on
++// Android and would have the service dereference a non-pointer.
++//
++// SYNC CONTRACT (XR_DXR_weave.h §XrWeaveSubmitHandlesDXR, v7): there is NO
++// acquire fence on Android. The caller's GPU writes into |input_handle| must be
++// COMPLETE before this is called, and the call returns only once the woven
++// output is GPU-complete. The wait is the GPU provider's job (it owns the Skia
++// context that produced the pixels) — see DisplayXRWeaveGpuAndroid.
++//
++// |result.woven_handle| is the woven AHardwareBuffer*, non-zero on the FIRST
++// successful submit and again on every reallocation (window resize), 0 on
++// steady-state frames.
+ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchAndroid(
+     uintptr_t input_handle,
+     const std::vector<DisplayXRWeaveClient::WeaveRect>& rects,

@@ -1,0 +1,260 @@
+From cc91f3368555da468cabc42119bbcea7736f5b63 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 02:12:10 +0000
+Subject: [PATCH] fix(android): draw back only where the runtime actually wove
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On-device symptom: 2D page elements are occasionally WOVEN during a scroll —
+the interlace lattice appears over content that is not a 3D tile.
+
+The Android draw-back is the cause, and it is a gating gap rather than a
+geometry bug. Windows' phase (B) is ONE whole-window kSrcOver of a texture the
+runtime clears to transparent on the frame's first chunk, so pixels it did not
+weave this frame contribute nothing to the composite. Android's phase (B) is a
+per-rect kSrc, and it was iterating |inline_3d_rects_| — THIS frame's rects —
+sampling the shared woven buffer at the same window coordinates it writes. So a
+rect that moved between the weave and the draw-back stamps whatever the buffer
+holds at the NEW coordinates over live page content. During a scroll that is
+last frame's woven tile landing on 2D elements, which is exactly the report.
+
+|drawn_rect| — the rect the runtime actually wove a target's pixels at — has
+existed since browser#87 and is written in four places, but it is read NOWHERE
+in the tree: 0046 replaced Windows' per-rect draw with the whole-window one and
+the field went dead. Android is the platform that needs it, so read it there.
+A target that did not weave this frame (declined copy, off-window, failed
+batch) has it cleared and is now skipped instead of stamping a stale region.
+
+Three more gaps closed while in here, all of them browser#87/#99 machinery that
+was compiled out on Android only because it sat inside the same #if as the
+WINDOWS phase (B):
+
+  * the browser#87 liveness gate and the browser#99/web#12 recovery draw are
+    portable Skia — they draw canvas mailboxes through the representation
+    factory into |output| — and are now built for Android too. Without the
+    recovery draw, gating the draw-back would have traded "weave over 2D" for
+    "black tile", which is not a trade.
+  * a failed SubmitBatchSync now clears every target's pending/drawn rect. The
+    RPC failing means the runtime's woven output was NOT updated for any
+    target, however many copied in, and |wove_this_frame| alone only stops the
+    current frame — a stale |pending_rect| could still be promoted later.
+  * BatchKeepPrevious is implemented for the Android provider, guarded on the
+    rect being unchanged since the last real copy so a moved rect can never
+    drag a copy behind the scroll, and dropped on prune and on any window-size
+    change (which reallocates and re-clears the staging image).
+
+The frosted list is drained before the new early bail, for the same reason
+Windows drains it before its own: a stale clip belongs to no frame.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ .../gpu/displayxr_weave_gpu_android.cc        | 41 +++++++++++++
+ .../gpu/displayxr_weave_gpu_android.h         | 15 +++++
+ .../skia_output_surface_impl_on_gpu.cc        | 61 ++++++++++++++++++-
+ 3 files changed, 114 insertions(+), 3 deletions(-)
+
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.cc b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+index 9f934d88d7223..02ff8d505f176 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+@@ -79,6 +79,13 @@ bool DisplayXRWeaveGpuAndroid::SubmitInFlight(uint32_t /*target_id*/) const {
+ }
+ 
+ void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
++  // (web#12, 0074) A window-size change reallocates the staging image, so every
++  // remembered copy names pixels that no longer exist. Forget them BEFORE the
++  // batch opens, or the first frame at the new size can keep-previous out of a
++  // freshly-cleared (transparent) buffer.
++  if (batch_size_ != window_size) {
++    batch_last_copied_.clear();
++  }
+   batch_open_ = true;
+   batch_size_ = window_size;
+   batch_entries_.clear();
+@@ -110,6 +117,31 @@ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
+   // element's squeezed SBS into the shared window-sized staging image AT THIS
+   // RECT before calling us (see the class comment on why there is no blit).
+   batch_entries_.push_back({target_id, window_rect});
++  // (web#12, 0074) Remember WHERE those pixels landed in the never-cleared
++  // staging image — the fact BatchKeepPrevious needs on a later frame whose
++  // draw failed.
++  batch_last_copied_[target_id] = window_rect;
++  return true;
++}
++
++// (web#12, patch 0074) Stage this target's entry WITHOUT a copy, so the runtime
++// re-weaves the pixels already sitting at |window_rect| in the shared staging
++// image. Honoured only when |batch_last_copied_| says this exact target wrote
++// this exact rect: anything else and the staging content at that rect belongs
++// to another frame's geometry (or to nobody), and re-weaving it would smear a
++// stale tile across the scroll rather than merely losing one.
++bool DisplayXRWeaveGpuAndroid::BatchKeepPrevious(const gfx::Rect& window_rect,
++                                                 uint32_t target_id) {
++  if (!batch_open_ || window_rect.IsEmpty()) {
++    return false;
++  }
++  auto it = batch_last_copied_.find(target_id);
++  if (it == batch_last_copied_.end() || it->second != window_rect) {
++    return false;
++  }
++  batch_entries_.push_back({target_id, window_rect});
++  // NOT updated: |batch_last_copied_| already names this rect, and a keep is
++  // not a copy — the pixels are the ones the last real copy left behind.
+   return true;
+ }
+ 
+@@ -227,6 +259,7 @@ void DisplayXRWeaveGpuAndroid::PruneTarget(uint32_t target_id) {
+   // input (owned by Viz) and one cached woven AHardwareBuffer — so retiring a
+   // target is just dropping its stored result.
+   results_.erase(target_id);
++  batch_last_copied_.erase(target_id);
+ }
+ 
+ void DisplayXRWeaveGpuAndroid::PruneTargets(size_t count) {
+@@ -237,6 +270,14 @@ void DisplayXRWeaveGpuAndroid::PruneTargets(size_t count) {
+       ++it;
+     }
+   }
++  for (auto it = batch_last_copied_.begin();
++       it != batch_last_copied_.end();) {
++    if (it->first >= count) {
++      it = batch_last_copied_.erase(it);
++    } else {
++      ++it;
++    }
++  }
+ }
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.h b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+index 60ef39bd62310..917e1e629d952 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+@@ -91,6 +91,8 @@ class DisplayXRWeaveGpuAndroid : public viz::DisplayXRWeaveProvider {
+   bool BatchMode() const override;
+   void BeginBatchSync(const gfx::Size& window_size) override;
+   bool SubmitBatchSync() override;
++  bool BatchKeepPrevious(const gfx::Rect& window_rect,
++                         uint32_t target_id) override;
+ 
+  private:
+   bool batch_open_ = false;
+@@ -130,6 +132,19 @@ class DisplayXRWeaveGpuAndroid : public viz::DisplayXRWeaveProvider {
+     Result result;
+   };
+   base::flat_map<uint32_t, Pending> results_;
++
++  // (web#12, patch 0074) Where each target's pixels were last really drawn into
++  // the shared staging image, in window-relative DEVICE px — the same space
++  // WeaveRectAndroid takes. The staging image is allocated once per window size
++  // and cleared exactly once at allocation (EnsureWeaveStagingAndroid), never
++  // per frame, so last frame's SBS is still sitting there; that is what makes
++  // keeping a tile we could not redraw sound at all.
++  //
++  // The guard is rect equality, NOT mere presence: a tile whose rect moved
++  // since its last real copy has stale pixels at the WRONG place, so keeping it
++  // would drag a copy behind the scroll. Dropped by PruneTarget(s) because a
++  // retired target's slot may be reused by a different element.
++  base::flat_map<uint32_t, gfx::Rect> batch_last_copied_;
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 4b60de1966f0d..65705be2c5776 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -4291,11 +4291,34 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // no matter how many targets copied in.
+     const bool batch_ok = provider->SubmitBatchSync();
+     wove_this_frame = wove_this_frame && batch_ok;
++    if (!batch_ok) {
++      // (browser#87) The submit RPC failed, so the runtime's woven output was
++      // NOT updated — for any target, however many copied in. Every
++      // |pending_rect| set above therefore describes a weave that did not
++      // happen, and phase (B) must not draw from it. Clearing here is the
++      // per-target half of |wove_this_frame|: the whole-frame gate stops the
++      // draw-back on THIS frame, and these cleared rects stop a target being
++      // drawn at a rect it was never woven at on a LATER one.
++      for (auto& [prune_key, prune_st] : displayxr_targets_) {
++        prune_st.pending_rect = gfx::Rect();
++        prune_st.drawn_rect = gfx::Rect();
++      }
++    }
+   }
+ 
+-#if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID)
+   // ---- (B') RECOVERY DRAW: degrade to mono, never to black ----
+   //
++  // ANDROID (this patch): the whole block below — the recovery draw and
++  // browser#87's liveness gate — was compiled out on Android purely because it
++  // sat inside the same #if as the WINDOWS phase (B). Nothing in it is
++  // Windows-specific: it draws canvas mailboxes through the portable Skia
++  // representation factory into |output|. Android needs it MORE than Windows
++  // does, because the Android draw-back is a per-rect kSrc rather than a
++  // whole-window kSrcOver over a runtime-cleared texture, so a missed weave
++  // there is not a no-op — it replaces live page pixels with whatever the
++  // shared woven buffer happens to hold at those coordinates.
++  //
+   // (browser#99, generalized from whole-frame to PER-TILE by web#12.)
+   //
+   // The two halves of the dark-tile mechanism are decided in different places
+@@ -4525,6 +4548,13 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // rec_accesses / rec_reps release here, after the submit.
+   };
+ 
++#if BUILDFLAG(IS_ANDROID)
++  // Drained before the gate below for the same reason the Windows branch drains
++  // it before ITS early returns: if the draw-back does not happen, the right
++  // state to be left in is "no clip", not "last frame's clip". (Android does
++  // not apply the frosted clip yet; it still must not latch one.)
++  inline_3d_frosted_rects_.clear();
++#endif
+   // (browser#87) Liveness gate: skip the Phase (B) draw-back entirely when this
+   // frame wove nothing, rather than blitting a woven texture that still holds
+   // the previous page's pixels. Batch mode only: the batch weave completes
+@@ -4563,6 +4593,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     recovery_draw(/*only_unsubmitted=*/true);
+   }
+ 
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID)
++
++#if BUILDFLAG(IS_WIN)
+   // ---- (B) Draw back the accumulated window-sized woven output (Windows) ----
+   // The runtime weaves EVERY submitted sub-rect into ONE window-sized handback
+   // texture and (v5, browser#22) clears the gaps to transparent on the frame's
+@@ -5163,8 +5196,30 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // and the 2D chrome outside these rects stays as the root composited it.
+     // NEAREST is mandatory — this is a device-pixel-exact blit of an interlace
+     // lattice, and any filtering blends neighbouring views into each other.
+-    for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
+-      gfx::Rect rect = inline_3d_rects_[i].rect;
++    //
++    // (browser#87, ported to Android) Iterate the TARGETS and draw each one's
++    // |drawn_rect| — the rect the runtime actually wove this target's pixels at
++    // — NOT this frame's |inline_3d_rects_|. The two differ exactly when
++    // something went wrong, and on this branch that difference is an artifact
++    // rather than a no-op:
++    //
++    //   * The blit is kSrc and samples the shared woven buffer at the SAME
++    //     window coordinates it writes. A rect that moved between the weave and
++    //     the draw-back therefore stamps whatever the buffer holds at the NEW
++    //     coordinates over live page content — during a scroll that is last
++    //     frame's woven tile landing on top of 2D elements. This is the
++    //     reported on-device symptom.
++    //   * A rect present this frame whose target did not weave (declined copy,
++    //     failed batch, off-window) has |drawn_rect| cleared by the submit loop
++    //     above, so it is skipped here instead of stamping a stale region.
++    //
++    // Windows does not need this: its phase (B) is ONE whole-window kSrcOver of
++    // a texture the runtime clears to transparent on the frame's first chunk,
++    // so pixels it did not weave this frame contribute nothing. Android's
++    // per-rect kSrc has no such protection, which is why |drawn_rect| — written
++    // since browser#87 and read nowhere — has to be read here.
++    for (const auto& [tgt_key, tgt_st] : displayxr_targets_) {
++      gfx::Rect rect = tgt_st.drawn_rect;
+       rect.Intersect(window_bounds);
+       if (rect.IsEmpty()) {
+         continue;

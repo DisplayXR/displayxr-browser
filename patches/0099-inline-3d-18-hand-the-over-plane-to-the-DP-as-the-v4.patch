@@ -1,0 +1,545 @@
+From 282863b8bd833f74061438d9f19ca8768bb1b87e Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 02:35:04 +0000
+Subject: [PATCH] inline-3d(18): hand the over-plane to the DP as the v4
+ overlay atlas (Android)
+
+XR_DXR_weave spec v4 lets a present-owner give the runtime a
+window-sized premultiplied-RGBA atlas the display processor composites
+OVER the woven output in the same pass. The runtime's Android arm
+implements it (comp_multi_weave_android.c imports the AHardwareBuffer
+and runs vk_local2d_composite_flatten_draw); the browser never sent one,
+and DisplayXRWeaveGpuAndroid hard-coded overlay_handle = 0.
+
+Checked before building on the assumption, because the shape of the gap
+is not what the TODO implied: the WINDOWS caller for this channel does
+not exist either. Patch 0065 retired it - the Phase-2 plane split lifts
+page content over a tile and composites it browser-side - and
+displayxr_weave_provider.h says so in as many words ("NO CALLER as of
+patch 0065"). Android already runs that same browser-side composite. So
+this is not a missing feature being backfilled; it is the Phase-3
+optimisation the header deliberately kept the virtuals for.
+
+No new atlas is assembled and nothing is copied. SkiaRenderer's
+over-plane is ALREADY a window-sized premultiplied RGBA8 image,
+transparent outside the tile rects, flattened in stacking order - bit
+for bit the v4 contract, whose alpha IS the 2D-vs-3D mask. Under
+--inline-3d-dp-overlay it is allocated with SCANOUT usage (what routes a
+SharedImage to AHardwareBufferImageBackingFactory on Android; RGBA_8888
+was already required there) and handed over instead of blitted back.
+
+Extraction is the same three calls the staging input uses, with the same
+hazard: GetAHardwareBufferFenceSync()->buffer(), never
+GetAHardwareBuffer() (the base override is a bare NOTREACHED), and the
+read access is held across SubmitBatchSync so the buffer stays alive and
+readable while the service composites from it. It runs AFTER
+FinishSkiaWritesForWeaveAndroid(): the over-plane was painted by the
+same Skia context, so that submit-and-sync-to-CPU is what discharges the
+outbound writes there is no acquire fence for (spec v7 - the caller's
+writes must be complete before the call).
+
+OPT-IN, and for a real asymmetry rather than caution. The browser-side
+draw is WHOLE-WINDOW; the Android blit covers only drawn_rect per
+target. Those coincide on a healthy frame (the plane is transparent
+outside the tile rects by construction) and diverge on a frame where a
+target declined its weave, where the DP path loses that tile's
+over-content. Off by default keeps the shipping behaviour byte-for-byte
+on every platform, and the switch is never defaulted on the way
+--inline-3d-occlusion is.
+
+Fails soft throughout: a refused SCANOUT allocation falls back to the
+plain plane, a failed extraction leaves the browser-side composite on,
+and every diagnostic is latched (no per-frame logging).
+
+Refs browser#18
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ .../browser/chrome_content_browser_client.cc  |  14 +++
+ .../gpu/displayxr_weave_gpu_android.cc        |  52 ++++++++-
+ .../gpu/displayxr_weave_gpu_android.h         |  16 +++
+ .../viz/service/display/direct_renderer.cc    |   8 ++
+ .../viz/service/display/direct_renderer.h     |  16 +++
+ .../viz/service/display/skia_renderer.cc      |  50 ++++++++-
+ .../displayxr_weave_provider.cc               |  11 ++
+ .../displayxr_weave_provider.h                |  21 ++++
+ .../skia_output_surface_impl_on_gpu.cc        | 103 +++++++++++++++++-
+ .../skia_output_surface_impl_on_gpu.h         |  16 +++
+ 10 files changed, 297 insertions(+), 10 deletions(-)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 3935baf0003aa..cb1a0cfd47511 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2877,6 +2877,20 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+         !command_line->HasSwitch("inline-3d-occlusion")) {
+       command_line->AppendSwitch("inline-3d-occlusion");
+     }
++    // (browser#18, XR_DXR_weave v4) Hand the Phase-2 over-plane to the runtime's
++    // display processor as the spec-v4 overlay atlas instead of compositing it
++    // browser-side. Forwarded here, before any process_type branch, for the same
++    // reason --inline-3d-occlusion is: it is read in the GPU/Viz process by BOTH
++    // the compositor thread (SkiaRenderer, to allocate the plane with the
++    // SCANOUT usage an AHardwareBuffer export needs) and the GPU thread
++    // (SkiaOutputSurfaceImplOnGpu, to extract and stage it). Never defaulted on
++    // - unlike the occlusion switch there is no chrome_main_delegate.cc arm for
++    // it; it is opt-in only, and Android-only in effect.
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++            "inline-3d-dp-overlay") &&
++        !command_line->HasSwitch("inline-3d-dp-overlay")) {
++      command_line->AppendSwitch("inline-3d-dp-overlay");
++    }
+ #if BUILDFLAG(IS_WIN)
+     // The weave input is an NT-shared keyed-mutex D3D11 texture the DisplayXR
+     // service creates on the runtime's adapter — the high-performance discrete
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.cc b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+index a738b13c015e7..c8eb11c1d69f8 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+@@ -92,6 +92,9 @@ void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
+   batch_input_ahb_ = 0;
+   // (browser#88) A stale wish is worse than no wish - see the member comment.
+   batch_flat_rects_.clear();
++  // (browser#18 v4) Same rule for the overlay atlas: a frame that stages none
++  // must weave with none, not with last frame's.
++  batch_overlay_ahb_ = 0;
+ 
+   // Window geometry (ADR-036 D6 / XR_DXR_weave v7): REQUIRED on Android, and
+   // published from here because this is where the client-area size is known.
+@@ -171,6 +174,30 @@ void DisplayXRWeaveGpuAndroid::SetBatchWish(
+   batch_flat_rects_ = flat_rects;
+ }
+ 
++// (browser#18, XR_DXR_weave spec v4) Stage the caller's window-sized
++// premultiplied-alpha RGBA8 overlay atlas for this batch frame. Note what is
++// NOT here: no import, no copy, no second device. The atlas is already an
++// AHardwareBuffer the caller extracted from a Viz SharedImage, and the buffer
++// itself travels over the runtime IPC socket - so unlike the Windows twin
++// (which owns a keyed-mutex texture and does a whole-resource
++// CopySubresourceRegion into it every frame) this is a pointer assignment.
++//
++// SYNC: the caller has already discharged its outbound writes before calling
++// (the same submit-and-sync-to-CPU that covers the input staging image covers
++// this one, because both were written by the SAME Skia context). There is no
++// acquire fence on Android by contract - see the header.
++//
++// LIFETIME: borrowed. The caller must hold the overlay read access that
++// produced |ahardware_buffer| across SubmitBatchSync().
++bool DisplayXRWeaveGpuAndroid::SetBatchOverlayAndroid(
++    uintptr_t ahardware_buffer) {
++  if (!batch_open_ || ahardware_buffer == 0) {
++    return false;
++  }
++  batch_overlay_ahb_ = ahardware_buffer;
++  return true;
++}
++
+ bool DisplayXRWeaveGpuAndroid::SetBatchInputAndroid(uintptr_t ahardware_buffer,
+                                                     int acquire_fence_fd) {
+   if (!batch_open_ || ahardware_buffer == 0) {
+@@ -210,13 +237,28 @@ bool DisplayXRWeaveGpuAndroid::SubmitBatchSync() {
+     flat.push_back({f.x(), f.y(), f.width(), f.height()});
+   }
+ 
+-  // ONE synchronous submit for the whole frame. The handle kind is declared
+-  // inside SubmitBatchAndroid (XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR); no
+-  // overlay atlas is staged on Android (the browser composites its own over-
+-  // plane, patch 0063-0065), so the overlay handle is 0.
++  // ONE synchronous submit for the whole frame. Both handle kinds are declared
++  // inside SubmitBatchAndroid (XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR).
++  //
++  // |batch_overlay_ahb_| is 0 unless --inline-3d-dp-overlay staged the Phase-2
++  // over-plane as the spec-v4 atlas this frame; 0 omits the overlay chain
++  // entirely and the browser composites that plane itself (patches 0063-0065),
++  // which is what ships by default on every platform.
++  const uintptr_t overlay = batch_overlay_ahb_;
+   DisplayXRWeaveClient::WeaveSubmitResult sr =
+-      SubmitBatchAndroid(batch_input_ahb_, rects, /*overlay_handle=*/0, flat);
++      SubmitBatchAndroid(batch_input_ahb_, rects, overlay, flat);
+   batch_input_ahb_ = 0;
++  batch_overlay_ahb_ = 0;
++  if (overlay != 0) {
++    static bool logged_overlay = false;
++    if (!logged_overlay) {
++      logged_overlay = true;
++      LOG(WARNING) << "[DisplayXR] android weave: DP-composited 2D overlay "
++                      "atlas live (window-sized premul RGBA8 AHardwareBuffer, "
++                      "spec v4) - the browser-side over-plane composite is "
++                      "standing down for these frames";
++    }
++  }
+   if (!sr.ok) {
+     static int fails = 0;
+     if (fails < 3) {
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.h b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+index e98b2176fd13e..a001fa13e345a 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+@@ -94,6 +94,7 @@ class DisplayXRWeaveGpuAndroid : public viz::DisplayXRWeaveProvider {
+   bool BatchKeepPrevious(const gfx::Rect& window_rect,
+                          uint32_t target_id) override;
+   void SetBatchWish(const std::vector<gfx::Rect>& flat_rects) override;
++  bool SetBatchOverlayAndroid(uintptr_t ahardware_buffer) override;
+ 
+  private:
+   bool batch_open_ = false;
+@@ -162,6 +163,21 @@ class DisplayXRWeaveGpuAndroid : public viz::DisplayXRWeaveProvider {
+   // the panel's 3D element off wherever LAST frame's 2D sat, which after a
+   // scroll is over live 3D.
+   std::vector<gfx::Rect> batch_flat_rects_;
++
++  // (browser#18, XR_DXR_weave spec v4) This batch frame's DP-composited 2D
++  // overlay atlas: a window-sized premultiplied-alpha RGBA8 AHardwareBuffer the
++  // runtime's display processor composites OVER the woven output
++  // (final = woven*(1 - a) + overlay), so the crisp 2D lands on the interlaced
++  // 3D as screen-depth pixels without the browser blitting it back itself.
++  //
++  // NOT OWNED, exactly like |batch_input_ahb_|: it is the backing of a Viz
++  // SharedImage whose overlay read access the CALLER holds across the submit,
++  // and that access is the only thing keeping it alive during the weave.
++  //
++  // CLEARED by BeginBatchSync, so a frame that stages no atlas submits no
++  // overlay chain rather than re-sending the previous frame's - which after a
++  // scroll would paint last frame's 2D over this frame's 3D.
++  uintptr_t batch_overlay_ahb_ = 0;
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
+index f8c259c01d702..248134f0c3489 100644
+--- a/components/viz/service/display/direct_renderer.cc
++++ b/components/viz/service/display/direct_renderer.cc
+@@ -626,6 +626,14 @@ bool DirectRenderer::IsInline3dOcclusionEnabled() {
+   return enabled;
+ }
+ 
++// static
++bool DirectRenderer::IsInline3dDpOverlayEnabled() {
++  static const bool enabled =
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "inline-3d-dp-overlay");
++  return enabled;
++}
++
+ void DirectRenderer::ComputeInline3dPlaneSplit(
+     const AggregatedRenderPass* root) {
+   inline3d_over_clips_.clear();
+diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
+index 398daa86f5675..1b3d137f042e0 100644
+--- a/components/viz/service/display/direct_renderer.h
++++ b/components/viz/service/display/direct_renderer.h
+@@ -116,6 +116,22 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+   // Cached — the command line does not change after startup.
+   static bool IsInline3dOcclusionEnabled();
+ 
++  // True iff --inline-3d-dp-overlay is on this process's command line. OFF by
++  // default, and deliberately a second switch rather than a widening of
++  // --inline-3d-occlusion: it does not change WHAT is composited, only WHO
++  // composites it. With the plane split on (the shipping default) the over-plane
++  // is painted either way; this switch decides whether the browser draws it back
++  // itself with a whole-window kSrcOver, or hands it to the runtime's display
++  // processor as the XR_DXR_weave spec-v4 overlay atlas
++  // (XrWeaveSubmitOverlaysDXR) so the DP composites it inside the same pass that
++  // weaves. ANDROID ONLY today - it is the one platform whose runtime arm has a
++  // live v4 consumer (comp_multi_weave_android.c ->
++  // vk_local2d_composite_flatten_draw); the Windows arm's caller was retired by
++  // the Phase 2 plane split (patch 0065) and never rebuilt.
++  //
++  // Cached - the command line does not change after startup.
++  static bool IsInline3dDpOverlayEnabled();
++
+   void ReallocatedFrameBuffers();
+   void DecideRenderPassAllocationsForFrame(
+       const AggregatedRenderPassList& render_passes_in_draw_order,
+diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
+index b17dfa65bf969..0f40625d5ff38 100644
+--- a/components/viz/service/display/skia_renderer.cc
++++ b/components/viz/service/display/skia_renderer.cc
+@@ -3866,9 +3866,20 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
+   if (size.IsEmpty()) {
+     return;
+   }
+-  // Premultiplied RGBA8, NOT scanout: this plane is sampled by a later stage,
+-  // never handed to the OS compositor as a plane of its own. Keeping SCANOUT
+-  // off also keeps it off the DComp/swap-chain paths entirely.
++  // Premultiplied RGBA8. Normally NOT scanout: this plane is sampled by a later
++  // stage, never handed to the OS compositor as a plane of its own, and keeping
++  // SCANOUT off also keeps it off the DComp/swap-chain paths entirely.
++  //
++  // The ONE exception is Android with --inline-3d-dp-overlay, where the plane is
++  // not sampled by us at all - it is handed to the runtime's display processor
++  // as the XR_DXR_weave v4 overlay atlas, and that crosses the wire as an
++  // AHardwareBuffer. On Android SCANOUT is exactly what routes a SharedImage to
++  // AHardwareBufferImageBackingFactory (the analogue of SCANOUT ->
++  // IOSurfaceImageBacking on mac); without it there is no AHardwareBuffer to
++  // extract, no matter that the image builds and draws fine. RGBA_8888 is
++  // already the required format on that path (AHardwareBufferSupportedFormat()
++  // does not list BGRA at all, and the runtime's Android weave is RGBA8 UNORM
++  // end to end), so only the usage has to change.
+   const SharedImageFormat format = SinglePlaneFormat::kRGBA_8888;
+   const gfx::ColorSpace color_space = RenderPassColorSpace(root);
+ 
+@@ -3881,12 +3892,43 @@ void SkiaRenderer::MaybeDrawInline3dOverPlane(
+   }
+   bool created_now = false;
+   if (!inline_3d_over_plane_) {
+-    const gpu::SharedImageUsageSet usage =
++    const gpu::SharedImageUsageSet plain_usage =
+         gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
+         gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE;
++    const gpu::SharedImageUsageSet ahb_usage =
++        gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++        gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE |
++        gpu::SHARED_IMAGE_USAGE_SCANOUT;
++#if BUILDFLAG(IS_ANDROID)
++    const bool want_scanout = IsInline3dDpOverlayEnabled();
++#else
++    const bool want_scanout = false;
++#endif
++    const gpu::SharedImageUsageSet usage =
++        want_scanout ? ahb_usage : plain_usage;
+     gpu::Mailbox mailbox = skia_output_surface_->CreateSharedImage(
+         format, size, color_space, RenderPassAlphaType::kPremul, usage,
+         "DisplayXROverPlane", gpu::kNullSurfaceHandle);
++    if (mailbox.IsZero() && want_scanout) {
++      // FAIL SOFT, in the only direction that is safe. If the AHB-capable
++      // allocation is refused (an odd size, a driver without the usage combo),
++      // fall back to the plain plane: the DP overlay path then finds no
++      // AHardwareBuffer to extract, does not stage an atlas, and the GPU thread
++      // keeps compositing the plane browser-side exactly as it does with the
++      // switch off. Losing an optimisation beats losing the over-content.
++      mailbox = skia_output_surface_->CreateSharedImage(
++          format, size, color_space, RenderPassAlphaType::kPremul, plain_usage,
++          "DisplayXROverPlane", gpu::kNullSurfaceHandle);
++      static bool logged_scanout_fallback = false;
++      if (!logged_scanout_fallback) {
++        logged_scanout_fallback = true;
++        LOG(WARNING) << "[DisplayXR] inline-3D over-plane: SCANOUT allocation "
++                        "refused at "
++                     << size.ToString()
++                     << "; falling back to a non-AHB plane (the DP overlay "
++                        "atlas is off, the browser-side composite stays on)";
++      }
++    }
+     if (mailbox.IsZero()) {
+       DLOG(ERROR) << "[DisplayXR] inline-3D plane-split: over-plane "
+                      "CreateSharedImage failed";
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+index 424e7eaede517..ecf80c73499ee 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.cc
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -44,6 +44,17 @@ bool DisplayXRWeaveProvider::BatchKeepPrevious(const gfx::Rect& window_rect,
+ void DisplayXRWeaveProvider::SetBatchWish(
+     const std::vector<gfx::Rect>& flat_rects) {}
+ 
++#if BUILDFLAG(IS_ANDROID)
++// v4 DP-composited overlay atlas default: refuse. A provider that cannot stage
++// an atlas must say so, because the caller uses the return value to decide
++// whether to ALSO composite the over-plane itself - answering "yes" without
++// staging anything would drop the 2D content entirely.
++bool DisplayXRWeaveProvider::SetBatchOverlayAndroid(
++    uintptr_t ahardware_buffer) {
++  return false;
++}
++#endif
++
+ #if BUILDFLAG(IS_WIN)
+ bool DisplayXRWeaveProvider::SetBatchOverlay(ID3D11Device* device,
+                                              ID3D11Texture2D* atlas_tex,
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index 86971a58cc1e8..6d5e797cc9c1d 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -290,6 +290,27 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   // the browser-side kSrcOver the split does today. The runtime-side v4
+   // contract is shipped and unchanged, so keeping the wire binding costs
+   // nothing.
++#if BUILDFLAG(IS_ANDROID)
++  // Android twin of SetBatchOverlay (browser#18, XR_DXR_weave spec v4).
++  // |ahardware_buffer| is an AHardwareBuffer* carried as a uintptr_t (this
++  // header includes no Android platform header on purpose - see the note at the
++  // top): a WINDOW-SIZED, PREMULTIPLIED-alpha RGBA8 atlas with every 2D overlay
++  // already rastered at its own window position and flattened in stacking (z)
++  // order onto transparency. Its premultiplied ALPHA is the 2D-vs-3D mask; the
++  // DP composites final = woven*(1 - a) + overlay in the same pass that weaves.
++  //
++  // BORROWED, not owned: the caller must keep the buffer alive and readable
++  // across the following SubmitBatchSync() (in practice by holding the
++  // OverlayImageRepresentation read access that produced it), exactly like the
++  // input AHardwareBuffer handed to SetBatchInputAndroid.
++  //
++  // Call once per batch frame between BeginBatchSync and SubmitBatchSync.
++  // Returns true if the atlas was staged; a frame that never calls this, or
++  // whose call returns false, weaves with no overlay chain at all - byte-for-
++  // byte the pre-v4 submit. Default: no-op.
++  virtual bool SetBatchOverlayAndroid(uintptr_t ahardware_buffer);
++#endif
++
+ #if BUILDFLAG(IS_WIN)
+   virtual bool SetBatchOverlay(ID3D11Device* device,
+                                ID3D11Texture2D* atlas_tex,
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index aba2c63b44121..10143db675ad0 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -389,6 +389,11 @@ SkiaOutputSurfaceImplOnGpu::SkiaOutputSurfaceImplOnGpu(
+   // disagree.
+   inline3d_occlusion_enabled_ =
+       base::CommandLine::ForCurrentProcess()->HasSwitch("inline-3d-occlusion");
++  // (browser#18 v4) The second, independent switch: who composites the
++  // over-plane, not what is on it. See the member's header comment.
++  inline3d_dp_overlay_enabled_ =
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "inline-3d-dp-overlay");
+ 
+   weak_ptr_ = weak_ptr_factory_.GetWeakPtr();
+   buffer_presented_callback_ = CreateSafeRepeatingCallback(
+@@ -4115,6 +4120,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // Ungated, Phase (B) would blit the PREVIOUS page's whole woven texture over
+   // the new page — the navigation ghost.
+   [[maybe_unused]] bool wove_this_frame = false;
++  // (browser#18 v4, Android) True once the Phase-2 over-plane has been staged as
++  // the runtime DP's overlay atlas for THIS frame's submit. Phase (B) reads it
++  // to stand its own whole-window over-plane composite down, so the 2D is
++  // composited exactly once.
++  [[maybe_unused]] bool dp_overlay_staged_android = false;
+   for (size_t t = 0; t < inline_3d_rects_.size(); ++t) {
+     const base::Token key = DisplayXRTargetKey(inline_3d_rects_[t], t);
+     auto target_it = displayxr_targets_.find(key);
+@@ -4284,6 +4294,84 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         }
+       }
+     }
++
++    // ---- The DP-composited 2D overlay atlas (XR_DXR_weave v4) --------------
++    //
++    // The atlas is not assembled here and there is no copy: SkiaRenderer has
++    // ALREADY painted every 2D quad that sits in FRONT of a woven tile into
++    // |inline_3d_over_plane_mailbox_| - a window-sized, premultiplied-alpha
++    // RGBA8 plane, transparent everywhere outside the tile rects, flattened in
++    // stacking order. That is bit-for-bit the v4 contract (window-sized premul
++    // RGBA, alpha IS the 2D-vs-3D mask), so with --inline-3d-dp-overlay the
++    // plane is simply handed over instead of being blitted back by phase (B).
++    //
++    // The mac 0053 template needed a Chromium-allocated scratch to blit
++    // through, because MoltenVK exports its surfaces untagged. Android needs no
++    // such copy: the plane is AHardwareBuffer-backed in its own right (the
++    // SCANOUT usage SkiaRenderer adds under this switch is what selects
++    // AHardwareBufferImageBackingFactory), so the extraction is the SAME three
++    // calls the staging input uses.
++    //
++    // ORDER MATTERS: this runs AFTER FinishSkiaWritesForWeaveAndroid() above.
++    // The over-plane was painted by an earlier task on the same Skia context,
++    // and that submit-and-sync-to-CPU is what makes those writes complete
++    // before the runtime reads the buffer. There is no acquire fence on Android
++    // (spec v7), so "complete before the call" is the whole contract.
++    //
++    // The read access + fence-sync are held in THIS scope so they outlive
++    // SubmitBatchSync() below - the same lifetime rule as the input, and for
++    // the same reason: the access is what keeps the buffer alive and readable
++    // while the service process composites from it.
++    std::unique_ptr<gpu::OverlayImageRepresentation> over_overlay_rep;
++    std::unique_ptr<gpu::OverlayImageRepresentation::ScopedReadAccess>
++        over_overlay_read;
++    std::unique_ptr<base::android::ScopedHardwareBufferFenceSync> over_ahb;
++    if (inline3d_dp_overlay_enabled_ && inline3d_occlusion_enabled_ &&
++        !inline_3d_over_plane_mailbox_.IsZero() &&
++        inline_3d_over_plane_size_ == window_bounds.size()) {
++      over_overlay_rep =
++          shared_image_representation_factory_->ProduceOverlayForWeave(
++              inline_3d_over_plane_mailbox_);
++      over_overlay_read = over_overlay_rep
++                              ? over_overlay_rep->BeginScopedReadAccess()
++                              : nullptr;
++      // GetAHardwareBufferFenceSync(), NOT GetAHardwareBuffer() - the base
++      // OverlayImageRepresentation::GetAHardwareBuffer() is a bare NOTREACHED()
++      // and only the FenceSync form is overridden by the AHB backing. Same
++      // hazard, same answer, as the staging extraction above.
++      over_ahb = over_overlay_read
++                     ? over_overlay_read->GetAHardwareBufferFenceSync()
++                     : nullptr;
++      AHardwareBuffer* overlay_ahb = over_ahb ? over_ahb->buffer() : nullptr;
++      if (overlay_ahb) {
++        dp_overlay_staged_android = provider->SetBatchOverlayAndroid(
++            reinterpret_cast<uintptr_t>(overlay_ahb));
++      }
++      if (!dp_overlay_staged_android) {
++        // FAIL SOFT: leave the flag false and phase (B) composites the plane
++        // browser-side exactly as it does with the switch off. Latched once per
++        // process - the condition is steady-state, not transient, and a
++        // per-frame line here is the log bloat the project's conventions ban.
++        static bool logged_no_overlay_ahb = false;
++        if (!logged_no_overlay_ahb) {
++          logged_no_overlay_ahb = true;
++          LOG(ERROR)
++              << "[DisplayXR] android weave: cannot stage the DP overlay atlas "
++                 "(rep="
++              << (over_overlay_rep ? "ok" : "NULL")
++              << " access=" << (over_overlay_read ? "ok" : "NULL")
++              << " ahb_sync=" << (over_ahb ? "ok" : "NULL") << " cleared="
++              << (over_overlay_rep
++                      ? (over_overlay_rep->IsCleared() ? "yes" : "NO")
++                      : "?")
++              << "); compositing the over-plane browser-side instead. "
++                 "access=NULL with cleared=NO means the cleared-state gate "
++                 "refused the read; otherwise the plane lacks SCANOUT usage "
++                 "(--inline-3d-dp-overlay must be on when the plane is "
++                 "ALLOCATED, not merely when it is read).";
++        }
++      }
++    }
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
+     // (browser#87) A batch with zero copied targets — or a failed submit RPC —
+@@ -5306,9 +5394,22 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // Mirror of the Windows/mac composites (see the Windows block for the
+     // per-pixel contract and the R9 no-double-count rule). LAST, so it wins
+     // over the draw-back — over means over.
++    //
++    // (browser#18 v4) ...unless the runtime's DP already composited that plane
++    // for us this frame. It composites INTO the woven output, so the pixels
++    // arrive through the per-rect blit above and drawing the plane again here
++    // would double-composite every translucent scrim.
++    //
++    // The known asymmetry, stated rather than discovered later: the browser-side
++    // draw is WHOLE-WINDOW while the blit above covers only |drawn_rect| per
++    // target. Those coincide on a healthy frame (the plane is transparent
++    // outside the tile rects by construction), and diverge on a frame where a
++    // target declined its weave - there the DP path loses that tile's 2D
++    // over-content, where the browser-side path would have kept it. That is
++    // precisely why --inline-3d-dp-overlay is opt-in.
+     bool over_plane_drawn = false;
+     const bool over_plane_size_ok =
+-        inline3d_occlusion_enabled_ &&
++        inline3d_occlusion_enabled_ && !dp_overlay_staged_android &&
+         !inline_3d_over_plane_mailbox_.IsZero() &&
+         inline_3d_over_plane_size_ == window_bounds.size();
+     auto over_rep = over_plane_size_ok
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 2037fa60e17ee..adb5fbf9ce1c2 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -819,6 +819,22 @@ class SkiaOutputSurfaceImplOnGpu
+   // content.
+   bool inline3d_occlusion_enabled_ = false;
+ 
++  // DisplayXR inline-3D (browser#18, XR_DXR_weave spec v4): cached
++  // --inline-3d-dp-overlay, read in the constructor beside the switch above.
++  // ANDROID ONLY in effect. When on, the Phase-2 over-plane is handed to the
++  // runtime's display processor as the v4 overlay atlas instead of being
++  // composited browser-side, and the plane is allocated with SCANOUT usage so it
++  // has an AHardwareBuffer to hand over (SkiaRenderer, same switch via
++  // DirectRenderer::IsInline3dDpOverlayEnabled - two readers, one switch, same
++  // process, so they cannot disagree).
++  //
++  // OFF by default. The browser-side composite is the shipping mechanism on all
++  // three platforms and is whole-window; the DP path composites inside the
++  // runtime's woven output, which the Android draw-back samples only at the
++  // rects it actually wove. Those coincide on a healthy frame and diverge on a
++  // recovery frame, so this stays opt-in until it has device miles.
++  bool inline3d_dp_overlay_enabled_ = false;
++
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+   // DisplayXR inline-3D (#625, Step B / B4d — GPU-resident weave) scratch
+   // SharedImage state. |mailbox| is an owned D3DImageBacking sized to a rect:
