@@ -50,14 +50,13 @@ GPU thread post-paint / pre-swap.
   `WeaveCompositedSurface` (+ `prefer_zero_copy`), `MaybeWeaveOutput` (GL path), `MaybeWeaveRootRenderPass`
   (DComp root render-pass path). Also `skia_output_surface_impl.{cc,h}`.
 
-  **Canvas resource join.** The aggregator records every resource-bearing quad
-  `{ResourceId, root-space rect, uv, SQS layer id, pass id}` and joins each inline-3D canvas to its
-  quad by **layer identity**, with a 70%-overlap geometric `best_match` as the fallback. **Not just
-  root-pass quads** (0081): a canvas inside the render surface a `backdrop-filter` forces onto its
-  enclosing effect node (`RenderSurfaceReason::kBackdropScope`) draws into a CHILD pass, so a
-  root-only search could never find it. A child-pass match is only accepted if the pass reaches the
-  root through trivially composited `RenderPassDrawQuad`s (opacity 1, `kSrcOver`, no filters/mask,
-  axis-aligned) — the weave draw-back is a root-space blit and cannot reproduce anything else.
+  **Canvas resource join.** The page flattens into ONE render pass here, so the aggregator records
+  every ROOT resource-bearing quad `{ResourceId, root-space rect, uv, SQS layer id}` and joins each
+  inline-3D canvas to its quad by **layer identity**, with a 70%-overlap geometric `best_match` as
+  the fallback. Quads outside that pool are recorded too but are **diagnostic only** (0081) — they
+  never win a join; they exist so the `ID-MATCH FALLBACK` marker can say whether an unmatched
+  element is drawn *somewhere the join does not look* or is **not drawn at all** (no
+  `SharedQuadState` anywhere), which need opposite follow-ups.
   **Submission is in lockstep with preparation** (0081): a tile with no resolved canvas resource is
   not suppressed from the page raster, so its rect is withheld from the weave submission entirely —
   weaving it would interlace whatever page content happens to be there. `Display` resolves `ResourceId → gpu::Mailbox`
@@ -70,11 +69,7 @@ GPU thread post-paint / pre-swap.
   declared. `DirectRenderer::ComputeInline3dPlaneSplit` walks the live `quad_list` at DRAW time
   — never the aggregation-time ordinals, which `RemoveOverdrawQuads()` and `ProcessForOverlays()`
   erase and reorder — finds each tile's canvas quad at index `k`, and takes the intersecting quads
-  in front of it as the OVER set (`[0, k)`; index 0 is frontmost). It descends from the root into
-  child passes that touch a tile (0081); a tile whose home pass is not the root gets **no**
-  over-plane — lifting a quad out of a child pass changes what it composites against — and instead
-  gets the D-prime treatment for every quad in front of it, in its own pass and up the ancestor
-  spine: those rects are clipped out of the woven draw-back and wished flat.
+  in front of it as the OVER set (`[0, k)`; index 0 is frontmost).
   `SkiaRenderer::MaybeDrawInline3dOverPlane` paints that set into a window-sized transparent premul
   RGBA8 plane through the root pass's target-to-device transform, so each quad lands in identical
   device pixels; a difference clip punches the tile rects out of the page draw; and phase (B) of

@@ -1,0 +1,383 @@
+From 0324d66f26e5922ae7ffb5a2dca37f1435178433 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 21 Aug 2026 17:43:29 -0700
+Subject: [PATCH] inline-3d(#117): never weave a region the page still owns,
+ and say WHY a tile did not join
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces the first 0081, which FAILED on hardware (composition sample, box run
+32533836796): "a heavy blurred veil on ALL the page, 3d assets either black or
+SBS underneath". This one is the small, provably-inert half of it plus the
+instrumentation that would have prevented the mistake.
+
+WHAT THE FAILING SITTING PROVED.
+
+The pre-declared falsification fired: `CHILD-PASS join` count 0 across the
+whole session, `tiles_in_child_pass=0` on every plane-split line, while
+`tiles_without_k=1` persisted. So the cross-pass join never engaged, and the
+entire draw-time half of that patch was INERT on the page that failed. It was
+a fix for a condition that page does not have.
+
+The new fallback counters say what the condition actually is. Steady state:
+
+  ID-MATCH FALLBACK: … target=878,698 796x796 among 41 candidate quads
+    (7 in child passes, 1 weavable passes, 0 inadmissible id hits)
+
+"1 weavable passes" is the root pass alone — every child pass touching a tile
+on that page is a backdrop-FILTER pass (the sample's .frostfull / .frosthalf /
+frosted header / .frostbadge), which the weavability gate refuses correctly
+because a root-space blit cannot reproduce a blur. And "0 inadmissible id
+hits" is the decisive number: NO quad anywhere in the frame — root pass, child
+pass, admissible or not — carries that element's layer id. The tile's layer
+emitted no SharedQuadState at all. No join, cross-pass or otherwise, could
+ever have matched it.
+
+So #117's third mechanism, as diagnosed, is not what that page suffers from,
+and the cross-pass join has zero hardware evidence behind it. It is withdrawn
+rather than shipped on a hypothesis. It is preserved verbatim in this repo's
+history (cr151 commit 17a2d4f, patch file at browser-wt-117 commit d30ec89)
+and can return the moment a log line justifies it.
+
+THE VEIL, CONCRETELY — AND IT IS NOT NEW.
+
+The mechanism is D-prime (0068) meeting a page built to stress it, and the
+sample states the contract it expects in its own markup (case 02: "the frost
+itself is crisp, and the region behind it reads FLAT"). What it gets is not
+flat, it is empty:
+
+  * Display::DrawAndSwap suppresses each joined tile's canvas resource from the
+    page raster — that is what lets the weave own those pixels;
+  * ComputeInline3dPlaneSplit records, for every backdrop-filter RPDQ over a
+    tile, `own_rect ∩ tile_rect` into inline3d_frosted_rects_;
+  * phase (B) clips the woven draw-back out of each of those rects
+    (SkClipOp::kDifference).
+
+Inside a frost rect the frame therefore has NEITHER the canvas (suppressed)
+NOR the weave (clipped). It has whatever was behind the canvas — and the
+sample's stages are deliberately bare ("A stage is VISUALLY BARE: no
+background, border, radius or overflow clip"), so what the blur samples is the
+flat page background. Dark. That is the reported "3d assets black", and the
+un-joined tile beside it is the reported "SBS".
+
+At the density this was designed against — the gallery's single frosted header
+band, `frosted=1` — the withheld strip was thin and sat over page chrome, so
+nobody saw it. This page runs `frosted=8` with `.frostfull{inset:-10px}`
+covering three entire tiles at once, so every covered asset goes dark and the
+page reads as veiled. The first 0081's own commit message asserted the
+opposite ("it is not a hole: suppression exposes the page background still
+drawn beneath it") — true, and irrelevant: when the frost covers the WHOLE
+tile, the page background IS the whole tile.
+
+That defect predates both 0080 and 0081 and is not addressed here. Fixing it
+means giving the frost something real to blur — a mono draw where the weave is
+withheld — or not withholding the weave when the frost covers most of a tile.
+Both are D-prime design changes and neither belongs in a #117 patch.
+
+WHAT THIS PATCH DOES.
+
+(1) WEAVE SUBMISSION MOVES IN LOCKSTEP WITH PAGE PREPARATION (display.cc).
+
+Display::DrawAndSwap submitted a weave rect for EVERY tracked rect,
+unconditionally — including tiles it had just failed to resolve and had
+therefore NOT suppressed from the page raster. Those rects still hold ordinary
+page pixels; for a tile straddling the top of the viewport, clipped to a 198px
+strip, those pixels are the site's sticky header. The runtime was told to
+weave it, and did: the gallery's title came back interlaced. That is content
+with nothing to do with inline-3D being corrupted by it.
+
+It is the exact inverse of web#12's "never weave the hole" law, and it slips
+past that law's own guard: the GPU-side check refuses to SNAPSHOT such a tile,
+but 0074's keep-previous rescue then re-submits the rect from inside that very
+branch, so it reached the runtime's batch anyway.
+
+A rect is now submitted only if this frame prepared it: the tile has a
+resolved canvas layer, OR nothing resolved at all this frame (in which case no
+canvas quad was suppressed and snapshotting the page is the legitimate
+pre-browser#18 weave source). That is precisely the predicate the GPU stage
+already applies one stage later; moving it EARLIER is what stops the rect
+reaching the batch at all.
+
+KNOWN TRADE, stated rather than discovered later: a tile that loses its
+resource can no longer be rescued by 0074's keep-previous, because its rect is
+not in the batch to be kept. It shows the page's own drawing instead of a
+stale stereo frame. That is the same "strictly better failure" web#12 chose —
+the page draws the tile exactly as a page with no inline-3D would — and it is
+the only direction that guarantees the runtime never weaves page chrome.
+Withholding is counted at LOG(ERROR) on 0073's discipline, because it is also
+the moment a tile stops weaving and must never be silent. On the composition
+sample it fires for 1 of 5 tiles in steady state and 3 of 4 at some scroll
+positions, which is a real amount of lost weaving and exactly why it is loud.
+
+(2) THE FALLBACK MARKER STOPS GUESSING (surface_aggregator.{h,cc}).
+
+"layer_id stamped but no root quad carries it (canvas quad occluded, in a
+child pass, or resource not ready)" bundled three situations needing opposite
+follow-ups behind one string, and the withdrawn patch picked the wrong one.
+The marker now splits them on evidence:
+
+  * elsewhere > 0 — the element IS drawn, by a quad in a pass this join does
+    not search. A join problem; the pass id names the isolation.
+  * elsewhere = 0 — NOTHING in the frame carries this layer id. The layer
+    emitted no SharedQuadState, so no join could match it: not in the drawn
+    layer list, or the resource is not ready. A cc/producer problem.
+
+To answer that question the aggregator has to have LOOKED outside the root
+resolved pass, so it now records those quads too — and |from_root_resolved_pass|
+is what keeps this strictly an observability change. Both joins skip any
+candidate without that flag, so the admitted pool is the EXACT pool the old
+recording condition produced and the matched set is bit-identical to 0080.
+Verified by inspection of the diff: the only non-comment changes in the joins
+are the two `if (!cand.from_root_resolved_pass) continue;` guards. The
+diagnostic entries are capped at 512.
+
+Files:
+  components/viz/service/display/display.cc
+  components/viz/service/display/surface_aggregator.{h,cc}
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ components/viz/service/display/display.cc     | 57 +++++++++++++
+ .../viz/service/display/surface_aggregator.cc | 81 +++++++++++++++++--
+ .../viz/service/display/surface_aggregator.h  | 15 ++++
+ 3 files changed, 147 insertions(+), 6 deletions(-)
+
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index d652a9f..f31982f 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1055,11 +1055,68 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+     if (skia_output_surface_) {
+       // Phase-1 identity: the GPU stage keys its per-target weave state by the
+       // element token, so carry {rect, id} rather than bare rects.
++      //
++      // (browser#117) NEVER WEAVE A REGION YOU DID NOT PREPARE. This list used
++      // to be every tracked rect, unconditionally. That is the inverse of
++      // web#12's "never weave the hole" law and it is just as damaging: a tile
++      // whose canvas quad could not be resolved this frame is NOT suppressed
++      // from the page raster, so its rect still holds ordinary page pixels —
++      // and on a tile straddling the top of the viewport those pixels are the
++      // site's own sticky header. Submitting the rect anyway told the runtime
++      // to weave the header: the title came back interlaced (2D chrome pushed
++      // through the lenticular lattice) while the unsuppressed remainder of the
++      // tile below showed its raw side-by-side buffer. Doubly wrong, and the
++      // half that corrupts UNRELATED content is the worse half.
++      //
++      // So weave submission and page preparation move in LOCKSTEP: a rect is
++      // submitted only if this frame prepared it. "Prepared" is exactly the
++      // predicate the GPU stage already applies one stage later
++      // (skia_output_surface_impl_on_gpu.cc, "NEVER WEAVE THE HOLE") — the tile
++      // has a resolved canvas layer, OR nothing at all resolved this frame, in
++      // which case no canvas quad was suppressed and snapshotting the page is
++      // the legitimate pre-browser#18 weave source. Moving the same test
++      // EARLIER is what stops the rect reaching the runtime's batch at all,
++      // which the GPU-side skip could not do on its own: 0074's keep-previous
++      // rescue re-submits the rect from that very branch.
++      //
++      // The tile loses nothing it had. It is not suppressed, so the page draws
++      // it exactly as a page with no inline-3D would — the same "strictly
++      // better failure" web#12 chose, now applied to the submission too.
+       std::vector<SkiaOutputSurface::Inline3dRect> weave_rects;
+       weave_rects.reserve(frame.inline_3d_rects.size());
++      int unprepared = 0;
+       for (const auto& r : frame.inline_3d_rects) {
++        bool prepared = resolved_canvas.empty();
++        for (const auto& layer : resolved_canvas) {
++          // Identity where there is one; the legacy zero-id channel has only
++          // geometry, and Display's own tile join above uses the same pair of
++          // tests in the same order.
++          if (!r.id.is_zero() ? layer.id == r.id : layer.rect == r.rect) {
++            prepared = true;
++            break;
++          }
++        }
++        if (!prepared) {
++          ++unprepared;
++          continue;
++        }
+         weave_rects.push_back({r.rect, r.id});
+       }
++      if (unprepared > 0) {
++        // LOG(ERROR) on 0073's discipline (first 3, then 1-in-300): withholding
++        // a rect is the correct outcome but it is also the moment the tile
++        // stops weaving, so it must never be silent.
++        static int s_unprepared = 0;
++        const int n = s_unprepared++;
++        if (n < 3 || (n % 300) == 0) {
++          LOG(ERROR) << "[DisplayXR] inline-3D withheld " << unprepared
++                     << " of " << frame.inline_3d_rects.size()
++                     << " weave rects: no canvas resource resolved, so the page"
++                        " still owns those pixels and the weave must not touch"
++                        " them (withheld="
++                     << (n + 1) << ")";
++        }
++      }
+       skia_output_surface_->SetInline3DRects(std::move(weave_rects),
+                                              std::move(resolved_canvas));
+     }
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 432ac77..7f67d81 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -1491,8 +1491,28 @@ void SurfaceAggregator::CopyQuadsToPass(
+         // emits such a quad whose SharedImage is that layer's isolated content.
+         // At Aggregate() end the ones matching an inline-3D canvas rect are the
+         // isolated canvas resources the weave stage feeds as weave INPUT.
+-        if (resolved_pass.is_root() &&
+-            quad_data.remapped_resource_id != kInvalidResourceId) {
++        //
++        // browser#117: also record quads from NON-root resolved passes, purely
++        // so the fallback marker below can tell "no quad anywhere carries this
++        // element's layer id" apart from "a quad does carry it, but in a pass
++        // this join does not search". Those two need opposite follow-ups and
++        // were indistinguishable, which is what made the first attempt at this
++        // issue chase the wrong one.
++        //
++        // DIAGNOSTIC ONLY, and the |from_root_resolved_pass| flag is what keeps
++        // it so: every join below admits candidates on that flag, i.e. on the
++        // EXACT predicate this condition used before, so the matched set is
++        // bit-identical to the 0080 build. Nothing here changes a pixel — it
++        // only makes an existing ambiguity observable. Making the join actually
++        // follow the identity across passes is a separate, unproven change and
++        // is deliberately NOT in this patch.
++        const bool from_root_resolved_pass = resolved_pass.is_root();
++        if (quad_data.remapped_resource_id != kInvalidResourceId &&
++            (from_root_resolved_pass ||
++             cross_pass_diag_quads_ < kMaxCrossPassDiagQuads)) {
++          if (!from_root_resolved_pass) {
++            ++cross_pass_diag_quads_;
++          }
+           // Map quad->rect (quad content space) to ROOT space: first the quad's
+           // SharedQuadState quad_to_target_transform (→ dest pass target), then
+           // the dest pass's transform_to_root_target. Without the SQS transform
+@@ -1533,7 +1553,8 @@ void SurfaceAggregator::CopyQuadsToPass(
+                                                      quad->visible_rect),
+                uv, dest_sqs ? dest_sqs->layer_id : 0u,
+                dest_sqs ? dest_sqs->layer_namespace_id
+-                        : std::pair<uint32_t, uint32_t>()});
++                        : std::pair<uint32_t, uint32_t>(),
++               dest_pass->id, from_root_resolved_pass});
+         }
+       }
+     }
+@@ -2213,6 +2234,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   tracked_element_rects_ = {};
+   inline_3d_rects_ = {};
+   root_resource_quads_ = {};
++  cross_pass_diag_quads_ = 0;
+ 
+   ResolvedFrameData* resolved_frame = GetResolvedFrame(surface_id);
+ 
+@@ -2487,6 +2509,12 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     // when exactly one candidate qualifies — the slow-scroll/steady case.
+     int64_t best_score = -1;
+     for (const RootResourceQuad& cand : quads) {
++      // browser#117: candidates recorded for DIAGNOSIS ONLY are not join
++      // candidates. This restores the exact pool the recording condition used
++      // to produce, so widening that condition cannot move a single match.
++      if (!cand.from_root_resolved_pass) {
++        continue;
++      }
+       const gfx::Rect& qr = cand.rect;
+       if (qr.IsEmpty()) {
+         continue;
+@@ -2535,6 +2563,10 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     }
+     std::optional<RootResourceQuad> found;
+     for (const RootResourceQuad& cand : quads) {
++      // browser#117: diagnostic-only entries never win a join — see best_match.
++      if (!cand.from_root_resolved_pass) {
++        continue;
++      }
+       if (cand.sqs_layer_id == target.sqs_layer_id &&
+           cand.layer_namespace_id == target.layer_namespace_id) {
+         // LAST match wins, matching best_match's tie policy: one layer can
+@@ -2668,19 +2700,56 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       // different follow-ups, and telling them apart from a log is the whole
+       // value of the marker. Throttled: a persistent fallback would otherwise
+       // spam at frame rate.
++      //
++      // browser#117: "no root quad carries it" used to bundle three very
++      // different situations behind one string — occluded, in a child pass, or
++      // resource not ready — and the first attempt at this issue picked the
++      // wrong one and shipped a fix for a condition the failing page did not
++      // have. Split it on evidence instead. |elsewhere| is the number of quads
++      // that DO carry this element's (namespace, layer id) but were recorded
++      // only for diagnosis, i.e. live in a pass this join does not search.
++      //
++      //   elsewhere > 0 → the element IS being drawn, just not where the join
++      //                   looks. That is a join problem, and the pass id names
++      //                   the isolation that caused it.
++      //   elsewhere = 0 → NOTHING in the frame carries this layer id. The
++      //                   layer emitted no SharedQuadState at all, so no join
++      //                   could ever have matched it: the element is not in the
++      //                   drawn layer list, or its resource is not ready. That
++      //                   is a cc/producer problem, not a join problem.
++      size_t elsewhere = 0;
++      AggregatedRenderPassId elsewhere_pass;
++      if (canvas.sqs_layer_id != 0) {
++        for (const RootResourceQuad& cand : root_resource_quads_) {
++          if (!cand.from_root_resolved_pass &&
++              cand.sqs_layer_id == canvas.sqs_layer_id &&
++              cand.layer_namespace_id == canvas.layer_namespace_id) {
++            ++elsewhere;
++            elsewhere_pass = cand.pass_id;
++          }
++        }
++      }
+       const char* reason =
+           canvas.sqs_layer_id == 0
+               ? "no layer_id stamped (legacy/TreesInViz channel or pre-Phase-1 "
+                 "renderer)"
+-              : "layer_id stamped but no root quad carries it (canvas quad "
+-                "occluded, in a child pass, or resource not ready)";
++          : elsewhere > 0
++              ? "layer_id stamped and DRAWN, but only by a quad in a pass this "
++                "join does not search (cross-pass isolation)"
++              : "layer_id stamped but NO quad anywhere in the frame carries it "
++                "— the layer emitted no SharedQuadState (not in the drawn "
++                "layer "
++                "list, or resource not ready); no join could match it";
+       static int fallback_dbg = 0;
+       if ((fallback_dbg++ % 60) == 0) {
+         VLOG(1) << "[DisplayXR] inline-3D ID-MATCH FALLBACK: reason=" << reason
+                 << " id=" << canvas.id.ToString()
+                 << " layer_id=" << canvas.sqs_layer_id
+                 << " target=" << canvas.rect.ToString() << " among "
+-                << root_resource_quads_.size() << " root quads";
++                << root_resource_quads_.size() << " quads ("
++                << cross_pass_diag_quads_
++                << " diagnostic-only), elsewhere=" << elsewhere << " pass="
++                << (elsewhere ? elsewhere_pass.GetUnsafeValue() : 0u);
+       }
+       // browser#117: the fallback compares on the COMMON visible space, so a
+       // tile that is only partly on screen scores against its own quad exactly
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index 3b1618d..05e2810 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -523,8 +523,23 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+     // renderer did not stamp one (legacy channel / older renderer).
+     uint32_t sqs_layer_id = 0;
+     std::pair<uint32_t, uint32_t> layer_namespace_id;
++    // browser#117, DIAGNOSTIC ONLY. |pass_id| is the aggregated pass the quad
++    // was copied into; |from_root_resolved_pass| is whether it came out of a
++    // surface's ROOT resolved pass — the exact predicate that used to decide
++    // whether this quad was recorded at all. Every join admits candidates on
++    // |from_root_resolved_pass| and nothing else, so the matched set is
++    // unchanged; the two fields exist so the ID-MATCH FALLBACK marker can say
++    // whether an unmatched element's quad is NOWHERE or merely somewhere this
++    // join does not look. Those two need opposite follow-ups.
++    AggregatedRenderPassId pass_id;
++    bool from_root_resolved_pass = true;
+   };
+   std::vector<RootResourceQuad> root_resource_quads_;
++  // browser#117: how many diagnostic-only (non-root-resolved-pass) entries are
++  // in |root_resource_quads_|, capped so a pathological page cannot turn an
++  // observability aid into an unbounded per-frame allocation.
++  static constexpr size_t kMaxCrossPassDiagQuads = 512;
++  size_t cross_pass_diag_quads_ = 0;
+ };
+ 
+ }  // namespace viz
