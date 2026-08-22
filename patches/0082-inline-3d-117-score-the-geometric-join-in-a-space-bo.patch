@@ -1,0 +1,239 @@
+From 9d517a2e1b1f82a6f3bcce2c7c23de0a4b9b9d65 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Fri, 21 Aug 2026 22:15:59 -0700
+Subject: [PATCH] =?UTF-8?q?inline-3d(#117):=20score=20the=20geometric=20jo?=
+ =?UTF-8?q?in=20in=20a=20space=20both=20rects=20can=20occupy=20=E2=80=94?=
+ =?UTF-8?q?=20the=20top-edge=20raw=20SBS?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ROOT CAUSE of the last standing #117 symptom: "content weaves ok, shows SBS
+when leaving from the top less than 50%. No such problem on the bottom."
+Reproduced on the model sample, which has no frost, no sticky header and no
+child render passes — so neither the frosted-header theory nor the cross-pass
+join (withdrawn in 0081) could ever have explained it.
+
+It is an arithmetic defect in one line of the geometric fallback, and both
+fingerprints — TOP-only, and a threshold — fall straight out of it.
+
+THE TWO HALVES ARE CLIPPED TO DIFFERENT SPACES, STILL.
+
+A tracked rect is clipped by TransformRectToDestRootTargetSpace (this file,
+~line 406) to |dest_root_target_clip_rect| — the EMBEDDING SURFACE's own
+root-space footprint, i.e. the web contents area. On a browser window that area
+begins BELOW the tab strip and toolbar: every tracked rect in every capture from
+the reporting machine is floored at exactly y=218, on two unrelated pages.
+
+|root_output_rect| (browser#94) is the whole WINDOW — "outside root 0,0
+2593x1974" in the same logs — starting at y=0.
+
+0080 made best_match clip BOTH rects before taking the ratio, and that was the
+right idea; it just clipped them to |root_output_rect|, which the target can
+never reach. So for a tile crossing the TOP, the candidate keeps a band 218px
+tall that the target cannot have, and that band goes into the denominator:
+
+    score(v) = 1000·v / (v + 218)
+
+for a tile with v pixels still visible. That crosses the 700 bar at v = 509 —
+48.8% of the sample's 1043px tile. Below it the tile matches nothing, is
+neither suppressed nor woven, and the page draws its raw side-by-side buffer.
+
+The held failing frame is this equation and nothing else:
+
+    target=204,218 1043x481   (46.1% visible)   ->   score 688   vs bar 700
+
+At the BOTTOM edge there is no chrome below the contents, so the surface clip
+and the window clip share an edge, the band is zero, and the score is ~1000 at
+any visibility. That is the reported "no such problem on the bottom", and it is
+why this survived every bottom-edge sweep including 0080's hardware pass.
+
+It also explains the history. Pre-0080 the denominator was the unclipped quad
+area and the bar behaved as a ~70%-VISIBILITY gate (the original report). 0080
+moved it to ~49% and the symptom shrank rather than disappearing — which is
+exactly what the field reports did, from "below ~70%" to "less than 50%".
+
+FIX. Clip to a space both rects can actually occupy. Each Inline3dTrackedRect
+now carries the clip it was cut with, and |common_clip_for| cuts the candidate
+with the same one (further intersected with |root_output_rect|, so it is never
+larger and browser#94's off-viewport reasoning is untouched). Applied at both
+scoring sites — the fallback itself and dup_rank. Bottom, sides and the fully
+visible case are unaffected: there the clip already agreed, so the score does
+not move.
+
+DIAGNOSTIC. The "NO match" line now prints the best REJECTED score and the clip
+it was taken in. 688-against-700 and 20-against-700 mean completely different
+things, and printing neither is why an arithmetic near-miss read for months as
+a mysterious visibility cliff. The next capture confirms or refutes this fix
+from that number alone.
+
+STILL OPEN, deliberately not fixed here. The IDENTITY join is dead for this
+element at EVERY scroll position — "NO quad anywhere in the frame carries it",
+elsewhere=0, on frames that wove correctly as well as frames that did not. The
+element's quad IS present and IS correct (above the threshold the fallback
+adopts it and the tile weaves right), so this is a STAMPING mismatch, not the
+layer being culled: the drawing layer's SharedQuadState does not carry the id
+that CollectTrackedElementRects stamped on the rect. That is a real second
+defect — it means the whole path runs on a geometric guess — but it is not what
+draws raw SBS, and it wants its own investigation with its own hardware gate.
+Fixing the arithmetic restores correct weaving at every visibility regardless of
+which of the two joins lands the match.
+
+Files:
+  components/viz/service/display/surface_aggregator.{h,cc}
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../viz/service/display/surface_aggregator.cc | 64 +++++++++++++++++--
+ .../viz/service/display/surface_aggregator.h  |  7 ++
+ 2 files changed, 65 insertions(+), 6 deletions(-)
+
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 7f67d81..d371abb 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2476,6 +2476,34 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   // buffer. Clipping BOTH rects to the root pass footprint first removes the
+   // asymmetry: a 40%-visible tile now scores ~1000 against its own quad, and
+   // the bar goes back to meaning "is this the same element".
++  //
++  // browser#117 (TOP-EDGE DEFECT). |root_output_rect| alone is the WRONG common
++  // clip, and it is wrong in one direction only, which is why this reproduced
++  // at the top of the viewport and never at the bottom.
++  //
++  // A tracked rect is clipped by TransformRectToDestRootTargetSpace to the
++  // EMBEDDING SURFACE's root-target clip — the web contents area, which on a
++  // browser window begins below the tab strip and toolbar (y=218 device px on
++  // the reporting machine; every tracked rect in every capture is floored at
++  // exactly that value). |root_output_rect| is the whole WINDOW, from y=0.
++  // Clipping the candidate to the window therefore leaves it holding a band of
++  // height 218 that the target cannot have, and that band inflates the
++  // denominator:
++  //
++  //   score(v) = 1000·v / (v + 218)      for a tile of height H crossing the
++  //                                       TOP with v pixels still visible
++  //
++  // which crosses the 700 bar at v = 509, i.e. 48.8% of a 1043px tile. Below
++  // that the tile matches nothing, is neither suppressed nor woven, and the
++  // page draws its raw side-by-side buffer. The held failing frame is exactly
++  // this: target 204,218 1043x481 (46.1% visible) scores 688. At the BOTTOM
++  // edge there is no chrome below the contents, so both rects are clipped at
++  // the same y, the band is zero and the score is ~1000 at any visibility —
++  // which is precisely the reported "no such problem on the bottom".
++  //
++  // 0080 made this comparison clip-symmetric in NAME; the fix is to clip to a
++  // space both rects can actually occupy. Each tracked rect now carries the
++  // clip it was cut with, and the candidate is cut with the same one.
+   auto overlap_score = [](const gfx::Rect& a, const gfx::Rect& b,
+                           const gfx::Rect& clip) -> int64_t {
+     gfx::Rect ca = a;
+@@ -2493,6 +2521,18 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     }
+     return (ia * 1000) / max_area;
+   };
++  // browser#117: the space BOTH halves of a comparison against |canvas| can
++  // occupy — the root pass footprint further cut by whatever clip that rect was
++  // already cut with. Never larger than |root_output_rect|, so the browser#94
++  // off-viewport reasoning is unaffected.
++  auto common_clip_for =
++      [&root_output_rect](const Inline3dTrackedRect& canvas) {
++        gfx::Rect clip = root_output_rect;
++        if (canvas.root_target_clip) {
++          clip.Intersect(*canvas.root_target_clip);
++        }
++        return clip;
++      };
+   auto best_match = [&overlap_score](const gfx::Rect& target,
+                                      const std::vector<RootResourceQuad>& quads,
+                                      const gfx::Rect& clip)
+@@ -2508,6 +2548,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     // header. Ties keep the later (topmost) quad, preserving the old behaviour
+     // when exactly one candidate qualifies — the slow-scroll/steady case.
+     int64_t best_score = -1;
++    int64_t best_rejected = -1;
+     for (const RootResourceQuad& cand : quads) {
+       // browser#117: candidates recorded for DIAGNOSIS ONLY are not join
+       // candidates. This restores the exact pool the recording condition used
+@@ -2522,6 +2563,11 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       // browser#117: both rects clipped to |clip| before the ratio, so partial
+       // visibility can never read as a mismatch.
+       const int64_t score = overlap_score(qr, target, clip);
++      // browser#117: remember the best REJECTED score too. A near-miss (say
++      // 688 against the 700 bar) and a nothing-like-it miss (say 20) mean
++      // completely different things, and the top-edge defect was invisible for
++      // as long as the log printed neither.
++      best_rejected = std::max(best_rejected, score);
+       if (score < 700) {
+         continue;
+       }
+@@ -2542,7 +2588,9 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       if ((miss_dbg++ % 60) == 0) {
+         VLOG(1) << "[DisplayXR] inline-3D NO match for target="
+                 << target.ToString() << " among " << quads.size()
+-                << " root quads — overlay left to the page this frame";
++                << " root quads (best rejected score=" << best_rejected
++                << "/1000, bar=700, clip=" << clip.ToString()
++                << ") — overlay left to the page this frame";
+       }
+     }
+     return found;
+@@ -2611,7 +2659,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+         return 0;
+       }
+       return 1 + std::max<int64_t>(
+-                     0, overlap_score(m->rect, r.rect, root_output_rect));
++                     0, overlap_score(m->rect, r.rect, common_clip_for(r)));
+     };
+     std::vector<Inline3dTrackedRect> deduped;
+     deduped.reserve(inline_3d_rects_.size());
+@@ -2754,7 +2802,8 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       // browser#117: the fallback compares on the COMMON visible space, so a
+       // tile that is only partly on screen scores against its own quad exactly
+       // as a fully visible one does.
+-      m = best_match(canvas.rect, root_resource_quads_, root_output_rect);
++      m = best_match(canvas.rect, root_resource_quads_,
++                     common_clip_for(canvas));
+     }
+     if (m) {
+       frame.inline_3d_canvas_resources.push_back(
+@@ -2946,7 +2995,10 @@ void SurfaceAggregator::CollectTrackedElementRects(
+             {TransformRectToDestRootTargetSpace(
+                  rect_data.visible_bounds, target_transform,
+                  transform_to_root_target, root_target_clip_rect),
+-             rect_data.id, rect_data.sqs_layer_id, client_namespace_id});
++             rect_data.id, rect_data.sqs_layer_id, client_namespace_id,
++             // browser#117: keep the clip that was just applied. The join needs
++             // it to compare this rect against an UNCLIPPED quad rect fairly.
++             root_target_clip_rect});
+         has_tracked_inline3d = true;
+       }
+       if (has_tracked_inline3d) {
+@@ -2979,8 +3031,8 @@ void SurfaceAggregator::CollectTrackedElementRects(
+           {TransformRectToDestRootTargetSpace(rect, target_transform,
+                                               transform_to_root_target,
+                                               root_target_clip_rect),
+-           base::Token(), /*sqs_layer_id=*/0u,
+-           std::pair<uint32_t, uint32_t>()});
++           base::Token(), /*sqs_layer_id=*/0u, std::pair<uint32_t, uint32_t>(),
++           root_target_clip_rect});
+     }
+   }
+ }
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index 05e2810..e499bb0 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -492,6 +492,13 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+     base::Token id;
+     uint32_t sqs_layer_id = 0;
+     std::pair<uint32_t, uint32_t> layer_namespace_id;
++    // browser#117: the root-space clip that TransformRectToDestRootTargetSpace
++    // already applied to |rect| — the embedding surface's own footprint, which
++    // on a browser window starts BELOW the top chrome, not at the window's
++    // y=0. The geometric fallback has to compare in this space or it is not
++    // comparing like with like; see |overlap_score|. Nullopt only when the rect
++    // reached us unclipped.
++    std::optional<gfx::Rect> root_target_clip;
+   };
+   std::vector<Inline3dTrackedRect> inline_3d_rects_;
+ 
