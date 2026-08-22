@@ -1,4 +1,4 @@
-From 06c22db8faac1151fe49ded1b4cf88012020930f Mon Sep 17 00:00:00 2001
+From c7746454f841d3069e5c62c61e60ab32e0aeb6a6 Mon Sep 17 00:00:00 2001
 From: David <dfattal@gmail.com>
 Date: Thu, 20 Aug 2026 07:45:06 +0000
 Subject: [PATCH] chore(android): label the launcher icon "DisplayXR Browser"

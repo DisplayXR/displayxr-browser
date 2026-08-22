@@ -1,8 +1,11 @@
-From 3b6a64492aaee19315b2e4e1b354d57ee1b3bd9e Mon Sep 17 00:00:00 2001
+From ecdee00f0ce99d03a80512ea53c20e049a30e8f1 Mon Sep 17 00:00:00 2001
 From: David <dfattal@gmail.com>
 Date: Sat, 22 Aug 2026 06:26:35 +0000
 Subject: [PATCH] fix(android): draw the woven output whole-window, not per
  submit-time rect
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Device report after the browser#87 draw-back fix: no more 2D stamping, all
 seven tiles weave, but during a scroll the woven content TRAILS its element by
@@ -56,14 +59,21 @@ blits - fewer draw calls, more texels, well under a millisecond on this Adreno.
 The frame is still dominated by the unchanged synchronous submit (~5.5-6.5 ms
 at full res, one batch call for all rects).
 
+AND COUNT WHAT WOVE, not what exists. Once the draw is one whole-window blit
+there is no per-tile draw left to count, and reporting displayxr_targets_.size()
+made the diagnostic read "drew back 6" on a frame where five tiles wove and one
+did not — evidence pointing away from the very tile that was broken. |drawn_rect|
+is non-empty exactly for the targets that took part in THIS frame's weave, so
+count those.
+
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
 ---
- .../skia_output_surface_impl_on_gpu.cc        | 86 ++++++++++++-------
- 1 file changed, 53 insertions(+), 33 deletions(-)
+ .../skia_output_surface_impl_on_gpu.cc        | 97 ++++++++++++-------
+ 1 file changed, 64 insertions(+), 33 deletions(-)
 
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 269c7fa731e9b..5a8d89a03649a 100644
+index 269c7fa731e9b..e7f94b5348c2b 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 @@ -5376,32 +5376,54 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
@@ -144,7 +154,7 @@ index 269c7fa731e9b..5a8d89a03649a 100644
      //
      // (browser#88 Stage 3 - D') ...except inside the FROSTED rects, which are
      // subtracted from every one of these draws with a kDifference clip. Those
-@@ -5443,21 +5465,19 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -5443,21 +5465,30 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          out_canvas->clipRect(gfx::RectToSkRect(frosted), SkClipOp::kDifference,
                               /*doAntiAlias=*/false);
        }
@@ -170,7 +180,18 @@ index 269c7fa731e9b..5a8d89a03649a 100644
                                    &paint, SkCanvas::kStrict_SrcRectConstraint);
          drew_any = true;
 -        ++rects_drawn;
-+        rects_drawn = static_cast<int>(displayxr_targets_.size());
++        // COUNT WHAT WOVE, not what exists. The draw is now one whole-window
++        // blit, so there is no per-tile draw to count — but reporting
++        // displayxr_targets_.size() here would report the target COUNT and read
++        // as "6 tiles drawn back" on a frame where only 5 of them actually
++        // wove, which is the opposite of diagnostic. |drawn_rect| is non-empty
++        // exactly for the targets that took part in THIS frame's weave, so
++        // count those.
++        for (const auto& [tgt_key, tgt_st] : displayxr_targets_) {
++          if (!tgt_st.drawn_rect.IsEmpty()) {
++            ++rects_drawn;
++          }
++        }
        }
      }
      if (!frosted_rects.empty()) {
