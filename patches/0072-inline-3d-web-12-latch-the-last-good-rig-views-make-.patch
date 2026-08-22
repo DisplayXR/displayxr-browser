@@ -1,4 +1,4 @@
-From 915f78e04de2a3523780618040f8ae0f9debe32f Mon Sep 17 00:00:00 2001
+From c370569f69f0274db902078a58dac13418d62021 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 21:11:42 -0700
 Subject: [PATCH] inline-3d(web#12): latch the last-good rig views, make the
@@ -297,10 +297,10 @@ index b0fa3703cf233..c9a19e63ffdd8 100644
    bool active_ = false;
    // One deprecation warning per layer for the retired exclude/unexclude calls,
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.cc b/third_party/blink/renderer/modules/xr/xr_session.cc
-index bb7b3984c03a6..82ee1efb96a4f 100644
+index 9c6b569faa534..47e3ad8b7af42 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.cc
 +++ b/third_party/blink/renderer/modules/xr/xr_session.cc
-@@ -273,6 +273,11 @@ std::optional<V8XRDepthType::Enum> DepthTypeToEnum(
+@@ -275,6 +275,11 @@ std::optional<V8XRDepthType::Enum> DepthTypeToEnum(
    NOTREACHED();
  }
  
@@ -312,7 +312,7 @@ index bb7b3984c03a6..82ee1efb96a4f 100644
  }  // namespace
  
  #define DCHECK_HIT_TEST_SOURCES()                                         \
-@@ -1616,6 +1621,11 @@ void XRSession::ForceEnd(ShutdownPolicy shutdown_policy) {
+@@ -1632,6 +1637,11 @@ void XRSession::ForceEnd(ShutdownPolicy shutdown_policy) {
        layer->close();
      }
    }
@@ -324,7 +324,7 @@ index bb7b3984c03a6..82ee1efb96a4f 100644
  
    xr_->ExitPresent(
        BindOnce(&XRSession::OnExitPresent, WrapWeakPersistent(this)));
-@@ -2557,13 +2567,25 @@ void XRSession::UpdateInlineView() {
+@@ -2582,13 +2592,25 @@ void XRSession::UpdateInlineView() {
  
    // Mono inline path. If we were previously in the 2-view inline-3d layout,
    // drop it so we rebuild a single view.
@@ -353,7 +353,7 @@ index bb7b3984c03a6..82ee1efb96a4f 100644
    }
  
    float aspect = 1.0f;
-@@ -2634,9 +2656,45 @@ gfx::Rect XRSession::Inline3DSceneWindowRect() const {
+@@ -2659,9 +2681,45 @@ gfx::Rect XRSession::Inline3DSceneWindowRect() const {
    return gfx::ToRoundedRect(css_rect);
  }
  
@@ -400,7 +400,7 @@ index bb7b3984c03a6..82ee1efb96a4f 100644
  }
  
  void XRSession::RegisterDisplayLayer(XRDisplayLayer* layer) {
-@@ -2660,9 +2718,32 @@ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
+@@ -2685,9 +2743,32 @@ void XRSession::UnregisterDisplayLayer(XRDisplayLayer* layer) {
    display_layers_.erase(layer);
    // A closed scene layer must stop scoping the views (its canvas is gone), or
    // we'd keep building frusta for a stale rect.
@@ -436,7 +436,7 @@ index bb7b3984c03a6..82ee1efb96a4f 100644
    }
  }
  
-@@ -3160,6 +3241,7 @@ void XRSession::Trace(Visitor* visitor) const {
+@@ -3185,6 +3266,7 @@ void XRSession::Trace(Visitor* visitor) const {
    visitor->Trace(hit_test_source_ids_to_hit_test_sources_);
    visitor->Trace(hit_test_source_ids_to_transient_input_hit_test_sources_);
    visitor->Trace(views_);
@@ -445,7 +445,7 @@ index bb7b3984c03a6..82ee1efb96a4f 100644
    visitor->Trace(image_scores_resolvers_);
    EventTarget::Trace(visitor);
 diff --git a/third_party/blink/renderer/modules/xr/xr_session.h b/third_party/blink/renderer/modules/xr/xr_session.h
-index e3d8149430e11..7c1da0cca800c 100644
+index 52ae0d143a52b..82e0afcc421f1 100644
 --- a/third_party/blink/renderer/modules/xr/xr_session.h
 +++ b/third_party/blink/renderer/modules/xr/xr_session.h
 @@ -517,6 +517,11 @@ class XRSession final : public EventTarget,

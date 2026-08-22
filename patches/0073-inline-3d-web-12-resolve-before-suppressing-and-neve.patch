@@ -1,4 +1,4 @@
-From 8fd0071e3b78a0884fc137ee9e460c235b11b3e9 Mon Sep 17 00:00:00 2001
+From a1447154331c061d04584b7381b7062e10926131 Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 22:10:01 -0700
 Subject: [PATCH] inline-3d(web#12): resolve before suppressing, and never
@@ -134,10 +134,10 @@ index a5665b2f0e329..d239344dd6c1a 100644
    }
  
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index 3d1631de8972b..5f69e88260dca 100644
+index 125abbb6553e5..d652a9f8cd398 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
-@@ -987,26 +987,73 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -986,26 +986,73 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
      // canvas rects to the GPU thread before DrawFrame (which enqueues
      // FinishPaintCurrentFrame), so the post-paint output weave loop reads the
      // rects that match this frame's composited pixels.
@@ -227,7 +227,7 @@ index 3d1631de8972b..5f69e88260dca 100644
        // Phase-1 identity: the GPU stage keys its per-target weave state by the
        // element token, so carry {rect, id} rather than bare rects.
        std::vector<SkiaOutputSurface::Inline3dRect> weave_rects;
-@@ -1014,8 +1061,8 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1013,8 +1060,8 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
        for (const auto& r : frame.inline_3d_rects) {
          weave_rects.push_back({r.rect, r.id});
        }
@@ -238,7 +238,7 @@ index 3d1631de8972b..5f69e88260dca 100644
      }
      // DisplayXR inline-3D (browser#22 B): hand the renderer the resources the
      // weave draw-back is the single source for, so their quads are not painted
-@@ -1034,9 +1081,12 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1033,9 +1080,12 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
          // excludes already-suppressed resources from its over set); the
          // difference clip punches its over-tile part out of the page raster and
          // the over-plane composite draws it back on top.
@@ -255,10 +255,10 @@ index 3d1631de8972b..5f69e88260dca 100644
        renderer_->SetInline3dSuppressedResources(std::move(suppressed));
      }
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index 43b8034bb98fa..bcbe82f400ca4 100644
+index 93ed2a62b8d58..7188ce68a2978 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -2821,9 +2821,30 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+@@ -2820,9 +2820,30 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
    // inline_3d_rects_ are window-relative device-px, so only the window-sized root
    // render pass (== the whole composited page, the CEF pageTex equivalent under
    // DComp) carries them. Non-root overlay passes are element-sized — skip them.
@@ -289,7 +289,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
    static bool logged = false;
    if (!logged) {
      logged = true;
-@@ -3021,12 +3042,19 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3020,12 +3041,19 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            return c;
          }
        }
@@ -314,7 +314,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
        }
      }
      for (const auto& c : inline_3d_canvas_layers_) {
-@@ -3038,9 +3066,48 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3037,9 +3065,48 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          return c;
        }
      }
@@ -363,7 +363,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
    // |key| identifies the target in |displayxr_targets_|; |t| indexes this
    // frame's rects. Everything the submit touches now hangs off the keyed state,
    // so a target's provider slot / scratch image / in-flight rect stay with it
-@@ -3067,6 +3134,44 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3066,6 +3133,44 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      const gfx::Rect clean_sbs_rect = clean_sbs.rect;  // UNCLIPPED full tile
      const gfx::RectF clean_sbs_uv = clean_sbs.uv;     // resource sub-rect (#73)
  
@@ -408,7 +408,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
      // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the
      // composited sub-rect on the GPU instead of the readPixels roundtrip:
      // Skia-copy it into an owned scratch D3DImageBacking, ProduceOverlay its
-@@ -3191,6 +3296,18 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3190,6 +3295,18 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                }
              }
            }
@@ -427,7 +427,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
            if (!src_img) {
              src_img = output->makeImageSnapshot(
                  SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
-@@ -3408,6 +3525,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3407,6 +3524,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          // Remember where this target was submitted so phase (B) draws the woven
          // pixels at the rect the runtime placed them, not a later drifted rect.
          st.pending_rect = rect;
@@ -437,7 +437,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
          return true;
        }
      }
-@@ -3417,6 +3537,32 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3416,6 +3536,32 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      // input. Ganesh has a synchronous SkSurface::readPixels; Graphite has no sync
      // readback, so it uses the blocking-async path. This reads the clean pre-
      // weave page (phase (A) runs before the woven draw-back in (B)).
@@ -470,7 +470,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
      const SkImageInfo info = SkImageInfo::Make(
          rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
          SkColorSpace::MakeSRGB());
-@@ -3582,49 +3728,60 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3581,49 +3727,60 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
    }
  
  #if BUILDFLAG(IS_WIN)
@@ -574,7 +574,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
      std::vector<std::unique_ptr<gpu::SkiaImageRepresentation>> rec_reps;
      std::vector<std::unique_ptr<gpu::SkiaImageRepresentation::ScopedReadAccess>>
          rec_accesses;
-@@ -3640,11 +3797,17 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3639,11 +3796,17 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        if (on_screen.IsEmpty()) {
          continue;
        }
@@ -596,7 +596,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
        if (c.mailbox.IsZero()) {
          ++rec_missing;
          continue;
-@@ -3704,9 +3867,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3703,9 +3866,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        rec_reps.push_back(std::move(rep));
        rec_accesses.push_back(std::move(access));
      }
@@ -612,7 +612,7 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
      if (rec_drawn > 0) {
        std::vector<GrBackendSemaphore> empty_sem;
        FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
-@@ -3719,15 +3885,61 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3718,15 +3884,61 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      }
      // browser#99's triage plan asked for exactly this number: how often are we
      // punching a hole, and how many of those holes could we not repair.
@@ -681,6 +681,3 @@ index 43b8034bb98fa..bcbe82f400ca4 100644
    }
  
    // ---- (B) Draw back the accumulated window-sized woven output (Windows) ----
--- 
-2.42.0.windows.2
-

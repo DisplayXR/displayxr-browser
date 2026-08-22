@@ -1,4 +1,4 @@
-From 627b2d0beb16d09d62f7215a48dbf9072642f15e Mon Sep 17 00:00:00 2001
+From 1a75229f39a7f24c4465e246c99b26b19c4011ae Mon Sep 17 00:00:00 2001
 From: dfattal <dfattal@gmail.com>
 Date: Wed, 19 Aug 2026 23:46:13 -0700
 Subject: [PATCH] inline-3d(web#12): read back the clean canvas, and keep the
@@ -366,10 +366,10 @@ index 5670e5ec9db9f..30783e9f17043 100644
    // Set ONCE per batch frame, between BeginBatchSync and SubmitBatchSync, with
    // this frame's FLAT rects: the sub-areas of the submitted weave rects whose
 diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-index bcbe82f400ca4..b1de20ea94f9f 100644
+index 7188ce68a2978..3ece7cc5e34ab 100644
 --- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
 +++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
-@@ -3134,6 +3134,55 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3133,6 +3133,55 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      const gfx::Rect clean_sbs_rect = clean_sbs.rect;  // UNCLIPPED full tile
      const gfx::RectF clean_sbs_uv = clean_sbs.uv;     // resource sub-rect (#73)
  
@@ -425,7 +425,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
      // ---- (web#12) NEVER WEAVE THE HOLE ----
      //
      // |inline_3d_canvas_layers_| is now EXACTLY the set display.cc suppressed
-@@ -3169,7 +3218,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3168,7 +3217,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                     << " layers=" << inline_3d_canvas_layers_.size()
                     << " skips=" << (n + 1) << ")";
        }
@@ -434,7 +434,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
      }
  
      // B4d GPU-resident weave (DComp path, prefer_zero_copy). Keep the
-@@ -3181,15 +3230,30 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3180,15 +3229,30 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      // write access. Any step failing falls through to the CPU readback below.
      if (prefer_zero_copy) {
        bool zc = [&]() -> bool {
@@ -474,7 +474,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
            }
            return false;
          };
-@@ -3233,18 +3297,25 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3232,18 +3296,25 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                "DisplayXRScratch");
            if (!shared_image_factory_->CreateSharedImage(
                    mailbox, si_info, gpu::kNullSurfaceHandle)) {
@@ -502,7 +502,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
            }
            std::vector<GrBackendSemaphore> sbegin, send;
            SkSurfaceProps props;
-@@ -3252,7 +3323,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3251,7 +3322,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                /*final_msaa_count=*/0, props, &sbegin, &send,
                gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
            if (!scratch_write || !scratch_write->surface()) {
@@ -512,7 +512,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
            }
            SkSurface* scratch_surface = scratch_write->surface();
            if (!sbegin.empty()) {
-@@ -3277,21 +3349,68 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3276,21 +3348,68 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            // beneath the SBS (browser#30) -- the SBS must then composite OVER it
            // rather than replace it.
            bool blended_backdrop = false;
@@ -594,7 +594,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
                  }
                }
              }
-@@ -3300,20 +3419,43 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3299,20 +3418,43 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            // the quads display.cc removed from the page raster — and we failed
            // to open it (ProduceSkia / BeginScopedReadAccess / CreateSkImage).
            // The output snapshot below is therefore guaranteed to be the hole,
@@ -645,7 +645,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
            }
  
            // browser#30: PRE-BLEND THE PAGE BACKDROP UNDER THE SBS.
-@@ -3462,34 +3604,157 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3461,34 +3603,157 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            if (graphite_shared_context()) {
              graphite_shared_context()->submit();
            }
@@ -813,7 +813,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
          }
  
          // (4) GPU-resident weave: CopySubresourceRegion scratch -> keyed-mutex
-@@ -3507,7 +3772,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3506,7 +3771,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          // of the read access (kept alive across the copy).
          gfx::ScopedIOSurface ios = overlay_read->GetIOSurface();
          if (!ios) {
@@ -823,7 +823,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
          }
          bool submitted = provider->WeaveCanvasMac(
              ios.get(), gfx::Rect(0, 0, rw, rh), rect, st.slot);
-@@ -3519,7 +3785,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3518,7 +3784,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
                       "readback) "
                    << rw << "x" << rh;
          }
@@ -841,7 +841,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
        }();
        if (zc) {
          // Remember where this target was submitted so phase (B) draws the woven
-@@ -3532,11 +3807,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3531,11 +3806,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        }
      }
  
@@ -859,7 +859,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
      //
      // ---- (web#12) …and "the clean pre-weave page" is exactly what it stopped
      // being when browser#22 landed suppression. This path sources ONLY from
-@@ -3551,17 +3827,29 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3550,17 +3826,29 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      // If it did not (an empty layer list — the legacy no-canvas-resource
      // channel, and the GL output-device path), this readback is still the
      // correct weave source and is untouched.
@@ -892,7 +892,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
      }
      const SkImageInfo info = SkImageInfo::Make(
          rw, rh, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
-@@ -3583,7 +3871,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3582,7 +3870,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
            base::BindOnce(&WeaveReadPixelsContext::OnReadPixelsDone), &read_ctx);
        if (!read_ctx.finished || !read_ctx.async_result ||
            read_ctx.async_result->count() != 1) {
@@ -910,7 +910,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
        }
        src_pixels =
            reinterpret_cast<const uint8_t*>(read_ctx.async_result->data(0));
-@@ -3594,7 +3891,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3593,7 +3890,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        ganesh_pixels.resize(stride * rh);
        if (!output->readPixels(info, ganesh_pixels.data(), stride, rect.x(),
                                rect.y())) {
@@ -927,7 +927,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
        }
        src_pixels = ganesh_pixels.data();
        src_stride = stride;
-@@ -3611,8 +3916,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3610,8 +3915,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      if (submitted) {
        // Submit-time rect for phase (B) draw-back (see the zero-copy path above).
        st.pending_rect = rect;
@@ -941,7 +941,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
    };
  
    // Submit EVERY visible target this frame. Each target keys its own keyed-mutex
-@@ -3789,6 +4098,13 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3788,6 +4097,13 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
      rec_accesses.reserve(inline_3d_canvas_layers_.size());
      int rec_drawn = 0;
      int rec_missing = 0;
@@ -955,7 +955,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
      for (const auto& c : inline_3d_canvas_layers_) {
        // Clipped to nothing by the window: there is no hole on screen to fill.
        // Not counted as missing — nothing was lost.
-@@ -3810,29 +4126,69 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3809,29 +4125,69 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
        // is now belt-and-braces rather than the load-bearing case it was.
        if (c.mailbox.IsZero()) {
          ++rec_missing;
@@ -1041,7 +1041,7 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
        // LEFT EYE = the left half of the quad's EXISTING UV WINDOW, not of the
        // whole texture (browser#73): |uv| is the normalized sub-rect of the
        // resource that |rect| displays, and for an atlased or partially-mapped
-@@ -3898,6 +4254,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+@@ -3897,6 +4253,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
          LOG(ERROR) << "[DisplayXR] inline-3D recovery draw: n=" << rec_drawn
                     << " missing=" << rec_missing
                     << (only_unsubmitted ? " (per-tile)" : " (whole-frame)")
@@ -1056,6 +1056,3 @@ index bcbe82f400ca4..b1de20ea94f9f 100644
                     << " events=" << (n + 1);
        }
      }
--- 
-2.42.0.windows.2
-
