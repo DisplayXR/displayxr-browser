@@ -51,6 +51,30 @@ function Stage($m){
 }
 function Fail($m){ Stage "ERROR: $m"; "ERROR: $m" | Out-File $DONE -Encoding ascii; exit 1 }
 
+# RunCmd() - `cmd /c` with a length tripwire. Use it for ANY command string whose
+# length grows with the patch series. (The fixed-length `cmd /c` calls below cannot
+# grow, so they call cmd directly.)
+#
+# #132: the `git am` call in step 4 used to inline all N patch paths into one
+# `cmd /c` string. At 99 patches that string crossed cmd.exe's ceiling, cmd
+# rejected the whole thing with "The command line is too long.", `git am` NEVER
+# STARTED - and because the `>> $LOG 2>&1` redirect is part of the same rejected
+# string, rebase.log received not one byte of am output. $LASTEXITCODE was 1, so
+# the drift gate reported "patch series did not apply cleanly" for a series that
+# applies perfectly. A gate that blames the series for its own overflow is worse
+# than one that crashes, so: measure the string, and Fail with the number.
+#
+# Ceiling measured on the box class is 8156 chars for the string handed to cmd
+# (the documented 8191 less the `cmd /c ` prefix and quoting); 8000 leaves slack.
+$CMD_MAX = 8000
+function RunCmd($c){
+  if ($c.Length -gt $CMD_MAX) {
+    Fail ("internal: cmd line is " + $c.Length + " chars, over the $CMD_MAX cap " +
+          "(cmd.exe ceiling ~8156) - this is a HARNESS fault, not patch drift (#132)")
+  }
+  cmd /c $c
+}
+
 Stage "rebase to $TAG starting"
 
 # 0. Sync the canonical patch series from the repo into C:\build\patches.
@@ -179,14 +203,48 @@ if (-not $forceSync -and $syncedTag -eq $TAG) {
 $patches = Get-ChildItem 'C:\build\patches\*.patch' | Sort-Object Name
 if (-not $patches) { Fail 'no patches found at C:\build\patches' }
 Stage ("applying " + $patches.Count + " patches")
-$list = ($patches | ForEach-Object { '"' + $_.FullName + '"' }) -join ' '
-cmd /c "cd /d C:\cr\src && git am --3way --keep-non-patch $list >> $LOG 2>&1"
+
+# Concatenate the series into ONE mbox and pass ONE path (#132).
+#
+# `git format-patch` output IS mbox: every patch file opens with
+# "From <sha> Mon Sep 17 00:00:00 2001", so a concatenation in series order is a
+# valid mbox that `git am` consumes exactly as it consumes N separate files. The
+# point is not a bigger command-line budget - it is a command line whose length is
+# CONSTANT, and therefore immune to the series growing. The old shape passed
+# ~82 chars of command line per patch and died the moment the series reached 99.
+#
+# The copy must be byte-level. Get-Content/Set-Content would round-trip through PS
+# 5.1's encoding and line-ending handling, which corrupts the base85 payload of the
+# binary hunks (0001 carries third_party/displayxr/lib/openxr_loader.lib) and every
+# patch's context whitespace with it. [IO.File] streams the raw bytes untouched.
+$MBOX = 'C:\build\series.mbox'
+Remove-Item $MBOX -ErrorAction SilentlyContinue
+$fs = [System.IO.File]::Create($MBOX)
+try {
+  foreach ($p in $patches) {
+    $b = [System.IO.File]::ReadAllBytes($p.FullName)
+    $fs.Write($b, 0, $b.Length)
+  }
+} finally { $fs.Close() }
+Stage ("series.mbox built - " + [math]::Round((Get-Item $MBOX).Length/1KB) + " KB from " + $patches.Count + " patches")
+
+RunCmd "cd /d C:\cr\src && git am --3way --keep-non-patch $MBOX >> $LOG 2>&1"
 if ($LASTEXITCODE -ne 0) {
   # Capture the failing patch before aborting, so the CI job can name it.
   $failing = (cmd /c "cd /d C:\cr\src && git am --show-current-patch=raw 2>nul | findstr /b Subject")
-  if ($failing) { Stage "FAILING PATCH: $failing" }
   cmd /c "cd /d C:\cr\src && git am --abort >> $LOG 2>&1"
-  Fail "patch series did not apply cleanly on $TAG (rebase needed - #36)"
+  if ($failing) {
+    Stage "FAILING PATCH: $failing"
+    Fail "patch series did not apply cleanly on $TAG (rebase needed - #36)"
+  }
+  # Nothing to show => there is no am in progress => `git am` never started, so
+  # NOTHING has been learned about the series. Do NOT fall through to the drift
+  # message: #132 lost a full diagnosis cycle to this branch blaming patches/ for
+  # a harness bug. The tell in the log is `git am --abort` answering "Resolve
+  # operation not in progress, we are not resuming" with no "Applying:" line
+  # above it. Say what actually happened.
+  Fail ("git am NEVER STARTED - HARNESS fault, not a patch conflict. The series was " +
+        "NOT tested and is not implicated. Debug do_rebase.ps1, not patches/ (#132)")
 }
 Stage 'patch series applied cleanly'
 
