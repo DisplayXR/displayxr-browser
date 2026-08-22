@@ -81,6 +81,17 @@ from the fork branch tip (steps 1-4 above) rather than hand-splicing the offendi
 scripts/build.sh          # brand + gn gen out/Official + autoninja chrome (retry loop; multi-hour)
 ```
 
+**The series now spans two build targets.** Patches 0001–0082 are Windows + macOS; 0083–0102 are
+the Android arm (browser#100). A rebase is not verified until *both* compile, because most of the
+drift-prone files — `skia_output_surface_impl_on_gpu.cc`, `surface_aggregator.cc`,
+`displayxr_weave_gpu.cc` — carry arms for all three platforms behind `#if BUILDFLAG(IS_*)`, and a
+Windows-only build will not see an Android arm that has gone stale (a changed `fail()` signature,
+a lambda that moved inside a platform guard, an `#endif` that now closes the wrong `#if`). On the
+Linux build box:
+```bash
+autoninja -C out/Android chrome_public_apk      # target_os="android" target_cpu="arm64"
+```
+
 ## 6. Verify the weave (MANDATORY — a rebase can silently perturb the GPU path)
 Launch the official `chrome.exe` **Medium-integrity** (`explorer.exe run.bat`, never elevated) with:
 ```

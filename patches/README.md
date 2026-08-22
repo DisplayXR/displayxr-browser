@@ -1,8 +1,26 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **69 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **102 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+
+**Patches 0083–0102 are the ANDROID arm** (browser#100, design in
+[../docs/android-port.md](../docs/android-port.md), device traps in
+[../docs/android-pitfalls.md](../docs/android-pitfalls.md)). Everything before 0083 is
+Windows + macOS and is unchanged by them: the Android arm is additive, entering through the
+same `DisplayXRWeaveClient` / `viz::DisplayXRWeaveProvider` platform dispatcher patch **0052**
+introduced for macOS, plus one `#if !BUILDFLAG(IS_ANDROID)` arm inside 0074's clean-scratch CPU
+fallback (Android has no CPU-readback leg to fall back to). The shape of the arm: the browser
+process connects to the runtime and ships the socket down (0084–0085, runtime
+`android-ipc-fd-adoption`), the GPU process owns the present-owner session and submits
+AHardwareBuffers (0088–0089), and the pixels move by Skia-drawing each element straight into ONE
+shared window-sized staging image at its window position — there is no per-target scratch and no
+provider-side blit, which is why the destination/offset abstraction in 0089 exists. The rest are
+the Android analogues of already-landed Windows behaviour: rig locate (0092–0093), flat regions
+and frosted-glass clip (0097–0098), the v4 overlay atlas (0099), and the draw-back (0095, 0101).
+Building this arm is `autoninja -C out/Android chrome_public_apk`; it needs the DisplayXR Android
+runtime installed on the device, and the sim-display fallback is silent, so verify the active
+plug-in after any runtime install.
 Patch 0069 stops **browser-UI popups ghosting** (browser#88, Phase 3 Stage 4 item B). The omnibox
 dropdown, the autofill popups and every menu are separate OWNED top-level HWNDs that DWM composites
 ABOVE the browser window: they never enter Viz and can never be woven, yet the panel underneath stays

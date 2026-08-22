@@ -1,0 +1,176 @@
+From 3b6a64492aaee19315b2e4e1b354d57ee1b3bd9e Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 06:26:35 +0000
+Subject: [PATCH] fix(android): draw the woven output whole-window, not per
+ submit-time rect
+
+Device report after the browser#87 draw-back fix: no more 2D stamping, all
+seven tiles weave, but during a scroll the woven content TRAILS its element by
+about a frame.
+
+That is the documented residual of the stage this arm was at, not a new bug.
+The Windows lineage went 0022 -> 0046 for exactly this. 0022 introduced the
+submit-time |drawn_rect| draw-back and says of it in as many words that it
+"does not remove lag; it converts tearing/smear into coherent lateness". 0046
+then DELETED that loop: once the runtime clears its window-sized output to
+premultiplied transparent on the frame's first chunk (spec v5, in.firstChunk)
+"gaps carry no stale/smear, so there is no longer a reason to scope the draw to
+submit-time rects". The Android arm shipped 0022's half and never 0046's, so it
+inherited 0022's residual the moment the draw-back started honouring
+|drawn_rect|.
+
+WHERE THE FRAME ENTERED - not where it was expected to. It is not a submit that
+completes late, and the Android path is not structurally one frame behind:
+
+  * xrWeaveSubmitDXR is synchronous end to end. SubmitBatchAndroid calls
+    s.submit() inline and the service vkWaitForFences before replying
+    (comp_multi_weave_android.c) - return IS completion.
+  * that submit runs inside MaybeWeaveOutput(), after the page raster and
+    before Flush/Submit, in the same GPU task as the draw.
+  * Display::DrawAndSwap hands this frame's AGGREGATED rects to the GPU stage
+    before renderer_->DrawFrame(), and the tracked channel is cc's draw-time
+    projected visible_bounds, not the main-thread snapshot.
+
+Submit, weave and draw-back are all one frame. The lateness came from the DRAW
+consulting per-target state instead of the runtime's own output. |drawn_rect|
+is promoted only for a target that took part in THIS frame's weave, so a target
+momentarily absent from |inline_3d_rects_| - a re-raster, a lazy-activation
+margin, a lost race, all of which a scroll produces constantly - kept LAST
+frame's rect and was still drawn at it. One blipped frame per tile is one frame
+of coherent lateness, which is what a human reads as a trail.
+
+So stop asking a browser-side rect where the pixels are and let the runtime
+answer: ONE whole-window kSrcOver of the woven output. It placed those pixels,
+and its transparent clear means it contributes nothing where it wove nothing
+this frame. kSrcOver is safe for the same reason as on Windows - patch 0050
+pre-blends the page backdrop under the SBS, so a tile leaves the weave with
+alpha = 1 and kSrcOver and kSrc coincide inside it.
+
+The browser#87 stamping protection is not lost, it moves to where 0046 put it:
+|wove_this_frame| gates the whole block, so a frame that wove nothing draws
+nothing and the per-tile recovery draw paints those tiles mono. |pending_rect|
+and |drawn_rect| stay maintained as the per-target record.
+
+Cost on the GPU thread: one window-sized NEAREST sample replaces N per-tile
+blits - fewer draw calls, more texels, well under a millisecond on this Adreno.
+The frame is still dominated by the unchanged synchronous submit (~5.5-6.5 ms
+at full res, one batch call for all rects).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 86 ++++++++++++-------
+ 1 file changed, 53 insertions(+), 33 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 269c7fa731e9b..5a8d89a03649a 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -5376,32 +5376,54 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       output->wait(wbegin_sem.size(), wbegin_sem.data(),
+                    /*deleteSemaphoresAfterWait=*/false);
+     }
+-    // Per-rect kSrc, like the mac branch: the woven pixels REPLACE the raw SBS
+-    // and the 2D chrome outside these rects stays as the root composited it.
+-    // NEAREST is mandatory — this is a device-pixel-exact blit of an interlace
+-    // lattice, and any filtering blends neighbouring views into each other.
++    // ---- ONE whole-window kSrcOver, exactly as Windows does (patch 0046) ----
+     //
+-    // (browser#87, ported to Android) Iterate the TARGETS and draw each one's
+-    // |drawn_rect| — the rect the runtime actually wove this target's pixels at
+-    // — NOT this frame's |inline_3d_rects_|. The two differ exactly when
+-    // something went wrong, and on this branch that difference is an artifact
+-    // rather than a no-op:
++    // This replaces the per-tile kSrc loop that stood here, and the reason is
++    // the on-device report that followed the browser#87 draw-back fix: the
++    // woven content TRAILED its element by about a frame during a scroll.
+     //
+-    //   * The blit is kSrc and samples the shared woven buffer at the SAME
+-    //     window coordinates it writes. A rect that moved between the weave and
+-    //     the draw-back therefore stamps whatever the buffer holds at the NEW
+-    //     coordinates over live page content — during a scroll that is last
+-    //     frame's woven tile landing on top of 2D elements. This is the
+-    //     reported on-device symptom.
+-    //   * A rect present this frame whose target did not weave (declined copy,
+-    //     failed batch, off-window) has |drawn_rect| cleared by the submit loop
+-    //     above, so it is skipped here instead of stamping a stale region.
++    // That is not a new bug, it is the documented residual of the stage this
++    // arm was at. The Windows lineage went 0022 -> 0046 for precisely this:
++    // 0022 introduced the submit-time |drawn_rect| loop and says of it, in as
++    // many words, that it "does not remove lag; it converts tearing/smear into
++    // coherent lateness". 0046 then DELETED that loop, because once the
++    // runtime clears its window-sized output to premultiplied transparent on
++    // the frame's first chunk (spec v5, in.firstChunk) "gaps carry no
++    // stale/smear, so there is no longer a reason to scope the draw to
++    // submit-time rects". The Android arm shipped the 0022 half and never the
++    // 0046 half, so it inherited exactly 0022's residual.
+     //
+-    // Windows does not need this: its phase (B) is ONE whole-window kSrcOver of
+-    // a texture the runtime clears to transparent on the frame's first chunk,
+-    // so pixels it did not weave this frame contribute nothing. Android's
+-    // per-rect kSrc has no such protection, which is why |drawn_rect| — written
+-    // since browser#87 and read nowhere — has to be read here.
++    // Where the frame of lateness actually entered — it is NOT a submit that
++    // completes late. SubmitBatchSync is synchronous end to end (the service
++    // vkWaitForFences before it replies, comp_multi_weave_android.c), it runs
++    // inside MaybeWeaveOutput() after the page raster and before Flush/Submit,
++    // and Display::DrawAndSwap hands this frame's aggregated rects to the GPU
++    // stage before renderer_->DrawFrame(). Submit, weave and draw-back are all
++    // one frame. The lateness came from the DRAW consulting per-target state
++    // instead of the runtime's own output: |drawn_rect| is promoted only for a
++    // target that took part in THIS frame's weave, so a target that is absent
++    // from |inline_3d_rects_| for a frame — a re-raster, a lazy-activation
++    // margin, a lost race, all of which a scroll produces constantly — keeps
++    // LAST frame's rect and was still drawn at it. One blipped frame per tile
++    // is one frame of coherent lateness, which is what a human reads as trail.
++    //
++    // Drawing the runtime's output whole-window removes the question rather
++    // than answering it: the runtime placed those pixels, its transparent
++    // clear means it contributes nothing where it wove nothing this frame, and
++    // no browser-side rect takes part in the draw-back at all. kSrcOver is
++    // safe for the same reason it is on Windows — patch 0050 pre-blends the
++    // page backdrop under the SBS, so a tile leaves the weave with alpha = 1
++    // and kSrcOver and kSrc coincide inside it.
++    //
++    // The stamping protection browser#87 bought is NOT lost, it just moves to
++    // where 0046 put it: |wove_this_frame| gates this whole block, so a frame
++    // that wove nothing draws nothing and the recovery draw paints those tiles
++    // mono. |pending_rect| / |drawn_rect| are still maintained — they remain
++    // the per-target record of what the runtime was told, and the fallback if
++    // a pre-v5 runtime that does not clear its gaps ever has to be supported.
++    //
++    // NEAREST is still mandatory: this is a device-pixel-exact blit of an
++    // interlace lattice and any filtering blends neighbouring views together.
+     //
+     // (browser#88 Stage 3 - D') ...except inside the FROSTED rects, which are
+     // subtracted from every one of these draws with a kDifference clip. Those
+@@ -5443,21 +5465,19 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         out_canvas->clipRect(gfx::RectToSkRect(frosted), SkClipOp::kDifference,
+                              /*doAntiAlias=*/false);
+       }
+-      for (const auto& [tgt_key, tgt_st] : displayxr_targets_) {
+-        gfx::Rect rect = tgt_st.drawn_rect;
+-        rect.Intersect(window_bounds);
+-        if (rect.IsEmpty()) {
+-          continue;
+-        }
+-        const SkRect src_dst = SkRect::MakeXYWH(rect.x(), rect.y(),
+-                                                rect.width(), rect.height());
++      gfx::Rect woven_rect(displayxr_shared_woven_size_);
++      woven_rect.Intersect(window_bounds);
++      if (!woven_rect.IsEmpty()) {
++        const SkRect src_dst =
++            SkRect::MakeXYWH(woven_rect.x(), woven_rect.y(),
++                             woven_rect.width(), woven_rect.height());
+         SkPaint paint;
+-        paint.setBlendMode(SkBlendMode::kSrc);
++        paint.setBlendMode(SkBlendMode::kSrcOver);
+         out_canvas->drawImageRect(woven_img.get(), src_dst, src_dst,
+                                   SkSamplingOptions(SkFilterMode::kNearest),
+                                   &paint, SkCanvas::kStrict_SrcRectConstraint);
+         drew_any = true;
+-        ++rects_drawn;
++        rects_drawn = static_cast<int>(displayxr_targets_.size());
+       }
+     }
+     if (!frosted_rects.empty()) {

@@ -1,0 +1,184 @@
+From 0356f673de03366e8000b010278c52fef4e1831f Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 02:35:02 +0000
+Subject: [PATCH] inline-3d(88): apply the frosted-glass clip on the Android
+ draw-back
+
+Stage 3 - D' shipped on Windows and was left a no-op on Android: the
+frosted rect list was drained every frame ("never latched") and never
+used, so a backdrop-filter element over a woven tile was simply
+overwritten by the tile.
+
+It is worse on Android than the comment there claimed. The Windows
+draw-back is ONE whole-window kSrcOver of a texture the runtime clears to
+transparent, so an unclipped frosted region merely reads through the
+weave. Android's draw-back is a PER-RECT kSrc, which replaces the page
+pixels outright - the frosted element does not ghost there, it
+disappears.
+
+Take the list instead of dropping it (same place, same drain guarantee:
+the member is left empty either way, so the early returns below still
+cannot latch a stale clip), and subtract it from the per-rect blit with
+one kDifference clip around the whole loop. |output|'s own pixels - the
+crisp glass the page raster already drew - stay in place.
+
+The clip is scoped so it is gone before the Phase-2 over-plane
+composite: that plane is 2D ABOVE the weave and must never be clipped by
+it.
+
+Units stated at the interface: window-relative device px, y-down, root
+target space - the same space as inline_3d_rects_, drawn_rect and the
+weave rects. Nothing is converted anywhere on this path (patches
+0033/0035 settled that).
+
+Not anti-aliased, like Windows: an AA edge blends woven and page pixels
+in a one-pixel seam, and blending into woven pixels breaks the interlace
+lattice - the same reason the draw itself samples NEAREST.
+
+Refs browser#88
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 113 ++++++++++++++----
+ 1 file changed, 90 insertions(+), 23 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 65705be2c5776..aba2c63b44121 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -4549,10 +4549,23 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   };
+ 
+ #if BUILDFLAG(IS_ANDROID)
+-  // Drained before the gate below for the same reason the Windows branch drains
+-  // it before ITS early returns: if the draw-back does not happen, the right
+-  // state to be left in is "no clip", not "last frame's clip". (Android does
+-  // not apply the frosted clip yet; it still must not latch one.)
++  // (browser#88 Stage 3 - D') This frame's FROSTED rects, TAKEN here rather than
++  // merely dropped. The position is unchanged and so is the reason for it: the
++  // Android draw-back has early returns below this point (the browser#87
++  // liveness gate and the recovery paths), and if the draw-back does not happen
++  // the right state to be left in is "no clip", not "last frame's clip". Moving
++  // instead of clearing is the whole of this change - the local now reaches the
++  // per-rect blit at the bottom of this function, and the MEMBER is left empty
++  // either way, so the drain guarantee is byte-for-byte what it was.
++  //
++  // UNITS AND SPACE: window-relative device px, y-down. That is root-target
++  // space - the same space as |inline_3d_rects_|,
++  // |DisplayXRTargetState::drawn_rect|, the weave rects, and the flat list they
++  // are a subset of. No devicePixelRatio conversion happens anywhere on this
++  // path (patches 0033/0035 settled that); the rects arrive already in device px
++  // from DirectRenderer::ComputeInline3dPlaneSplit and are consumed in device px
++  // by SkCanvas, whose coordinates here ARE |output|'s device pixels.
++  std::vector<gfx::Rect> frosted_rects = std::move(inline_3d_frosted_rects_);
+   inline_3d_frosted_rects_.clear();
+ #endif
+   // (browser#87) Liveness gate: skip the Phase (B) draw-back entirely when this
+@@ -5118,11 +5131,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   // so the provider keeps the reference the runtime handed it and neither side
+   // can free the other's out from under it.
+   //
+-  // The frosted list is drained (never latched) for the same reason as the
+-  // Windows branch — a stale clip belongs to no frame. Applying it is Windows-
+-  // only for now; on Android a frosted rect is simply woven over, which is the
+-  // pre-browser#88 behaviour, not a regression.
+-  inline_3d_frosted_rects_.clear();
++  // |frosted_rects| was TAKEN above (before the liveness gate), for the same
++  // reason the Windows branch takes its copy before ITS early returns: a stale
++  // clip belongs to no frame. It is applied to the per-rect draw-back below.
+ 
+   for (auto& [key, st] : displayxr_targets_) {
+     DisplayXRWeaveProvider::Result r;
+@@ -5218,21 +5229,77 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // so pixels it did not weave this frame contribute nothing. Android's
+     // per-rect kSrc has no such protection, which is why |drawn_rect| — written
+     // since browser#87 and read nowhere — has to be read here.
+-    for (const auto& [tgt_key, tgt_st] : displayxr_targets_) {
+-      gfx::Rect rect = tgt_st.drawn_rect;
+-      rect.Intersect(window_bounds);
+-      if (rect.IsEmpty()) {
+-        continue;
++    //
++    // (browser#88 Stage 3 - D') ...except inside the FROSTED rects, which are
++    // subtracted from every one of these draws with a kDifference clip. Those
++    // rects belong to render passes carrying a BACKDROP FILTER over a woven
++    // tile - the one cell of the occlusion matrix neither the over-plane nor
++    // the weave can serve. Such a pass cannot join the over-plane (it samples a
++    // backdrop that plane does not have) and it cannot stay under the weave
++    // (Android's blit is kSrc, so the woven tile overwrites it outright and the
++    // element simply disappears). Withholding the weave from its rect leaves
++    // |output|'s own pixels - the crisp frosted glass the page raster already
++    // drew - in place instead.
++    //
++    // The trade is the same one Windows makes and is worth restating: the
++    // element looks RIGHT (real 2D glass, no interlace lattice, no half-width
++    // squeeze), and because the same rect is also in the flat list a capable
++    // panel switches its 3D element off there so it does not ghost either. What
++    // is LOST is depth behind it - the page drew that blur against the flat page
++    // backdrop, since at page-draw time the woven pixels did not exist - so the
++    // scene reads flat under the glass. Strictly better than both alternatives
++    // (element invisible, or element smeared through the weave).
++    //
++    // ONE save/restore around the WHOLE loop rather than per draw: the clip is a
++    // frame property, not a tile property, and the complement of a rect list is
++    // not a rect. Duplicate or overlapping rects are harmless to a difference
++    // clip, so the producer does not deduplicate.
++    //
++    // NOT anti-aliased, exactly as on Windows: an AA edge would blend woven and
++    // page pixels in a one-pixel seam, and blending INTO woven pixels breaks the
++    // interlace lattice (the same reason the draw itself samples NEAREST). A
++    // hard edge on the device-pixel boundary is what both sides expect.
++    //
++    // Scoped so the clip is gone before the over-plane composite below: that
++    // plane is 2D content ABOVE the weave and must never be clipped by it.
++    {
++      SkAutoCanvasRestore acr(out_canvas, /*doSave=*/!frosted_rects.empty());
++      for (const gfx::Rect& frosted : frosted_rects) {
++        // Window-relative device px, y-down - the same space as |rect| below
++        // and as the SkCanvas this clips.
++        out_canvas->clipRect(gfx::RectToSkRect(frosted), SkClipOp::kDifference,
++                             /*doAntiAlias=*/false);
++      }
++      for (const auto& [tgt_key, tgt_st] : displayxr_targets_) {
++        gfx::Rect rect = tgt_st.drawn_rect;
++        rect.Intersect(window_bounds);
++        if (rect.IsEmpty()) {
++          continue;
++        }
++        const SkRect src_dst = SkRect::MakeXYWH(rect.x(), rect.y(),
++                                                rect.width(), rect.height());
++        SkPaint paint;
++        paint.setBlendMode(SkBlendMode::kSrc);
++        out_canvas->drawImageRect(woven_img.get(), src_dst, src_dst,
++                                  SkSamplingOptions(SkFilterMode::kNearest),
++                                  &paint, SkCanvas::kStrict_SrcRectConstraint);
++        drew_any = true;
++        ++rects_drawn;
++      }
++    }
++    if (!frosted_rects.empty()) {
++      // Latched, not per-frame (the project bans per-frame logging on the hot
++      // path): the FIRST time a frosted clip is applied on this device, and
++      // then one line every 300 events, so a report of "the glass card
++      // vanished over a tile" can be answered with evidence instead of a guess.
++      static int frosted_dbg = 0;
++      const int fn = frosted_dbg++;
++      if (fn < 3 || (fn % 300) == 0) {
++        LOG(WARNING) << "[DisplayXR] android weave: frosted clip applied to "
++                     << frosted_rects.size()
++                     << " rect(s) (window-relative device px); tiles drawn="
++                     << rects_drawn << " events=" << (fn + 1);
+       }
+-      const SkRect src_dst = SkRect::MakeXYWH(rect.x(), rect.y(), rect.width(),
+-                                              rect.height());
+-      SkPaint paint;
+-      paint.setBlendMode(SkBlendMode::kSrc);
+-      out_canvas->drawImageRect(woven_img.get(), src_dst, src_dst,
+-                                SkSamplingOptions(SkFilterMode::kNearest),
+-                                &paint, SkCanvas::kStrict_SrcRectConstraint);
+-      drew_any = true;
+-      ++rects_drawn;
+     }
+ 
+     // ---- Phase 2 (plane split): composite the OVER plane above the weave ----

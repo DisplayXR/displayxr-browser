@@ -1,0 +1,339 @@
+From 11e624e945e0eef052996b6476ad3c11c85a1c89 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Fri, 21 Aug 2026 01:15:40 +0000
+Subject: [PATCH] feat(android): implement the per-rect rig view locate
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+LocateViewsForRectAndroid() was the M1 skeleton's `return {}`, so
+XRDisplayLayer scenes rendered mono while photo and video tiles wove
+correctly — the scene tile is the only one that needs per-eye views
+rather than pre-authored stereo pixels.
+
+Complete the arm the way LocateViewsForRectMac does, because patch 0036
+already made the flow platform-neutral: the runtime's XR_DXR_view_rig
+returns render-ready per-rect views (off-axis Kooima, m2v-scaled), so
+the client only has to ask and forward. The element's rect IS the zone
+canvas — window-client-relative device px, the same rect the weave
+already submits, so there is no second coordinate derivation to get
+wrong. (And since the pre-rotation opt-out, that rect is already in the
+panel's space.)
+
+The views are passed through VERBATIM. The runtime owns all of the
+Kooima/off-axis projection math; this arm copies xv.pose and xv.fov
+field-for-field into RigView and adds no projection, frustum or scale
+math of its own — the rig comfort factors are the same flat 1.0 the
+Windows and macOS arms send. Blink builds view.projectionMatrix /
+view.transform from exactly what the runtime returned.
+
+The only real platform delta is time. Windows converts QPC via
+XR_KHR_win32_convert_performance_counter_time; Android converts
+CLOCK_MONOTONIC via XR_KHR_convert_timespec_time, which needs
+XR_USE_TIMESPEC and the extension enabled at xrCreateInstance.
+
+That extension was the missing piece in the negotiated set: the arm
+enabled XR_DXR_view_rig alone. Rig views need all four —
+view_rig + display_zones + local_3d_zone + convert_timespec — since
+views are computed zone-relative and there is no legal displayTime
+without the conversion. They are now enabled together, all-or-none, and
+the existing "retry weave-only" path drops has_rig_views with them so a
+rejection degrades to mono instead of leaving the flag lying. A LOCAL
+reference space and the conversion PFN are resolved after xrCreateSession;
+neither needs a RUNNING session, so the client stays submit-only.
+
+Folded in: the locate's diagnostic states its FULL inputs — the zone rect AND
+the bound window geometry it is relative to, both labelled device px, plus
+virtualDisplayHeight and the returned FOV. A zone extent alone is the one number
+you cannot interpret without the window it is relative to, and a wrong-aspect
+report needed the units settled. The audit behind that line found nothing wrong
+on the Chromium side: Blink computes the scene rect and the weave rects with
+byte-identical code (frame->DevicePixelRatio() + css_rect.Scale(dsf), in
+xr_session.cc Inline3DSceneWindowRect / ReportInline3DRects), so the scene rect
+is DEVICE px exactly like the verified-correct weave rects; the mojo hop carries
+gfx::Rect ints untouched; and the Android rig and zone descriptors are
+byte-identical to the macOS arm, comfort factors and virtualDisplayHeight
+included. Patch 0035 is the standing contract — both sides device px, no
+devicePixelRatio normalisation (0033 tried that and was reverted) — and this
+path honours it.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ .../browser/displayxr_weave_client_android.cc | 197 +++++++++++++++++-
+ 1 file changed, 186 insertions(+), 11 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client_android.cc b/components/displayxr/browser/displayxr_weave_client_android.cc
+index a13033096cf9e..a2c5bd38092d3 100644
+--- a/components/displayxr/browser/displayxr_weave_client_android.cc
++++ b/components/displayxr/browser/displayxr_weave_client_android.cc
+@@ -44,6 +44,7 @@
+ #include <dlfcn.h>
+ #include <jni.h>
+ #include <stdlib.h>
++#include <time.h>
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -60,12 +61,18 @@
+ // already declared. jni.h likewise, for XR_USE_PLATFORM_ANDROID's JavaVM*.
+ #include <vulkan/vulkan.h>
+ 
++// XR_USE_TIMESPEC exposes xrConvertTimespecTimeToTimeKHR — the Android/Linux
++// analogue of the Windows QPC->XrTime conversion the rig locate needs, and the
++// same one the macOS arm uses.
+ #define XR_USE_GRAPHICS_API_VULKAN
+ #define XR_USE_PLATFORM_ANDROID
++#define XR_USE_TIMESPEC
+ #include <openxr/openxr.h>
+ #include <openxr/openxr_platform.h>
+ 
+ #include <openxr/XR_DXR_display_info.h>
++#include <openxr/XR_DXR_display_zones.h>
++#include <openxr/XR_DXR_local_3d_zone.h>
+ #include <openxr/XR_DXR_view_rig.h>
+ #include <openxr/XR_DXR_weave.h>
+ 
+@@ -106,6 +113,16 @@ struct AndroidWeaveState {
+   bool has_weave = false;
+   uint32_t weave_spec_version = 0;
+ 
++  // Rig locate (XR_DXR_view_rig + display_zones + local_3d_zone +
++  // convert_timespec). |has_rig_views| means all four negotiated AND the
++  // reference space / time-conversion PFN came up, i.e. LocateViewsForRect can
++  // actually ask the runtime for per-element off-axis views. False just means
++  // scenes render mono, which is the same degradation a rig-less runtime
++  // produces on the Windows and macOS arms.
++  bool has_rig_views = false;
++  PFN_xrConvertTimespecTimeToTimeKHR convert_time = nullptr;
++  XrSpace ref_space = XR_NULL_HANDLE;
++
+   PFN_xrWeaveBindWindow2DXR bind_window2 = nullptr;
+   PFN_xrWeaveSubmitDXR submit = nullptr;
+ 
+@@ -454,7 +471,8 @@ void InitializeCoreAndroid() {
+     return;
+   }
+   bool has_vk2 = false, has_android_ci = false, has_display_info = false,
+-       has_view_rig = false;
++       has_view_rig = false, has_display_zones = false, has_local3d = false,
++       has_convert_time = false;
+   for (const auto& e : exts) {
+     std::string_view n(e.extensionName);
+     if (n == XR_DXR_WEAVE_EXTENSION_NAME) {
+@@ -468,6 +486,12 @@ void InitializeCoreAndroid() {
+       has_display_info = true;
+     } else if (n == XR_DXR_VIEW_RIG_EXTENSION_NAME) {
+       has_view_rig = true;
++    } else if (n == XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) {
++      has_display_zones = true;
++    } else if (n == XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) {
++      has_local3d = true;
++    } else if (n == XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME) {
++      has_convert_time = true;
+     }
+   }
+   if (!s.has_weave || !has_vk2) {
+@@ -496,8 +520,18 @@ void InitializeCoreAndroid() {
+   // The weave is core; the rig only improves scene geometry. Track the boundary
+   // so a rig-side rejection retries weave-only rather than killing inline-3D.
+   const size_t weave_ext_count = enabled.size();
+-  if (has_view_rig) {
++  // All four or none: the rig views are computed zone-relative, so view_rig
++  // without display_zones/local_3d_zone cannot express "this element's rect is
++  // the canvas", and without the timespec conversion there is no legal
++  // displayTime to locate at. (display_zones requires local_3d_zone; the
++  // runtime enforces that at xrCreateInstance.)
++  s.has_rig_views =
++      has_view_rig && has_display_zones && has_local3d && has_convert_time;
++  if (s.has_rig_views) {
+     enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
++    enabled.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
++    enabled.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
++    enabled.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
+   }
+ 
+   XrInstanceCreateInfoAndroidKHR android_info = {
+@@ -520,10 +554,11 @@ void InitializeCoreAndroid() {
+   ici.enabledExtensionNames = enabled.data();
+ 
+   XrResult ir = xrCreateInstance(&ici, &s.instance);
+-  if (XR_FAILED(ir) && has_view_rig) {
+-    LOG(ERROR) << "[DisplayXR] xrCreateInstance with rig ext failed (" << ir
+-               << ") — retrying weave-only (scenes stay mono)";
++  if (XR_FAILED(ir) && s.has_rig_views) {
++    LOG(ERROR) << "[DisplayXR] xrCreateInstance with the rig ext set failed ("
++               << ir << ") — retrying weave-only (scenes stay mono)";
+     enabled.resize(weave_ext_count);
++    s.has_rig_views = false;
+     ici.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
+     ici.enabledExtensionNames = enabled.data();
+     ir = xrCreateInstance(&ici, &s.instance);
+@@ -587,9 +622,34 @@ void InitializeCoreAndroid() {
+     return;
+   }
+ 
++  // Rig locate needs a LOCAL reference space and the timespec conversion PFN.
++  // Neither needs a RUNNING session — xrLocateViews validates only the space,
++  // the view-config type and displayTime > 0 — so this stays submit-only, the
++  // same as the macOS arm.
++  if (s.has_rig_views) {
++    s.convert_time = GetXr<PFN_xrConvertTimespecTimeToTimeKHR>(
++        s.instance, "xrConvertTimespecTimeToTimeKHR");
++    auto xrCreateReferenceSpace = GetXr<PFN_xrCreateReferenceSpace>(
++        s.instance, "xrCreateReferenceSpace");
++    XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
++    rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
++    rsci.poseInReferenceSpace.orientation = {0.f, 0.f, 0.f, 1.f};
++    rsci.poseInReferenceSpace.position = {0.f, 0.f, 0.f};
++    const XrResult rr =
++        xrCreateReferenceSpace
++            ? xrCreateReferenceSpace(s.session, &rsci, &s.ref_space)
++            : XR_ERROR_FUNCTION_UNSUPPORTED;
++    if (XR_FAILED(rr) || !s.convert_time) {
++      LOG(ERROR) << "[DisplayXR] rig locate setup failed (space=" << rr
++                 << " convert_time=" << (s.convert_time ? "ok" : "NULL")
++                 << ") — scenes stay mono";
++      s.has_rig_views = false;
++    }
++  }
++
+   LOG(WARNING) << "[DisplayXR] inline-3D weave client ready on Android "
+                   "(Vulkan-bound IPC present-owner session, weave_spec="
+-               << s.weave_spec_version << " rig=" << has_view_rig << ")";
++               << s.weave_spec_version << " rig=" << s.has_rig_views << ")";
+ }
+ 
+ bool IsSupportedAndroid() {
+@@ -623,11 +683,126 @@ void SetWindowGeometryAndroid(int32_t origin_x,
+ std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectAndroid(
+     const DisplayXRWeaveClient::WeaveRect& rect,
+     float virtual_display_height) {
+-  // M3: the rig locate needs XR_DXR_display_zones + XR_DXR_local_3d_zone +
+-  // a reference space + XR_KHR_convert_timespec_time, exactly as
+-  // LocateViewsForRectMac does. Until then scenes render mono, which is the
+-  // same degradation a rig-less runtime already produces on the other arms.
+-  return {};
++  AndroidWeaveState& s = State();
++  std::vector<DisplayXRWeaveClient::RigView> out;
++  if (!s.has_rig_views || s.session == XR_NULL_HANDLE ||
++      s.ref_space == XR_NULL_HANDLE || !s.convert_time || rect.w <= 0 ||
++      rect.h <= 0) {
++    return out;
++  }
++
++  // xrLocateViews rejects displayTime <= 0. CLOCK_MONOTONIC -> XrTime via the
++  // timespec conversion (Android/Linux use this where Windows uses QPC). The
++  // time only drives head/display-plane prediction — the eyes come from the
++  // DP's latest sample — so "now" is right here.
++  struct timespec ts = {};
++  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++    return out;
++  }
++  XrTime now = 0;
++  if (XR_FAILED(s.convert_time(s.instance, &ts, &now)) || now <= 0) {
++    return out;
++  }
++
++  // The rig: virtualDisplayHeight sets the scene scale (m2v = it / the
++  // element's physical height, which the runtime computes from the zone rect).
++  // Factors at 1.0 = no comfort attenuation, physical perspective.
++  XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
++  rig.pose.orientation = {0.f, 0.f, 0.f, 1.f};
++  rig.pose.position = {0.f, 0.f, 0.f};
++  rig.virtualDisplayHeight =
++      virtual_display_height > 0.f ? virtual_display_height : 0.f;
++  rig.ipdFactor = 1.f;
++  rig.parallaxFactor = 1.f;
++  rig.perspectiveFactor = 1.f;
++
++  // The element's rect IS the canvas: window-client-relative device px, the
++  // very rect the weave already submits, so there is no second coordinate
++  // derivation to get wrong. (And since fix6 the root pass is in physical
++  // orientation, so this rect is already in the panel's space.)
++  XrDisplayZoneDXR zone = {XR_TYPE_DISPLAY_ZONE_DXR};
++  zone.next = &rig;
++  zone.zoneId = 0;
++  zone.rect.offset = {rect.x, rect.y};
++  zone.rect.extent = {rect.w, rect.h};
++
++  XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO};
++  li.next = &zone;
++  li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
++  li.displayTime = now;
++  li.space = s.ref_space;
++
++  auto xrLocateViews = GetXr<PFN_xrLocateViews>(s.instance, "xrLocateViews");
++  if (!xrLocateViews) {
++    return out;
++  }
++
++  XrViewState vs = {XR_TYPE_VIEW_STATE};
++  // The display's mode may expose N views; inline-3D consumes the PRIMARY
++  // STEREO PAIR (views 0-1). Size for 8 tiles so a >2-view mode does not trip
++  // XR_ERROR_SIZE_INSUFFICIENT.
++  XrView views[8];
++  for (XrView& vv : views) {
++    vv = XrView{XR_TYPE_VIEW};
++  }
++  uint32_t view_count = 0;
++  const XrResult lr =
++      xrLocateViews(s.session, &li, &vs, 8, &view_count, views);
++  if (XR_FAILED(lr) || view_count == 0) {
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      LOG(ERROR) << "[DisplayXR] xrLocateViews (rig) failed on Android -> "
++                 << lr;
++    }
++    return out;
++  }
++  // Both flags must be set: without POSITION_VALID the poses are meaningless
++  // and we would silently render a mono-ish scene at the origin.
++  if (!(vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ||
++      !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
++    return out;
++  }
++
++  const uint32_t take = view_count < 2u ? view_count : 2u;
++  for (uint32_t i = 0; i < take; ++i) {
++    const XrView& xv = views[i];
++    DisplayXRWeaveClient::RigView v;
++    v.pos_x = xv.pose.position.x;
++    v.pos_y = xv.pose.position.y;
++    v.pos_z = xv.pose.position.z;
++    v.orient_x = xv.pose.orientation.x;
++    v.orient_y = xv.pose.orientation.y;
++    v.orient_z = xv.pose.orientation.z;
++    v.orient_w = xv.pose.orientation.w;
++    v.fov_left = xv.fov.angleLeft;
++    v.fov_right = xv.fov.angleRight;
++    v.fov_up = xv.fov.angleUp;
++    v.fov_down = xv.fov.angleDown;
++    out.push_back(v);
++  }
++
++  static bool logged_first = false;
++  if (!logged_first && !out.empty()) {
++    logged_first = true;
++    // Everything the frustum depends on, in one line. Units are the whole bug
++    // class here (patches 0033/0035 were a device-px-vs-logical-px round trip),
++    // so state them rather than leaving them to be inferred from the shape of a
++    // number: the zone rect and the bound window geometry are BOTH
++    // window-client-relative DEVICE px, and the runtime's display info is
++    // device px too, so no ratio is applied anywhere on this path.
++    LOG(WARNING) << "[DisplayXR] android rig locate live: " << out.size()
++                 << " views | zone(device px)=" << rect.x << "," << rect.y
++                 << " " << rect.w << "x" << rect.h
++                 << " | bound window(device px)=" << s.geom_x << "," << s.geom_y
++                 << " " << s.geom_w << "x" << s.geom_h
++                 << " display=" << s.geom_display
++                 << " | virtualDisplayHeight=" << virtual_display_height << "m"
++                 << " | fov L/R/U/D=" << out[0].fov_left << "/"
++                 << out[0].fov_right << "/" << out[0].fov_up << "/"
++                 << out[0].fov_down;
++  }
++  return out;
+ }
+ 
+ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchAndroid(

@@ -1,0 +1,186 @@
+From e03274e090ac82653c25b5fe46a64f0a9f283db9 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 22:35:10 +0000
+Subject: [PATCH] fix(android): actually reconnect the runtime socket after a
+ GPU crash
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After the GPU process died the browser logged "GPU process lost;
+dropping the adopted runtime socket so the next launch reconnects", but
+the relaunched GPU process got "no runtime socket to hand the GPU
+process" — inline-3D was inert for the rest of the session.
+
+takeFdForChildProcess() -> ensureConnected() did try to reconnect, so
+the reconnect was being ATTEMPTED and failing silently: connectTo()
+reuses the retained Client, and a second blockingConnect() on a Client
+that already holds a binding is not something the runtime apk's Client
+promises to serve. The refusal returned null with nothing logged.
+
+Two changes, belt and braces:
+
+ - ensureConnected() now retries each runtime package twice. Attempt 0
+   reuses the retained Client (the warm path, and the one that keeps our
+   satellite slot); attempt 1 discards it — calling
+   markAsDiscardedByOwner() first when the runtime offers it, so the
+   binding and slot are released rather than leaked — and builds a fresh
+   one. connectTo() logs the refused return value.
+
+ - onAdopterLost() now posts the reconnect immediately instead of
+   leaving it to the next launch. The GPU relaunch lands within
+   milliseconds, so this moves the ~300 ms connect off the launcher
+   thread; if the launch wins the race, ensureConnected()'s lock makes
+   it wait for the in-flight connect rather than start a second one.
+
+Folded in: releasing the CLIENT, not just our dup of the socket. The first cut
+of this fix recovered the next GPU process but leaked each dead one's
+connection — runtime health showed slots 0 AND 1 as PRESENT_OWNER attributed to
+the browser pid from adopters that were already gone, and the third
+xrCreateInstance failed -10 (XR_ERROR_LIMIT_REACHED; the PRESENT_OWNER quota is
+2, system-wide). onAdopterLost() kept the Client on the documented theory that
+the Client owns the slot and the slot should never move. That theory is what
+leaks: the Client holds its own fd and its binding, so from the runtime's side
+the connection never died and the slot was never reclaimed.
+closeConnectionLocked() now drops the socket AND the Client
+(markAsDiscardedByOwner() first, best-effort, so the binding and slot go now
+rather than at GC), and onAdopterLost() calls it before posting the reconnect —
+exactly one live connection per browser process at any moment, and the fresh
+Client claims a slot only after the dead one is gone.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ .../displayxr/DisplayXrRuntimeConnector.java  | 92 +++++++++++++++----
+ 1 file changed, 74 insertions(+), 18 deletions(-)
+
+diff --git a/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java b/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java
+index c9ab99ac9b2ac..ab780c60f82d0 100644
+--- a/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java
++++ b/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java
+@@ -37,9 +37,15 @@ import java.lang.reflect.Method;
+  * <p>Two lifetime rules from the spec, both load-bearing:
+  *
+  * <ul>
+- *   <li>The Client instance is RETAINED for the browser-process lifetime. It owns the
+- *       ServiceConnection, the satellite-slot claim and the slot death-link token; dropping it
+- *       unbinds the service and releases the slot out from under the adopter.
++ *   <li>The Client instance is RETAINED while its adopter lives. It owns the ServiceConnection,
++ *       the satellite-slot claim and the slot death-link token; dropping it unbinds the service
++ *       and releases the slot out from under the adopter. It is RELEASED the moment the adopter
++ *       dies — see {@link #onAdopterLost}. Holding it across a GPU crash (which an earlier
++ *       revision did, on the theory that the slot should never move) leaks the connection: the
++ *       runtime sees the Client's own fd still open, keeps the dead adopter's slot as
++ *       PRESENT_OWNER, and the third GPU process fails xrCreateInstance with
++ *       XR_ERROR_LIMIT_REACHED — the PRESENT_OWNER quota is 2, system-wide. Exactly one live
++ *       connection per browser process, always.
+  *   <li>What we hand out is always a {@code dup()}. SO_PEERCRED, slot ownership and the death link
+  *       all attribute to THIS process (the connector), not the adopter — which is exactly why a GPU
+  *       crash does not cost us the slot.
+@@ -130,15 +136,50 @@ public class DisplayXrRuntimeConnector {
+     @CalledByNative
+     private static void onAdopterLost() {
+         synchronized (sLock) {
+-            if (sSocket == null) return;
++            if (sSocket == null && sClient == null) return;
++            // The Client goes too, not just our dup. Keeping it is what left slots 0 and 1 held
++            // by dead adopters until the runtime refused the third session (-10,
++            // XR_ERROR_LIMIT_REACHED).
++            closeConnectionLocked();
++        }
++        // Reconnect NOW rather than lazily. A GPU relaunch follows within
++        // milliseconds, and its launcher thread reaches takeFdForChildProcess()
++        // before a lazy reconnect would have started — which is exactly how the
++        // second GPU process ended up with "no runtime socket". Doing it here
++        // moves the ~300 ms connect off the launcher thread; if the launch does
++        // beat us to it, ensureConnected()'s lock makes it wait for this one
++        // instead of starting a second connect.
++        Log.i(TAG, "adopter lost; released the runtime connection, reconnecting now");
++        PostTask.postTask(TaskTraits.USER_BLOCKING_MAY_BLOCK, () -> ensureConnected());
++    }
++
++    /**
++     * Release EVERYTHING this process holds for the current runtime connection: our dup of the
++     * socket AND the Client (its own fd, its binding, its PRESENT_OWNER slot). Until both are
++     * gone the runtime cannot observe the connection dying, so the slot is never reclaimed.
++     *
++     * <p>Caller must hold {@link #sLock}.
++     */
++    private static void closeConnectionLocked() {
++        if (sSocket != null) {
+             try {
+                 sSocket.close();
+             } catch (Exception e) {
+-                Log.w(TAG, "closing the stale runtime socket failed", e);
++                Log.w(TAG, "closing the runtime socket failed", e);
+             }
+             sSocket = null;
+         }
+-        Log.i(TAG, "adopter lost; the next child launch will get a fresh socket");
++        if (sClient != null) {
++            // Best-effort: this is the runtime apk's API, not ours to depend on. Dropping the
++            // reference without it still lets the binding die with our last strong ref, it just
++            // takes until GC rather than now.
++            try {
++                sClient.getClass().getMethod("markAsDiscardedByOwner").invoke(sClient);
++            } catch (Exception e) {
++                Log.w(TAG, "markAsDiscardedByOwner failed; dropping the Client anyway", e);
++            }
++            sClient = null;
++        }
+     }
+ 
+     private static @Nullable ParcelFileDescriptor ensureConnected() {
+@@ -146,17 +187,29 @@ public class DisplayXrRuntimeConnector {
+             if (sSocket != null) return sSocket;
+             Context appContext = ContextUtils.getApplicationContext();
+             for (String pkg : RUNTIME_PACKAGES) {
+-                ParcelFileDescriptor socket;
+-                try {
+-                    socket = connectTo(appContext, pkg);
+-                } catch (Exception e) {
+-                    Log.w(TAG, "connect via " + pkg + " failed", e);
+-                    continue;
+-                }
+-                if (socket != null) {
+-                    sSocket = socket;
+-                    Log.i(TAG, "connected via " + pkg + ", fd " + socket.getFd());
+-                    return socket;
++                // Attempt 0 reuses the retained Client (the warm path, and the
++                // one that keeps our satellite slot). Attempt 1 rebuilds it: a
++                // RE-connect on a Client that already holds a binding is not
++                // something the runtime's Client promises to support, and a
++                // reconnect that fails silently is precisely what left the
++                // relaunched GPU process with no socket.
++                for (int attempt = 0; attempt < 2; ++attempt) {
++                    ParcelFileDescriptor socket = null;
++                    try {
++                        socket = connectTo(appContext, pkg);
++                    } catch (Exception e) {
++                        Log.w(TAG, "connect via " + pkg + " attempt " + attempt + " failed", e);
++                    }
++                    if (socket != null) {
++                        sSocket = socket;
++                        Log.i(TAG, "connected via " + pkg + ", fd " + socket.getFd()
++                                + (attempt == 0 ? "" : " (fresh Client)"));
++                        return socket;
++                    }
++                    if (sClient == null) break; // nothing retained to invalidate
++                    // Let go of the stale Client so attempt 1 builds a fresh one, releasing its
++                    // slot rather than stranding it.
++                    closeConnectionLocked();
+                 }
+             }
+             return null;
+@@ -182,7 +235,10 @@ public class DisplayXrRuntimeConnector {
+         Method blockingConnect =
+                 clientClass.getMethod("blockingConnect", Context.class, String.class);
+         Object result = blockingConnect.invoke(client, appContext, pkg);
+-        if (!(result instanceof Integer) || (Integer) result < 0) return null;
++        if (!(result instanceof Integer) || (Integer) result < 0) {
++            Log.w(TAG, "blockingConnect(" + pkg + ") refused: " + result);
++            return null;
++        }
+ 
+         // Client owns `fd`; take our own reference so the handoff and the Client lifetime are
+         // independent.

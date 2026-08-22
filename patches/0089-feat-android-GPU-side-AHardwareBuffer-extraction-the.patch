@@ -1,0 +1,1634 @@
+From 8477efbc196dcd901e18761724927c67beb8487e Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Thu, 20 Aug 2026 12:02:25 +0000
+Subject: [PATCH] =?UTF-8?q?feat(android):=20GPU-side=20AHardwareBuffer=20e?=
+ =?UTF-8?q?xtraction=20=E2=80=94=20the=20M1=20weave=20input/output?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The third arm of the patch-0052 dispatcher, and the answer to
+docs/android-port.md risk #3 ("does ProduceOverlayForWeave yield an
+AHardwareBuffer under Graphite-Dawn?"). It does — with two conditions that are
+not optional and are now recorded where they will be read:
+
+  * SCANOUT usage. It is what routes the SharedImage to
+    AHardwareBufferImageBackingFactory (which claims SCANOUT and adds
+    AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY). A DISPLAY-only image is claimed by
+    a Graphite/WrappedSkImage backing that has no AHardwareBuffer at all. Exact
+    analogue of the mac SCANOUT -> IOSurfaceImageBacking rule.
+  * RGBA_8888, not BGRA_8888. AHardwareBufferSupportedFormat() does not list
+    BGRA, so a BGRA request silently falls through to a non-AHB factory and the
+    extraction returns null with nothing else looking wrong. RGBA is also what
+    the runtime wants (comp_multi_weave_android.c is RGBA8 UNORM end-to-end).
+
+ProduceOverlayForWeave (ProduceOverlay minus the SCANOUT gate, patch 0005) is
+widened from IS_WIN||IS_APPLE to Android, keeping ONE extraction chain across
+all three arms even though Android would have passed the gate anyway.
+
+The Android arm deliberately has NO WeaveCanvasAndroid mirroring
+WeaveCanvasMac. mac hands the provider each element's IOSurface and the provider
+MTL-blits it into a provider-owned input — two copies, because the provider owns
+the input. Android has no second copy: the GPU process's only reliable graphics
+API is Skia, and Viz is already Skia-drawing each element into a scratch, so on
+Android that scratch IS the window-sized weave input — one SCANOUT/RGBA8
+SharedImage every element is drawn into at its own window position (|dst_offset|
+is what expresses that; it is (0,0) on win/mac, so the draw code stays one
+body). Mirroring mac would have meant standing up a private VkDevice purely to
+re-blit pixels Skia had just written.
+
+FENCES. The runtime imports no acquire fence on Android (XR_DXR_weave.h §v7:
+"the caller completes its GPU writes into inputTexture BEFORE calling
+xrWeaveSubmitDXR"), so the outbound wait is ours. The reference client uses a
+vkQueueSubmit-signalled VkFence + vkWaitForFences(UINT64_MAX); here the writer
+is Skia, so the cheapest correct equivalent is a submit with SyncToCpu::kYes /
+GrSyncCpu::kYes — one call, no fence import, no semaphore, no second device. A
+bare flush() is NOT enough: Graphite is deferred and flush only records. The
+inbound (producer) fence is -1 by construction — the only producer is the
+context we just synced — but SetBatchInputAndroid still takes and waits a
+sync_file fd (poll(POLLIN), which is what libsync's sync_wait does) so a foreign
+producer is correct the day one appears. The per-frame CPU stall is risk #4 and
+goes away with the runtime's sync_file follow-up.
+
+OUTPUT is consumed, not deferred. Unlike mac — which must blit its woven
+IOSurface through a Chromium scratch because MoltenVK exports it with
+pixel-format 0 — an AHardwareBuffer carries its own desc and
+AHardwareBufferImageBackingFactory imports gfx::ANDROID_HARDWARE_BUFFER
+natively, so the woven buffer is imported DIRECTLY as a SharedImage once (on the
+first submit and on every realloc) and drawn back per rect with kSrc + NEAREST,
+followed by the Phase-2 over-plane. One import, no per-frame copy. Ownership is
+a ScopedHardwareBufferHandle::Adopt, which IS the "release the old one when it
+is replaced" clause.
+
+Both weave entry points (MaybeWeaveOutput / MaybeWeaveRootRenderPass) are
+widened to Android and each logs once which one fired — that answers
+docs/android-port.md open item #2 from a logcat rather than a code read. Either
+way the Android arm is the same, since the staging path needs only a readable
+SkSurface; prefer_zero_copy is forced true there because it is not a
+"zero-copy vs readback" choice on Android — there is no second mechanism and
+deliberately no WeavePixelsAndroid.
+
+Refs #1056, docs/android-port.md M1
+
+Three device-loop fixes are folded in. Each was a hard failure on the first
+Adreno bring-up, and each is a standing trap for this path:
+
+  * A BACKEND-AWARE outbound wait. SIGSEGV SEGV_MAPERR at 0xc0 on
+    CompositorGpuTh, in an unconditional context_state_->FlushGraphiteRecorder()
+    — SharedContextState::FlushGraphiteRecorder() does an unguarded
+    gpu_main_graphite_recorder()->snap(), and that recorder is null here because
+    Dawn adapter validation FAILS on this device ("Validate adapter failed" /
+    "Failed to create Dawn context provider for Graphite"), so Viz fell back to
+    Ganesh-GL. Graphite-Dawn is Chrome's Android default but is NOT universal.
+    FinishSkiaWritesForWeaveAndroid() discharges the wait on whichever backend
+    is actually live: Graphite gets FlushGraphiteRecorder() — guarded on the
+    RECORDER, not merely the context — plus submit(SyncToCpu::kYes); Ganesh gets
+    submit(GrSyncCpu::kYes). If neither exists it logs one ERROR and latches the
+    path off rather than weaving pixels the GPU has not finished writing. The
+    live backend is logged once at startup.
+
+  * SetCleared() ON THE STAGING IMAGE. Per-frame "android weave: staging
+    SharedImage has no AHardwareBuffer (rep=ok access=NULL)" was not about the
+    AHardwareBuffer at all: OverlayImageRepresentation::BeginScopedReadAccess()
+    returns nullptr when !IsCleared(), and
+    SkiaImageRepresentation::ScopedWriteAccess::~ScopedWriteAccess() only calls
+    EndWriteAccess() — it does NOT set the cleared rect. Every other write site
+    in this file calls SetCleared() by hand; ours did not, so the image stayed
+    uncleared forever and every frame's read bounced. EnsureWeaveStagingAndroid
+    also stops returning true when the image could not be initialized.
+
+  * EXTRACT THE AHB THROUGH THE VIRTUAL THE BACKING IMPLEMENTS. SIGABRT /
+    "NOTREACHED hit" in the BASE OverlayImageRepresentation::GetAHardwareBuffer(),
+    which is a bare NOTREACHED(): OverlayImageAHBRepresentation overrides ONLY
+    GetAHardwareBufferFenceSync(). Use that, and keep the returned
+    ScopedHardwareBufferFenceSync alive in the same scope as the read access,
+    across SubmitBatchSync(). The acquire fence stays -1 because the
+    backend-aware wait above has already done a full CPU-side submit. (This only
+    became reachable once the cleared-state gate stopped refusing the access.)
+
+Rebased onto the published series: 0074 gave the zero-copy fail() a per-reason
+counter, so the Android staging call site takes one; and handoff_failed() moves
+out of the non-Android guard — the shared tail below the platform #if calls it
+on every platform — with the Android arm returning keep_previous() rather than
+0074's clean-scratch CPU readback, which Android has no leg for.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ chrome/gpu/BUILD.gn                           |   2 +-
+ chrome/gpu/chrome_content_gpu_client.cc       |  15 +-
+ chrome/gpu/chrome_content_gpu_client.h        |   7 +-
+ components/displayxr/gpu/BUILD.gn             |   4 +
+ .../gpu/displayxr_weave_gpu_android.cc        | 219 ++++++-
+ .../gpu/displayxr_weave_gpu_android.h         | 143 +++--
+ .../displayxr_weave_provider.cc               |   3 +-
+ .../displayxr_weave_provider.h                |  39 +-
+ .../skia_output_surface_impl_on_gpu.cc        | 560 +++++++++++++++++-
+ .../skia_output_surface_impl_on_gpu.h         |  46 +-
+ .../shared_image/shared_image_factory.cc      |   3 +-
+ .../shared_image/shared_image_factory.h       |   3 +-
+ .../shared_image/shared_image_manager.cc      |   5 +-
+ .../shared_image/shared_image_manager.h       |  14 +-
+ 14 files changed, 966 insertions(+), 97 deletions(-)
+
+diff --git a/chrome/gpu/BUILD.gn b/chrome/gpu/BUILD.gn
+index f0be962ee5aff..b48883d7c7add 100644
+--- a/chrome/gpu/BUILD.gn
++++ b/chrome/gpu/BUILD.gn
+@@ -47,7 +47,7 @@ static_library("gpu") {
+     }
+   }
+ 
+-  if (is_win || is_mac) {  # DXR mac PR3
++  if (is_win || is_mac || is_android) {  # DXR mac PR3 / android M1
+     # DisplayXR inline-3D (#625, Step B / B4): the GPU-side weave provider and the
+     # Viz provider setter ChromeContentGpuClient registers it through.
+     deps += [
+diff --git a/chrome/gpu/chrome_content_gpu_client.cc b/chrome/gpu/chrome_content_gpu_client.cc
+index 724a8161fd3d1..da80d672d8b9a 100644
+--- a/chrome/gpu/chrome_content_gpu_client.cc
++++ b/chrome/gpu/chrome_content_gpu_client.cc
+@@ -29,13 +29,15 @@
+ #include "media/media_buildflags.h"
+ #include "services/tracing/public/cpp/stack_sampling/tracing_sampler_profiler.h"
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+ // DisplayXR inline-3D (#625): Viz weave-provider setter + GPU provider impl.
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #if BUILDFLAG(IS_WIN)
+ #include "components/displayxr/gpu/displayxr_weave_gpu.h"
+ #elif BUILDFLAG(IS_APPLE)
+ #include "components/displayxr/gpu/displayxr_weave_gpu_mac.h"
++#elif BUILDFLAG(IS_ANDROID)
++#include "components/displayxr/gpu/displayxr_weave_gpu_android.h"
+ #endif
+ #endif
+ 
+@@ -66,7 +68,7 @@ ChromeContentGpuClient::ChromeContentGpuClient() {
+ }
+ 
+ ChromeContentGpuClient::~ChromeContentGpuClient() {
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+   if (weave_gpu_) {
+     viz::SetDisplayXRWeaveProvider(nullptr);
+   }
+@@ -152,11 +154,12 @@ void ChromeContentGpuClient::PostCompositorThreadCreated(
+                                 base::BindRepeating(
+                                     &CreateCoreUnwindersFactory)));
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+   // DisplayXR inline-3D (#625): create the GPU-side weave provider on the GPU
+   // main thread and register it with Viz. Windows binds a mojo bridge to the
+-  // browser weave client; macOS (#760 sync weave) brings up its own in-process
+-  // weave session in the provider ctor. Dormant unless --enable-inline-3d.
++  // browser weave client; macOS (#760 sync weave) and Android (#1036, the
++  // adopted runtime socket) bring up their own in-process weave session in the
++  // provider ctor. Dormant unless --enable-inline-3d.
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch("enable-inline-3d")) {
+ #if BUILDFLAG(IS_WIN)
+     auto gpu = std::make_unique<displayxr::DisplayXRWeaveGpu>();
+@@ -164,6 +167,8 @@ void ChromeContentGpuClient::PostCompositorThreadCreated(
+     weave_gpu_ = std::move(gpu);
+ #elif BUILDFLAG(IS_APPLE)
+     weave_gpu_ = std::make_unique<displayxr::DisplayXRWeaveGpuMac>();
++#elif BUILDFLAG(IS_ANDROID)
++    weave_gpu_ = std::make_unique<displayxr::DisplayXRWeaveGpuAndroid>();
+ #endif
+     viz::SetDisplayXRWeaveProvider(weave_gpu_.get());
+     VLOG(1) << "[DisplayXR] inline-3D GPU weave provider registered";
+diff --git a/chrome/gpu/chrome_content_gpu_client.h b/chrome/gpu/chrome_content_gpu_client.h
+index dd9325343e17b..69ae3e3798b8f 100644
+--- a/chrome/gpu/chrome_content_gpu_client.h
++++ b/chrome/gpu/chrome_content_gpu_client.h
+@@ -64,10 +64,11 @@ class ChromeContentGpuClient : public content::ContentGpuClient {
+   scoped_refptr<arc::ProtectedBufferManager> protected_buffer_manager_;
+ #endif
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+   // DisplayXR inline-3D (#625): created + registered with Viz in
+-  // PostCompositorThreadCreated when --enable-inline-3d is set. Base-typed
+-  // so Win (DisplayXRWeaveGpu) and mac (DisplayXRWeaveGpuMac) share it.
++  // PostCompositorThreadCreated when --enable-inline-3d is set. Base-typed so
++  // Win (DisplayXRWeaveGpu), mac (DisplayXRWeaveGpuMac) and Android
++  // (DisplayXRWeaveGpuAndroid) share it.
+   std::unique_ptr<viz::DisplayXRWeaveProvider> weave_gpu_;
+ #endif
+ };
+diff --git a/components/displayxr/gpu/BUILD.gn b/components/displayxr/gpu/BUILD.gn
+index c214f7c21cfc1..c39ff793d5daa 100644
+--- a/components/displayxr/gpu/BUILD.gn
++++ b/components/displayxr/gpu/BUILD.gn
+@@ -51,6 +51,10 @@ source_set("gpu") {
+       "displayxr_weave_gpu_android.cc",
+       "displayxr_weave_gpu_android.h",
+     ]
++    # No libs: AHardwareBuffer_acquire/release go through
++    # base::AndroidHardwareBufferCompat (dlsym'd, so this never hard-requires an
++    # API level the APK does not target); <android/hardware_buffer.h> supplies
++    # the opaque type only.
+   }
+ 
+ }
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.cc b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+index 252c44923b893..9f934d88d7223 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+@@ -6,41 +6,126 @@
+ 
+ #if BUILDFLAG(IS_ANDROID)
+ 
++#include <android/hardware_buffer.h>
++#include <errno.h>
++#include <poll.h>
++#include <unistd.h>
++
+ #include "base/logging.h"
++#include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "components/displayxr/browser/displayxr_weave_client_android.h"
+ 
+ namespace displayxr {
+ 
++namespace {
++
++// Wait for a sync_file fd to signal. This IS libsync's sync_wait(): a sync
++// fence fd becomes POLLIN-readable when it signals, so poll() is the whole
++// mechanism, minus a header dependency on <android/sync.h>. Always consumes
++// (closes) the fd.
++void WaitAndCloseFenceFd(int fd) {
++  if (fd < 0) {
++    return;
++  }
++  struct pollfd pfd = {};
++  pfd.fd = fd;
++  pfd.events = POLLIN;
++  // Bounded, like the runtime's own 1 s server-side wait: a fence that never
++  // signals is a driver bug, and blocking Viz's present thread forever on it
++  // turns that bug into a hang.
++  int rc;
++  do {
++    rc = poll(&pfd, 1, /*timeout_ms=*/1000);
++  } while (rc == -1 && errno == EINTR);
++  if (rc <= 0) {
++    static bool logged = false;
++    if (!logged) {
++      logged = true;
++      LOG(WARNING) << "[DisplayXR] android weave: acquire fence wait "
++                   << (rc == 0 ? "timed out" : "failed")
++                   << "; weaving anyway (logged once)";
++    }
++  }
++  close(fd);
++}
++
++}  // namespace
++
+ DisplayXRWeaveGpuAndroid::DisplayXRWeaveGpuAndroid() {
+   // Same shape as the mac provider: the GPU-process weave session is brought up
+   // in the constructor. On Android that is only possible because the browser
+   // process already handed this process a connected runtime socket and
+-  // gpu_main.cc published it as DXR_IPC_FD before we got here.
++  // gpu_main.cc published it as DXR_IPC_FD before we got here. Dormant (logs +
++  // returns) when that seam is absent, so a device without the runtime is
++  // unaffected.
+   InitializeCoreAndroid();
+ }
+ 
+ DisplayXRWeaveGpuAndroid::~DisplayXRWeaveGpuAndroid() = default;
+ 
+-bool DisplayXRWeaveGpuAndroid::IsLive() const {
+-  return IsSupportedAndroid();
++bool DisplayXRWeaveGpuAndroid::BatchMode() const {
++  // The Android path is batch-ONLY. v7 is the floor (AHardwareBuffer handle
++  // kind + xrWeaveBindWindow2DXR + explicit geometry), and v7 > v3, so the
++  // batch requirement is implied — but state it, because BatchMode() false
++  // would silently route Viz onto a per-target flow this provider does not
++  // implement.
++  return DisplayXRWeaveClient::IsSupported() &&
++         DisplayXRWeaveClient::WeaveSpecVersion() >= 7;
++}
++
++bool DisplayXRWeaveGpuAndroid::SubmitInFlight(uint32_t /*target_id*/) const {
++  // Synchronous: nothing is ever outstanding across frames.
++  return false;
+ }
+ 
+ void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
+   batch_open_ = true;
+   batch_size_ = window_size;
++  batch_entries_.clear();
++  batch_input_ahb_ = 0;
++
++  // Window geometry (ADR-036 D6 / XR_DXR_weave v7): REQUIRED on Android, and
++  // published from here because this is where the client-area size is known.
++  //
++  // M3 SEAM: the origin is a placeholder — (0,0) on display 0, i.e. "the client
++  // area is the whole panel". That is exactly right for the fullscreen Android
++  // browser window and wrong for nothing that ships today, but it is NOT the
++  // real answer: there is no window handle and a pure MOVE raises no resize, so
++  // the truth only exists in the Java UI. M3 samples
++  // View.getLocationOnScreen() in a Choreographer callback, ships it over
++  // displayxr_weave.mojom, and calls SetWindowGeometryAndroid() with it —
++  // replacing this line and nothing else. Per ADR-033 the browser reports
++  // geometry and NOTHING else; the weaver alone owns phase and snapping.
++  SetWindowGeometryAndroid(/*origin_x=*/0, /*origin_y=*/0,
++                           window_size.width(), window_size.height(),
++                           /*display_id=*/0);
+ }
+ 
+-bool DisplayXRWeaveGpuAndroid::WeaveCanvasAndroid(uintptr_t ahardware_buffer,
+-                                                  const gfx::Rect& src_rect,
+-                                                  const gfx::Rect& window_rect,
+-                                                  uint32_t target_id) {
+-  if (!logged_unimplemented_) {
+-    logged_unimplemented_ = true;
+-    LOG(WARNING) << "[DisplayXR] Android weave input assembly is M1 "
+-                    "(AHardwareBuffer blit into the shared window-sized input); "
+-                    "logged once";
++bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
++                                                uint32_t target_id) {
++  if (!batch_open_ || window_rect.IsEmpty()) {
++    return false;
+   }
+-  return false;
++  // Record only. The pixels are already where they belong: Viz Skia-drew this
++  // element's squeezed SBS into the shared window-sized staging image AT THIS
++  // RECT before calling us (see the class comment on why there is no blit).
++  batch_entries_.push_back({target_id, window_rect});
++  return true;
++}
++
++bool DisplayXRWeaveGpuAndroid::SetBatchInputAndroid(uintptr_t ahardware_buffer,
++                                                    int acquire_fence_fd) {
++  if (!batch_open_ || ahardware_buffer == 0) {
++    WaitAndCloseFenceFd(acquire_fence_fd);  // never leak the fd
++    return false;
++  }
++  // Inbound fence (see the header): -1 in the steady state, because the only
++  // producer is Viz's own Skia context and it flushed sync-to-CPU before
++  // handing this over. Waited anyway when present so a future foreign producer
++  // is correct by construction rather than by luck.
++  WaitAndCloseFenceFd(acquire_fence_fd);
++  batch_input_ahb_ = ahardware_buffer;
++  return true;
+ }
+ 
+ bool DisplayXRWeaveGpuAndroid::SubmitBatchSync() {
+@@ -48,16 +133,110 @@ bool DisplayXRWeaveGpuAndroid::SubmitBatchSync() {
+     return false;
+   }
+   batch_open_ = false;
+-  // The real submit is SubmitBatchAndroid(input AHB, rects, overlay), which
+-  // fails gracefully for now.
+-  return SubmitBatchAndroid(/*input_handle=*/0, /*rects=*/{},
+-                            /*overlay_handle=*/0)
+-      .ok;
++  if (batch_entries_.empty() || batch_input_ahb_ == 0) {
++    return false;
++  }
++
++  std::vector<DisplayXRWeaveClient::WeaveRect> rects;
++  rects.reserve(batch_entries_.size());
++  for (const BatchEntry& e : batch_entries_) {
++    rects.push_back({e.rect.x(), e.rect.y(), e.rect.width(), e.rect.height()});
++  }
++
++  // ONE synchronous submit for the whole frame. The handle kind is declared
++  // inside SubmitBatchAndroid (XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR); no
++  // overlay atlas is staged on Android (the browser composites its own over-
++  // plane, patch 0063-0065), so the overlay handle is 0.
++  DisplayXRWeaveClient::WeaveSubmitResult sr =
++      SubmitBatchAndroid(batch_input_ahb_, rects, /*overlay_handle=*/0);
++  batch_input_ahb_ = 0;
++  if (!sr.ok) {
++    static int fails = 0;
++    if (fails < 3) {
++      ++fails;
++      LOG(ERROR) << "[DisplayXR] android batch weave submit failed (n="
++                 << rects.size() << ")";
++    }
++    batch_entries_.clear();
++    return false;
++  }
++
++  // The woven AHardwareBuffer arrives on the FIRST submit and on every
++  // reallocation only; cache it and release the one it replaces. Ownership of
++  // the handback is ours (XR_DXR_weave.h §XrWeaveOutputDXR).
++  if (sr.woven_handle != 0 &&
++      reinterpret_cast<AHardwareBuffer*>(sr.woven_handle) != woven_ahb_.get()) {
++    // Adopt, not Create: the runtime already handed us ITS reference, and the
++    // assignment releases the buffer this one replaces.
++    woven_ahb_ = base::android::ScopedHardwareBufferHandle::Adopt(
++        reinterpret_cast<AHardwareBuffer*>(sr.woven_handle));
++    woven_fresh_ = true;
++    LOG(WARNING) << "[DisplayXR] android weave: woven AHardwareBuffer "
++                 << sr.width << "x" << sr.height << " adopted";
++  }
++  woven_w_ = sr.width;
++  woven_h_ = sr.height;
++  woven_fence_value_ = sr.fence_value;
++
++  if (woven_ahb_.get() == nullptr) {
++    return false;
++  }
++
++  // Publish the same shared woven buffer under every submitted target, exactly
++  // as the mac provider does. Only the FIRST result of a fresh allocation
++  // carries the handle: Viz imports on non-zero and reuses its mailbox
++  // otherwise, so handing the same handle to N targets would import N times.
++  bool first_fresh = woven_fresh_;
++  for (const BatchEntry& e : batch_entries_) {
++    Pending& p = results_[e.target_id];
++    p.have = true;
++    p.result = Result{};
++    p.result.ok = true;
++    p.result.woven_handle =
++        first_fresh ? reinterpret_cast<uintptr_t>(woven_ahb_.get()) : 0;
++    first_fresh = false;
++    // No fence handle: completion is SYNCHRONOUS on Android (xrWeaveSubmitDXR
++    // returned only once the weave was GPU-complete), so there is nothing for
++    // Viz to wait on. fence_value is carried as a plain monotonic counter.
++    p.result.fence_handle = 0;
++    p.result.fence_value = woven_fence_value_;
++    p.result.width = woven_w_;
++    p.result.height = woven_h_;
++  }
++  woven_fresh_ = false;
++  batch_entries_.clear();
++  return true;
++}
++
++bool DisplayXRWeaveGpuAndroid::TryTakeWovenResult(uint32_t target_id,
++                                                  Result* out) {
++  auto it = results_.find(target_id);
++  if (it == results_.end() || !it->second.have) {
++    return false;
++  }
++  *out = it->second.result;
++  // The handle is a one-shot: clear it so a second read of the same frame's
++  // result does not tell Viz to re-import a buffer it already holds.
++  it->second.result.woven_handle = 0;
++  return true;
+ }
+ 
+ void DisplayXRWeaveGpuAndroid::PruneTarget(uint32_t target_id) {
+-  // Nothing per-target is held yet. M1 releases this target's AHB + fence state
+-  // here (patch 0061's contract) BEFORE the caller reuses the id.
++  // Patch 0061's contract. Like mac, this provider owns NO per-target GPU
++  // resources — the whole page goes through one shared window-sized staging
++  // input (owned by Viz) and one cached woven AHardwareBuffer — so retiring a
++  // target is just dropping its stored result.
++  results_.erase(target_id);
++}
++
++void DisplayXRWeaveGpuAndroid::PruneTargets(size_t count) {
++  for (auto it = results_.begin(); it != results_.end();) {
++    if (it->first >= count) {
++      it = results_.erase(it);
++    } else {
++      ++it;
++    }
++  }
+ }
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.h b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+index 30b7d34922801..60ef39bd62310 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+@@ -12,67 +12,124 @@
+ #include <cstdint>
+ #include <vector>
+ 
++#include "base/android/scoped_hardware_buffer_handle.h"
++#include "base/containers/flat_map.h"
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+ namespace displayxr {
+ 
+-// Android GPU-process weave backend — the third arm of the patch-0052
+-// dispatcher, mirroring DisplayXRWeaveGpuMac.
++// Android GPU-process implementation of viz::DisplayXRWeaveProvider — the third
++// arm of the patch-0052 dispatcher, sibling of DisplayXRWeaveGpuMac.
+ //
+-// M2 SCOPE: a compile-clean skeleton with the real method shape and no GPU work.
+-// It is deliberately NOT yet a viz::DisplayXRWeaveProvider subclass: that
+-// interface is #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) and its per-platform
+-// arm takes the platform texture type (ID3D11Texture2D* / IOSurfaceRef). Adding
+-// the Android arm — WeaveCanvasAndroid(AHardwareBuffer*, ...) plus widening the
+-// header guard — belongs to M1, which is where ProduceOverlayForWeave() starts
+-// yielding AHardwareBuffers and there is something real to hand it. Registering
+-// a provider that returns false for every call would only make Viz do pointless
+-// work every frame.
++// It is DELIBERATELY THINNER than the mac provider, and the reason is worth
++// stating because it looks like a missing feature:
+ //
+-// What the M1/M3 implementation has to own, recorded here so it is not
+-// rediscovered:
+-//   * ONE shared window-sized AHB weave input (SCANOUT usage so the SharedImage
+-//     backing routes to the AHardwareBuffer path), blitted per visible element.
+-//   * Two fences per frame, because the runtime has NO acquire fence on Android:
+-//     wait the producer's ScopedHardwareBufferFenceSync::TakeFence() inbound,
+-//     and wait our own blit's VkFence before xrWeaveSubmitDXR.
+-//   * PruneTarget(target_id) (patch 0061) releasing whatever per-target AHB /
+-//     fence state this ends up holding — seven lines if it copies mac's single-
+-//     shared-input design.
+-//   * The woven AHardwareBuffer comes back non-NULL on the FIRST submit and on
+-//     every reallocation only; cache it and AHardwareBuffer_release() the old
+-//     one when it is replaced.
++//   mac:     WeaveCanvasMac MTL-blits each element's IOSurface into a
++//            provider-owned window-sized input IOSurface.
++//   Android: there is no such blit here at all. The GPU process's only reliable
++//            graphics API is Skia (Graphite-Dawn / Ganesh-Vulkan), and Viz is
++//            ALREADY doing a Skia draw of each element into a scratch. So the
++//            Android arm makes that scratch the window-sized weave input
++//            itself — one SCANOUT-usage (=> AHardwareBuffer-backed) SharedImage
++//            that Viz draws every element into at its own window position —
++//            and this class only collects the rects, latches the extracted
++//            AHardwareBuffer, and fires ONE xrWeaveSubmitDXR. Mirroring mac's
++//            second copy would have meant standing up a private VkDevice in the
++//            GPU process purely to re-blit pixels Skia had just written.
++//
++// Per frame:
++//   BeginBatchSync(window_size);         // publishes window geometry, opens
++//                                        // the batch
++//   WeaveRectAndroid(rect, target_id);   // per visible element: record only
++//   SetBatchInputAndroid(ahb, fence_fd); // the staged input, extracted by Viz
++//   SubmitBatchSync();                   // ONE synchronous submit
++//
++// FENCES — the contract, not laziness (XR_DXR_weave.h §XrWeaveSubmitHandlesDXR,
++// spec v7; reference client main.cpp:930-933). There is NO acquire fence on
++// Android: the runtime does not import a caller fence, so the caller's GPU
++// writes into the input AHardwareBuffer must be COMPLETE before
++// xrWeaveSubmitDXR is called. Two waits exist in principle:
++//
++//   1. INBOUND (the producer's fence). Would matter if some OTHER producer had
++//      written the buffer. Here Viz's own Skia context wrote it and Viz issues a
++//      submit-and-sync-to-CPU flush before handing it over, so by construction
++//      nothing is outstanding. SetBatchInputAndroid still ACCEPTS a sync_file fd
++//      and waits on it (poll(POLLIN) — which is exactly what libsync's
++//      sync_wait() does) so the seam is honest the day a foreign producer
++//      appears.
++//   2. OUTBOUND (our own writes). This is the real one, and it is discharged on
++//      the Viz side by the sync-to-CPU submit, because that is the CHEAPEST
++//      CORRECT option available: the pixels are written by Skia, so a Skia
++//      submit+wait is one call with no fence import, no semaphore, and no
++//      second device. A vkQueueSubmit-signalled VkFence (what the reference
++//      client's upload_input() does) would be strictly more machinery for the
++//      same guarantee here.
++//
++// The cost is one CPU stall per frame on Viz's present thread, on top of the
++// already-synchronous submit. The runtime's documented follow-up is an fd-based
++// sync_file acquire/release pair which deletes both waits (#1036).
+ //
+ // Created + called on the GPU main thread.
+-class DisplayXRWeaveGpuAndroid {
++class DisplayXRWeaveGpuAndroid : public viz::DisplayXRWeaveProvider {
+  public:
+   DisplayXRWeaveGpuAndroid();
+   DisplayXRWeaveGpuAndroid(const DisplayXRWeaveGpuAndroid&) = delete;
+   DisplayXRWeaveGpuAndroid& operator=(const DisplayXRWeaveGpuAndroid&) = delete;
+-  ~DisplayXRWeaveGpuAndroid();
+-
+-  // True once the weave session in this process is live. False for all of M2.
+-  bool IsLive() const;
++  ~DisplayXRWeaveGpuAndroid() override;
+ 
+-  // Batch bracket, matching the mac provider's contract:
+-  //   BeginBatchSync(window_size);
+-  //   WeaveCanvasAndroid(...) per visible target;   // copy-only
+-  //   SubmitBatchSync();                            // one synchronous submit
+-  void BeginBatchSync(const gfx::Size& window_size);
+-  bool WeaveCanvasAndroid(uintptr_t ahardware_buffer,
+-                          const gfx::Rect& src_rect,
+-                          const gfx::Rect& window_rect,
+-                          uint32_t target_id);
+-  bool SubmitBatchSync();
+-
+-  // Drop everything held for one target id (patch 0061's PruneTarget).
+-  void PruneTarget(uint32_t target_id);
++  // viz::DisplayXRWeaveProvider:
++  bool SubmitInFlight(uint32_t target_id) const override;
++  bool WeaveRectAndroid(const gfx::Rect& window_rect,
++                        uint32_t target_id) override;
++  bool SetBatchInputAndroid(uintptr_t ahardware_buffer,
++                            int acquire_fence_fd) override;
++  bool TryTakeWovenResult(uint32_t target_id, Result* out) override;
++  void PruneTargets(size_t count) override;
++  void PruneTarget(uint32_t target_id) override;
++  bool BatchMode() const override;
++  void BeginBatchSync(const gfx::Size& window_size) override;
++  bool SubmitBatchSync() override;
+ 
+  private:
+-  bool logged_unimplemented_ = false;
+   bool batch_open_ = false;
+   gfx::Size batch_size_;
++
++  // The window-sized AHardwareBuffer Viz staged this frame. NOT owned: it is
++  // the backing of a Viz SharedImage whose overlay read access outlives the
++  // submit, which is the only thing that keeps it alive across the call.
++  uintptr_t batch_input_ahb_ = 0;
++
++  struct BatchEntry {
++    uint32_t target_id = 0;
++    gfx::Rect rect;  // window-relative device px
++  };
++  std::vector<BatchEntry> batch_entries_;
++
++  // The woven output AHardwareBuffer. The runtime hands it back on the FIRST
++  // successful submit and again on every reallocation (window resize), NULL on
++  // steady-state frames — it re-weaves into the same buffer. Ownership of the
++  // handback transfers to us (XR_DXR_weave.h §XrWeaveOutputDXR), so it is
++  // Adopt()ed into a ScopedHardwareBufferHandle: assigning a new one releases
++  // the previous reference, which is exactly the "AHardwareBuffer_release the
++  // old one when it is replaced" clause, minus a hand-rolled refcount.
++  // |woven_fresh_| latches "this is a new buffer, Viz must (re)import it",
++  // consumed by the first TryTakeWovenResult that sees it.
++  base::android::ScopedHardwareBufferHandle woven_ahb_;
++  bool woven_fresh_ = false;
++  uint32_t woven_w_ = 0;
++  uint32_t woven_h_ = 0;
++  uint64_t woven_fence_value_ = 0;
++
++  // Latest woven result per target id, exactly as the mac provider does: every
++  // entry names the same shared woven buffer, so Viz imports once and draws
++  // each rect's region.
++  struct Pending {
++    bool have = false;
++    Result result;
++  };
++  base::flat_map<uint32_t, Pending> results_;
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+index b2049f39cce29..424e7eaede517 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.cc
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -4,7 +4,8 @@
+ 
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || \
++    BUILDFLAG(IS_ANDROID)  // DXR mac PR3 / android M1
+ 
+ namespace viz {
+ 
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index 30783e9f17043..86971a58cc1e8 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -7,13 +7,17 @@
+ 
+ #include "build/build_config.h"
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || \
++    BUILDFLAG(IS_ANDROID)  // DXR mac PR3 / android M1
+ 
+ #if BUILDFLAG(IS_WIN)
+ #include <d3d11.h>
+ #elif BUILDFLAG(IS_APPLE)
+ #include <IOSurface/IOSurfaceRef.h>
+ #endif
++// Android pulls in NO platform header here on purpose: every AHardwareBuffer*
++// crossing this interface travels as a uintptr_t, so viz keeps no ownership
++// contract with, and no include of, <android/hardware_buffer.h>.
+ 
+ #include <cstdint>
+ #include <vector>
+@@ -132,6 +136,39 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+                                 uint32_t content_view_width,
+                                 uint32_t content_view_height,
+                                 const std::vector<gfx::Rect>& rects);
++#elif BUILDFLAG(IS_ANDROID)
++  // Android (docs/android-port.md M1). Deliberately NOT a WeaveCanvasAndroid
++  // mirroring WeaveCanvasMac, and the asymmetry is the design, not a gap:
++  //
++  //   mac      hands the provider each element's IOSurface and the provider
++  //            MTL-blits it into a provider-owned window-sized input.
++  //   Android  has no such second copy. The only graphics API the GPU process
++  //            reliably owns is Skia (Graphite-Dawn / Ganesh-Vulkan), and this
++  //            caller is ALREADY doing a Skia draw of each element into a
++  //            scratch — so on Android that scratch IS the window-sized weave
++  //            input: ONE SCANOUT-usage (=> AHardwareBuffer-backed) SharedImage
++  //            every element is drawn into at its own window position.
++  //            Re-blitting inside the provider would mean standing up a private
++  //            VkDevice purely to move pixels Skia had just written.
++  //
++  // So the per-element call records geometry only, and the frame's single
++  // input handle is latched once, after every element has been drawn.
++  virtual bool WeaveRectAndroid(const gfx::Rect& window_rect,
++                                uint32_t target_id) = 0;
++
++  // Latch this frame's staged weave input: |ahardware_buffer| is the staging
++  // SharedImage's AHardwareBuffer (as a uintptr_t), extracted via
++  // ProduceOverlayForWeave -> GetAHardwareBuffer.
++  //
++  // |acquire_fence_fd| is an OWNED sync_file fd for the writes that produced it,
++  // or -1. THE RUNTIME HAS NO ACQUIRE FENCE ON ANDROID (XR_DXR_weave spec v7):
++  // the caller's GPU writes must be complete before xrWeaveSubmitDXR, so the
++  // caller flushes its Skia context SYNC-TO-CPU before calling this and normally
++  // passes -1. The parameter exists so a foreign producer (a decoder, a camera)
++  // can be handled correctly the day one appears, rather than silently racing.
++  // The provider always consumes the fd.
++  virtual bool SetBatchInputAndroid(uintptr_t ahardware_buffer,
++                                    int acquire_fence_fd) = 0;
+ #endif
+ 
+   // If a completed weave result for |target_id| is available and not yet taken,
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 0df6183cae16c..05b777b1da4bc 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -126,6 +126,16 @@
+ #include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+ #include "ui/gfx/mac/io_surface.h"
++#elif BUILDFLAG(IS_ANDROID)
++#include <android/hardware_buffer.h>
++
++#include "base/android/scoped_hardware_buffer_fence_sync.h"
++#include "base/android/scoped_hardware_buffer_handle.h"
++#include "components/viz/common/resources/shared_image_format.h"
++#include "components/viz/service/display_embedder/displayxr_weave_provider.h"
++#include "gpu/command_buffer/service/shared_image/shared_image_representation.h"
++#include "ui/gfx/geometry/rect_conversions.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
+ #endif
+ 
+ #if BUILDFLAG(ENABLE_VULKAN)
+@@ -543,7 +553,7 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+     if (!draw_success) {
+       draw_render_pass_failed_ = true;
+     }
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+     // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model): weave the
+     // composited output's inline-3d sub-rects AFTER the page is painted, before
+     // Flush/Submit. (Graphite-Dawn is chrome's default.)
+@@ -585,7 +595,7 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintCurrentFrame(
+                    *scoped_output_device_paint_->GetCanvas());
+     }
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+     // DisplayXR inline-3D (#625, Step B / B4b — CEF sub-rect model): weave the
+     // composited output's inline-3d sub-rects AFTER the page is painted, before
+     // Flush/Submit.
+@@ -780,7 +790,7 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintRenderPass(
+     }
+     if (insert_success) {
+       skia_representation->SetCleared();
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+       // DisplayXR inline-3D (#625, Step B / B4c): under DComp the composited page
+       // lands in the ROOT render-pass backing (this Graphite recording), not the
+       // output-device surface — weave it here so --disable-direct-composition is
+@@ -809,7 +819,7 @@ void SkiaOutputSurfaceImplOnGpu::FinishPaintRenderPass(
+     DrawOverdraw(std::move(overdraw_ddl), *surface->getCanvas());
+   }
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+   // DisplayXR inline-3D (#625, Step B / B4c): under DComp (Ganesh backend) the
+   // composited page lands in the ROOT render-pass backing (this DDL), not the
+   // output-device surface — weave it here so --disable-direct-composition is no
+@@ -2759,7 +2769,7 @@ void SkiaOutputSurfaceImplOnGpu::SetInline3dOverPlane(
+   inline_3d_frosted_rects_ = std::move(frosted_rects);
+ }
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+ // static
+ base::Token SkiaOutputSurfaceImplOnGpu::DisplayXRTargetKey(
+     const SkiaOutputSurface::Inline3dRect& rect,
+@@ -2808,6 +2818,19 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+   }
+   // GL output-device backbuffer (ANGLE): no easily-extractable ID3D11Texture2D,
+   // so keep the WeavePixels CPU readback here.
++#if BUILDFLAG(IS_ANDROID)
++  // docs/android-port.md open item #2: which entry does Android's
++  // SkiaOutputDevice actually take? Log it ONCE from each, so one adb logcat
++  // answers it on device instead of a code read. Whichever fires, the Android
++  // arm below is the same (the staging path needs only a readable SkSurface),
++  // so this is diagnostics, not a branch.
++  static bool logged_entry_output = false;
++  if (!logged_entry_output) {
++    logged_entry_output = true;
++    LOG(WARNING) << "[DisplayXR] android weave entry: MaybeWeaveOutput() "
++                    "(output-device SkSurface)";
++  }
++#endif
+   WeaveCompositedSurface(output, out_canvas, /*prefer_zero_copy=*/false);
+ }
+ 
+@@ -2851,6 +2874,14 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+             << surface->width() << "x" << surface->height()
+             << " rects=" << inline_3d_rects_.size();
+   }
++#if BUILDFLAG(IS_ANDROID)
++  static bool logged_entry_rrp = false;
++  if (!logged_entry_rrp) {
++    logged_entry_rrp = true;
++    LOG(WARNING) << "[DisplayXR] android weave entry: "
++                    "MaybeWeaveRootRenderPass() (root render-pass surface)";
++  }
++#endif
+   // DComp root backing is a D3D-backed swap-chain image — prefer the GPU-
+   // resident weave (Skia scratch copy -> ProduceOverlay -> WeaveCanvas), no CPU
+   // readback. Falls back to WeavePixels per-rect if the scratch overlay route
+@@ -2866,6 +2897,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   if (!provider) {
+     return;
+   }
++#if BUILDFLAG(IS_ANDROID)
++  if (displayxr_weave_backend_unusable_android_) {
++    return;
++  }
++#endif
+ #if BUILDFLAG(IS_WIN)
+   // Windows weaves same-device: the canvas copy + keyed-mutex input live on the
+   // Viz GPU-main D3D11 device. macOS routes through IOSurfaces (no device here).
+@@ -2874,6 +2910,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+   if (!device_x) {
+     return;
+   }
++#endif
++#if BUILDFLAG(IS_ANDROID)
++  // Android has exactly ONE input mechanism, and it is the "zero-copy" one:
++  // a Skia draw into an AHardwareBuffer-backed staging SharedImage. That works
++  // from ANY readable SkSurface, so it is not tied to the DComp/root-render-pass
++  // entry the flag was invented for — and there is no CPU-readback fallback to
++  // fall back TO (no WeavePixelsAndroid exists, deliberately: it would be a
++  // second mechanism with no second use). Force it on for both entry points.
++  prefer_zero_copy = true;
+ #endif
+   const gfx::Rect window_bounds(size_);
+   if (window_bounds.IsEmpty()) {
+@@ -3283,7 +3328,27 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           }
+           return false;
+         };
+-        // (1) Ensure an owned DISPLAY_READ/WRITE (NON-SCANOUT) D3DImageBacking
++        // (1) Pick the DESTINATION of this element's Skia copy.
++        //
++        // Windows/macOS: a per-target scratch sized to |rect|, whose platform
++        // texture the provider then blits into its own window-sized weave
++        // input — two copies, because the provider owns the input.
++        //
++        // Android: there is no provider-side blit (see WeaveRectAndroid), so
++        // the destination IS the shared window-sized staging image and the
++        // element is drawn straight to its window position. |dst_offset| is
++        // what expresses that; it is (0,0) everywhere else, so the draw code
++        // below is one body, not two.
++#if BUILDFLAG(IS_ANDROID)
++        if (!EnsureWeaveStagingAndroid(window_bounds.size())) {
++          static int c_stg_android = 0;
++          return fail("EnsureWeaveStagingAndroid", &c_stg_android);
++        }
++        const gpu::Mailbox dst_mailbox = displayxr_staging_mailbox_android_;
++        const gfx::Vector2d dst_offset = rect.OffsetFromOrigin();
++#else
++        const gfx::Vector2d dst_offset;
++        // Ensure an owned DISPLAY_READ/WRITE (NON-SCANOUT) D3DImageBacking
+         // scratch sized to |rect|. Non-scanout is deliberate: a SCANOUT backing
+         // on Windows becomes a DComp visual (want_dcomp_texture in
+         // d3d_image_backing_factory.cc) whose overlay image is NOT a raw texture
+@@ -3329,16 +3394,18 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           st.scratch_mailbox = mailbox;
+           st.scratch_size = rect.size();
+         }
++        const gpu::Mailbox dst_mailbox = st.scratch_mailbox;
++#endif  // BUILDFLAG(IS_ANDROID)
+ 
+         // (web#12, 0074) Did the scratch end up holding CLEAN pixels — the
+         // canvas resource rather than a snapshot of a possibly-holed |output|?
+         // Hoisted out of the compose block below because part 1's CPU fallback,
+         // which lives after it, is legal only when this is true.
+-        bool scratch_is_clean = false;
++        [[maybe_unused]] bool scratch_is_clean = false;
+         // (2) GPU Skia-copy the composited sub-rect into the scratch surface.
+         {
+           auto scratch_rep = shared_image_representation_factory_->ProduceSkia(
+-              st.scratch_mailbox, context_state_.get());
++              dst_mailbox, context_state_.get());
+           if (!scratch_rep) {
+             static int c_ps_scratch = 0;
+             return fail("ProduceSkia(scratch)", &c_ps_scratch);
+@@ -3556,8 +3623,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                   static_cast<float>(rw) / kWeaveViewCount;
+               for (int v = 0; v < kWeaveViewCount; ++v) {
+                 // Float bounds so an odd |rw| leaves no seam between halves.
+-                const SkRect dst = SkRect::MakeLTRB(v * half_w, 0,
+-                                                    (v + 1) * half_w, rh);
++                // Offset by |dst_offset|: zero on win/mac (a rect-sized
++                // scratch), the element's window origin on Android (the shared
++                // window-sized staging image).
++                const SkRect dst = SkRect::MakeLTRB(
++                    dst_offset.x() + v * half_w, dst_offset.y(),
++                    dst_offset.x() + (v + 1) * half_w, dst_offset.y() + rh);
+                 // Linear, not nearest: this is a 2:1 horizontal downscale of
+                 // page content (text), where nearest aliases badly.
+                 scratch_surface->getCanvas()->drawImageRect(
+@@ -3605,12 +3676,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           // image. With an unclipped tile this reduces to the previous
+           // behaviour exactly.
+           SkRect src = src_from_canvas ? uv_px : SkRect::MakeWH(iw, ih);
+-          SkRect dst = SkRect::MakeWH(rw, rh);
++          SkRect dst = SkRect::MakeXYWH(dst_offset.x(), dst_offset.y(), rw, rh);
+           if (src_from_canvas && !clean_sbs_rect.IsEmpty() &&
+               rect != clean_sbs_rect) {
+             dst = SkRect::MakeXYWH(
+-                static_cast<float>(clean_sbs_rect.x() - rect.x()),
+-                static_cast<float>(clean_sbs_rect.y() - rect.y()),
++                dst_offset.x() +
++                    static_cast<float>(clean_sbs_rect.x() - rect.x()),
++                dst_offset.y() +
++                    static_cast<float>(clean_sbs_rect.y() - rect.y()),
+                 static_cast<float>(clean_sbs_rect.width()),
+                 static_cast<float>(clean_sbs_rect.height()));
+           }
+@@ -3641,6 +3714,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           // scratch_write / scratch_rep release here; content is submitted.
+         }
+ 
++#if !BUILDFLAG(IS_ANDROID)
+         // ---- (web#12, 0074 — PART 1) CPU READBACK FROM THE CLEAN CANVAS ----
+         //
+         // The scratch now holds this tile's finished weave input: the clean
+@@ -3750,11 +3824,37 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         // composed and correct, only the route to the weave input is broken. So
+         // count the reason and take part 1's road rather than returning false
+         // into the |output| readback 0073 has to gate away.
++#endif  // !BUILDFLAG(IS_ANDROID)
++
++        // Every failure from here on is a GPU-HANDOFF failure: the pixels are
++        // composed and correct, only the route to the weave input is broken.
++        // Declared outside the guard above because the shared tail below the
++        // platform #if calls it on every platform.
+         auto handoff_failed = [&](const char* why, int* counter) -> bool {
+           fail(why, counter);
++#if BUILDFLAG(IS_ANDROID)
++          // Android has no CPU-readback leg to take: there is no
++          // WeavePixelsAndroid on the provider, and the element was drawn
++          // straight into the SHARED staging image rather than into a
++          // per-target scratch there would be anything to read back FROM. Its
++          // road out of a handoff failure is 0074's other one — keep the pixels
++          // the last real copy left at this rect, and let browser#99's recovery
++          // draw paint it mono rather than black.
++          return keep_previous();
++#else
+           return cpu_weave_from_scratch();
++#endif
+         };
+ 
++#if BUILDFLAG(IS_ANDROID)
++        // (3/4-android) Nothing to extract per element: the pixels are already
++        // at their window position inside the SHARED staging image, and its
++        // AHardwareBuffer is pulled out ONCE per frame (after every element has
++        // drawn) just before the batch submit — see the staging block below.
++        // Extracting here would open N overlay read accesses on the same image
++        // and interleave them with the Skia write accesses of later elements.
++        bool submitted = provider->WeaveRectAndroid(rect, st.slot);
++#else
+         // (3) ProduceOverlayForWeave the scratch (SCANOUT-gate-free) to get its
+         // raw ID3D11Texture2D.
+         auto overlay_rep =
+@@ -3804,6 +3904,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         bool submitted = provider->WeaveCanvasMac(
+             ios.get(), gfx::Rect(0, 0, rw, rh), rect, st.slot);
+ #endif
++#endif  // BUILDFLAG(IS_ANDROID)
+         static bool logged_zc = false;
+         if (submitted && !logged_zc) {
+           logged_zc = true;
+@@ -3833,6 +3934,18 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       }
+     }
+ 
++#if BUILDFLAG(IS_ANDROID)
++    // NO CPU-readback fallback on Android, and this is deliberate. The path
++    // above is not really "zero copy vs readback" here — it is a Skia draw into
++    // an AHardwareBuffer-backed staging image, which works from ANY readable
++    // SkSurface. There is therefore no second mechanism to fall back TO, and no
++    // WeavePixelsAndroid on the provider (adding one would be a whole CPU
++    // upload path with no user). A failure means the staging image could not be
++    // made or the element could not be drawn; weaving nothing is the honest
++    // outcome — the caller then clears this target's drawn_rect and the
++    // browser#99 recovery draw paints it mono rather than black.
++    return false;
++#else
+     // CPU-readback fallback (GL output device, or a failed zero-copy step):
+     // read the composited sub-rect back to CPU (BGRA8) and upload it into the
+     // weave input. Ganesh has a synchronous SkSurface::readPixels; Graphite has
+@@ -3948,6 +4061,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // for this tile has now failed; keep what it had rather than let the
+     // caller clear its rects and hand it to the recovery draw.
+     return keep_previous();
++#endif  // BUILDFLAG(IS_ANDROID)
+   };
+ 
+   // Submit EVERY visible target this frame. Each target keys its own keyed-mutex
+@@ -4055,6 +4169,97 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+     provider->SetBatchWish(wish_flat);
+ 
++#if BUILDFLAG(IS_ANDROID)
++    // ---- M1: hand the runtime this frame's weave INPUT ---------------------
++    //
++    // Every visible element has now been Skia-drawn into the shared
++    // window-sized staging image at its own window position, so the staging
++    // image IS the spec-v3 batch input. Two things have to happen before
++    // xrWeaveSubmitDXR, in this order:
++    //
++    //  1. THE OUTBOUND WAIT. The runtime imports NO caller fence on Android
++    //     (XR_DXR_weave.h §XrWeaveSubmitHandlesDXR, spec v7): "the caller
++    //     completes its GPU writes into inputTexture BEFORE calling
++    //     xrWeaveSubmitDXR". The reference client discharges this with a
++    //     vkQueueSubmit-signalled VkFence + vkWaitForFences(UINT64_MAX)
++    //     (main.cpp upload_input()). Here the writer is Skia, so the cheapest
++    //     CORRECT equivalent is a submit with SyncToCpu::kYes / GrSyncCpu::kYes
++    //     — one call, no fence import, no semaphore, no second device. A bare
++    //     flush() is NOT enough: Graphite is deferred and flush only records.
++    //     This is the per-frame CPU stall docs/android-port.md risk #4 names;
++    //     it goes away when the runtime's sync_file acquire/release lands.
++    //  2. THE EXTRACTION. ProduceOverlayForWeave (ProduceOverlay minus the
++    //     SCANOUT gate) -> BeginScopedReadAccess -> GetAHardwareBuffer. The
++    //     read access must OUTLIVE the submit — it is what keeps the buffer
++    //     alive and readable while the service process weaves from it — hence
++    //     the two locals held across SubmitBatchSync() below.
++    //
++    // The acquire fd is -1 by construction: the only producer is the Skia
++    // context we just synced. SetBatchInputAndroid still takes one so a foreign
++    // producer is correct the day one appears.
++    std::unique_ptr<gpu::OverlayImageRepresentation> staging_overlay_rep;
++    std::unique_ptr<gpu::OverlayImageRepresentation::ScopedReadAccess>
++        staging_overlay_read;
++    // Owns the AHardwareBuffer handle for as long as the runtime is reading it,
++    // so it lives in the same scope as the read access — see the ordering note
++    // above.
++    std::unique_ptr<base::android::ScopedHardwareBufferFenceSync> staging_ahb;
++    if (!displayxr_staging_mailbox_android_.IsZero() &&
++        FinishSkiaWritesForWeaveAndroid()) {
++      staging_overlay_rep =
++          shared_image_representation_factory_->ProduceOverlayForWeave(
++              displayxr_staging_mailbox_android_);
++      staging_overlay_read =
++          staging_overlay_rep ? staging_overlay_rep->BeginScopedReadAccess()
++                              : nullptr;
++      // GetAHardwareBufferFenceSync(), NOT GetAHardwareBuffer(). Despite the
++      // header calling the former deprecated, OverlayImageAHBRepresentation
++      // (ahardwarebuffer_image_backing_factory.cc) overrides ONLY that one;
++      // GetAHardwareBuffer() falls through to the base class, which is a bare
++      // NOTREACHED() (shared_image_representation.cc:916) — an unconditional
++      // SIGABRT on this exact path. The one class that does override
++      // GetAHardwareBuffer() there is VideoImageAHBRepresentation, a
++      // VideoImageRepresentation, which is not what ProduceOverlayForWeave
++      // hands back.
++      staging_ahb = staging_overlay_read
++                        ? staging_overlay_read->GetAHardwareBufferFenceSync()
++                        : nullptr;
++      AHardwareBuffer* input_ahb = staging_ahb ? staging_ahb->buffer() : nullptr;
++      if (input_ahb) {
++        provider->SetBatchInputAndroid(
++            reinterpret_cast<uintptr_t>(input_ahb), /*acquire_fence_fd=*/-1);
++        static bool logged_ahb = false;
++        if (!logged_ahb) {
++          logged_ahb = true;
++          LOG(WARNING) << "[DisplayXR] weave: GPU-resident scratch path (no CPU "
++                          "readback) — staging AHardwareBuffer "
++                       << displayxr_staging_size_android_.ToString();
++        }
++      } else {
++        static bool logged_no_ahb = false;
++        if (!logged_no_ahb) {
++          logged_no_ahb = true;
++          // Latched (once per process): a per-frame LOG(ERROR) here is exactly
++          // the log bloat the project's logging conventions ban, and the
++          // condition is steady-state, not transient.
++          LOG(ERROR) << "[DisplayXR] android weave: cannot extract the staging "
++                        "AHardwareBuffer (rep="
++                     << (staging_overlay_rep ? "ok" : "NULL")
++                     << " access=" << (staging_overlay_read ? "ok" : "NULL")
++                     << " ahb_sync=" << (staging_ahb ? "ok" : "NULL")
++                     << " cleared="
++                     << (staging_overlay_rep
++                             ? (staging_overlay_rep->IsCleared() ? "yes" : "NO")
++                             : "?")
++                     << "). access=NULL with cleared=NO means the read was "
++                        "refused by the cleared-state gate, not that the "
++                        "backing lacks an AHardwareBuffer; otherwise check "
++                        "SCANOUT usage and an AHB-supported format.";
++        }
++      }
++    }
++#endif  // BUILDFLAG(IS_ANDROID)
++
+     // (browser#87) A batch with zero copied targets — or a failed submit RPC —
+     // leaves the runtime's woven output untouched, so it is NOT live this frame
+     // no matter how many targets copied in.
+@@ -4835,9 +5040,334 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+             << " woven inline-3D rect(s) from a " << woven_w << "x" << woven_h
+             << " scratch";
+   }
+-#endif  // BUILDFLAG(IS_WIN) / BUILDFLAG(IS_APPLE)
++#elif BUILDFLAG(IS_ANDROID)
++  // ---- (B) Android SYNCHRONOUS draw-back --------------------------------
++  //
++  // SubmitBatchSync already blocked until the runtime finished weaving (the
++  // Android submit contract: no output fence, completion IS the return), so
++  // there is nothing to wait on here — unlike Windows, which GPU-waits the
++  // shared fence before sampling.
++  //
++  // And unlike macOS there is no blit-through-a-Chromium-scratch either. The
++  // mac branch exists only because MoltenVK exports its woven IOSurface with
++  // pixel-format 0 and CreateSharedImage rejects it. An AHardwareBuffer carries
++  // its own AHardwareBuffer_Desc, and AHardwareBufferImageBackingFactory
++  // imports gfx::ANDROID_HARDWARE_BUFFER handles natively, so the runtime's
++  // woven buffer is imported DIRECTLY — one import, no per-frame copy.
++  //
++  // Refcounts: ScopedHardwareBufferHandle::Create() takes its OWN reference,
++  // so the provider keeps the reference the runtime handed it and neither side
++  // can free the other's out from under it.
++  //
++  // The frosted list is drained (never latched) for the same reason as the
++  // Windows branch — a stale clip belongs to no frame. Applying it is Windows-
++  // only for now; on Android a frosted rect is simply woven over, which is the
++  // pre-browser#88 behaviour, not a regression.
++  inline_3d_frosted_rects_.clear();
++
++  for (auto& [key, st] : displayxr_targets_) {
++    DisplayXRWeaveProvider::Result r;
++    if (!provider->TryTakeWovenResult(st.slot, &r) || !r.ok) {
++      continue;
++    }
++    st.drawn_rect = st.pending_rect;
++    if (!r.woven_handle) {
++      continue;  // steady state: reuse the mailbox we already imported
++    }
++    if (!displayxr_shared_woven_mailbox_.IsZero()) {
++      skia_representations_.erase(displayxr_shared_woven_mailbox_);
++      shared_image_factory_->DestroySharedImage(
++          displayxr_shared_woven_mailbox_);
++      displayxr_shared_woven_mailbox_ = gpu::Mailbox();
++    }
++    gfx::GpuMemoryBufferHandle gmb_handle(
++        base::android::ScopedHardwareBufferHandle::Create(
++            reinterpret_cast<AHardwareBuffer*>(r.woven_handle)));
++    gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++    // RGBA8, matching the runtime's WEAVE_VK_FORMAT (VK_FORMAT_R8G8B8A8_UNORM,
++    // comp_multi_weave_android.c) — and the only 8-bit 4-channel format
++    // AHardwareBufferSupportedFormat() accepts.
++    gpu::SharedImageInfo si_info(
++        SinglePlaneFormat::kRGBA_8888,
++        gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height)),
++        gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++        kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++        "DisplayXRWoven");
++    if (shared_image_factory_->CreateSharedImage(mailbox, si_info,
++                                                 std::move(gmb_handle))) {
++      displayxr_shared_woven_mailbox_ = mailbox;
++      displayxr_shared_woven_size_ =
++          gfx::Size(static_cast<int>(r.width), static_cast<int>(r.height));
++      LOG(WARNING) << "[DisplayXR] android weave: imported woven "
++                   << r.width << "x" << r.height << " AHardwareBuffer";
++    } else {
++      LOG(ERROR) << "[DisplayXR] failed to import woven AHardwareBuffer "
++                 << r.width << "x" << r.height;
++    }
++  }
++
++  if (displayxr_shared_woven_mailbox_.IsZero()) {
++    return;  // nothing woven yet — leave the raw SBS content
++  }
++
++  bool drew_any = false;
++  int rects_drawn = 0;
++  {
++    auto woven_rep = shared_image_representation_factory_->ProduceSkia(
++        displayxr_shared_woven_mailbox_, context_state_.get());
++    if (!woven_rep) {
++      return;
++    }
++    std::vector<GrBackendSemaphore> wbegin_sem, wend_sem;
++    auto woven_access = woven_rep->BeginScopedReadAccess(&wbegin_sem,
++                                                         &wend_sem);
++    if (!woven_access) {
++      return;
++    }
++    sk_sp<SkImage> woven_img =
++        woven_access->CreateSkImage(context_state_.get());
++    if (!woven_img) {
++      return;
++    }
++    if (!wbegin_sem.empty()) {
++      output->wait(wbegin_sem.size(), wbegin_sem.data(),
++                   /*deleteSemaphoresAfterWait=*/false);
++    }
++    // Per-rect kSrc, like the mac branch: the woven pixels REPLACE the raw SBS
++    // and the 2D chrome outside these rects stays as the root composited it.
++    // NEAREST is mandatory — this is a device-pixel-exact blit of an interlace
++    // lattice, and any filtering blends neighbouring views into each other.
++    for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
++      gfx::Rect rect = inline_3d_rects_[i].rect;
++      rect.Intersect(window_bounds);
++      if (rect.IsEmpty()) {
++        continue;
++      }
++      const SkRect src_dst = SkRect::MakeXYWH(rect.x(), rect.y(), rect.width(),
++                                              rect.height());
++      SkPaint paint;
++      paint.setBlendMode(SkBlendMode::kSrc);
++      out_canvas->drawImageRect(woven_img.get(), src_dst, src_dst,
++                                SkSamplingOptions(SkFilterMode::kNearest),
++                                &paint, SkCanvas::kStrict_SrcRectConstraint);
++      drew_any = true;
++      ++rects_drawn;
++    }
++
++    // ---- Phase 2 (plane split): composite the OVER plane above the weave ----
++    // Mirror of the Windows/mac composites (see the Windows block for the
++    // per-pixel contract and the R9 no-double-count rule). LAST, so it wins
++    // over the draw-back — over means over.
++    bool over_plane_drawn = false;
++    const bool over_plane_size_ok =
++        inline3d_occlusion_enabled_ &&
++        !inline_3d_over_plane_mailbox_.IsZero() &&
++        inline_3d_over_plane_size_ == window_bounds.size();
++    auto over_rep = over_plane_size_ok
++                        ? shared_image_representation_factory_->ProduceSkia(
++                              inline_3d_over_plane_mailbox_,
++                              context_state_.get())
++                        : nullptr;
++    std::vector<GrBackendSemaphore> obegin_sem, oend_sem;
++    auto over_access =
++        over_rep ? over_rep->BeginScopedReadAccess(&obegin_sem, &oend_sem)
++                 : nullptr;
++    if (over_access) {
++      sk_sp<SkImage> over_img =
++          over_access->CreateSkImage(context_state_.get());
++      if (over_img) {
++        if (!obegin_sem.empty()) {
++          output->wait(obegin_sem.size(), obegin_sem.data(),
++                       /*deleteSemaphoresAfterWait=*/false);
++        }
++        const SkRect win = SkRect::MakeXYWH(
++            window_bounds.x(), window_bounds.y(), window_bounds.width(),
++            window_bounds.height());
++        SkPaint over_paint;
++        over_paint.setBlendMode(SkBlendMode::kSrcOver);
++        out_canvas->drawImageRect(over_img.get(), win, win,
++                                  SkSamplingOptions(SkFilterMode::kNearest),
++                                  &over_paint,
++                                  SkCanvas::kStrict_SrcRectConstraint);
++        over_plane_drawn = true;
++      }
++    }
++
++    // ONE flush for the whole draw-back, before the read accesses release
++    // (the 0064 lesson: an access released before the submit draws nothing).
++    if (drew_any || over_plane_drawn) {
++      std::vector<GrBackendSemaphore> empty_sem;
++      FlushSurface(output, empty_sem, /*scoped_write_access=*/nullptr);
++      if (gr_context()) {
++        gr_context()->submit();
++      }
++      if (graphite_shared_context()) {
++        graphite_shared_context()->submit();
++      }
++    }
++  }
++
++  static bool logged_drawback_android = false;
++  if (drew_any && !logged_drawback_android) {
++    logged_drawback_android = true;
++    LOG(WARNING) << "[DisplayXR] android composited weave: drew back "
++                 << rects_drawn << " woven inline-3D rect(s) from a "
++                 << displayxr_shared_woven_size_.ToString()
++                 << " AHardwareBuffer";
++  }
++#endif  // BUILDFLAG(IS_WIN) / BUILDFLAG(IS_APPLE) / BUILDFLAG(IS_ANDROID)
++}
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
++
++#if BUILDFLAG(IS_ANDROID)
++bool SkiaOutputSurfaceImplOnGpu::EnsureWeaveStagingAndroid(
++    const gfx::Size& window_size) {
++  if (window_size.IsEmpty()) {
++    return false;
++  }
++  if (!displayxr_staging_mailbox_android_.IsZero() &&
++      displayxr_staging_size_android_ == window_size) {
++    return true;
++  }
++  if (!displayxr_staging_mailbox_android_.IsZero()) {
++    skia_representations_.erase(displayxr_staging_mailbox_android_);
++    shared_image_factory_->DestroySharedImage(
++        displayxr_staging_mailbox_android_);
++    displayxr_staging_mailbox_android_ = gpu::Mailbox();
++    displayxr_staging_size_android_ = gfx::Size();
++  }
++
++  gpu::Mailbox mailbox = gpu::Mailbox::Generate();
++  // SCANOUT is what routes this to AHardwareBufferImageBackingFactory (the
++  // exact analogue of SCANOUT -> IOSurfaceImageBacking on mac); RGBA_8888
++  // because AHardwareBufferSupportedFormat() does not list BGRA at all and the
++  // runtime's Android weave path is RGBA8 UNORM end-to-end. Both facts are in
++  // the header comment; getting either wrong yields a SharedImage that builds,
++  // draws, and then has no AHardwareBuffer to extract.
++  gpu::SharedImageInfo si_info(
++      SinglePlaneFormat::kRGBA_8888, window_size,
++      gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++      kPremul_SkAlphaType,
++      gpu::SHARED_IMAGE_USAGE_SCANOUT | gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++          gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE,
++      "DisplayXRWeaveStaging");
++  if (!shared_image_factory_->CreateSharedImage(mailbox, si_info,
++                                                gpu::kNullSurfaceHandle)) {
++    LOG(ERROR) << "[DisplayXR] android weave: CreateSharedImage(staging) "
++                  "failed " << window_size.ToString();
++    return false;
++  }
++  displayxr_staging_mailbox_android_ = mailbox;
++  displayxr_staging_size_android_ = window_size;
++
++  // A fresh SharedImage is UNCLEARED, and each element writes only its own
++  // rect — so this image would never become "cleared" on its own and the
++  // overlay BeginScopedReadAccess that extracts the AHardwareBuffer would
++  // refuse it forever. Clear the whole thing once, to TRANSPARENT: the runtime
++  // reads only the submitted rects, but a transparent rest is the honest value
++  // for a premultiplied input and costs one clear per resize.
++  auto rep = shared_image_representation_factory_->ProduceSkia(
++      mailbox, context_state_.get());
++  if (!rep) {
++    LOG(ERROR) << "[DisplayXR] android weave: ProduceSkia(staging) failed — "
++                  "the weave input cannot be initialized";
++    return false;
++  }
++  {
++    std::vector<GrBackendSemaphore> sbegin, send;
++    SkSurfaceProps props;
++    auto write = rep->BeginScopedWriteAccess(
++        /*final_msaa_count=*/0, props, &sbegin, &send,
++        gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++    if (!write || !write->surface()) {
++      LOG(ERROR) << "[DisplayXR] android weave: BeginScopedWriteAccess(staging)"
++                    " failed — the weave input cannot be initialized";
++      return false;
++    }
++    SkSurface* surface = write->surface();
++    if (!sbegin.empty()) {
++      surface->wait(sbegin.size(), sbegin.data(),
++                    /*deleteSemaphoresAfterWait=*/false);
++    }
++    surface->getCanvas()->clear(SkColors::kTransparent);
++    FlushSurface(surface, send, write.get());
++    if (auto* gr = gr_context()) {
++      gr->submit();
++    }
++    if (auto* graphite = graphite_shared_context()) {
++      graphite->submit();
++    }
++    // Mark the image INITIALIZED. This is the entire point of the clear above,
++    // and omitting it was the bug: ~ScopedWriteAccess() only calls
++    // EndWriteAccess() — it does NOT set the cleared rect, which is why every
++    // other write site in this file calls SetCleared() by hand. Without it the
++    // staging image stayed UNCLEARED forever, and
++    // OverlayImageRepresentation::BeginScopedReadAccess() refused it every
++    // frame ("Attempt to read from an uninitialized SharedImage. debug_label:
++    // DisplayXRWeaveStaging") — which is what "rep=ok access=NULL" was really
++    // reporting, not a missing AHardwareBuffer.
++    //
++    // Whole-image SetCleared() is the honest call: the clear covered the whole
++    // image. The per-element draws afterwards only ever write sub-rects of an
++    // already-initialized image, so they need nothing further.
++    rep->SetCleared();
++  }
++  LOG(WARNING) << "[DisplayXR] android weave: staging AHardwareBuffer-backed "
++                  "SharedImage " << window_size.ToString() << " (RGBA8/SCANOUT)";
++  return true;
++}
++
++bool SkiaOutputSurfaceImplOnGpu::FinishSkiaWritesForWeaveAndroid() {
++  auto* graphite = graphite_shared_context();
++  auto* gr = gr_context();
++
++  static bool logged_backend = false;
++  if (!logged_backend) {
++    logged_backend = true;
++    LOG(WARNING) << "[DisplayXR] android weave Skia backend: "
++                 << (graphite ? "Graphite" : (gr ? "Ganesh" : "NONE"))
++                 << " (gr_context_type="
++                 << static_cast<int>(gpu_preferences_.gr_context_type)
++                 << ", graphite_recorder="
++                 << (context_state_->gpu_main_graphite_recorder() ? "yes" : "no")
++                 << ")";
++  }
++
++  if (graphite) {
++    // Graphite is DEFERRED, so the recorder has to be snapped into the context
++    // before the submit or the submit has nothing to wait on. Guard on the
++    // RECORDER, not merely on the context: SharedContextState::
++    // FlushGraphiteRecorder() does an unguarded
++    // gpu_main_graphite_recorder()->snap(), which is a null dereference when
++    // Graphite is half-initialized.
++    if (context_state_->gpu_main_graphite_recorder()) {
++      context_state_->FlushGraphiteRecorder();
++    }
++    graphite->submit(
++        skgpu::graphite::SubmitInfo(skgpu::graphite::SyncToCpu::kYes));
++    return true;
++  }
++
++  if (gr) {
++    // Ganesh (Vulkan or GL). The extraction below is unaffected: the staging
++    // SharedImage is AHardwareBuffer-backed because of its SCANOUT usage and
++    // RGBA_8888 format, which selects AHardwareBufferImageBackingFactory
++    // independently of the Skia backend, so ProduceOverlayForWeave ->
++    // BeginScopedReadAccess -> GetAHardwareBuffer still yields the buffer.
++    gr->submit(GrSyncCpu::kYes);
++    return true;
++  }
++
++  if (!displayxr_weave_backend_unusable_android_) {
++    displayxr_weave_backend_unusable_android_ = true;
++    LOG(ERROR) << "[DisplayXR] android weave: no usable Skia backend (neither "
++                  "a Graphite context nor a GrDirectContext) — the outbound "
++                  "wait cannot be discharged, so inline-3D is disabled for "
++                  "this GPU process";
++  }
++  return false;
+ }
+-#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#endif  // BUILDFLAG(IS_ANDROID)
+ 
+ #if BUILDFLAG(IS_APPLE)
+ bool SkiaOutputSurfaceImplOnGpu::EnsureScratchClearedMac(
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 110eff1cc9402..42452f2769964 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -508,7 +508,7 @@ class SkiaOutputSurfaceImplOnGpu
+   // returns a newly produced one and caches it.
+   gpu::SkiaImageRepresentation* GetSkiaRepresentation(gpu::Mailbox mailbox);
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+   // Defined with the rest of the DisplayXR weave state below; forward-declared
+   // so DisplayXRReleaseTarget() can name it here.
+   struct DisplayXRTargetState;
+@@ -581,6 +581,36 @@ class SkiaOutputSurfaceImplOnGpu
+   bool EnsureScratchClearedMac(const gpu::Mailbox& scratch_mailbox);
+ #endif
+ 
++#if BUILDFLAG(IS_ANDROID)
++  // DisplayXR inline-3D (docs/android-port.md M1). Lazily create (and clear
++  // once) the ONE window-sized RGBA8 staging SharedImage that IS the Android
++  // weave input: every visible element's squeezed SBS is Skia-drawn into it at
++  // its own window position, then its AHardwareBuffer is extracted via
++  // ProduceOverlayForWeave and handed to the runtime.
++  //
++  // Two format/usage facts are load-bearing and were both found the hard way:
++  //  * SCANOUT usage is what routes the backing to
++  //    AHardwareBufferImageBackingFactory (which claims SCANOUT and adds
++  //    AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY). Without it a DISPLAY-only image
++  //    is claimed by a Graphite/WrappedSkImage backing with no AHardwareBuffer
++  //    at all. This is the exact analogue of the mac SCANOUT -> IOSurface rule.
++  //  * RGBA_8888, NOT BGRA_8888. AHardwareBufferSupportedFormat() does not list
++  //    BGRA at all, so a BGRA request silently falls through to a non-AHB
++  //    factory and the extraction returns null. The runtime's Android weave
++  //    path is RGBA8 UNORM end-to-end (comp_multi_weave_android.c), so RGBA is
++  //    also what it wants.
++  bool EnsureWeaveStagingAndroid(const gfx::Size& window_size);
++
++  // Discharge the weave's OUTBOUND WAIT on whichever Skia backend this device
++  // actually runs, and log that backend once. Graphite-Dawn is Chrome's default
++  // on Android but is NOT universal — an Adreno driver that fails Dawn adapter
++  // validation leaves Viz on Ganesh (Vulkan or GL) with a NULL graphite context
++  // AND a null gpu_main_graphite_recorder_. Returns false when neither backend
++  // is usable, which permanently disables the weave rather than handing the
++  // runtime pixels the GPU has not finished writing.
++  bool FinishSkiaWritesForWeaveAndroid();
++#endif
++
+   class ReleaseCurrent {
+    public:
+     ReleaseCurrent(scoped_refptr<gl::GLSurface> gl_surface,
+@@ -789,7 +819,7 @@ class SkiaOutputSurfaceImplOnGpu
+   // content.
+   bool inline3d_occlusion_enabled_ = false;
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
+   // DisplayXR inline-3D (#625, Step B / B4d — GPU-resident weave) scratch
+   // SharedImage state. |mailbox| is an owned D3DImageBacking sized to a rect:
+   // the composited sub-rect is GPU Skia-copied into it, then ProduceOverlay
+@@ -873,6 +903,18 @@ class SkiaOutputSurfaceImplOnGpu
+   scoped_refptr<gfx::D3DSharedFence> displayxr_shared_woven_fence_;
+ #endif
+   gfx::Size displayxr_shared_woven_size_;
++
++#if BUILDFLAG(IS_ANDROID)
++  // The window-sized AHardwareBuffer-backed weave INPUT (see
++  // EnsureWeaveStagingAndroid). Shared by every target — the Android provider
++  // owns no per-target GPU state at all — and recreated on a window resize.
++  gpu::Mailbox displayxr_staging_mailbox_android_;
++  gfx::Size displayxr_staging_size_android_;
++  // Latched by FinishSkiaWritesForWeaveAndroid() when neither Skia backend can
++  // discharge the outbound wait. One ERROR, then inline-3D stays inert for the
++  // life of this GPU process instead of retrying (and re-logging) every frame.
++  bool displayxr_weave_backend_unusable_android_ = false;
++#endif
+ #endif
+ 
+ #if BUILDFLAG(IS_APPLE)
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.cc b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+index 52bfec29edd43..30fc7af61e247 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.cc
+@@ -1194,7 +1194,8 @@ SharedImageRepresentationFactory::ProduceOverlay(const gpu::Mailbox& mailbox) {
+   return manager_->ProduceOverlay(mailbox, memory_type_tracker_.get());
+ }
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || \
++    BUILDFLAG(IS_ANDROID)  // DXR mac PR3 / android M1
+ std::unique_ptr<OverlayImageRepresentation>
+ SharedImageRepresentationFactory::ProduceOverlayForWeave(
+     const gpu::Mailbox& mailbox) {
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_factory.h b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+index 7d21623feb57c..8b8ea378da5e2 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_factory.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_factory.h
+@@ -305,7 +305,8 @@ class GPU_GLES2_EXPORT SharedImageRepresentationFactory {
+       scoped_refptr<SharedContextState> context_state);
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox);
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || \
++    BUILDFLAG(IS_ANDROID)  // DXR mac PR3 / android M1
+   // DisplayXR inline-3D (#625, Step B): SCANOUT-free overlay produce used to read
+   // a (DISPLAY_READ/WRITE, non-SCANOUT) D3DImageBacking's ID3D11Texture2D on the
+   // GPU thread for the weave copy. See SharedImageManager::ProduceOverlayForWeave.
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.cc b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+index de3bbec3b72e7..1381c724c0a9a 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.cc
+@@ -384,7 +384,8 @@ std::unique_ptr<OverlayImageRepresentation> SharedImageManager::ProduceOverlay(
+   return representation;
+ }
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || \
++    BUILDFLAG(IS_ANDROID)  // DXR mac PR3 / android M1
+ std::unique_ptr<OverlayImageRepresentation>
+ SharedImageManager::ProduceOverlayForWeave(const gpu::Mailbox& mailbox,
+                                            gpu::MemoryTypeTracker* tracker) {
+@@ -398,7 +399,7 @@ SharedImageManager::ProduceOverlayForWeave(const gpu::Mailbox& mailbox,
+     return nullptr;
+   }
+ 
+-  // No SCANOUT enforcement here (see header): the weave source SI is
++  // No SCANOUT enforcement here (see header): on Windows the weave source SI is
+   // DISPLAY_READ/WRITE-only (no SCANOUT, so it stays a plain D3DImageBacking
+   // rather than a DComp visual), yet the D3D overlay representation still
+   // exposes its ID3D11Texture2D, which is all the weave copy needs.
+diff --git a/gpu/command_buffer/service/shared_image/shared_image_manager.h b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+index 034cebfccaafa..bb56cc6bdd16b 100644
+--- a/gpu/command_buffer/service/shared_image/shared_image_manager.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_manager.h
+@@ -117,14 +117,24 @@ class GPU_GLES2_EXPORT SharedImageManager
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlay(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE)  // DXR mac PR3
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_APPLE) || \
++    BUILDFLAG(IS_ANDROID)  // DXR mac PR3 / android M1
+   // DisplayXR inline-3D (#625, Step B). Identical to ProduceOverlay but WITHOUT
+   // the SCANOUT usage enforcement: the overlay representation is the GPU-thread
+   // path that exposes a backing's ID3D11Texture2D (via GetDCLayerOverlayImage),
+   // which is all the weave copy needs. A SCANOUT backing on Windows becomes a
+   // DComp visual (want_dcomp_texture), so the weave source is a DISPLAY_READ/
+   // WRITE (non-SCANOUT) D3DImageBacking read through this gate-free path; never
+-  // to actually scan out. Win-only, feature-gated by the caller.
++  // to actually scan out. Feature-gated by the caller on every platform.
++  //
++  // ANDROID (docs/android-port.md M1): same gate-free produce, different
++  // payload — OverlayImageRepresentation::ScopedReadAccess::GetAHardwareBuffer()
++  // is the ONLY way to get a raw AHardwareBuffer out of a Viz SharedImage under
++  // Graphite-Dawn, and that buffer is what xrWeaveSubmitDXR takes. Unlike
++  // Windows, the Android weave source DOES carry SCANOUT usage (it is what
++  // routes the backing to AHardwareBufferImageBackingFactory in the first
++  // place), so the gate would not have rejected it — but going through the same
++  // entry point keeps one extraction chain across all three arms.
+   std::unique_ptr<OverlayImageRepresentation> ProduceOverlayForWeave(
+       const Mailbox& mailbox,
+       MemoryTypeTracker* ref);
