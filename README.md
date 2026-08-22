@@ -161,7 +161,8 @@ scripts/     config.env (the pin) + fetch / build / brand / package / sign / rel
 branding/    product name, icons, about-page, user-agent strings
 installer/   NSIS installer (chains the runtime version check)
 feed/        the update feed published at updates.displayxr.org
-docs/        maintenance policy, rebase runbook, integration-point file list
+docs/        maintenance policy, rebase runbook, integration-point file list,
+             Android port design + as-built (android-port.md) and pitfalls (android-pitfalls.md)
 diagnostics/ the weave-capture harness used to debug the pipeline on hardware
 ```
 
