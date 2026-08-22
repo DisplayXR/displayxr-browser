@@ -1,4 +1,4 @@
-From 0356f673de03366e8000b010278c52fef4e1831f Mon Sep 17 00:00:00 2001
+From f3adb94f478e9440abfa295de5970273434daf77 Mon Sep 17 00:00:00 2001
 From: David <dfattal@gmail.com>
 Date: Sat, 22 Aug 2026 02:35:02 +0000
 Subject: [PATCH] inline-3d(88): apply the frosted-glass clip on the Android
