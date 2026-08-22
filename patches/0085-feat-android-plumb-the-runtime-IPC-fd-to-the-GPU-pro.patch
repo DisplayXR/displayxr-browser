@@ -1,4 +1,4 @@
-From 592a88c4b376f835746f9c17b52f3abe0670eb50 Mon Sep 17 00:00:00 2001
+From e6b4fdb61e748bcbca6e6ee038cdb0f7a238f632 Mon Sep 17 00:00:00 2001
 From: David <dfattal@gmail.com>
 Date: Thu, 20 Aug 2026 08:08:23 +0000
 Subject: [PATCH] feat(android): plumb the runtime IPC fd to the GPU process at
@@ -145,7 +145,7 @@ index a349cc302f4e6..3935baf0003aa 100644
  #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
  
 diff --git a/content/gpu/gpu_main.cc b/content/gpu/gpu_main.cc
-index f99ecf68ce23d..c68cacf891c43 100644
+index f99ecf68ce23d..a31262cb05cb4 100644
 --- a/content/gpu/gpu_main.cc
 +++ b/content/gpu/gpu_main.cc
 @@ -17,6 +17,7 @@
@@ -156,15 +156,7 @@ index f99ecf68ce23d..c68cacf891c43 100644
  #include "base/memory/raw_ptr.h"
  #include "base/message_loop/message_pump_type.h"
  #include "base/message_loop/message_pump_wakeup_counter.h"
-@@ -24,6 +25,7 @@
- #include "base/numerics/clamped_math.h"
- #include "base/process/current_process.h"
- #include "base/process/process_metrics.h"
-+#include "base/posix/global_descriptors.h"
- #include "base/rand_util.h"
- #include "base/run_loop.h"
- #include "base/strings/string_number_conversions.h"
-@@ -49,6 +51,7 @@
+@@ -49,6 +50,7 @@
  #include "content/common/skia_utils.h"
  #include "content/gpu/gpu_child_thread.h"
  #include "content/public/common/content_client.h"
@@ -172,6 +164,14 @@ index f99ecf68ce23d..c68cacf891c43 100644
  #include "content/public/common/content_features.h"
  #include "content/public/common/content_switches.h"
  #include "content/public/common/main_function_params.h"
+@@ -94,6 +96,7 @@
+ #if BUILDFLAG(IS_ANDROID)
+ #include "base/android/meminfo_dump_provider.h"
+ #include "base/posix/eintr_wrapper.h"
++#include "base/posix/global_descriptors.h"
+ #include "base/trace_event/memory_dump_manager.h"
+ #include "components/tracing/common/graphics_memory_dump_provider_android.h"
+ #include "sandbox/linux/services/thread_helpers.h"  // nogncheck
 @@ -164,6 +167,42 @@ bool IsInline3DGpuProcess() {
  }
  #endif  // BUILDFLAG(IS_WIN)
