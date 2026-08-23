@@ -1,0 +1,489 @@
+From 3c357732e6e2d9b030e0c3f208bbd50ddb70ed27 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 17:26:39 +0000
+Subject: [PATCH] fix(viz): suppress a canvas quad only once its resource is
+ proven openable
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The lockstep invariant, in shared code: NEVER SUPPRESS A REGION YOU CANNOT DRAW
+BACK. Display already withheld a weave rect for a tile with no resolved canvas
+layer; this closes the other half, which the device capture showed wide open —
+"recovery draw: n=0 missing=10 ... [no_mailbox=0 produce=10]". Ten layers that
+all RESOLVED, all got suppressed, and none of which could be opened. Every one
+of those tiles was a hole with nothing behind it.
+
+The predicate was too weak. "The ResourceId resolved to a non-zero mailbox" is
+what Display can see at aggregation time, and both platforms fail DOWNSTREAM of
+exactly that — Android refuses at ProduceSkia, Windows at BeginScopedReadAccess.
+Only the GPU thread can establish the predicate that matters, and it does so
+after Display has already decided. So Display now consults evidence the GPU
+thread writes: a lock-guarded, token-keyed set of elements whose canvas resource
+has been opened successfully at least once (Inline3dRecoveryUsable, defined in
+skia_output_surface.cc — both parties are in the GPU process on different
+threads, so a lock is the whole channel).
+
+Three parts, and the third is what makes it converge rather than latch:
+
+  * Display splits resolved layers into SUPPRESSED (proven) and PROBE (not yet
+    proven). Only the proven set reaches SetInline3dSuppressedResources.
+  * |inline_3d_canvas_layers_| still means EXACTLY the suppressed set, so every
+    "is |output| at this rect a hole?" test is untouched. The probe list is a
+    separate third list that is never a weave source and never answers that
+    question.
+  * The GPU stage opens the probe layers once per frame purely to learn. Without
+    it an unproven layer is never opened, so it never becomes proven, so it is
+    never suppressed — a tile that failed once would stay flat forever. Cost is
+    zero in the steady state: a layer that opens is promoted and the list
+    empties.
+
+The rect is ALWAYS submitted, for both lists. Withholding it would stop the
+weave running for that tile, and the weave's own successful canvas open is one
+of the two ways a layer gets promoted. Not suppressing it is what makes that
+safe: the page drew the quad, so the weave draws over real pixels, never a hole.
+Worst case is one frame of the page's own side-by-side. Flat is acceptable,
+empty never is.
+
+Demotion is recorded by the only code entitled to an opinion: the recovery draw,
+at the moment it tries to fill a hole and cannot.
+
+Also folded in, free, the two hypotheses for the shared root cause — the failure
+is DETERMINISTIC (produce=N/N every frame on Android, read_access=N/N on
+Windows), which rules out contention and points at a static mismatch. On the
+first recovery failure only, [DXR-H-PROBE] asks the SAME mailbox for an OVERLAY
+representation and reports whether the layer took part in this frame's weave.
+Overlay OK where Skia refused => H1, a representation/usage mismatch at
+creation, and the fix is a usage bit rather than a new primitive. A layer that
+was never submitted and still fails refutes H2 for it — and note the weave
+path's own access is scoped to its compose block and released long before
+recovery runs, and canvas mailboxes are never entered into
+|skia_representations_|, so nothing caches an access across the frame either.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ components/viz/service/display/display.cc     | 62 +++++++++++-
+ .../service/display/skia_output_surface.cc    | 45 +++++++++
+ .../viz/service/display/skia_output_surface.h | 37 ++++++-
+ .../skia_output_surface_impl.cc               |  6 +-
+ .../skia_output_surface_impl.h                |  3 +-
+ .../skia_output_surface_impl_on_gpu.cc        | 96 ++++++++++++++++++-
+ .../skia_output_surface_impl_on_gpu.h         | 10 +-
+ 7 files changed, 251 insertions(+), 8 deletions(-)
+
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index f31982fb385f2..1a4a91c677a98 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1015,8 +1015,24 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+     // DrawAndSwap, BEFORE renderer_->DrawFrame() below consumes the suppression
+     // set, and the resolve is a pure read of the resource provider Display
+     // already owns.
++    // LOCKSTEP (shared with win/browser): |resolved_canvas| is what we are
++    // ALLOWED TO SUPPRESS — resolved AND proven openable by the GPU thread.
++    // |probe_canvas| is resolved but not yet proven: NOT suppressed, handed to
++    // the GPU stage anyway so it can try to open it and promote it.
++    //
++    // The predicate had to change. "The ResourceId resolved to a non-zero
++    // mailbox" is what Display can see, and it is NOT sufficient: both
++    // platforms fail downstream of exactly that (Android refuses at
++    // ProduceSkia, Windows at BeginScopedReadAccess) — the device capture reads
++    // "recovery draw: n=0 missing=10 ... produce=10" with no_mailbox=0, i.e.
++    // ten layers that all resolved and none of which could be opened. Suppress
++    // on the weaker predicate and we punch ten holes nothing can fill, which is
++    // the void. So suppress on the STRONGER one, which only the GPU thread can
++    // establish, and which it reports back through Inline3dRecoverySet.
+     std::vector<SkiaOutputSurface::Inline3dLayerMailbox> resolved_canvas;
++    std::vector<SkiaOutputSurface::Inline3dLayerMailbox> probe_canvas;
+     ResourceIdSet resolved_canvas_ids;
++    int unproven = 0;
+     {
+       // Resolve each isolated canvas layer's ResourceId → its SharedImage
+       // mailbox here (Display owns the resource provider), handing the GPU
+@@ -1030,6 +1046,16 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+           ++dropped;
+           continue;
+         }
++        if (!Inline3dRecoveryUsable(layer.id)) {
++          // Not proven openable yet. Leave the page owning these pixels — the
++          // quad stays in the raster, so the worst case is one frame of the
++          // page's own side-by-side (which the weave draws over anyway when it
++          // succeeds). Flat is acceptable; empty never is.
++          probe_canvas.push_back(
++              {m, layer.rect, layer.visible_rect, layer.uv, layer.id});
++          ++unproven;
++          continue;
++        }
+         resolved_canvas.push_back(
+             {m, layer.rect, layer.visible_rect, layer.uv, layer.id});
+         resolved_canvas_ids.insert(layer.resource_id);
+@@ -1085,8 +1111,39 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+       std::vector<SkiaOutputSurface::Inline3dRect> weave_rects;
+       weave_rects.reserve(frame.inline_3d_rects.size());
+       int unprepared = 0;
++      if (unproven > 0) {
++        // Loud and counted, on 0073's discipline: this is the moment a tile
++        // stops being suppressed, so it must never be inferred from pixels.
++        static int s_unproven = 0;
++        const int n = s_unproven++;
++        if (n < 3 || (n % 300) == 0) {
++          LOG(ERROR) << "[DisplayXR] inline-3D lockstep: " << unproven << " of "
++                     << frame.inline_3d_canvas_resources.size()
++                     << " canvas layer(s) resolved but are NOT yet proven "
++                        "openable by the GPU thread — NOT suppressing them, so "
++                        "the page keeps drawing those tiles (flat, not void). "
++                        "They are still handed over to be probed (events="
++                     << (n + 1) << ")";
++        }
++      }
++      // A rect is prepared if EITHER list holds its layer: an unproven layer is
++      // still a real resolved resource, and its rect must still be submitted —
++      // withholding it would stop the weave from ever running for that tile,
++      // and the weave's own successful canvas open is one of the two ways a
++      // layer gets promoted. Not suppressing it is what makes that safe: the
++      // page drew the quad, so the weave draws over real pixels, never a hole.
++      auto layer_matches = [](const SkiaOutputSurface::Inline3dLayerMailbox& l,
++                              const auto& r) {
++        return !r.id.is_zero() ? l.id == r.id : l.rect == r.rect;
++      };
+       for (const auto& r : frame.inline_3d_rects) {
+-        bool prepared = resolved_canvas.empty();
++        bool prepared = resolved_canvas.empty() && probe_canvas.empty();
++        for (const auto& layer : probe_canvas) {
++          if (layer_matches(layer, r)) {
++            prepared = true;
++            break;
++          }
++        }
+         for (const auto& layer : resolved_canvas) {
+           // Identity where there is one; the legacy zero-id channel has only
+           // geometry, and Display's own tile join above uses the same pair of
+@@ -1118,7 +1175,8 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+         }
+       }
+       skia_output_surface_->SetInline3DRects(std::move(weave_rects),
+-                                             std::move(resolved_canvas));
++                                             std::move(resolved_canvas),
++                                             std::move(probe_canvas));
+     }
+     // DisplayXR inline-3D (browser#22 B): hand the renderer the resources the
+     // weave draw-back is the single source for, so their quads are not painted
+diff --git a/components/viz/service/display/skia_output_surface.cc b/components/viz/service/display/skia_output_surface.cc
+index 5c02fc1729fcc..6d2c1fb41a81f 100644
+--- a/components/viz/service/display/skia_output_surface.cc
++++ b/components/viz/service/display/skia_output_surface.cc
+@@ -4,8 +4,53 @@
+ 
+ #include "components/viz/service/display/skia_output_surface.h"
+ 
++#include "base/containers/flat_set.h"
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++
+ namespace viz {
+ 
++namespace {
++
++// Guarded by |Inline3dRecoveryLock()|. Written on the GPU thread (the only
++// party that can open a resource), read on the compositor thread by Display.
++base::Lock& Inline3dRecoveryLock() {
++  static base::NoDestructor<base::Lock> lock;
++  return *lock;
++}
++
++base::flat_set<base::Token>& Inline3dRecoveryUsableSet() {
++  static base::NoDestructor<base::flat_set<base::Token>> set;
++  return *set;
++}
++
++}  // namespace
++
++void Inline3dMarkRecoveryUsable(const base::Token& id) {
++  if (id.is_zero()) {
++    return;
++  }
++  base::AutoLock lock(Inline3dRecoveryLock());
++  Inline3dRecoveryUsableSet().insert(id);
++}
++
++void Inline3dMarkRecoveryUnusable(const base::Token& id) {
++  if (id.is_zero()) {
++    return;
++  }
++  base::AutoLock lock(Inline3dRecoveryLock());
++  Inline3dRecoveryUsableSet().erase(id);
++}
++
++bool Inline3dRecoveryUsable(const base::Token& id) {
++  if (id.is_zero()) {
++    return true;  // legacy channel: unchanged behaviour (see the header)
++  }
++  base::AutoLock lock(Inline3dRecoveryLock());
++  const auto& set = Inline3dRecoveryUsableSet();
++  return set.find(id) != set.end();
++}
++
+ SkiaOutputSurface::SkiaOutputSurface() = default;
+ 
+ SkiaOutputSurface::~SkiaOutputSurface() = default;
+diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
+index 1f77300d13bea..a9c8541a9718a 100644
+--- a/components/viz/service/display/skia_output_surface.h
++++ b/components/viz/service/display/skia_output_surface.h
+@@ -52,6 +52,32 @@ struct RenderPassGeometry;
+ }  // namespace copy_output
+ 
+ // This class extends the OutputSurface for SkiaRenderer needs.
++// DisplayXR inline-3D LOCKSTEP: the set of elements whose canvas resource has
++// been PROVEN openable on the GPU thread at least once.
++//
++// Suppression is decided in Display, at aggregation time; whether the GPU stage
++// can actually source a recovery draw for that layer is only knowable later, on
++// the GPU thread. Both platforms fail DOWNSTREAM of a resolved, non-zero
++// mailbox (Android refuses at ProduceSkia, Windows at BeginScopedReadAccess),
++// so "the ResourceId resolved" — the predicate Display has — does not imply
++// "the hole can be filled". Suppressing on it punches holes nothing can fill,
++// which is the dark void seen on both platforms.
++//
++// So Display consults evidence the GPU thread writes: an element's quad is
++// suppressed only once its resource has been opened successfully at least once.
++// Both parties live in the GPU process on different threads, so a lock-guarded
++// set is the entire channel — no mojo, no per-frame allocation.
++//
++// A ZERO id (the legacy main-thread channel, which carries no element token)
++// reports USABLE: there is no key to learn under, so the conservative choice is
++// to leave that channel's behaviour exactly as it is today rather than withhold
++// suppression from it forever.
++VIZ_SERVICE_EXPORT void Inline3dMarkRecoveryUsable(const base::Token& id);
++// Recorded ONLY by code that tried to fill a hole and could not — that is the
++// exact evidence "this element must not be suppressed on the next frame".
++VIZ_SERVICE_EXPORT void Inline3dMarkRecoveryUnusable(const base::Token& id);
++VIZ_SERVICE_EXPORT bool Inline3dRecoveryUsable(const base::Token& id);
++
+ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
+                                              public ExternalUseClient {
+  public:
+@@ -243,9 +269,18 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
+   // Phase 2 retired the third (OVERLAY) list this used to carry: page content
+   // over a tile is lifted by the draw-order split onto the over-plane below,
+   // not by declared per-element overlays.
++  // |probe_layers| (LOCKSTEP) are resolved canvas layers that were NOT
++  // suppressed this frame because they are not yet proven usable. They are
++  // handed over anyway, every frame, purely so the GPU stage can try to open
++  // them and promote them into the proven set — without that, an unproven layer
++  // is never opened, never becomes proven, and stays unsuppressed forever.
++  // They are NEVER a weave source and never answer the hole question:
++  // |canvas_layers| remains EXACTLY the suppressed set, which is the invariant
++  // every "is |output| at this rect a hole?" test depends on.
+   virtual void SetInline3DRects(
+       std::vector<Inline3dRect> rects,
+-      std::vector<Inline3dLayerMailbox> canvas_layers) {}
++      std::vector<Inline3dLayerMailbox> canvas_layers,
++      std::vector<Inline3dLayerMailbox> probe_layers) {}
+ 
+   // DisplayXR inline-3D Phase 2 (plane split): the window-sized premultiplied
+   // RGBA plane holding the page content that sits OVER the woven tiles, freshly
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+index f1d58e1ca54b1..1479f8cd71a6a 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+@@ -1065,7 +1065,8 @@ void SkiaOutputSurfaceImpl::SetFrameRate(
+ 
+ void SkiaOutputSurfaceImpl::SetInline3DRects(
+     std::vector<Inline3dRect> rects,
+-    std::vector<Inline3dLayerMailbox> canvas_layers) {
++    std::vector<Inline3dLayerMailbox> canvas_layers,
++    std::vector<Inline3dLayerMailbox> probe_layers) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(impl_on_gpu_);
+   // Canvas layers are already resolved to {mailbox, rect} in Display (via its
+@@ -1075,7 +1076,8 @@ void SkiaOutputSurfaceImpl::SetInline3DRects(
+   // rects + canvas layers ride ONE task, frame-atomic. browser#18.
+   auto task = base::BindOnce(&SkiaOutputSurfaceImplOnGpu::SetInline3DRects,
+                              base::Unretained(impl_on_gpu_.get()),
+-                             std::move(rects), std::move(canvas_layers));
++                             std::move(rects), std::move(canvas_layers),
++                             std::move(probe_layers));
+   EnqueueGpuTask(std::move(task), {}, /*make_current=*/false,
+                  /*need_framebuffer=*/false);
+ }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
+index 38a0aced746b4..3f08c0335eb72 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
+@@ -178,7 +178,8 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurfaceImpl : public SkiaOutputSurface {
+   // DisplayXR inline-3D (#625, Step B / B4b; canvas resources browser#18).
+   void SetInline3DRects(
+       std::vector<Inline3dRect> rects,
+-      std::vector<Inline3dLayerMailbox> canvas_layers) override;
++      std::vector<Inline3dLayerMailbox> canvas_layers,
++      std::vector<Inline3dLayerMailbox> probe_layers) override;
+   // Phase 2 plane split: the over-plane the weave stage composites above the
+   // weave (patch 0064).
+   void SetInline3dOverPlane(gpu::Mailbox mailbox,
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 8caa88c2e9906..1cf57ce8a05e6 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2766,9 +2766,11 @@ gfx::GpuFenceHandle SkiaOutputSurfaceImplOnGpu::CreateReleaseFenceForGL() {
+ 
+ void SkiaOutputSurfaceImplOnGpu::SetInline3DRects(
+     std::vector<SkiaOutputSurface::Inline3dRect> rects,
+-    std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers) {
++    std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers,
++    std::vector<SkiaOutputSurface::Inline3dLayerMailbox> probe_layers) {
+   inline_3d_rects_ = std::move(rects);
+   inline_3d_canvas_layers_ = std::move(canvas_layers);
++  inline_3d_probe_layers_ = std::move(probe_layers);
+ }
+ 
+ void SkiaOutputSurfaceImplOnGpu::SetInline3dOverPlane(
+@@ -2957,6 +2959,46 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     return;
+   }
+ 
++  // ---- LOCKSTEP PROBE: promote what can be opened ---------------------------
++  //
++  // These are resolved canvas layers Display did NOT suppress this frame,
++  // because they are not yet proven openable. Nothing else in this function
++  // ever touches them — they are not a weave source and they do not answer the
++  // hole question. Their only purpose is to close the loop: without an attempt
++  // here, an unproven layer is never opened, so it never becomes proven, so it
++  // is never suppressed, and a tile that failed once would stay flat forever.
++  //
++  // Cost is zero in the steady state: a layer that opens is promoted, Display
++  // moves it into the suppressed list on the next frame, and this list empties.
++  for (const auto& probe : inline_3d_probe_layers_) {
++    if (probe.mailbox.IsZero()) {
++      continue;
++    }
++    auto probe_rep = shared_image_representation_factory_->ProduceSkia(
++        probe.mailbox, context_state_.get());
++    if (!probe_rep) {
++      continue;
++    }
++    std::vector<GrBackendSemaphore> pbegin, pend;
++    auto probe_access = probe_rep->BeginScopedReadAccess(&pbegin, &pend);
++    if (!probe_access) {
++      continue;
++    }
++    if (!probe_access->CreateSkImage(context_state_.get())) {
++      continue;
++    }
++    Inline3dMarkRecoveryUsable(probe.id);
++    static int s_promoted = 0;
++    const int n = s_promoted++;
++    if (n < 3 || (n % 300) == 0) {
++      LOG(ERROR) << "[DisplayXR] inline-3D lockstep: promoted element "
++                 << probe.id.ToString()
++                 << " to PROVEN (its canvas resource opened) — its quad may be "
++                    "suppressed from the next frame (promotions=" << (n + 1)
++                 << ")";
++    }
++  }
++
+   // CEF sub-rect model (design §13.3), now ASYNC (design §13.6): the composited
+   // page (2D chrome + each inline-3d canvas's flat SBS pixels, already squashed
+   // together) is in |output| — exactly the Step-A CEF host's `pageTex`. |output|
+@@ -3606,6 +3648,9 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                 continue;
+               }
+               src_from_canvas = true;
++              // LOCKSTEP: this resource opened. That is the evidence Display
++              // needs to be allowed to suppress this element's quad.
++              Inline3dMarkRecoveryUsable(inline_3d_rects_[t].id);
+               if (!cbegin.empty()) {
+                 scratch_surface->wait(cbegin.size(), cbegin.data(),
+                                       /*deleteSemaphoresAfterWait=*/false);
+@@ -4667,6 +4712,53 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+             ++rec_fail_produce;
+             break;
+         }
++        // LOCKSTEP: this is the exact moment we learn we CANNOT fill a hole we
++        // punched. Retract the permission to suppress this element; Display
++        // leaves its quad in the page raster from the next frame, so the tile
++        // degrades to flat rather than to void. Flat acceptable, empty never.
++        Inline3dMarkRecoveryUnusable(c.id);
++
++        // ---- H1 vs H2, decided once per process, for one tile --------------
++        // The failure is DETERMINISTIC (produce=N/N every frame on Android,
++        // read_access=N/N on Windows), which rules out contention and points at
++        // a static mismatch. Two cheap discriminators, both free:
++        //
++        //  * Ask the SAME mailbox for an OVERLAY representation. If the overlay
++        //    succeeds where Skia refused, the backing is alive and healthy and
++        //    what differs is the representation the backing supports — i.e. a
++        //    usage/representation-type mismatch at CREATION (H1), and the fix
++        //    is a usage bit, not a new primitive. If both refuse, the mailbox
++        //    is not usable by this stage at all.
++        //  * Report whether this layer took part in this frame's weave. H2
++        //    (same-frame self-conflict: the weave still holds an access) can
++        //    only explain a tile the weave actually opened. A tile that was
++        //    NEVER submitted and still fails refutes H2 outright — and note the
++        //    weave path's own access is scoped to its compose block and
++        //    released well before this runs, and canvas mailboxes are never
++        //    entered into |skia_representations_|, so nothing caches an access
++        //    across the frame either.
++        static bool logged_h = false;
++        if (!logged_h) {
++          logged_h = true;
++          auto overlay_probe =
++              shared_image_representation_factory_->ProduceOverlayForWeave(
++                  c.mailbox);
++          LOG(ERROR)
++              << "[DisplayXR][H-PROBE] recovery could not open a resolved "
++                 "canvas: id=" << c.id.ToString()
++              << " rect=" << c.rect.ToString() << " failed_step="
++              << (rec_step == 2 ? "BeginScopedReadAccess"
++                                : (rec_step == 3 ? "CreateSkImage"
++                                                 : "ProduceSkia"))
++              << " overlay_representation="
++              << (overlay_probe ? "OK -> H1 (representation/usage mismatch at "
++                                  "creation; Skia refused, overlay did not)"
++                                : "ALSO REFUSED -> not a Skia-only gate")
++              << " this_layer_was_submitted_this_frame="
++              << (canvas_was_submitted(c.mailbox)
++                      ? "yes"
++                      : "NO -> H2 (same-frame self-conflict) refuted for it");
++        }
+         continue;
+       }
+       // LEFT EYE = the left half of the quad's EXISTING UV WINDOW, not of the
+@@ -4690,6 +4782,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       // viewport-clipped WebGL canvas resource's physical texture can be
+       // shorter than the SkImage claims and a source crop edge-clamps into a
+       // downward smear.
++      // LOCKSTEP: opened here too — equally good evidence as the weave path.
++      Inline3dMarkRecoveryUsable(c.id);
+       const SkRect dst = gfx::RectToSkRect(c.rect);
+       SkPaint paint;
+       paint.setBlendMode(SkBlendMode::kSrcOver);
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index adb5fbf9ce1c2..51be67d7d8399 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -238,7 +238,8 @@ class SkiaOutputSurfaceImplOnGpu
+   // on the GPU thread.
+   void SetInline3DRects(
+       std::vector<SkiaOutputSurface::Inline3dRect> rects,
+-      std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers);
++      std::vector<SkiaOutputSurface::Inline3dLayerMailbox> canvas_layers,
++      std::vector<SkiaOutputSurface::Inline3dLayerMailbox> probe_layers);
+ 
+   // DisplayXR inline-3D Phase 2 (plane split): record the over-plane painted
+   // for the frame currently being finished. Consumed by
+@@ -756,6 +757,13 @@ class SkiaOutputSurfaceImplOnGpu
+   // DisplayXR isolated layers (browser#18): canvas layers (clean SBS) used as
+   // weave input. Each a resolved {mailbox, rect}. Empty when none this frame.
+   std::vector<SkiaOutputSurface::Inline3dLayerMailbox> inline_3d_canvas_layers_;
++  // LOCKSTEP: resolved canvas layers that were NOT suppressed this frame
++  // because they are not yet proven openable. Handed over every frame purely so
++  // the GPU stage can try to open them and promote them into the proven set —
++  // without that an unproven layer is never opened, never becomes proven, and
++  // stays unsuppressed forever. NEVER a weave source, and never consulted by
++  // the hole tests: |inline_3d_canvas_layers_| stays EXACTLY the suppressed set.
++  std::vector<SkiaOutputSurface::Inline3dLayerMailbox> inline_3d_probe_layers_;
+ 
+   // DisplayXR inline-3D Phase 2 (plane split): the window-sized premultiplied
+   // RGBA plane SkiaRenderer painted the OVER set into for the frame currently
