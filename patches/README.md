@@ -1,12 +1,12 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **109 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **110 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
 
-**Numbering note:** the series runs 0001–0106 then **0111**, **0112** and **0113** — 0107–0110 are
-reserved by the shared viz tail (browser#141), still open. Each of 0111/0112/0113 took the first free
-slot above it, so nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in
+**Numbering note:** the series runs 0001–0106 then **0111**–**0114** — 0107–0110 are
+reserved by the shared viz tail (browser#141), still open. Each of 0111/0112/0113/0114 took the first
+free slot above it, so nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in
 filename order and a gap is not a conflict.
 
 Patch **0112** closes browser#119 + browser#120 (Windows). The browser#99/web#12 recovery draw was
@@ -95,6 +95,26 @@ rest is WITHHELD and drawn mono from 0112's primitive, clipped to the withheld r
 tier-2 degradation, flat but eye-consistent. Overlapping tiles are also barred from
 `BatchKeepPrevious`, whose record can name a region the other tile has since written. With no
 overlap every computed value is bit-for-bit what the pre-patch code produced.
+
+Patch **0114** gives the lower tile back everything it still owns (browser#143). 0113's row band was
+right about the eyes and too expensive: beside a corner occluder it flattened pixels nothing covers,
+and a FULL-HEIGHT occluder flattened the tile outright. There is no protocol change here and that is
+a finding, not a shortcut — a per-entry SOURCE rect was investigated and rejected, because a
+sub-rect's two eye sources sit half a pair-width apart so a midpoint-split source rect only ever
+expresses the full-width case, and more fundamentally the shared input is already texel-overwritten
+where tiles overlap, so no wire format recovers the lost pixels. Only RE-STAGING does. So 0114
+GUILLOTINES the lower tile minus the occluder (TOP/LEFT/RIGHT/BOTTOM, ≤ 4 rects) and REPACKS each
+piece: two 1:1 box copies out of the tile's own scratch put that piece's eye pair inside the piece's
+own footprint, so the pair is exactly as wide as its destination, `srcRect == dstRect`, and today's
+protocol expresses it unchanged. Every guillotine cut lands on an EVEN column — load-bearing, because
+the three platform arms round an odd pair's halves differently (D3D11 splits `rw / 2.0f` as a float,
+macOS and Android take an integer `rw / 2`), so an odd cut is exactly the per-eye asymmetry #131/#143
+exist to kill; the occluder is snapped OUTWARD and an odd-width tile's residual column goes mono.
+A full-width piece takes the literal identity copy, so the NO-OVERLAP PATH STAYS BYTE-IDENTICAL.
+Budget: 8 rects per tile, 32 per frame (the wire cap, and one submit per frame keeps the runtime's
+motion predictor fed), largest-first demotion back to 0113's row band, logged. The ANDROID arm stages
+by Skia draw at the full rect and is gated to one rect until its own repack lands (#122/#100). Also
+closes browser#144: 0113 left `weave_src_y` unread on Android, failing `-Werror,-Wunused-variable`.
 
 Patch 0069 stops **browser-UI popups ghosting** (browser#88, Phase 3 Stage 4 item B). The omnibox
 dropdown, the autofill popups and every menu are separate OWNED top-level HWNDs that DWM composites
