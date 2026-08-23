@@ -1,8 +1,20 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **107 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **108 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+
+Patch **0112** closes browser#119 + browser#120 (Windows). The browser#99/web#12 recovery draw was
+sourcing from the producer's LIVE canvas SharedImage, which `D3DImageBacking::ValidateBeginAccess`
+refuses for as long as a write access is open — so it read `n=0` on every healthy frame. 0112 sources
+the mono draw from the **per-target weave scratch** instead (the one the fork itself composes and is the
+sole writer of), which makes `recovery_source_actually_available(tile)` answerable without probing a
+contended resource. It also gives browser#120's frosted regions their mono content **in the page raster,
+before the backdrop-filter pass samples it** (the ordering is the whole fix — repairing after the glass
+is composited would destroy the crispness D' exists to protect), and decouples the Phase-2 over-plane
+composite from the weave-landed gate, a latent 0057/0064 coupling that dropped the 2D repair on any
+frame the weave missed. **Numbering note:** 0112 collides with the open Android series (browser#138,
+patches 0103–0110) and with browser#139's 0111; renumber on merge — whichever lands second moves.
 
 **Numbering note:** the series runs 0001–0106 then **0111** — 0107–0110 are reserved by the
 shared viz tail (browser#141), open alongside this one. 0111 (browser#130, Windows/macOS/Android
