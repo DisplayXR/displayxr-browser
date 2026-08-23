@@ -49,7 +49,14 @@ function Stage($m){
   Write-Output $line
   Add-Content -Path $LOG -Value $line -Encoding ascii
 }
+# TWO kinds of failure, and conflating them is how #132 cost two builds and a
+# wrong diagnosis. Fail() means THE SERIES DID NOT APPLY - a real drift signal,
+# and the caller reports it as CONFLICT. FailHarness() means WE could not get far
+# enough to judge the series (bad ref, download, unzip, gclient, a command line
+# we overflowed ourselves): the series is unjudged, so saying "conflict" about it
+# is a lie that sends someone to rewrite patches that are fine.
 function Fail($m){ Stage "ERROR: $m"; "ERROR: $m" | Out-File $DONE -Encoding ascii; exit 1 }
+function FailHarness($m){ Stage "HARNESS: $m"; "HARNESS: $m" | Out-File $DONE -Encoding ascii; exit 1 }
 
 # RunCmd() - `cmd /c` with a length tripwire. Use it for ANY command string whose
 # length grows with the patch series. (The fixed-length `cmd /c` calls below cannot
@@ -69,7 +76,7 @@ function Fail($m){ Stage "ERROR: $m"; "ERROR: $m" | Out-File $DONE -Encoding asc
 $CMD_MAX = 8000
 function RunCmd($c){
   if ($c.Length -gt $CMD_MAX) {
-    Fail ("internal: cmd line is " + $c.Length + " chars, over the $CMD_MAX cap " +
+    FailHarness ("internal: cmd line is " + $c.Length + " chars, over the $CMD_MAX cap " +
           "(cmd.exe ceiling ~8156) - this is a HARNESS fault, not patch drift (#132)")
   }
   cmd /c $c
@@ -111,27 +118,44 @@ $EXT = 'C:\build\patchsrc'
 Remove-Item $ZIP -Force -ErrorAction SilentlyContinue
 Remove-Item $EXT -Recurse -Force -ErrorAction SilentlyContinue
 
-# codeload wants refs/heads/<branch> for a branch, but a bare SHA for a commit.
-if ($PATCH_REF -match '^[0-9a-fA-F]{40}$') { $refPath = $PATCH_REF }
-else { $refPath = "refs/heads/$PATCH_REF" }
-$URL = "https://codeload.github.com/DisplayXR/displayxr-browser/zip/$refPath"
-Stage "downloading patch series from $URL"
-try {
-    $ProgressPreference = 'SilentlyContinue'   # progress UI is slow and useless here
-    Invoke-WebRequest -Uri $URL -OutFile $ZIP -UseBasicParsing -TimeoutSec 300
-} catch {
-    Fail ("download failed for ref '" + $PATCH_REF + "': " + $_.Exception.Message)
+# codeload wants refs/heads/<branch> for a branch, but a bare SHA for a commit,
+# and it 404s on the wrong form rather than redirecting. The old test only
+# recognised a FULL 40-char SHA, so an ABBREVIATED one ('634581a') was sent as
+# refs/heads/634581a, 404d, and - because the download used Fail() - was reported
+# to CI as a patch CONFLICT. Nobody can guess the ref form from that.
+#
+# So try both forms rather than predicting one. Order by what the ref looks like
+# (hex 7-40 chars is probably a SHA) and fall through on failure; a branch whose
+# name happens to be hex still resolves, just on the second attempt.
+$ProgressPreference = 'SilentlyContinue'   # progress UI is slow and useless here
+if ($PATCH_REF -match '^[0-9a-fA-F]{7,40}$') { $forms = @($PATCH_REF, "refs/heads/$PATCH_REF") }
+else { $forms = @("refs/heads/$PATCH_REF", $PATCH_REF) }
+$dlErrors = @()
+foreach ($refPath in $forms) {
+    $URL = "https://codeload.github.com/DisplayXR/displayxr-browser/zip/$refPath"
+    Stage "downloading patch series from $URL"
+    try {
+        Invoke-WebRequest -Uri $URL -OutFile $ZIP -UseBasicParsing -TimeoutSec 300
+        break
+    } catch {
+        $dlErrors += ($refPath + ' -> ' + $_.Exception.Message)
+        Remove-Item $ZIP -Force -ErrorAction SilentlyContinue
+    }
 }
-if (-not (Test-Path $ZIP)) { Fail "no zip downloaded for ref '$PATCH_REF'" }
+if (-not (Test-Path $ZIP)) {
+    FailHarness ("could not download the patch series for ref '" + $PATCH_REF +
+                 "' in any form (" + ($dlErrors -join '; ') +
+                 "). The series was never judged - this is NOT a patch conflict.")
+}
 Stage ("downloaded " + [math]::Round((Get-Item $ZIP).Length/1KB) + " KB")
 
 try { Expand-Archive -Path $ZIP -DestinationPath $EXT -Force }
-catch { Fail ("expand failed: " + $_.Exception.Message) }
+catch { FailHarness ("expand failed: " + $_.Exception.Message) }
 
 $srcDir = Get-ChildItem $EXT -Directory | Select-Object -First 1
-if (-not $srcDir) { Fail "zip contained no top-level directory" }
+if (-not $srcDir) { FailHarness "zip contained no top-level directory" }
 $srcPatches = @(Get-ChildItem (Join-Path $srcDir.FullName 'patches\*.patch') -ErrorAction SilentlyContinue)
-if ($srcPatches.Count -eq 0) { Fail "no patches under patches/ at '$PATCH_REF'" }
+if ($srcPatches.Count -eq 0) { FailHarness "no patches under patches/ at '$PATCH_REF'" }
 
 if (Test-Path $PATCH_DIR) {
     # Clear first: a series that SHRANK would otherwise leave orphans behind that
@@ -153,7 +177,7 @@ Stage 'working tree reset'
 cmd /c "cd /d C:\cr\src && git fetch --tags --depth=1 origin tag $TAG >> $LOG 2>&1"
 if ($LASTEXITCODE -ne 0) { cmd /c "cd /d C:\cr\src && git fetch --tags origin >> $LOG 2>&1" }
 cmd /c "cd /d C:\cr\src && git checkout -f $TAG >> $LOG 2>&1"
-if ($LASTEXITCODE -ne 0) { Fail "checkout $TAG" }
+if ($LASTEXITCODE -ne 0) { FailHarness "checkout $TAG" }
 Stage "checked out $TAG"
 
 # 3. gclient sync to match the tag (run from the .gclient root).
@@ -191,7 +215,7 @@ if (-not $forceSync -and $syncedTag -eq $TAG) {
     # and the next run must NOT believe it is synced.
     Remove-Item $SYNC_MARKER -ErrorAction SilentlyContinue
     cmd /c "cd /d C:\cr && gclient sync -D --force --reset --nohooks >> $LOG 2>&1"
-    if ($LASTEXITCODE -ne 0) { Fail 'gclient sync' }
+    if ($LASTEXITCODE -ne 0) { FailHarness 'gclient sync' }
     Stage 'gclient sync OK'
     cmd /c "cd /d C:\cr && gclient runhooks >> $LOG 2>&1"
     Stage 'runhooks done'
@@ -201,7 +225,7 @@ if (-not $forceSync -and $syncedTag -eq $TAG) {
 # 4. Re-apply the inline-3D patch series. THE DRIFT GATE: if `git am` fails the series
 #    needs a manual rebase (#36) and we must NOT proceed to a build.
 $patches = Get-ChildItem 'C:\build\patches\*.patch' | Sort-Object Name
-if (-not $patches) { Fail 'no patches found at C:\build\patches' }
+if (-not $patches) { FailHarness 'no patches found at C:\build\patches' }
 Stage ("applying " + $patches.Count + " patches")
 
 # Concatenate the series into ONE mbox and pass ONE path (#132).
@@ -243,7 +267,7 @@ if ($LASTEXITCODE -ne 0) {
   # a harness bug. The tell in the log is `git am --abort` answering "Resolve
   # operation not in progress, we are not resuming" with no "Applying:" line
   # above it. Say what actually happened.
-  Fail ("git am NEVER STARTED - HARNESS fault, not a patch conflict. The series was " +
+  FailHarness ("git am NEVER STARTED - HARNESS fault, not a patch conflict. The series was " +
         "NOT tested and is not implicated. Debug do_rebase.ps1, not patches/ (#132)")
 }
 Stage 'patch series applied cleanly'
@@ -267,9 +291,9 @@ Stage 'patch series applied cleanly'
 #    the patches, which never touch this file.
 $brandSrc = Join-Path $srcDir.FullName 'branding/BRANDING'
 $brandDst = 'C:\cr\src\chrome\app\theme\chromium\BRANDING'
-if (-not (Test-Path $brandSrc)) { Fail "no branding/BRANDING in the downloaded series" }
+if (-not (Test-Path $brandSrc)) { FailHarness "no branding/BRANDING in the downloaded series" }
 Copy-Item $brandSrc $brandDst -Force
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $brandDst)) { Fail 'branding copy failed' }
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $brandDst)) { FailHarness 'branding copy failed' }
 $prod = (Select-String -Path $brandDst -Pattern '^PRODUCT_FULLNAME=' | Select-Object -First 1).Line
 Stage ("branding applied - " + $prod)
 
