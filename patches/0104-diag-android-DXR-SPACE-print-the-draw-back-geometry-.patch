@@ -1,0 +1,108 @@
+From a01b12556e2158257bceee333344898d31ff7dbf Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 17:15:10 +0000
+Subject: [PATCH] =?UTF-8?q?diag(android):=20[DXR-SPACE]=20print=20the=20dr?=
+ =?UTF-8?q?aw-back=20geometry=20as=20NUMBERS=20=E2=80=94=20TEMPORARY?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The belt-clip "paints nothing" report cannot be resolved from the logs we have,
+because the two logs that describe the same frame disagree and neither carries a
+number: the count says "drew back 10" (so drew_any is true and ten targets had a
+non-empty drawn_rect) while the screen shows no woven pixels at all. A boolean
+"the intersection was empty" also cannot tell a near-miss from a wild miss — and
+a displaced-but-nonzero intersection names its own offset, which is the single
+most useful fact available here.
+
+So print the numbers, once per process for the first three weaving frames, in a
+NAMED SPACE: window_bounds, size_, the woven buffer rect, the clip bounds, the
+frosted count, every submitted rect, and per target its pending_rect, drawn_rect,
+the intersection with the clip bounds and that intersection's AREA. All of it is
+device px, window-relative, y-down — the space inline_3d_rects_, pending_rect,
+drawn_rect, window_bounds and the |output| canvas are all documented to share.
+This log exists to prove or break that claim.
+
+It discriminates the suspects that are zero on desktop and nonzero on device: a
+status-bar / display-cutout inset, SurfaceView origin vs window origin, and
+dst_offset (zero on win/mac, the element's window origin on Android). Any of
+them appears here as a constant offset between submitted_rects and drawn, or as
+an x_woven that is nonzero but displaced.
+
+Log-only. No behaviour change from 4c005b60, deliberately: the runtime A/B now
+running on the pad must not be confounded by a browser-side change, and the
+belt's fix-vs-delete verdict is deferred until that A/B says whether the woven
+output had any content in it at all.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019Lf6vUbdL59MqXMwJxB489
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 48 +++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 4ec3814475b52..8caa88c2e9906 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -12,6 +12,7 @@
+ #include <vector>
+ 
+ #include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/containers/span.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/debug/dump_without_crashing.h"
+@@ -5530,6 +5531,53 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       // the browser independent of that guarantee either way.
+       const gfx::Rect woven_bounds = gfx::IntersectRects(
+           gfx::Rect(displayxr_shared_woven_size_), window_bounds);
++      // ===== [DXR-SPACE] TEMPORARY numeric settler - drop before capture =====
++      // Print the NUMBERS, in a named space, for the first few frames. A
++      // boolean "the intersection was empty" cannot tell a near-miss from a
++      // wild miss, and the count log and the clip disagree — so measure the
++      // exact feed of each. EVERYTHING below is DEVICE PX, WINDOW-RELATIVE,
++      // y-down: the space inline_3d_rects_, pending_rect, drawn_rect,
++      // window_bounds and the |output| canvas are all documented to share.
++      // This log exists to PROVE or BREAK that, which is the one question the
++      // boolean logs cannot answer. Suspects it discriminates: a status-bar /
++      // display-cutout inset, SurfaceView origin vs window origin, and
++      // dst_offset (zero on win/mac, the element's window origin on Android) —
++      // any of which shows up here as a constant offset between
++      // |submitted_rects| and |drawn|, or a nonzero-but-displaced x_woven.
++      {
++        static int s_space = 0;
++        const int n = s_space++;
++        if (n < 3) {
++          std::string per_target;
++          for (const auto& [sp_key, sp_st] : displayxr_targets_) {
++            gfx::Rect x_woven = sp_st.drawn_rect;
++            x_woven.Intersect(woven_bounds);
++            per_target +=
++                " {slot=" + base::NumberToString(sp_st.slot) +
++                " drawn=" + sp_st.drawn_rect.ToString() +
++                " pending=" + sp_st.pending_rect.ToString() +
++                " x_woven=" + x_woven.ToString() + " area=" +
++                base::NumberToString(static_cast<int64_t>(x_woven.width()) *
++                                     static_cast<int64_t>(x_woven.height())) +
++                "}";
++          }
++          std::string rects;
++          for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
++            rects += " " + inline_3d_rects_[i].rect.ToString();
++          }
++          LOG(WARNING) << "[DXR-SPACE] f" << n
++                       << " (all device px, window-relative, y-down)"
++                       << " window_bounds=" << window_bounds.ToString()
++                       << " size_=" << size_.ToString() << " woven_buffer="
++                       << gfx::Rect(displayxr_shared_woven_size_).ToString()
++                       << " woven_bounds=" << woven_bounds.ToString()
++                       << " frosted=" << frosted_rects.size()
++                       << " targets=" << displayxr_targets_.size()
++                       << " submitted_rects=[" << rects << " ]"
++                       << " per_target=[" << per_target << " ]";
++        }
++      }
++      // ===== end [DXR-SPACE] =====
+       {
+         SkPaint paint;
+         paint.setBlendMode(SkBlendMode::kSrcOver);

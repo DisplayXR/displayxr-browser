@@ -1,10 +1,10 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **102 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **106 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
 
-**Patches 0083–0102 are the ANDROID arm** (browser#100, design in
+**Patches 0083–0106 are the ANDROID arm** (browser#100, design in
 [../docs/android-port.md](../docs/android-port.md), device traps in
 [../docs/android-pitfalls.md](../docs/android-pitfalls.md)). Everything before 0083 is
 Windows + macOS and is unchanged by them: the Android arm is additive, entering through the
@@ -21,6 +21,16 @@ and frosted-glass clip (0097–0098), the v4 overlay atlas (0099), and the draw-
 Building this arm is `autoninja -C out/Android chrome_public_apk`; it needs the DisplayXR Android
 runtime installed on the device, and the sim-display fallback is silent, so verify the active
 plug-in after any runtime install.
+
+**Patches 0103–0106 are the occlusion/space follow-up** (browser#100) that made
+`displayxr-web` `samples/composition` cases 01/09/13 show their 2D and 3D content together on
+device. 0103 scopes the woven draw-back to the rects the runtime actually wove (the companion
+half of 0102's SurfaceControl evaluation-site gate); 0105 appends `--inline-3d-occlusion` by
+default on Android exactly as the `IS_WIN` block in `chrome_main_delegate.cc` already did, and
+0106 hoists the Android over-plane occlusion composite out from behind the five weave
+preconditions so it also runs on weave-less frames. 0104 is the `[DXR-SPACE]` diagnostic
+(draw-back geometry printed as numbers) and is **temporary** — drop it once the scroll-lag item
+is closed. All four are Android-only: they touch no shared behaviour the Windows lane relies on.
 Patch 0069 stops **browser-UI popups ghosting** (browser#88, Phase 3 Stage 4 item B). The omnibox
 dropdown, the autofill popups and every menu are separate OWNED top-level HWNDs that DWM composites
 ABOVE the browser window: they never enter Viz and can never be woven, yet the panel underneath stays
