@@ -1,8 +1,14 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **106 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **107 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+
+**Numbering note:** the series runs 0001–0106 then **0111** — 0107–0110 are reserved by the
+shared viz tail (browser#141), open alongside this one. 0111 (browser#130, Windows/macOS/Android
+alike) takes the first free slot above it, so it is this patch's final number whether or not that
+PR lands, and nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in
+filename order and a gap is not a conflict.
 
 **Patches 0083–0106 are the ANDROID arm** (browser#100, design in
 [../docs/android-port.md](../docs/android-port.md), device traps in
@@ -31,6 +37,25 @@ default on Android exactly as the `IS_WIN` block in `chrome_main_delegate.cc` al
 preconditions so it also runs on weave-less frames. 0104 is the `[DXR-SPACE]` diagnostic
 (draw-back geometry printed as numbers) and is **temporary** — drop it once the scroll-lag item
 is closed. All four are Android-only: they touch no shared behaviour the Windows lane relies on.
+
+Patch 0111 makes the weave honour the **ancestor clip chain** (browser#130). A tile inside an
+`overflow:auto` panel, scrolled out of view within the panel, came back woven OUTSIDE the panel
+as soon as the PAGE scrolled — the browser#117/0081 corruption class, the weave painting a region
+the page does not own. The governing invariant is that a weave rect is the element's screen rect
+intersected with every ancestor clip. Two different notions of "clipped" meet here and only one of
+them is being added: cc deliberately SKIPS the `visible_layer_rect` intersection for
+`kInline3dWeave` (0026 — the tracked chunk lands on a layer with no drawable content, so that rect
+is empty and would zero the weave; 0079/0080–0082 then rely on the resulting raw bounds so a tile
+partly visible at the VIEWPORT edge still scores a geometric join), while the property-tree CLIP
+CHAIN is a live quantity that is correct for a non-drawing layer and was simply never applied.
+0111 walks it with cc's own `PointIsClippedByAncestorClipNode()` idiom, stopping ABOVE the viewport
+clip node so the viewport edge stays browser#117's case and an element with no clipping ancestor is
+byte-identical to before. The viz half is the other necessary edge: an empty tracked rect is no
+longer dropped by the aggregator, because after 0094 dropping it lowers the tracked cardinality, the
+per-element legacy fallback reads the element as MISSING, and Blink's UNCLIPPED
+`getBoundingClientRect` rect is admitted in its place — resurrecting the tile the panel just clipped
+away. Kept on the list it takes the path an off-window tile already takes (0028: window-bounds
+intersect empty → clear pending/drawn, submit nothing, keep the slot and its scratch images).
 Patch 0069 stops **browser-UI popups ghosting** (browser#88, Phase 3 Stage 4 item B). The omnibox
 dropdown, the autofill popups and every menu are separate OWNED top-level HWNDs that DWM composites
 ABOVE the browser window: they never enter Viz and can never be woven, yet the panel underneath stays

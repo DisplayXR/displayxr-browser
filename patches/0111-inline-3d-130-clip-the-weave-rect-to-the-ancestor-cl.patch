@@ -1,0 +1,260 @@
+From a062910778a5055ce63b92729c3782db32f1419c Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 22:02:11 -0700
+Subject: [PATCH] inline-3d(#130): clip the weave rect to the ancestor clip
+ chain, not just the viewport
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A 3D tile inside an `overflow:auto` panel, scrolled out of view WITHIN the
+panel, reappeared woven OUTSIDE its container as soon as the PAGE was
+scrolled — painted where the container's clip should have removed it
+entirely. Same corruption class as browser#117 / patch 0081: the weave
+painting a region the page does not own.
+
+THE GOVERNING INVARIANT. The weave may only paint where the browser would
+have painted the canvas. A weave rect is therefore the element's screen rect
+intersected with EVERY ANCESTOR CLIP.
+
+TWO DIFFERENT NOTIONS OF "CLIPPED", and the fix is only correct because it
+applies the second without reintroducing the first.
+
+  1. |draw_properties().visible_layer_rect| — a DRAW property. cc skips
+     intersecting with it for kInline3dWeave on purpose (patch 0026): the
+     inline-3d tracked chunk lands on a layer with NO drawable content, whose
+     visible_layer_rect is EMPTY, so intersecting would zero every weave rect.
+     browser#94/#117 then built on the resulting raw element bounds — a tile
+     partly visible at the VIEWPORT edge must still report a rect for the
+     geometric join to score. That carve-out is hardware-validated at
+     90/70/50/10% and is untouched here.
+
+  2. the property-tree CLIP CHAIN — a real `overflow` / `clip-path` clip node
+     contributed by an ancestor. This is a live property-tree quantity: it is
+     computed and correct whether or not the layer draws, so it is safe on the
+     very path that must skip (1). It is what was being ignored, and ignoring
+     it is #130: the tracked rect kept its unclipped bounds, so a page scroll
+     translated those bounds back into view with nothing left to cut them.
+
+FIX, cc side. CalculateVisibleBounds() gains the ClipTree, and for the weave
+feature intersects the projected element rect with the accumulated ancestor
+clip. The walk is cc's own idiom from PointIsClippedByAncestorClipNode():
+from layer->clip_tree_index() up while `id > kViewportPropertyNodeId`,
+honouring AppliesLocalClip() and projecting each node's clip through
+transform_tree.ToScreen(clip_node.transform_id) — the same screen space
+layer->ScreenSpaceTransform() maps the element rect into.
+
+The viewport clip (node 1) is EXCLUDED, deliberately. That is browser#117's
+case and it must stay unclipped here. It also means the change is inert for
+an element with no clipping ancestor: the walk starts at the viewport node,
+contributes nothing, and the rect is byte-identical to today's.
+
+FIX, viz side — without which the cc half is undone one layer down. An empty
+tracked rect used to be DROPPED in SurfaceAggregator::CollectTrackedElementRects.
+It must not be, now that empty means "the page paints none of this element":
+
+  * the legacy main-thread channel is a per-element fallback gated on
+    CARDINALITY (patch 0094). Dropping the rect lowers the tracked count by
+    one, the pigeonhole reads the element as MISSING, and Blink's UNCLIPPED
+    getBoundingClientRect rect is admitted in its place — resurrecting the
+    exact tile the panel clipped away.
+  * the weave already handles an on-list target with nothing on screen: it
+    intersects each rect with the window bounds and, when empty, clears the
+    target's pending/drawn rects and submits nothing (patch 0028) while
+    KEEPING its slot and scratch images, so a tile that comes back pays no
+    cold reallocation. Dropping the rect instead starts the absence grace
+    period and tears those down.
+
+So a clipped-away tile now travels the same path an off-window tile already
+travels. It is inert in the join (browser#94 skips any rect that does not
+intersect the root pass), inert in the weave, and it keeps the cardinality
+honest. Only an UNIDENTIFIED (zero-token) empty rect is still dropped: it can
+hold no target slot and carries no information worth a list entry.
+
+Refs browser#130
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ cc/trees/layer_tree_host_impl.cc              | 91 ++++++++++++++++++-
+ .../viz/service/display/surface_aggregator.cc | 33 ++++++-
+ 2 files changed, 120 insertions(+), 4 deletions(-)
+
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index dcddff1..5104b64 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -358,6 +358,71 @@ bool IsFixedOrStickyOccluderTransform(int transform_id,
+          sticky_or_viewport_scroll_node != outer_scroll_id;
+ }
+ 
++// DisplayXR inline-3D (browser#130): the accumulated ANCESTOR clip that applies
++// to |layer|, in screen space, EXCLUDING the viewport clip.
++//
++// This is deliberately NOT the same thing as |visible_layer_rect|, and the
++// distinction is the whole point of this helper. There are two independent
++// notions of "clipped" in play for a tracked element:
++//
++//   * |draw_properties().visible_layer_rect| — a DRAW property. It is only
++//     computed for layers that contribute to a drawn render surface, so for the
++//     inline-3d tracked chunk (which lands on a layer with no drawable content)
++//     it is EMPTY, and intersecting with it would zero every weave rect. That
++//     is why kInline3dWeave skips it (see |use_unclipped_element_bounds| below,
++//     patch 0026), and why browser#94/#117 rely on the raw element bounds so a
++//     tile that is only partly visible at the VIEWPORT edge still reports the
++//     rect the geometric join is scored against.
++//
++//   * the property-tree CLIP CHAIN — a real `overflow` / `clip-path` clip node
++//     contributed by an ancestor (a scroll container, say). This is a live
++//     property-tree quantity: it exists and is correct whether or not the layer
++//     draws, so it is safe to apply on the very path that must skip
++//     |visible_layer_rect|. Ignoring it is browser#130: a tile scrolled out of
++//     an `overflow:auto` panel kept reporting its unclipped bounds, so a
++//     subsequent PAGE scroll walked those bounds back into view and the weave
++//     painted the tile outside the container that had clipped it away.
++//
++// The viewport clip (node |kViewportPropertyNodeId|) is deliberately excluded:
++// the viewport edge is browser#117's case and must stay unclipped here, exactly
++// as cc's own PointIsClippedByAncestorClipNode() separates the two.
++// |applies| is set false when no ancestor contributes a clip at all, in which
++// case the caller must leave the rect untouched.
++gfx::Rect AncestorClipInScreenSpace(const LayerImpl* layer,
++                                    const ClipTree& clip_tree,
++                                    const TransformTree& transform_tree,
++                                    bool* applies) {
++  *applies = false;
++  gfx::Rect accumulated;
++  for (int id = layer->clip_tree_index(); id > kViewportPropertyNodeId;
++       id = clip_tree.Node(id).parent_id) {
++    const ClipNode& clip_node = clip_tree.Node(id);
++    // A node that does not apply a local clip is a pixel-moving filter, which
++    // EXPANDS the accumulated clip rather than shrinking it. Skipping it is
++    // conservative in the safe direction: we never shrink the weave rect on
++    // account of a node that could only have grown it.
++    if (!clip_node.AppliesLocalClip()) {
++      continue;
++    }
++    // ToEnclosingRect + ProjectEnclosingClippedRect, i.e. rounded OUTWARD, and
++    // the same idiom PointIsClippedByAncestorClipNode() uses on this tree. For
++    // a clip that is the permissive direction: at worst the weave rect keeps a
++    // sub-pixel sliver the page antialiased away, where rounding inward would
++    // shave a pixel off a rect that is entirely correct.
++    const gfx::Rect clip_in_screen_space =
++        MathUtil::ProjectEnclosingClippedRect(
++            transform_tree.ToScreen(clip_node.transform_id),
++            gfx::ToEnclosingRect(clip_node.clip));
++    if (*applies) {
++      accumulated.Intersect(clip_in_screen_space);
++    } else {
++      accumulated = clip_in_screen_space;
++      *applies = true;
++    }
++  }
++  return accumulated;
++}
++
+ // Returns the visible bounds of the tracked element on the given layer,
+ // optionally subtracting any front occluders in screen space.
+ gfx::Rect CalculateVisibleBounds(
+@@ -365,6 +430,7 @@ gfx::Rect CalculateVisibleBounds(
+     const viz::TrackedElementRect& rect_data_in_layer_space,
+     bool use_unclipped_element_bounds,
+     const std::vector<HeuristicFixedOrStickyOccluder>& front_occluders,
++    const ClipTree& clip_tree,
+     const TransformTree& transform_tree,
+     int inner_scroll_id,
+     int outer_scroll_id,
+@@ -385,6 +451,26 @@ gfx::Rect CalculateVisibleBounds(
+   gfx::Rect element_screen_rect = MathUtil::ProjectEnclosingClippedRect(
+       layer->ScreenSpaceTransform(), visible_layer_rect);
+ 
++  // DisplayXR inline-3D (browser#130): having skipped |visible_layer_rect|
++  // above, put back the half of it that IS reachable and IS correct for a
++  // non-drawing layer — the ancestor clip chain. The weave may only paint where
++  // the browser would have painted the canvas, so the weave rect is the
++  // element's screen rect intersected with every ancestor clip. Without this an
++  // `overflow:auto` panel's clip is invisible to the weave and a tile scrolled
++  // out of the panel is woven outside it as soon as the page scrolls.
++  //
++  // An empty result is meaningful and is passed on as such: it says "the page
++  // paints none of this element this frame", which downstream is the same
++  // "nothing on screen for this target" case an off-window tile already takes.
++  if (use_unclipped_element_bounds && !element_screen_rect.IsEmpty()) {
++    bool has_ancestor_clip = false;
++    const gfx::Rect ancestor_clip = AncestorClipInScreenSpace(
++        layer, clip_tree, transform_tree, &has_ancestor_clip);
++    if (has_ancestor_clip) {
++      element_screen_rect.Intersect(ancestor_clip);
++    }
++  }
++
+   if (rect_data_in_layer_space.should_exclude_fixed_and_sticky_occlusions) {
+     int layer_transform_id = layer->transform_tree_index();
+     int layer_sticky_or_viewport_scroll_node =
+@@ -2394,6 +2480,9 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
+       outer_scroll ? outer_scroll->transform_id : kInvalidPropertyNodeId;
+   const TransformTree& transform_tree =
+       active_tree()->property_trees()->transform_tree();
++  // DisplayXR inline-3D (browser#130): the weave rect must honour the ancestor
++  // clip chain, which lives here and stays valid for layers that do not draw.
++  const ClipTree& clip_tree = active_tree()->property_trees()->clip_tree();
+   base::flat_map<int, int> sticky_or_viewport_scroll_cache;
+   std::vector<HeuristicFixedOrStickyOccluder> front_occluders;
+ 
+@@ -2430,7 +2519,7 @@ viz::TrackedElementRects LayerTreeHostImpl::CollectTrackedElementRects(
+           transformed_rect.visible_bounds = CalculateVisibleBounds(
+               layer, rect_data,
+               feature == viz::TrackedElementFeature::kInline3dWeave,
+-              front_occluders, transform_tree, inner_scroll_id,
++              front_occluders, clip_tree, transform_tree, inner_scroll_id,
+               outer_scroll_id, sticky_or_viewport_scroll_cache);
+ 
+           // Set the element data with screen space visible bounds.
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 53026b9..5cbaf7f 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2988,11 +2988,38 @@ void SurfaceAggregator::CollectTrackedElementRects(
+     if (feature == TrackedElementFeature::kInline3dWeave) {
+       // Route into the weave rects; keep these out of the generic map so they
+       // don't leak into CopyOutput geometry or the pixel-moving-filter union.
+-      // Skip empty rects (fully-clipped/offscreen canvases) — an empty rect
+-      // must never suppress the legacy fallback below or reach the weave.
++      //
++      // browser#130: an EMPTY tracked rect used to be dropped here. It must not
++      // be. Now that cc intersects the weave rect with the ancestor clip chain,
++      // "empty" is cc stating positively that the page paints NONE of this
++      // element this frame — a tile scrolled out of its `overflow:auto` panel,
++      // say. Dropping it made that statement indistinguishable from "cc had
++      // nothing to say about this element", and the two are handled in opposite
++      // ways downstream:
++      //
++      //   * the legacy main-thread channel below is a per-element fallback
++      //     gated on CARDINALITY. A dropped rect lowers the tracked count by
++      //     one, the pigeonhole then reads the element as MISSING, and Blink's
++      //     unclipped getBoundingClientRect rect is admitted in its place —
++      //     which resurrects the very tile the panel clipped away, weaving it
++      //     outside its container. The clip fix would have been undone one
++      //     layer down.
++      //   * the weave itself already handles an on-list target with nothing on
++      //     screen: it intersects each rect with the window bounds and, when
++      //     that is empty, clears the target's pending/drawn rects and submits
++      //     nothing (patch 0028) while KEEPING its slot and scratch images, so
++      //     a tile that comes back does not pay a cold reallocation. Dropping
++      //     the rect instead would start the target's absence grace period and
++      //     tear those down.
++      //
++      // So keep it, exactly as an off-window tile is kept. It is inert in the
++      // join (browser#94 already skips any rect that does not intersect the
++      // root pass) and inert in the weave, and it keeps the cardinality honest.
++      // Only an UNIDENTIFIED empty rect is still dropped: with no token it can
++      // hold no target slot and carries no information worth a list entry.
+       tracked_metadata_count += tracked_elements.size();
+       for (const auto& rect_data : tracked_elements) {
+-        if (rect_data.visible_bounds.IsEmpty()) {
++        if (rect_data.visible_bounds.IsEmpty() && rect_data.id.is_zero()) {
+           continue;
+         }
+         // Phase-1 identity: carry the element's token and the (namespace,
+-- 
+2.42.0.windows.2
+
