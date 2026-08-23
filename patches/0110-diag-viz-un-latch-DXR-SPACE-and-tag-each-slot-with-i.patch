@@ -1,0 +1,125 @@
+From b38f42408aedb072c8528206debe83271088e7c7 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sun, 23 Aug 2026 01:43:21 +0000
+Subject: [PATCH] diag(viz): un-latch [DXR-SPACE] and tag each slot with its
+ rect CHANNEL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two changes, both aimed at making the next device capture able to prove which
+rect channel the weave followed during a fling.
+
+[DXR-SPACE] printed only the first 3 frames, so it could only ever describe a
+page at REST — and the lag it exists to settle is a scroll behaviour, silent for
+thousands of frames by the time a finger is on the glass. Move it to first-3
+then 1-in-300 (~5 s at 60 fps).
+
+It also could not answer the question at all. At rest the tracked and legacy
+copies of one element are pixel-identical, so no amount of geometry separates
+them. Tag every live target with the channel its key came from — a token key is
+the compositor-thread tracked channel (projected through ScreenSpaceTransform at
+draw time, zero lag), a positional Token(0, index) key is the Blink main-thread
+getBoundingClientRect channel (trails the composited pixels during a fling) —
+and tag each submitted rect the same way, so a pair describing ONE element reads
+as such instead of as two near-identical rectangles.
+
+Same discipline for the aggregator's legacy-admission log, which was latched to
+a single line at startup: whether the legacy channel is admitted at all is the
+question behind the report, and one startup line is gone from a logcat ring long
+before a fling is captured.
+---
+ .../viz/service/display/surface_aggregator.cc | 13 +++++---
+ .../skia_output_surface_impl_on_gpu.cc        | 33 ++++++++++++++++---
+ 2 files changed, 38 insertions(+), 8 deletions(-)
+
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index eb0b04e9b13ef..07b831e187006 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -3215,9 +3215,13 @@ void SurfaceAggregator::AdmitLegacyInline3dRects() {
+   // shape of the bug above, so say so once rather than leaving it to be
+   // inferred from a tile that looks wrong.
+   if (legacy_admitted > 0 && tracked_count > 0) {
+-    static bool logged_union = false;
+-    if (!logged_union) {
+-      logged_union = true;
++    // First 3 then 1-in-300, not latched-once. Whether the legacy channel is
++    // being admitted at all is THE question behind the scroll-lag report, and a
++    // single line emitted at startup is gone from a logcat ring long before a
++    // fling is captured.
++    static int s_union = 0;
++    const int n_union = s_union++;
++    if (n_union < 3 || (n_union % 300) == 0) {
+       LOG(WARNING) << "[DisplayXR] inline-3D rect union: tracked="
+                    << tracked_count << " (of "
+                    << tracked_inline_3d_metadata_count_
+@@ -3226,7 +3230,8 @@ void SurfaceAggregator::AdmitLegacyInline3dRects() {
+                    << " total=" << inline_3d_rects_.size()
+                    << " — element(s) missing from the tracked channel were "
+                       "recovered from the main-thread channel; without this "
+-                      "they would render as raw SBS";
++                      "they would render as raw SBS (events="
++                   << (n_union + 1) << ")";
+     }
+   }
+   pending_legacy_inline_3d_rects_.clear();
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 1cf57ce8a05e6..57de8a330f788 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -5641,13 +5641,34 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       {
+         static int s_space = 0;
+         const int n = s_space++;
+-        if (n < 3) {
++        // First 3 then 1-in-300 (~5 s at 60 fps). The first-3-only latch could
++        // only ever describe a page at REST: the lag this log exists to settle
++        // is a SCROLL behaviour, and by the time a finger is on the glass the
++        // log has been silent for thousands of frames. A steady trickle is what
++        // makes a fling capturable.
++        if (n < 3 || (n % 300) == 0) {
++          // Which CHANNEL each live target came from. A target key is the
++          // element token when the rect carried identity (the compositor-thread
++          // tracked channel, projected through ScreenSpaceTransform at draw
++          // time — zero lag) and a positional Token(0, index) when it did not
++          // (the Blink main-thread getBoundingClientRect channel, which trails
++          // the composited pixels during a fling). Which one a slot is
++          // following is precisely the question a capture has to answer, and no
++          // amount of geometry in this log can answer it: at rest the two are
++          // pixel-identical.
++          base::flat_set<base::Token> legacy_keys;
++          for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
++            if (inline_3d_rects_[i].id.is_zero()) {
++              legacy_keys.insert(DisplayXRTargetKey(inline_3d_rects_[i], i));
++            }
++          }
+           std::string per_target;
+           for (const auto& [sp_key, sp_st] : displayxr_targets_) {
+             gfx::Rect x_woven = sp_st.drawn_rect;
+             x_woven.Intersect(woven_bounds);
+             per_target +=
+-                " {slot=" + base::NumberToString(sp_st.slot) +
++                " {slot=" + base::NumberToString(sp_st.slot) + " chan=" +
++                (legacy_keys.contains(sp_key) ? "legacy" : "tracked") +
+                 " drawn=" + sp_st.drawn_rect.ToString() +
+                 " pending=" + sp_st.pending_rect.ToString() +
+                 " x_woven=" + x_woven.ToString() + " area=" +
+@@ -5655,11 +5676,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                                      static_cast<int64_t>(x_woven.height())) +
+                 "}";
+           }
++          // Each submitted rect tagged with its channel too, so a pair that
++          // describes ONE element is visible as such rather than as two
++          // near-identical rectangles.
+           std::string rects;
+           for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
+-            rects += " " + inline_3d_rects_[i].rect.ToString();
++            rects += " " + inline_3d_rects_[i].rect.ToString() +
++                     (inline_3d_rects_[i].id.is_zero() ? "/legacy" : "/tracked");
+           }
+-          LOG(WARNING) << "[DXR-SPACE] f" << n
++          LOG(WARNING) << "[DXR-SPACE] f" << n << " (n=" << (n + 1) << ")"
+                        << " (all device px, window-relative, y-down)"
+                        << " window_bounds=" << window_bounds.ToString()
+                        << " size_=" << size_.ToString() << " woven_buffer="
