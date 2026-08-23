@@ -11,10 +11,22 @@ the mono draw from the **per-target weave scratch** instead (the one the fork it
 sole writer of), which makes `recovery_source_actually_available(tile)` answerable without probing a
 contended resource. It also gives browser#120's frosted regions their mono content **in the page raster,
 before the backdrop-filter pass samples it** (the ordering is the whole fix — repairing after the glass
-is composited would destroy the crispness D' exists to protect), and decouples the Phase-2 over-plane
-composite from the weave-landed gate, a latent 0057/0064 coupling that dropped the 2D repair on any
-frame the weave missed. **Numbering note:** 0112 collides with the open Android series (browser#138,
-patches 0103–0110) and with browser#139's 0111; renumber on merge — whichever lands second moves.
+is composited would destroy the crispness D' exists to protect).
+
+**Split out, deferred:** an earlier draft of 0112 also decoupled the Phase-2 over-plane composite from
+the weave-landed gate — a latent 0057/0064 coupling that dropped the 2D repair on any frame the weave
+missed. The Android arm shipped a device-verified fix for the same defect on its own `#if` arm, and two
+competing implementations of one function is the thing to avoid, so the Windows generalization lands as
+its own follow-up. The split-out hunks are preserved verbatim, with the argument and the piece to carry
+forward (the counted log separating *"published but not composited"* from *"nothing published"*), at
+[../docs/pending/overplane-generalization.patch.txt](../docs/pending/overplane-generalization.patch.txt)
+— deliberately **not** in `patches/`, so `git am patches/*.patch` can never pick it up.
+
+**Numbering note:** the series runs 0001–0106 then **0112** — 0107–0110 are reserved by the
+shared viz tail (browser#141) and 0111 by browser#139, both open alongside this one. 0112 is the
+first free slot above both, so it is this patch's final number whether or not either lands, and
+nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in filename order and
+a gap is not a conflict.
 
 **Numbering note:** the series runs 0001–0106 then **0111** — 0107–0110 are reserved by the
 shared viz tail (browser#141), open alongside this one. 0111 (browser#130, Windows/macOS/Android
