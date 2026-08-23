@@ -1,11 +1,11 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **110 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **111 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
 
-**Numbering note:** the series runs 0001–0106 then **0111**–**0114** — 0107–0110 are
-reserved by the shared viz tail (browser#141), still open. Each of 0111/0112/0113/0114 took the first
+**Numbering note:** the series runs 0001–0106 then **0111**–**0115** — 0107–0110 are
+reserved by the shared viz tail (browser#141), still open. Each of 0111/0112/0113/0114/0115 took the first
 free slot above it, so nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in
 filename order and a gap is not a conflict.
 
@@ -115,6 +115,19 @@ Budget: 8 rects per tile, 32 per frame (the wire cap, and one submit per frame k
 motion predictor fed), largest-first demotion back to 0113's row band, logged. The ANDROID arm stages
 by Skia draw at the full rect and is gated to one rect until its own repack lands (#122/#100). Also
 closes browser#144: 0113 left `weave_src_y` unread on Android, failing `-Werror,-Wunused-variable`.
+
+Patch **0115** implements the ANDROID half of browser#143 and lifts 0114's Android one-rect gate.
+Android has no per-target scratch to repack out of, so the repack cannot live where the Windows/macOS
+one does: it lives in viz's STAGING DRAW instead — the element's own canvas draw is issued once per
+guillotine piece, clipped to that piece and translated by an INTEGER offset, so each piece's eye pair
+lands inside the piece's own footprint exactly as the provider-side box copies do on the other arms.
+0114's decomposition, budgets, even-cut rule and largest-first demotion are untouched; 0115 only
+teaches the Android arm to honour the destination rects 0114 already computes, through new provider
+virtuals. Kill-switch `--disable-inline-3d-android-repack`. Frames with no overlap keep the
+`single_full_width` short-circuit and stay BYTE-IDENTICAL. Device-verified on the reference Android
+panel: composition case 12 shows both tiles fully 3D and one-eye-at-a-time clean, with
+`[DXR-REPACK] tiles=1 pieces=2 demoted_cap=0 demoted_budget=0 refused_odd=0` and the overlap pair
+reported DECOMPOSED; the trail regression stayed 9/9 frames at baseline.
 
 Patch 0069 stops **browser-UI popups ghosting** (browser#88, Phase 3 Stage 4 item B). The omnibox
 dropdown, the autofill popups and every menu are separate OWNED top-level HWNDs that DWM composites
