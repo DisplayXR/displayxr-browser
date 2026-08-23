@@ -87,6 +87,28 @@ GPU thread post-paint / pre-swap.
   forwarded to the GPU process (the split) and the renderer (`occlusionByDrawOrder`).
   `--disable-inline-3d-occlusion` is the kill switch; it disables the plane split only — there is
   no declared-exclusion path left to fall back to.
+
+  **Two default-append arms, one per platform.** Patch 0065 put the append inside
+  `#if BUILDFLAG(IS_WIN)`, so for the whole life of the Android port (0083–0102) the switch was
+  never appended there and the entire Phase-2 path was dead on Android — the page punched nothing
+  and every 2D element over a tile was woven. Fix16 adds the matching `IS_ANDROID` arm, scoped to
+  the same `enable-inline-3d` guard as the `AndroidSurfaceControl` override beside it (inline-3D
+  itself is still opt-in on Android, arriving via `/data/local/tmp/chrome-command-line`). Same
+  precedence on both: `--disable-inline-3d-occlusion` wins, an explicit `--inline-3d-occlusion` is
+  left alone, otherwise the default is appended.
+
+  **The composite is the repair half of the punch and runs unconditionally.** The compositor thread
+  punches the lifted 2D out of the page raster whenever the switch is on; the GPU thread composites
+  the over-plane back. On Android the composite used to sit at the bottom of phase (B) behind five
+  weave preconditions (the browser#87 liveness gate, `displayxr_shared_woven_mailbox_.IsZero()`,
+  and `ProduceSkia` / `BeginScopedReadAccess` / `CreateSkImage` on the woven buffer), so any frame
+  that failed to weave kept the punch and dropped the repair — the overlay vanished and the bare
+  tile showed. Fix16 hoists it into `composite_over_plane_android()`, called on all five exits plus
+  the healthy path, flushing inside itself so `over_access` outlives the submit. It stays
+  whole-window `kSrcOver` and unclipped by the woven rects (clipping it is the inverse bug,
+  browser#120: "2D visible, tile dark"). The throttled `[DisplayXR] inline-3D occlusion composite:
+  over-plane WxH drawn=N skipped=N` marker is `LOG(WARNING)` on Android, not `VLOG(1)` as on
+  Windows, so a default logcat capture is self-verifying.
 - **New:** `viz/service/display_embedder/displayxr_weave_provider.{cc,h}` (`WeavePixels` + `WeaveCanvas`)
 
 ## 4. gpu — the two additive `ProduceOverlayForWeave` methods (the rebase-fragile layer)
