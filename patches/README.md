@@ -1,13 +1,12 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **108 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **109 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
 
-**Numbering note:** the series runs 0001–0106 then **0111** and **0112** — 0107–0110 are reserved by the
-shared viz tail (browser#141), open alongside this one. 0111 (browser#130, Windows/macOS/Android
-alike) takes the first free slot above it, so it is this patch's final number whether or not that
-PR lands, and nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in
+**Numbering note:** the series runs 0001–0106 then **0111**, **0112** and **0113** — 0107–0110 are
+reserved by the shared viz tail (browser#141), still open. Each of 0111/0112/0113 took the first free
+slot above it, so nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in
 filename order and a gap is not a conflict.
 
 Patch **0112** closes browser#119 + browser#120 (Windows). The browser#99/web#12 recovery draw was
@@ -80,6 +79,23 @@ per-element legacy fallback reads the element as MISSING, and Blink's UNCLIPPED
 `getBoundingClientRect` rect is admitted in its place — resurrecting the tile the panel just clipped
 away. Kept on the list it takes the path an off-window tile already takes (0028: window-bounds
 intersect empty → clear pending/drawn, submit nothing, keep the slot and its scratch images).
+
+Patch **0113** defines what OVERLAPPING inline-3D tiles do (browser#131), which until now was
+undefined and eye-INCONSISTENT. The batch weave input is one window-sized texture written per target
+at the target's own window position and never cleared, and the copy order is the aggregator's
+`base::Token` sort — so in an overlap the later copy CLOBBERS the earlier, and because the runtime
+maps a submitted rect's left half to the left eye and its right half to the right, the lower tile
+keeps a clean left eye and grows a displaced replica of its neighbour in the right. The policy is
+**topmost-wins**: the upper tile owns the overlap and the lower tile's weave rect is reduced by it.
+The reduction is always a ROW BAND — a submitted rect is a side-by-side pair whose eye split is its
+own horizontal midpoint, so trimming columns would move the split and re-create the very
+eye-inconsistency being closed. Where one row band expresses the remainder exactly the lower tile
+loses nothing; where it cannot (a corner or interior overlap) the largest clean band is kept and the
+rest is WITHHELD and drawn mono from 0112's primitive, clipped to the withheld rows — the documented
+tier-2 degradation, flat but eye-consistent. Overlapping tiles are also barred from
+`BatchKeepPrevious`, whose record can name a region the other tile has since written. With no
+overlap every computed value is bit-for-bit what the pre-patch code produced.
+
 Patch 0069 stops **browser-UI popups ghosting** (browser#88, Phase 3 Stage 4 item B). The omnibox
 dropdown, the autofill popups and every menu are separate OWNED top-level HWNDs that DWM composites
 ABOVE the browser window: they never enter Viz and can never be woven, yet the panel underneath stays

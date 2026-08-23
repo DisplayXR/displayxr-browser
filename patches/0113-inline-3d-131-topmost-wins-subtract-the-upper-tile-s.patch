@@ -1,0 +1,684 @@
+From b307850e5304801161294688583445cbe479f980 Mon Sep 17 00:00:00 2001
+From: v <v@v>
+Date: Sun, 23 Aug 2026 03:11:11 -0700
+Subject: [PATCH] =?UTF-8?q?inline-3d(#131):=20topmost-wins=20=E2=80=94=20s?=
+ =?UTF-8?q?ubtract=20the=20upper=20tile's=20rect,=20don't=20clobber?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+THE MECHANISM, settled from source on browser#131 and not re-derived here. The
+batch weave input is ONE window-sized texture; each target's side-by-side is
+copied into it AT ITS OWN WINDOW POSITION and the input is never cleared, and
+the copy order is the aggregator's base::Token sort, which has nothing to do
+with z. The runtime then samples each submitted rect's LEFT half into the left
+eye and its RIGHT half into the right eye, so an overlap that falls in one half
+of a rect corrupts exactly ONE EYE: the lower tile keeps a clean left eye and
+grows a displaced replica of its neighbour in the right. (The competing
+candidate, a stale |drawn_rect|, was REFUTED: the field has had no reader on
+this arm since 0046 deleted the per-tile draw-back.)
+
+Clipping the COPY cannot fix it -- both tiles need their own pixels at the same
+input address. Disjointness has to be achieved at the RECT level.
+
+THE POLICY (David, decided on browser#131): TOPMOST-WINS. In an overlap the
+UPPER tile owns the pixels -- that is what the DOM already says, and it is the
+only answer that keeps depth for the tile the author put in front. The LOWER
+tile's weave rect is reduced by the upper tile's rect.
+
+1. CARRY Z-ORDER TO THE GPU STAGE. Until now "lower" was not nameable there.
+   The aggregator already knows the paint order: |root_resource_quads_| is
+   filled during CopyQuadsToPass, which walks each pass's quad_list in its
+   natural FRONT-TO-BACK order (the same convention
+   ComputeInline3dPlaneSplit's |k| uses, and the reverse of the BackToFront
+   replay). Stamp that recording index onto each RootResourceQuad, read it
+   through the EXISTING identity join, and carry it on
+   AggregatedFrame::Inline3dTrackedRect -> SkiaOutputSurface::Inline3dRect ->
+   the GPU stage. Smaller == upper. An element no root quad claims (browser#94
+   offscreen tile, legacy channel) keeps kUnknownZOrder and sorts bottom-most;
+   the vector position breaks ties so the relation is total and stable.
+
+2. SUBTRACT, DON'T CLOBBER. Before the submit loop, reduce each target's rect
+   by the rect of every target above it. The reduction is a ROW BAND and never
+   a column band, and that is not a shortcut -- a submitted rect is not a
+   window onto the input, it is a SIDE-BY-SIDE PAIR whose eye split is the
+   rect's own horizontal midpoint. Trimming rows leaves the split where it was;
+   trimming columns MOVES it, so the runtime would cut the pair somewhere other
+   than between the eyes and hand each eye a mixture of both -- re-creating, by
+   construction, the exact eye-inconsistency this patch ends. So:
+
+     * SUBTRACT (exact) -- the overlap spans the lower tile's full width and
+       touches its top or bottom edge. The remainder is one rect; the lower
+       tile weaves everything it still owns in stereo and the upper weaves the
+       overlap in stereo. Nothing is lost.
+     * FALLBACK (tier-2, the documented one) -- every other geometry: a corner
+       overlap (the case reported), an interior one, or any overlap narrower
+       than the tile. Keep the LARGER clean row band and WITHHOLD the rest.
+
+   |rect| itself is deliberately NOT reduced: the scratch stays sized to and
+   composed at the WHOLE tile, so the withheld rows keep a live mono source and
+   a permanently-overlapped tile never freezes. Only the handoff is cropped --
+   a source sub-rect for WeaveCanvas / WeaveCanvasMac, a whole-scanline pointer
+   offset for WeavePixels, and |weave| for WeaveRectAndroid and pending_rect.
+   Every one of them is an identity when nothing overlaps.
+
+3. DRAW THE WITHHELD ROWS MONO, via 0112's primitive. Those rows are woven by
+   nobody and their canvas quad is suppressed from the page raster, so without
+   this they are the browser#99 hole: black. The recovery loop's
+   "already submitted, don't repaint" rule is right about the band that wove
+   and wrong about everything else the tile owns, so the mono draw is clipped
+   to the withheld rows -- it cannot reach the woven band. It also falls out of
+   the wish (wish = union(weave rects) - union(flat rects)), so the panel's
+   lens switches OFF over those rows and the flat pixels stay crisp.
+
+4. NEVER KEEP-PREVIOUS AN OVERLAPPING TILE. |batch_last_copied_| records
+   "target P's pixels are at rect P", and where two tiles shared input pixels
+   that record can name a region the other tile has since written -- a replay
+   would re-weave the neighbour's content and log it as a clean keep. Both ends
+   of an overlapping pair decline and take the mono road instead.
+
+THE NON-OVERLAPPING CASE IS BYTE-IDENTICAL. With no overlap the computed band
+is bit-for-bit the rect the pre-patch code produced, the source sub-rects and
+pointer offsets degenerate to their previous values, keep-previous is
+untouched, and the withheld region is empty so the mono leg never runs. The
+only cost is one O(N^2) rect-intersect over a handful of tiles.
+
+Overlaps are never silent: one throttled line (first 3, then 1-in-300) names
+each pair, its z values, the overlap, the kept band, and whether it took
+SUBTRACT or FALLBACK; the recovery line gains a withheld= count.
+---
+ .../viz/service/display/aggregated_frame.h    |  14 +
+ components/viz/service/display/display.cc     |   5 +-
+ .../viz/service/display/skia_output_surface.h |   6 +
+ .../viz/service/display/surface_aggregator.cc |  18 +-
+ .../viz/service/display/surface_aggregator.h  |   7 +
+ .../skia_output_surface_impl_on_gpu.cc        | 298 +++++++++++++++++-
+ .../skia_output_surface_impl_on_gpu.h         |  10 +
+ 7 files changed, 346 insertions(+), 12 deletions(-)
+
+diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
+index c118447..f996438 100644
+--- a/components/viz/service/display/aggregated_frame.h
++++ b/components/viz/service/display/aggregated_frame.h
+@@ -96,6 +96,20 @@ class VIZ_SERVICE_EXPORT AggregatedFrame {
+     // identity of any kind.
+     uint32_t sqs_layer_id = 0;
+     std::pair<uint32_t, uint32_t> layer_namespace_id;
++    // browser#131: WHERE THIS ELEMENT IS IN THE PAINT ORDER — the front-to-back
++    // index of the root-pass quad that draws it (index 0 == frontmost, the
++    // same convention DirectRenderer::ComputeInline3dPlaneSplit's |k| uses, and
++    // the reverse of the BackToFront replay order). The GPU stage needs it to
++    // answer "which of two overlapping tiles is the UPPER one"; until this
++    // field existed, "lower" was not even nameable there — the batch copy order
++    // is the aggregator's base::Token sort, which has nothing to do with z.
++    // |kUnknownZOrder| when no root quad claims this element (the browser#94
++    // offscreen-but-registered tile, and the legacy main-thread channel, which
++    // carries no layer identity to join on); an unknown z sorts LAST, i.e. as
++    // the bottom-most tile, which is the conservative answer for an element
++    // the root pass does not draw.
++    static constexpr size_t kUnknownZOrder = static_cast<size_t>(-1);
++    size_t z_order = kUnknownZOrder;
+   };
+   std::vector<Inline3dTrackedRect> inline_3d_rects;
+ 
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index f31982f..28d5d79 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1100,7 +1100,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+           ++unprepared;
+           continue;
+         }
+-        weave_rects.push_back({r.rect, r.id});
++        // browser#131: |z_order| rides along untouched — the GPU stage's
++        // topmost-wins rect subtraction is the only consumer, and this is the
++        // only channel that reaches it.
++        weave_rects.push_back({r.rect, r.id, r.z_order});
+       }
+       if (unprepared > 0) {
+         // LOG(ERROR) on 0073's discipline (first 3, then 1-in-300): withholding
+diff --git a/components/viz/service/display/skia_output_surface.h b/components/viz/service/display/skia_output_surface.h
+index 1f77300..197f241 100644
+--- a/components/viz/service/display/skia_output_surface.h
++++ b/components/viz/service/display/skia_output_surface.h
+@@ -231,6 +231,12 @@ class VIZ_SERVICE_EXPORT SkiaOutputSurface : public OutputSurface,
+   struct Inline3dRect {
+     gfx::Rect rect;
+     base::Token id;
++    // browser#131: the element's front-to-back paint index, copied verbatim
++    // from AggregatedFrame::Inline3dTrackedRect::z_order (see the long note
++    // there). Smaller == UPPER. This is the only thing at the GPU stage that
++    // knows which of two overlapping tiles owns the shared pixels; the batch
++    // copy order is a base::Token sort and says nothing about z.
++    size_t z_order = AggregatedFrame::Inline3dTrackedRect::kUnknownZOrder;
+   };
+ 
+   // DisplayXR inline-3D (#625, Step B / B4b): set the page's inline-3d canvas
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 5cbaf7f..1250565 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -1546,6 +1546,9 @@ void SurfaceAggregator::CopyQuadsToPass(
+           // aggregator assigned to the client — together the exact join key
+           // against a tracked element rect.
+           const SharedQuadState* dest_sqs = dest_quad->shared_quad_state;
++          // browser#131: stamp the recording position as this quad's
++          // front-to-back index (see RootResourceQuad::order).
++          const size_t quad_order = root_resource_quads_.size();
+           root_resource_quads_.push_back(
+               {quad_data.remapped_resource_id,
+                cc::MathUtil::MapEnclosingClippedRect(to_root, quad->rect),
+@@ -1554,7 +1557,7 @@ void SurfaceAggregator::CopyQuadsToPass(
+                uv, dest_sqs ? dest_sqs->layer_id : 0u,
+                dest_sqs ? dest_sqs->layer_namespace_id
+                         : std::pair<uint32_t, uint32_t>(),
+-               dest_pass->id, from_root_resolved_pass});
++               dest_pass->id, from_root_resolved_pass, quad_order});
+         }
+       }
+     }
+@@ -2692,8 +2695,19 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     // Phase-2 (plane split): carry the layer half of the join key too, so the
+     // draw-time split can key a tile's quad index by identity rather than by
+     // resource id alone.
++    //
++    // browser#131: and carry the PAINT ORDER. This is the same identity join
++    // the canvas-resource pairing below uses — deliberately, so "which quad is
++    // this element" has exactly one answer in this function — read for its
++    // recorded front-to-back position rather than for its resource. Elements
++    // the join misses keep |kUnknownZOrder| and are treated as bottom-most.
++    size_t z = AggregatedFrame::Inline3dTrackedRect::kUnknownZOrder;
++    std::optional<RootResourceQuad> zm = id_match(r, root_resource_quads_);
++    if (zm) {
++      z = zm->order;
++    }
+     frame.inline_3d_rects.push_back(
+-        {r.rect, r.id, r.sqs_layer_id, r.layer_namespace_id});
++        {r.rect, r.id, r.sqs_layer_id, r.layer_namespace_id, z});
+   }
+   // Phase-1 identity: match each inline-3d canvas rect to the resource quad
+   // that draws it by IDENTITY first, geometry only as a fallback.
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index e499bb0..61bf468 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -540,6 +540,13 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+     // join does not look. Those two need opposite follow-ups.
+     AggregatedRenderPassId pass_id;
+     bool from_root_resolved_pass = true;
++    // browser#131: this quad's FRONT-TO-BACK index. |root_resource_quads_| is
++    // filled during CopyQuadsToPass, which walks each source pass's quad_list
++    // in its natural (front-to-back) order and appends in the order the quads
++    // land in the aggregated root pass — so the recording index IS the paint
++    // order, smaller == closer to the viewer. Recorded rather than re-derived
++    // because the joins below hand out a COPY of the entry, not its position.
++    size_t order = 0;
+   };
+   std::vector<RootResourceQuad> root_resource_quads_;
+   // browser#117: how many diagnostic-only (non-root-resolved-pass) entries are
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 0b3cfd5..d4a1969 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -12,7 +12,9 @@
+ #include <vector>
+ 
+ #include "base/command_line.h"
++#include "base/compiler_specific.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/stringprintf.h"
+ #include "base/containers/span.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/debug/dump_without_crashing.h"
+@@ -3248,6 +3250,153 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         return false;
+       };
+ 
++  // ---- (browser#131) TOPMOST-WINS: MAKE THE FRAME'S WEAVE RECTS DISJOINT ----
++  //
++  // THE MECHANISM, settled from source and not re-derived here. The batch weave
++  // input is ONE window-sized texture; each target's side-by-side is copied
++  // into it AT ITS OWN WINDOW POSITION and the input is never cleared. Where
++  // two targets' rects overlap, the later copy CLOBBERS the earlier — and the
++  // copy order is the aggregator's base::Token sort, not z. The runtime then
++  // samples each submitted rect's LEFT half into the left eye and its RIGHT
++  // half into the right eye (comp_d3d11_service.cpp), so an overlap that falls
++  // in one half of a rect corrupts exactly ONE EYE: the lower tile keeps a
++  // clean left eye and grows a displaced replica of its neighbour in the right.
++  // That is worse than any wrong-looking-but-consistent answer, because it
++  // breaks fusion rather than merely looking wrong.
++  //
++  // Clipping the COPY cannot fix it: both tiles need their own pixels at the
++  // same input address, and one address cannot hold two values. Disjointness
++  // has to be achieved at the RECT level, which is what this does.
++  //
++  // THE POLICY (David, browser#131): TOPMOST-WINS. In an overlap the UPPER tile
++  // owns the pixels — that is what the DOM already says, and it is the only
++  // answer that preserves depth for the tile the author put in front. So the
++  // LOWER tile's weave rect is reduced by the upper tile's rect.
++  //
++  // WHY THE REDUCTION IS A ROW BAND AND NEVER A COLUMN BAND. A submitted rect
++  // is not a window onto the input; it is a SIDE-BY-SIDE PAIR whose eye split
++  // is the rect's own horizontal midpoint. Trimming rows leaves the split where
++  // it was and simply weaves fewer scanlines — every downstream leg reduces to
++  // a row offset. Trimming COLUMNS moves the midpoint, so the runtime would cut
++  // the pair somewhere other than between the eyes and hand each eye a mixture
++  // of both — re-creating, by construction, the exact eye-inconsistency this
++  // patch exists to end. A column trim is therefore not a cheaper variant of
++  // this fix; it is the bug. Hence:
++  //
++  //   * SUBTRACT (exact) — the overlap spans the lower tile's full width and
++  //     touches its top or bottom edge. The remainder is a single row band, so
++  //     the lower tile weaves everything it still owns, in stereo, and the
++  //     overlap is woven in stereo by the upper tile. Nothing is lost.
++  //   * FALLBACK (tier-2, and the documented one) — every other geometry: a
++  //     corner overlap (the case reported on browser#131), an interior one, or
++  //     any overlap narrower than the tile. Subtraction would leave an L or a
++  //     pair of bands, which one rect cannot express. Keep the LARGER of the
++  //     two clean row bands and WITHHOLD the rest. The withheld rows are then
++  //     drawn MONO from the tile's own scratch (browser#119's primitive), so
++  //     the region degrades from stereo to flat rather than to a hole — and it
++  //     is eye-consistent, which is the point.
++  //
++  // Both paths are gated on an overlap actually existing. With no overlap
++  // |topmost_bands[t]| is bit-for-bit the rect the pre-patch code computed and
++  // every consumer below degenerates to its previous arithmetic.
++  std::vector<gfx::Rect> topmost_bands(inline_3d_rects_.size());
++  std::vector<uint8_t> topmost_overlap(inline_3d_rects_.size(), 0);
++  {
++    // Each target's on-screen FOOTPRINT. Under topmost-wins a tile owns this
++    // whole rect, including the part it may itself withhold from the weave —
++    // so this, not the reduced band, is what a lower tile subtracts. (The
++    // input outside a tile's submitted band holds no defined content for it,
++    // so letting a lower tile weave there would sample stale pixels.)
++    std::vector<gfx::Rect> own(inline_3d_rects_.size());
++    for (size_t i = 0; i < inline_3d_rects_.size(); ++i) {
++      own[i] = inline_3d_rects_[i].rect;
++      own[i].Intersect(window_bounds);
++      topmost_bands[i] = own[i];
++    }
++    size_t pairs = 0;
++    size_t fallbacks = 0;
++    std::string detail;
++    for (size_t l = 0; l < own.size(); ++l) {
++      if (own[l].IsEmpty()) {
++        continue;
++      }
++      for (size_t u = 0; u < own.size(); ++u) {
++        if (u == l || own[u].IsEmpty()) {
++          continue;
++        }
++        // Front-to-back, with the vector position (the aggregator's token
++        // sort) as the tiebreak so the relation is TOTAL and stable across
++        // frames even where two tiles report the same or an unknown z.
++        const bool u_is_upper =
++            inline_3d_rects_[u].z_order != inline_3d_rects_[l].z_order
++                ? inline_3d_rects_[u].z_order < inline_3d_rects_[l].z_order
++                : u < l;
++        if (!u_is_upper) {
++          continue;
++        }
++        const gfx::Rect band = topmost_bands[l];
++        gfx::Rect isect = band;
++        isect.Intersect(own[u]);
++        if (isect.IsEmpty()) {
++          continue;
++        }
++        ++pairs;
++        // Both ends of the pair are marked: the record BatchKeepPrevious
++        // replays names a region the other tile may have written, so neither
++        // may take that road this frame (see |keep_previous| below).
++        topmost_overlap[l] = 1;
++        topmost_overlap[u] = 1;
++        const int top_h = isect.y() - band.y();
++        const int bot_h = band.bottom() - isect.bottom();
++        gfx::Rect keep;
++        if (top_h >= bot_h) {
++          keep = gfx::Rect(band.x(), band.y(), band.width(),
++                           top_h > 0 ? top_h : 0);
++        } else {
++          keep = gfx::Rect(band.x(), isect.bottom(), band.width(), bot_h);
++        }
++        // |keep| is a full-width row band of |band|, so the complement is one
++        // row band too and Rect::Subtract returns it exactly. The step is
++        // LOSSLESS iff what we gave up is precisely the overlap.
++        gfx::Rect given_up = band;
++        given_up.Subtract(keep);
++        if (given_up != isect) {
++          ++fallbacks;
++        }
++        topmost_bands[l] = keep;
++        if (detail.size() < 400) {
++          detail += base::StringPrintf(
++              " {lower=%s z=%zu rect=%s upper=%s z=%zu rect=%s overlap=%s "
++              "kept=%s %s}",
++              inline_3d_rects_[l].id.ToString().c_str(),
++              inline_3d_rects_[l].z_order, band.ToString().c_str(),
++              inline_3d_rects_[u].id.ToString().c_str(),
++              inline_3d_rects_[u].z_order, own[u].ToString().c_str(),
++              isect.ToString().c_str(), keep.ToString().c_str(),
++              given_up == isect ? "SUBTRACT" : "FALLBACK(mono)");
++        }
++        if (keep.IsEmpty()) {
++          break;
++        }
++      }
++    }
++    if (pairs > 0) {
++      // 0073's discipline (first 3, then 1-in-300). An overlap is never
++      // silent: the SUBTRACT path costs nothing but the FALLBACK path is a
++      // tier-2 degradation of real pixels, and which one fired is decided by
++      // page geometry that changes as the user scrolls.
++      static int s_overlap = 0;
++      const int n = s_overlap++;
++      if (n < 3 || (n % 300) == 0) {
++        LOG(ERROR) << "[DisplayXR] inline-3D OVERLAPPING tiles (browser#131): "
++                   << pairs << " pair(s), " << fallbacks
++                   << " needing the mono fallback — topmost-wins reduced the "
++                      "lower tile's weave rect (frames="
++                   << (n + 1) << ")" << detail;
++      }
++    }
++  }
++
+   // |key| identifies the target in |displayxr_targets_|; |t| indexes this
+   // frame's rects. Everything the submit touches now hangs off the keyed state,
+   // so a target's provider slot / scratch image / in-flight rect stay with it
+@@ -3268,6 +3417,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+     const int rw = rect.width();
+     const int rh = rect.height();
++    // (browser#131) The rows this target may actually weave — |rect| with any
++    // upper tile's rows trimmed off (see the topmost-wins block above). It is
++    // |rect| itself whenever nothing overlaps, which is what keeps the common
++    // path byte-identical: |weave_src_y| is 0, |weave| == |rect|, and every
++    // expression below reduces to the one it replaced. |rect| is deliberately
++    // NOT reduced — the scratch stays sized to and composed at the WHOLE tile,
++    // so the mono primitive still has a live, full-tile source for the rows
++    // this frame withholds.
++    const gfx::Rect weave = topmost_bands[t];
++    const int weave_src_y = weave.IsEmpty() ? 0 : weave.y() - rect.y();
+     const SkiaOutputSurface::Inline3dLayerMailbox clean_sbs =
+         canvas_mailbox_for(inline_3d_rects_[t].id, rect);
+     const gpu::Mailbox clean_sbs_mailbox = clean_sbs.mailbox;
+@@ -3306,6 +3465,17 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // the same unchanged record; only a real copy, a rect change, a resize or a
+     // target retirement moves it.
+     auto keep_previous = [&]() -> bool {
++      // (browser#131) NEVER KEEP AN OVERLAPPING TILE. |batch_last_copied_|
++      // records "target P's pixels are at rect P", and where two tiles share
++      // input pixels that record can name a region the OTHER tile has since
++      // written — so a replay would re-weave the neighbour's content and log
++      // it as a clean keep. Topmost-wins makes the submitted rects disjoint
++      // going forward, but the record predates this frame and the band itself
++      // moves as the overlap does, so the honest answer for an overlapping
++      // target is to decline and let the mono recovery carry it.
++      if (topmost_overlap[t]) {
++        return false;
++      }
+       if (!provider->BatchMode() ||
+           !provider->BatchKeepPrevious(rect, st.slot)) {
+         return false;
+@@ -3880,6 +4050,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         // scratch_write / scratch_rep release here; content is submitted.
+         }
+ 
++        // (browser#131) FULLY COVERED BY UPPER TILES. Deliberately placed
++        // AFTER the compose: the scratch has just been refreshed and armed, so
++        // the mono leg draws this tile's LIVE content rather than freezing at
++        // whatever it held when the overlap began. There is simply nothing
++        // left to weave, so leave the batch alone and let the caller route the
++        // whole tile to the recovery draw.
++        if (weave.IsEmpty()) {
++          return false;
++        }
++
+ #if !BUILDFLAG(IS_ANDROID)
+         // ---- (web#12, 0074 — PART 1) CPU READBACK FROM THE CLEAN CANVAS ----
+         //
+@@ -3964,13 +4144,20 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+             rb_pixels = rb_ganesh.data();
+             rb_stride = row;
+           }
++          // (browser#131) Upload only the rows this target still owns. The
++          // trim is a whole number of scanlines by construction, so it is a
++          // pointer offset and nothing else — no repack, no stride change, and
++          // an identity when |weave| == |rect| (|weave_src_y| == 0).
++          const uint8_t* rb_band =
++              UNSAFE_TODO(rb_pixels + static_cast<size_t>(weave_src_y) *
++                                          rb_stride);
+ #if BUILDFLAG(IS_WIN)
+           const bool ok = provider->WeavePixels(
+-              device_x.Get(), rb_pixels, static_cast<uint32_t>(rb_stride), rect,
++              device_x.Get(), rb_band, static_cast<uint32_t>(rb_stride), weave,
+               st.slot);
+ #elif BUILDFLAG(IS_APPLE)
+           const bool ok = provider->WeavePixelsMac(
+-              rb_pixels, static_cast<uint32_t>(rb_stride), rect, st.slot);
++              rb_band, static_cast<uint32_t>(rb_stride), weave, st.slot);
+ #endif
+           if (ok) {
+             static int c_rb_ok = 0;
+@@ -4019,7 +4206,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         // drawn) just before the batch submit — see the staging block below.
+         // Extracting here would open N overlay read accesses on the same image
+         // and interleave them with the Skia write accesses of later elements.
+-        bool submitted = provider->WeaveRectAndroid(rect, st.slot);
++        // (browser#131) |weave|, not |rect|: the element was DRAWN into the
++        // shared staging image at its full window rect (which is topmost-wins
++        // in the staging image too — the upper tile draws last over the
++        // overlap), but it may only SUBMIT the rows it still owns, or it would
++        // sample the neighbour's pixels into its own eyes.
++        bool submitted = provider->WeaveRectAndroid(weave, st.slot);
+ #else
+         // (3) ProduceOverlayForWeave the scratch (SCANOUT-gate-free) to get its
+         // raw ID3D11Texture2D.
+@@ -4053,10 +4245,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         // input, then fire the async WeaveSubmit. The overlay read access stays
+         // valid across the dispatch (the copy into the input is synchronous; the
+         // RPC completes later).
++        // (browser#131) The source rect crops the SCRATCH to the same rows the
++        // destination band covers. Identity when nothing overlaps.
+         bool submitted = provider->WeaveCanvas(
+             device_x.Get(), ov->d3d11_video_texture(),
+             static_cast<UINT>(ov->texture_array_slice()),
+-            gfx::Rect(0, 0, rw, rh), rect, st.slot);
++            gfx::Rect(0, weave_src_y, rw, weave.height()), weave, st.slot);
+ #elif BUILDFLAG(IS_APPLE)
+         // (4) mac: the scratch's backing IOSurface is MTLBlit-copied into the
+         // shared window-sized weave input at |rect| by the provider, then woven
+@@ -4068,7 +4262,8 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           return handoff_failed("overlay GetIOSurface", &c_ov_ios);
+         }
+         bool submitted = provider->WeaveCanvasMac(
+-            ios.get(), gfx::Rect(0, 0, rw, rh), rect, st.slot);
++            ios.get(), gfx::Rect(0, weave_src_y, rw, weave.height()), weave,
++            st.slot);
+ #endif
+ #endif  // BUILDFLAG(IS_ANDROID)
+         static bool logged_zc = false;
+@@ -4092,7 +4287,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       if (zc) {
+         // Remember where this target was submitted so phase (B) draws the woven
+         // pixels at the rect the runtime placed them, not a later drifted rect.
+-        st.pending_rect = rect;
++        // (browser#131) That is the reduced band when an upper tile owns part
++        // of this one — the draw-back must cover exactly what was woven, and
++        // the withheld rows are the mono leg's business.
++        st.pending_rect = weave;
+         if (!clean_sbs_mailbox.IsZero()) {
+           submitted_canvas_mailboxes.push_back(clean_sbs_mailbox);
+         }
+@@ -4100,6 +4298,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       }
+     }
+ 
++    // (browser#131) The same fully-covered exit as inside the zero-copy leg,
++    // repeated for the paths that never entered it (the GL output device, and
++    // a zero-copy attempt that fell out before its own guard). Nothing this
++    // target owns is left to weave, so do not take the CPU readback road for
++    // it — the caller clears its rects and the recovery draw paints the whole
++    // tile mono.
++    if (weave.IsEmpty()) {
++      return false;
++    }
++
+ #if BUILDFLAG(IS_ANDROID)
+     // NO CPU-readback fallback on Android, and this is deliberate. The path
+     // above is not really "zero copy vs readback" here — it is a Skia draw into
+@@ -4210,17 +4418,21 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       src_stride = stride;
+     }
+ 
++    // (browser#131) Same whole-scanline offset as the clean-scratch readback
++    // above; an identity when nothing overlaps this target.
++    const uint8_t* src_band = UNSAFE_TODO(
++        src_pixels + static_cast<size_t>(weave_src_y) * src_stride);
+ #if BUILDFLAG(IS_WIN)
+     const bool submitted = provider->WeavePixels(
+-        device_x.Get(), src_pixels, static_cast<uint32_t>(src_stride), rect,
++        device_x.Get(), src_band, static_cast<uint32_t>(src_stride), weave,
+         st.slot);
+ #elif BUILDFLAG(IS_APPLE)
+     const bool submitted = provider->WeavePixelsMac(
+-        src_pixels, static_cast<uint32_t>(src_stride), rect, st.slot);
++        src_band, static_cast<uint32_t>(src_stride), weave, st.slot);
+ #endif
+     if (submitted) {
+       // Submit-time rect for phase (B) draw-back (see the zero-copy path above).
+-      st.pending_rect = rect;
++      st.pending_rect = weave;
+       return true;
+     }
+     // (web#12, 0074) The very last exit. Everything that could produce pixels
+@@ -4275,6 +4487,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // only the canvas-LAYER list in hand and must paint at the tile's LIVE
+     // position; the scratch may have been composed at an older one.
+     st.frame_rect = probe;
++    // (browser#131) …and what of it this target is allowed to weave. The
++    // difference is the WITHHELD region the mono leg fills. Recorded here, on
++    // the state, because the recovery draw downstream reaches a target through
++    // its canvas layer and has no index into this frame's rect vector.
++    st.weave_rect = topmost_bands[t];
+     if (probe.IsEmpty()) {
+       // Nothing of this target is on screen, so nothing may be drawn back for
+       // it either: Phase B paints |drawn_rect| every frame, and a stale value
+@@ -4290,6 +4507,7 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       // scroll back would pay a cold re-allocation.
+       st.pending_rect = gfx::Rect();
+       st.drawn_rect = gfx::Rect();
++      st.weave_rect = gfx::Rect();
+       continue;
+     }
+     if (!batch && provider->SubmitInFlight(st.slot)) {
+@@ -4330,6 +4548,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     if (!present) {
+       absent_st.pending_rect = gfx::Rect();
+       absent_st.drawn_rect = gfx::Rect();
++      // (browser#131) A target that did not take part in this frame withheld
++      // nothing from it either. Cleared (rather than |frame_rect|, which 0112's
++      // recovery predicate reads) so the withheld-region mono leg can never
++      // fire off a stale pair.
++      absent_st.weave_rect = gfx::Rect();
+     }
+   }
+ 
+@@ -4644,6 +4867,12 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     int rec_from_scratch = 0;
+     int rec_fail_scratch = 0;
+     int rec_no_scratch_source = 0;
++    // (browser#131) Mono draws that filled rows TOPMOST-WINS withheld from a
++    // tile that otherwise wove fine. Counted apart from the rest because it is
++    // a different event: not a failure anywhere, but the tier-2 half of a
++    // deliberate policy, and its rate is how often overlapping tiles cost
++    // depth on a real page.
++    int rec_withheld = 0;
+ 
+     // ---- (browser#119) recovery_source_actually_available(tile) ------------
+     //
+@@ -4782,6 +5011,52 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+       // Repainting it would draw a mono left eye over a correctly woven stereo
+       // tile — the one way a recovery draw could make things worse.
+       if (only_unsubmitted && canvas_was_submitted(c.mailbox)) {
++        // ---- (browser#131) …EXCEPT THE ROWS TOPMOST-WINS WITHHELD ---------
++        //
++        // A tile whose weave rect was reduced DID submit — so the rule above
++        // is right about the band it wove and wrong about everything else it
++        // owns. Those rows are woven by nobody and their canvas quad is
++        // suppressed from the page raster, so without this they are the
++        // browser#99 hole: black. Paint the same mono the recovery paints,
++        // CLIPPED to the withheld rows, and the tier-2 degradation the policy
++        // documents becomes flat-but-consistent rather than absent.
++        //
++        // The clip is what makes this safe over a woven tile: it cannot reach
++        // the band that wove, and the rows it does reach carry no woven pixels
++        // to be worse than. Where the withheld rows are the OVERLAP itself
++        // (the exact-subtraction case) the upper tile's woven output lands on
++        // top of them in phase (B) — mono is then merely a floor under a
++        // stereo answer, not the answer.
++        DisplayXRTargetState* wst = scratch_source_for(c.mailbox);
++        if (wst && !wst->weave_rect.IsEmpty() &&
++            wst->weave_rect != wst->frame_rect &&
++            wst->frame_rect.Contains(wst->weave_rect)) {
++          const gfx::Rect full = wst->frame_rect;
++          const gfx::Rect band = wst->weave_rect;
++          // The trim is always whole scanlines, so the withheld region is at
++          // most the two row bands above and below |band|.
++          const gfx::Rect withheld[2] = {
++              gfx::Rect(full.x(), full.y(), full.width(), band.y() - full.y()),
++              gfx::Rect(full.x(), band.bottom(), full.width(),
++                        full.bottom() - band.bottom())};
++          for (const gfx::Rect& w : withheld) {
++            if (w.IsEmpty()) {
++              continue;
++            }
++            out_canvas->save();
++            out_canvas->clipRect(gfx::RectToSkRect(w), SkClipOp::kIntersect,
++                                 /*doAntiAlias=*/false);
++            const bool ok = mono_from_scratch(*wst);
++            out_canvas->restore();
++            if (ok) {
++              ++rec_drawn;
++              ++rec_from_scratch;
++              ++rec_withheld;
++            } else {
++              ++rec_fail_scratch;
++            }
++          }
++        }
+         continue;
+       }
+       // Nothing in hand -> this tile stays black; count it so the log below
+@@ -4955,6 +5230,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                    << " [scratch=" << rec_from_scratch
+                    << " no_source=" << rec_no_scratch_source
+                    << " scratch_fail=" << rec_fail_scratch << "]"
++                   // (browser#131) withheld=N counts the mono fills over rows
++                   // an UPPER tile owns. Non-zero means overlapping tiles are
++                   // on screen and the fallback path is live; it is NOT a
++                   // failure count.
++                   << " [withheld=" << rec_withheld << "]"
+                    << " events=" << (n + 1);
+       }
+     }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 40d93db..397f15d 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -925,6 +925,16 @@ class SkiaOutputSurfaceImplOnGpu
+     // LIVE rect, never at the stale one.
+     gfx::Rect scratch_rect;
+     gfx::Rect frame_rect;
++    // ---- (browser#131) TOPMOST-WINS ------------------------------------
++    //
++    // The rect this target actually SUBMITTED this frame: |frame_rect| with
++    // the rows an upper tile owns trimmed off. Equal to |frame_rect| on every
++    // frame nothing overlapped this target (the overwhelmingly common case),
++    // and EMPTY when an upper tile covers it outright. |frame_rect| minus this
++    // is the WITHHELD region — pixels this element owns on the page that no
++    // weave rect covers, so nobody would draw them; the mono primitive fills
++    // them instead of leaving the suppression hole.
++    gfx::Rect weave_rect;
+   };
+   base::flat_map<base::Token, DisplayXRTargetState> displayxr_targets_;
+   // Provider slots currently owned by an entry of |displayxr_targets_|. New
