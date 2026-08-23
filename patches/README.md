@@ -1,14 +1,38 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **107 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **108 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
 
-**Numbering note:** the series runs 0001–0106 then **0111** — 0107–0110 are reserved by the
+**Numbering note:** the series runs 0001–0106 then **0111** and **0112** — 0107–0110 are reserved by the
 shared viz tail (browser#141), open alongside this one. 0111 (browser#130, Windows/macOS/Android
 alike) takes the first free slot above it, so it is this patch's final number whether or not that
 PR lands, and nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in
 filename order and a gap is not a conflict.
+
+Patch **0112** closes browser#119 + browser#120 (Windows). The browser#99/web#12 recovery draw was
+sourcing from the producer's LIVE canvas SharedImage, which `D3DImageBacking::ValidateBeginAccess`
+refuses for as long as a write access is open — so it read `n=0` on every healthy frame. 0112 sources
+the mono draw from the **per-target weave scratch** instead (the one the fork itself composes and is the
+sole writer of), which makes `recovery_source_actually_available(tile)` answerable without probing a
+contended resource. It also gives browser#120's frosted regions their mono content **in the page raster,
+before the backdrop-filter pass samples it** (the ordering is the whole fix — repairing after the glass
+is composited would destroy the crispness D' exists to protect).
+
+**Split out, deferred:** an earlier draft of 0112 also decoupled the Phase-2 over-plane composite from
+the weave-landed gate — a latent 0057/0064 coupling that dropped the 2D repair on any frame the weave
+missed. The Android arm shipped a device-verified fix for the same defect on its own `#if` arm, and two
+competing implementations of one function is the thing to avoid, so the Windows generalization lands as
+its own follow-up. The split-out hunks are preserved verbatim, with the argument and the piece to carry
+forward (the counted log separating *"published but not composited"* from *"nothing published"*), at
+[../docs/pending/overplane-generalization.patch.txt](../docs/pending/overplane-generalization.patch.txt)
+— deliberately **not** in `patches/`, so `git am patches/*.patch` can never pick it up.
+
+**Numbering note:** the series runs 0001–0106 then **0112** — 0107–0110 are reserved by the
+shared viz tail (browser#141) and 0111 by browser#139, both open alongside this one. 0112 is the
+first free slot above both, so it is this patch's final number whether or not either lands, and
+nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in filename order and
+a gap is not a conflict.
 
 **Patches 0083–0106 are the ANDROID arm** (browser#100, design in
 [../docs/android-port.md](../docs/android-port.md), device traps in

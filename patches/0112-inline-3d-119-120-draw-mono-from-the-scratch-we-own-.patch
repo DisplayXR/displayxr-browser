@@ -1,0 +1,678 @@
+From 83ea0c9c9d12fafd34d27ad86cc9843fa55ecae4 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Sat, 22 Aug 2026 23:03:19 -0700
+Subject: [PATCH] inline-3d(#119, #120): draw mono from the scratch we own
+
+THE DIAGNOSIS, settled on hardware and not re-derived here. The browser#99
+recovery draw fires and yields n=0 in normal operation. ProduceSkia SUCCEEDS
+(produce=0); the refusal is D3DImageBacking::ValidateBeginAccess -- without
+SHARED_IMAGE_USAGE_CONCURRENT_READ_WRITE, an OPEN WRITE ACCESS refuses every
+access including a read, and a canvas that is producing holds write across its
+whole frame. %TEMP%\dxr_fs.log: ~830 "Already being accessed for write" each
+paired 1:1 with "Unable to initialize graphite::BackendTextures", interleaved
+with the n=0 recovery lines, zero keyed-mutex and zero fence failures.
+
+NOT the usage bit. Adding CONCURRENT_READ_WRITE at drawing_buffer.cc:2065 would
+licence sampling a canvas MID-WRITE: the recovery would paint a torn canvas and
+the weave leg -- which takes the same read access -- would weave a TORN SBS,
+strictly worse than 0074's keep-previous. It is also a Blink change carried
+through every rebase to fix a compositor-side SOURCING decision, and today's
+DISPLAY_READ / RASTER_READ consumers depend on the exclusion it removes.
+
+INSTEAD: recover from the per-target scratch we already own.
+
+1. THE PRIMITIVE. attempt_submit already composes each tile's finished weave
+   input into a per-target scratch SharedImage (created at the DisplayXRScratch
+   site, DISPLAY_READ|DISPLAY_WRITE|CPU_READ, sized to the tile's clipped rect;
+   filled with the clean canvas SBS through the quad's UV window over the 0050
+   pre-blended page backdrop). We are its ONLY writer, so it can never be
+   write-contended. The recovery now draws the LEFT HALF of where the SBS landed
+   in that scratch, magnified 2x horizontally back over the tile -- the mono
+   twin of 0074's BatchKeepPrevious, with the same licence and the same
+   scratch_size == rect.size() guard. The canvas-resource leg stays as the
+   fallback for a tile the weave has never composed.
+
+2. THE PREDICATE. recovery_source_actually_available(tile) is answered from
+   bookkeeping the compose recorded -- scratch_has_clean_sbs (set ONLY from
+   src_from_canvas, never from an |output| snapshot, which on a suppressed frame
+   IS the hole), the canvas mailbox it composed from, where the SBS landed, and
+   at which rect. No probe of a contended resource, no per-frame cost. Both
+   platforms' failures were downstream of a non-zero mailbox, so a cheap
+   existence check passes and still leaves a void; this one cannot. Placement is
+   guarded: the scratch survives a MOVE (only a size change reallocates it), so
+   only two placements are admitted -- the exact one, or a pure translation of
+   the trivial full-scratch layout to the live rect. A clipped tile that also
+   moved declines and falls through to today's behaviour rather than ghosting.
+
+3. #120 -- MONO UNDER FROST, and the ordering IS the bug. Inside a frosted rect
+   the region is drawn by nobody: the canvas quad was withheld from the page
+   raster and D' (0068) clips the woven draw-back out of backdrop-filter rects.
+   The frost then blurs a dark void. Skia samples a backdrop filter from
+   whatever is already on the canvas at saveLayer time, so the fix cannot live
+   in the GPU-side hook -- by then the glass is composited and mono over it
+   would destroy the crispness D' exists to protect. ComputeInline3dPlaneSplit
+   therefore records each frosted rect against the TILE'S OWN CANVAS QUAD;
+   ShouldSkipQuad stops skipping that quad; and SkiaRenderer draws it MONO,
+   clipped into exactly those rects, at its own place in the page raster. The
+   order is structural, not hopeful: a frosted rect is only ever recorded for a
+   quad at front-to-back index i < k(T), and DrawRenderPassOnGpu walks
+   BackToFront, so index k is painted before index i, always. D's contract is
+   untouched -- the glass still samples pre-weave page pixels and stays crisp,
+   the depth behind it still reads flat -- but flat is now literally true.
+
+NOT IN THIS PATCH: the over-plane decoupling. An earlier draft of this change
+also carried a second, independent fix -- hoisting the Phase-2 over-plane
+composite out from behind the `batch && !wove_this_frame` gate so it runs on all
+five of phase (B)'s exits rather than only on woven frames. It has been SPLIT
+OUT and deferred: the Android arm's parallel investigation shipped a
+device-verified fix for the same function on its own `#if` arm, and two
+competing implementations of one function is the thing to avoid. The Windows
+generalization lands as its own follow-up; the split-out hunks are preserved
+verbatim at docs/pending/overplane-generalization.patch.txt.
+
+That split is clean by construction -- the two halves share no line and no
+symbol. Every hunk this patch keeps precedes every hunk that was removed, and
+the removed lambda's state (over_rep / over_access / over_plane_drawn) is
+declared and consumed entirely within the removed hunks. What this patch keeps
+is the mono primitive only: the scratch-sourced recovery source, its predicate,
+and the renderer-side #120 mono-under-frost ordering fix.
+
+The ORDERING claim above still holds and is the reason the two were drafted
+together: on a withheld frame the region wants mono first and the over-plane on
+top. With this patch alone the mono goes down; whether the over-plane is
+composited over it on a weave-less frame is exactly what the deferred follow-up
+decides.
+
+Patch 0081's withhold semantics are untouched: this changes only what is DRAWN
+in a withheld region, never what is submitted. #131's topmost-wins consumes this
+primitive and lands separately.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../viz/service/display/direct_renderer.cc |  45 ++++++++++++++++++++++++++++++++++++++++++++-
+ .../viz/service/display/direct_renderer.h  |  28 ++++++++++++++++++++++++++++
+ .../viz/service/display/skia_renderer.cc   |  85 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ .../viz/service/display/skia_renderer.h    |  18 ++++++++++++++++++
+ .../skia_output_surface_impl_on_gpu.cc     | 217 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ .../skia_output_surface_impl_on_gpu.h      |  36 ++++++++++++++++++++++++++++++++++++
+ 6 files changed, 426 insertions(+), 3 deletions(-)
+
+diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
+index 248134f..75e50b6 100644
+--- a/components/viz/service/display/direct_renderer.cc
++++ b/components/viz/service/display/direct_renderer.cc
+@@ -342,6 +342,11 @@ void DirectRenderer::DrawFrame(
+   inline3d_over_clips_.clear();
+   inline3d_flat_rects_.clear();
+   inline3d_frosted_rects_.clear();
++  // (browser#120) The mono-under-frost list is frame-scoped for the sharpest
++  // version of the same reason as the frosted list it is derived from: it
++  // holds RAW QUAD POINTERS into this frame's list, and it un-suppresses a
++  // canvas quad, so a stale entry would both dangle and paint.
++  inline3d_mono_clips_.clear();
+ 
+   output_surface_->SetNeedsMeasureNextDrawLatency();
+   BeginDrawingFrame();
+@@ -639,6 +644,11 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+   inline3d_over_clips_.clear();
+   inline3d_flat_rects_.clear();
+   inline3d_frosted_rects_.clear();
++  // (browser#120) The mono-under-frost list is frame-scoped for the sharpest
++  // version of the same reason as the frosted list it is derived from: it
++  // holds RAW QUAD POINTERS into this frame's list, and it un-suppresses a
++  // canvas quad, so a stale entry would both dangle and paint.
++  inline3d_mono_clips_.clear();
+   if (!root || inline_3d_tiles_.empty()) {
+     return;
+   }
+@@ -802,6 +812,32 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+           if (!frosted.IsEmpty()) {
+             inline3d_frosted_rects_.push_back(frosted);
+             raw_flat.push_back(frosted);
++            // ---- (browser#120) MONO UNDER FROST -------------------------
++            //
++            // (1) removed the weave from this rect and (3) accepted that the
++            // scene behind the glass reads flat. What (1)-(3) never said is
++            // that it reads EMPTY — but that is what ships today, because the
++            // tile's canvas quad is ALSO gone from the page raster
++            // (suppression), so the backdrop this pass blurs is a dark void.
++            //
++            // Record the rect against the tile's own canvas quad. That quad
++            // is drawn at front-to-back index k, this pass at i < k, and
++            // DrawRenderPassOnGpu walks BackToFront — so painting mono there
++            // lands in the page raster BEFORE this pass samples its backdrop,
++            // which is the entire fix. D's contract is untouched: the glass
++            // still samples pre-weave page pixels and still stays crisp; the
++            // depth behind it still reads flat. Flat is merely now the tile's
++            // own flat content rather than nothing.
++            //
++            // Only when the tile's canvas is actually SUPPRESSED. An
++            // unsuppressed tile still has its own quad in the page raster —
++            // the page is already its own recovery, and a better one.
++            if (tile.canvas_resource_id != kInvalidResourceId &&
++                !inline_3d_suppressed_resources_.empty() &&
++                inline_3d_suppressed_resources_.contains(
++                    tile.canvas_resource_id)) {
++              inline3d_mono_clips_[quads[*k].quad].push_back(frosted);
++            }
+           }
+         }
+         continue;
+@@ -905,7 +941,14 @@ bool DirectRenderer::ShouldSkipQuad(const DrawQuad& quad,
+   if (!inline_3d_suppressed_resources_.empty() &&
+       quad.resource_id != kInvalidResourceId &&
+       inline_3d_suppressed_resources_.contains(quad.resource_id)) {
+-    return true;
++    // (browser#120) …unless a FROSTED rect sits over this tile. Then the
++    // region inside that rect is drawn by nobody — the weave is clipped out of
++    // it by D' and the page has been punched here — so the quad is let
++    // through, and SkiaRenderer::DoDrawQuad draws it MONO, clipped to exactly
++    // those frosted rects. Outside them the suppression still holds and the
++    // weave still owns the pixels: the mono draw is scoped to the clip, not to
++    // the quad.
++    return !inline3d_mono_clips_.contains(&quad);
+   }
+ 
+   if (render_pass_scissor.IsEmpty())
+diff --git a/components/viz/service/display/direct_renderer.h b/components/viz/service/display/direct_renderer.h
+index 1b3d137..965e5fb 100644
+--- a/components/viz/service/display/direct_renderer.h
++++ b/components/viz/service/display/direct_renderer.h
+@@ -529,6 +529,34 @@ class VIZ_SERVICE_EXPORT DirectRenderer {
+   // Frame-scoped.
+   std::vector<gfx::Rect> inline3d_frosted_rects_;
+ 
++  // DisplayXR inline-3D (browser#120): MONO UNDER FROST — for each tile whose
++  // canvas quad is SUPPRESSED and over which a frosted rect sits, the frosted
++  // rects that sit over it, keyed by that tile's own canvas quad.
++  //
++  // WHY IT EXISTS. Inside a frosted rect the region is drawn by NOBODY: the
++  // canvas quad was withheld from the page raster (display.cc suppression) and
++  // the woven draw-back is clipped out of the rect by D' above. The page's
++  // backdrop-filter pass then blurs a dark void and the frosted card reads
++  // black. D' says "depth behind the glass reads FLAT" — this list is what
++  // makes flat literally true instead of empty.
++  //
++  // WHY IT IS KEYED BY THE CANVAS QUAD, and why that is the whole fix.
++  // ORDERING IS THE BUG. Skia samples a backdrop filter from whatever is
++  // already on the canvas at saveLayer time (skia_renderer.cc,
++  // DrawRenderPassQuad), so the mono content has to be in the page raster
++  // BEFORE the frosted pass draws — not repaired afterwards, when the glass is
++  // already composited over a void. The tile's canvas quad is the one draw
++  // that is guaranteed to precede it: ComputeInline3dPlaneSplit only records a
++  // frosted rect for a quad at front-to-back index i < k(T), i.e. strictly IN
++  // FRONT of the tile, and DrawRenderPassOnGpu walks the quad list
++  // BackToFront — so index k is painted before index i, always.
++  //
++  // Frame-scoped, cleared with the other three lists. The pointers are into
++  // the current frame's quad list, exactly like |inline3d_over_clips_|; empty
++  // (and never consulted) when the flag is off or nothing is frosted.
++  base::flat_map<const DrawQuad*, absl::InlinedVector<gfx::Rect, 2>>
++      inline3d_mono_clips_;
++
+   bool visible_ = false;
+   bool disable_color_checks_for_testing_ = false;
+ 
+diff --git a/components/viz/service/display/skia_renderer.cc b/components/viz/service/display/skia_renderer.cc
+index 0f40625..ddbdf41 100644
+--- a/components/viz/service/display/skia_renderer.cc
++++ b/components/viz/service/display/skia_renderer.cc
+@@ -1599,6 +1599,61 @@ void SkiaRenderer::SetInline3dQuadClips(
+   inline3d_clip_in_ = clip_in;
+ }
+ 
++void SkiaRenderer::DrawInline3dMonoUnderFrost(
++    const DrawQuad* quad,
++    const absl::InlinedVector<gfx::Rect, 2>& frosted) {
++  // A tile's canvas resource is a TextureDrawQuad. Any other material would
++  // ignore the eye-half override in DrawTextureQuad and draw the RAW
++  // side-by-side squeezed to half width — visibly worse than the void this is
++  // fixing — so refuse rather than guess.
++  if (quad->material != DrawQuad::Material::kTextureContent) {
++    static int mono_material_dbg = 0;
++    const int n = mono_material_dbg++;
++    if (n < 3 || n == 9 || n == 99 || n == 999) {
++      LOG(ERROR) << "[DisplayXR] inline-3D mono-under-frost: tile canvas quad "
++                    "is not a texture quad (material="
++                 << static_cast<int>(quad->material)
++                 << "); the frosted region keeps its void (skips=" << (n + 1)
++                 << ")";
++    }
++    return;
++  }
++  // ONE draw per frosted rect, each with an INTERSECT clip, rather than one
++  // draw clipped to their union: the union of a rect list is not a rect, and
++  // painting mono outside a frosted rect would put a flat left eye where the
++  // weave is about to draw correct stereo. Frosted rects over one tile are a
++  // handful at most (they are per backdrop-filter pass), and overlapping ones
++  // paint the same pixels twice with the same source, which is idempotent.
++  inline3d_mono_left_eye_ = true;
++  for (const gfx::Rect& rect : frosted) {
++    if (rect.IsEmpty()) {
++      continue;
++    }
++    SetInline3dQuadClips({}, rect);
++    DrawQuadParams params =
++        CalculateDrawQuadParams(current_frame()->target_to_device_transform,
++                                scissor_rect_, quad, /*draw_region=*/nullptr);
++    DrawQuadInternal(quad, /*rpdq=*/nullptr, &params);
++  }
++  // Flush before dropping the clip and the eye-half flag: both are applied at
++  // PrepareCanvas / DrawTextureQuad time, so a quad still sitting in the batch
++  // when they change would be replayed under the wrong ones.
++  // SetInline3dQuadClips does the flush itself whenever the clip is live, which
++  // it is here (clip_in has a value), so the reset call below is the flush.
++  SetInline3dQuadClips({}, std::nullopt);
++  inline3d_mono_left_eye_ = false;
++  // Countable, on the 0070 throttle discipline: first 3, then decades. This is
++  // the only line that says the frosted region is being filled at all, and at
++  // VLOG(1) "no lines" would never have been evidence of absence.
++  static int mono_dbg = 0;
++  const int n = mono_dbg++;
++  if (n < 3 || n == 9 || n == 99 || n == 999 || n == 9999) {
++    LOG(ERROR) << "[DisplayXR] inline-3D mono under frost: " << frosted.size()
++               << " rect(s) filled from the suppressed tile canvas (draws="
++               << (n + 1) << ")";
++  }
++}
++
+ void SkiaRenderer::DoDrawQuad(const DrawQuad* quad,
+                               const gfx::QuadF* draw_region) {
+   if (!current_canvas_)
+@@ -1620,6 +1675,26 @@ void SkiaRenderer::DoDrawQuad(const DrawQuad* quad,
+     }
+     SetInline3dQuadClips(std::move(clip_out), std::nullopt);
+   }
++  // ---- (browser#120) MONO UNDER FROST -------------------------------------
++  //
++  // This quad is an inline-3D tile's canvas, SUPPRESSED from the page raster,
++  // with one or more frosted rects over it. DirectRenderer::ShouldSkipQuad let
++  // it through for exactly this: draw its LEFT-EYE HALF, clipped to those
++  // rects and to nothing else, so the backdrop-filter pass that comes later in
++  // this same back-to-front walk blurs real flat content instead of a void.
++  //
++  // Drawn HERE, in the quad's own place in the page raster, is the whole point
++  // — the ordering is the bug (see |inline3d_mono_clips_|'s header). Doing it
++  // in the GPU-side weave hook would be too late by an entire pass: the glass
++  // is composited by then and mono over it would destroy D's crispness, which
++  // is the thing D' exists to protect.
++  if (!inline3d_painting_over_plane_ && !inline3d_mono_clips_.empty()) {
++    if (auto it = inline3d_mono_clips_.find(quad);
++        it != inline3d_mono_clips_.end()) {
++      DrawInline3dMonoUnderFrost(quad, it->second);
++      return;
++    }
++  }
+   DrawQuadParams params =
+       CalculateDrawQuadParams(current_frame()->target_to_device_transform,
+                               scissor_rect_, quad, draw_region);
+@@ -2832,6 +2907,16 @@ void SkiaRenderer::DrawTextureQuad(const TextureDrawQuad* quad,
+       gfx::Size(image->width(), image->height()));
+   params->vis_tex_coords = cc::MathUtil::ScaleRectProportional(
+       uv_rect, gfx::RectF(quad->rect), params->visible_rect);
++  // (browser#120) MONO: halve the texel window so |visible_rect| maps to the
++  // LEFT EYE of the side-by-side instead of to both, i.e. a 2x horizontal
++  // magnification of the left half over the same destination. Applied to
++  // |vis_tex_coords| — the quad's OWN uv window, already scaled to the visible
++  // rect — and not to the whole texture, for the browser#73 reason: for an
++  // atlased or partially-mapped canvas resource the two are different
++  // rectangles and halving the texture would sample another tile's pixels.
++  if (inline3d_mono_left_eye_) {
++    params->vis_tex_coords.set_width(params->vis_tex_coords.width() * 0.5f);
++  }
+ 
+   gfx::RectF valid_texel_bounds = gfx::RectF(image->width(), image->height());
+   // For video frames, `valid_texel_bounds` is VideoFrame::visible_rect which is
+diff --git a/components/viz/service/display/skia_renderer.h b/components/viz/service/display/skia_renderer.h
+index 9bd2f6c..a92e03a 100644
+--- a/components/viz/service/display/skia_renderer.h
++++ b/components/viz/service/display/skia_renderer.h
+@@ -674,6 +674,24 @@ class VIZ_SERVICE_EXPORT SkiaRenderer : public DirectRenderer {
+   void SetInline3dQuadClips(absl::InlinedVector<gfx::Rect, 2> clip_out,
+                             std::optional<gfx::Rect> clip_in);
+ 
++  // DisplayXR inline-3D (browser#120): MONO UNDER FROST. Draws |quad| — an
++  // inline-3D tile's SUPPRESSED canvas — as its LEFT-EYE HALF, once per
++  // |frosted| rect and clipped into it, at the quad's own place in the page
++  // raster. See |DirectRenderer::inline3d_mono_clips_| for why the position in
++  // the back-to-front walk (not the pixels) is the fix.
++  void DrawInline3dMonoUnderFrost(
++      const DrawQuad* quad,
++      const absl::InlinedVector<gfx::Rect, 2>& frosted);
++
++  // Set for the duration of a mono-under-frost draw. DrawTextureQuad halves
++  // the quad's texel window while it is true, so |visible_rect| maps to the
++  // left eye of the side-by-side rather than to both — the same "left half of
++  // the quad's OWN uv window, never of the whole texture" rule (browser#73)
++  // that the GPU-side recovery draw follows. Like the clips above it is
++  // applied at draw/batch time, so SetInline3dQuadClips' flush is what keeps a
++  // batch from straddling a change to it.
++  bool inline3d_mono_left_eye_ = false;
++
+   const bool is_using_raw_draw_;
+ 
+   // Returns true if we need to push a color conversion layer to correctly draw
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index e7f94b5..a55ad8a 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -108,6 +108,10 @@
+ #include "components/viz/service/display/dc_layer_overlay.h"
+ #include "components/viz/service/display_embedder/displayxr_weave_provider.h"
+ #include "components/viz/service/display_embedder/skia_output_device_dcomp.h"
++// (browser#119) gfx::ToEnclosingRect, for recording where the side-by-side
++// landed inside the per-target weave scratch. The Apple and Android arms below
++// already pull this in; Windows needs it now too.
++#include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+ #include "ui/gfx/win/d3d_shared_fence.h"
+ #include "ui/gl/dc_layer_overlay_image.h"
+@@ -2809,6 +2813,12 @@ void SkiaOutputSurfaceImplOnGpu::DisplayXRReleaseTarget(
+     skia_representations_.erase(st.scratch_mailbox);
+     st.scratch_mailbox = gpu::Mailbox();
+   }
++  // (browser#119) The recovery licence dies with the image it describes. A
++  // stale true here would send the mono draw at a destroyed mailbox.
++  st.scratch_has_clean_sbs = false;
++  st.scratch_canvas_mailbox = gpu::Mailbox();
++  st.scratch_sbs_dst = gfx::Rect();
++  st.scratch_rect = gfx::Rect();
+   // Order matters: the provider must close this target's un-taken result
+   // handles and reset its keyed-mutex input BEFORE the slot goes back in the
+   // pool, or the next target admitted could take the slot and inherit them.
+@@ -3477,6 +3487,14 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+             skia_representations_.erase(st.scratch_mailbox);
+             st.scratch_mailbox = gpu::Mailbox();
+           }
++          // (browser#119) A reallocated scratch holds nothing. The recovery
++          // predicate must go false with it — this is the same
++          // |scratch_size == rect.size()| guard 0074 already relies on, stated
++          // once, in the one place that can invalidate it.
++          st.scratch_has_clean_sbs = false;
++          st.scratch_canvas_mailbox = gpu::Mailbox();
++          st.scratch_sbs_dst = gfx::Rect();
++          st.scratch_rect = gfx::Rect();
+           gpu::Mailbox mailbox = gpu::Mailbox::Generate();
+           gpu::SharedImageInfo si_info(
+               SinglePlaneFormat::kBGRA_8888, rect.size(),
+@@ -3827,7 +3845,38 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           // ask.
+           scratch_is_clean =
+               src_from_canvas || inline_3d_canvas_layers_.empty();
+-          // scratch_write / scratch_rep release here; content is submitted.
++#if !BUILDFLAG(IS_ANDROID)
++          // ---- (browser#119) ARM THE RECOVERY SOURCE ----------------------
++          //
++          // The scratch has just been written and submitted, and |dst| is
++          // exactly where the FULL side-by-side landed inside it. Record that
++          // geometry now, while it is in hand: the recovery draw runs later in
++          // this same function with only the canvas-LAYER list to work from,
++          // and re-deriving the eye split from that list would repeat the
++          // browser#73 clipped-tile mapping in a second place.
++          //
++          // |src_from_canvas| ONLY, deliberately stricter than
++          // |scratch_is_clean|. The latter is also true when nothing was
++          // suppressed this frame (the |output| snapshot IS the page's own
++          // quad then), but such a scratch holds page pixels, and a LATER
++          // frame that does suppress must not recover from them. The recovery
++          // exists for suppressed tiles, so the canvas resource is the only
++          // source that is right for it by construction.
++          //
++          // Android is excluded because it has no per-target scratch at all:
++          // its |dst_mailbox| is the SHARED window-sized staging image and
++          // |dst_offset| is the tile's window position, so there is no
++          // per-tile image to draw from. Its recovery keeps the canvas-
++          // resource path (where its failure is at `produce`, one step earlier
++          // than Windows' — a different bug, tracked on the Android arm).
++          st.scratch_has_clean_sbs = src_from_canvas;
++          if (src_from_canvas) {
++            st.scratch_canvas_mailbox = clean_sbs_mailbox;
++            st.scratch_sbs_dst = gfx::ToEnclosingRect(gfx::SkRectToRectF(dst));
++            st.scratch_rect = rect;
++          }
++#endif  // !BUILDFLAG(IS_ANDROID)
++        // scratch_write / scratch_rep release here; content is submitted.
+         }
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -4220,6 +4269,11 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     DisplayXRTargetState& st = target_it->second;
+     gfx::Rect probe = inline_3d_rects_[t].rect;
+     probe.Intersect(window_bounds);
++    // (browser#119) Where this target IS this frame, recorded before any of
++    // the submit's early exits. The recovery draw runs after this loop with
++    // only the canvas-LAYER list in hand and must paint at the tile's LIVE
++    // position; the scratch may have been composed at an older one.
++    st.frame_rect = probe;
+     if (probe.IsEmpty()) {
+       // Nothing of this target is on screen, so nothing may be drawn back for
+       // it either: Phase B paints |drawn_rect| every frame, and a stale value
+@@ -4558,6 +4612,137 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     int rec_fail_produce = 0;
+     int rec_fail_read_access = 0;
+     int rec_fail_mk_image = 0;
++    // (browser#119) The scratch-sourced leg, counted separately so the log
++    // says which SOURCE carried each tile rather than only how many were lost.
++    int rec_from_scratch = 0;
++    int rec_fail_scratch = 0;
++    int rec_no_scratch_source = 0;
++
++    // ---- (browser#119) recovery_source_actually_available(tile) ------------
++    //
++    // THE PREDICATE, answered from a resource WE own. Every previous version
++    // of this question was answered from the producer's live canvas
++    // SharedImage, and both platforms' failures are downstream of a non-zero
++    // mailbox — Windows at BeginScopedReadAccess (D3DImageBacking refuses a
++    // read while a write access is open, and the canvas holds write across its
++    // producing frame), Android at ProduceSkia — so a mailbox-existence check
++    // passes and still leaves a void.
++    //
++    // The per-target scratch has exactly one writer, this function, so it is
++    // never contended. "Is a recovery source available" therefore reduces to
++    // bookkeeping this loop already holds: did we compose this tile from its
++    // CLEAN canvas resource, at the size the scratch is still allocated at?
++    // No probe, no access, no per-frame cost.
++    //
++    // PLACEMENT is the one thing that is not free. The scratch survives a
++    // move (only a SIZE change reallocates it), so its pixels may have been
++    // composed at an older position. Painting them there would be a ghost —
++    // the artifact class 0079 and the off-window rect clearing above exist to
++    // prevent — so only two placements are admitted: the exact one, or a pure
++    // translation to the live rect of the trivial full-scratch layout. A
++    // clipped tile that has ALSO moved declines and falls through to the
++    // canvas-resource leg, i.e. to exactly today's behaviour.
++    auto scratch_source_for =
++        [&](const gpu::Mailbox& canvas_mailbox) -> DisplayXRTargetState* {
++      if (canvas_mailbox.IsZero()) {
++        return nullptr;
++      }
++      for (auto& [scratch_key, sst] : displayxr_targets_) {
++        if (!sst.scratch_has_clean_sbs || sst.scratch_mailbox.IsZero() ||
++            sst.scratch_canvas_mailbox != canvas_mailbox ||
++            sst.scratch_sbs_dst.IsEmpty() || sst.frame_rect.IsEmpty() ||
++            sst.scratch_size != sst.scratch_rect.size()) {
++          continue;
++        }
++        if (sst.frame_rect == sst.scratch_rect ||
++            (sst.frame_rect.size() == sst.scratch_rect.size() &&
++             sst.scratch_sbs_dst == gfx::Rect(sst.scratch_size))) {
++          return &sst;
++        }
++      }
++      return nullptr;
++    };
++
++    // ---- (browser#119) THE MONO-DRAW PRIMITIVE -----------------------------
++    //
++    // Draw the tile's LEFT-EYE HALF out of its scratch and over the region the
++    // frame withheld. The scratch holds this tile's finished weave input — the
++    // clean canvas side-by-side, mapped through the quad's UV window, over the
++    // pre-blended page backdrop — so the left half of |scratch_sbs_dst| IS the
++    // left eye, in scratch pixels, with the eye split at that rect's
++    // horizontal midpoint. Magnify it 2x horizontally back over the whole tile
++    // and the result is the same flat fallback the SDK shows when 3D is
++    // unavailable, which is the only honest choice: black is the bug, and a
++    // naive full-width draw would show the raw side-by-side squeezed to half.
++    //
++    // This is the mono twin of 0074's BatchKeepPrevious, with the same licence
++    // (the scratch is ours, uncontended, and holds this tile at this size) and
++    // the same guard (|scratch_size| tracks |rect.size()|, enforced by the
++    // destroy-and-reallocate above).
++    auto mono_from_scratch = [&](DisplayXRTargetState& sst) -> bool {
++      const gfx::Rect sbs = sst.scratch_sbs_dst;
++      const float scratch_w = static_cast<float>(sst.scratch_size.width());
++      const float scratch_h = static_cast<float>(sst.scratch_size.height());
++      float sx0 = static_cast<float>(sbs.x());
++      float sx1 = sx0 + static_cast<float>(sbs.width()) * 0.5f;
++      float sy0 = static_cast<float>(sbs.y());
++      float sy1 = static_cast<float>(sbs.bottom());
++      // Clamp the source into the scratch. A tile clipped at a screen edge
++      // places the FULL-tile |sbs| partly outside its own (clipped) scratch,
++      // and kStrict_SrcRectConstraint refuses a source rect that leaves the
++      // image. Ternaries rather than std::min/max: <algorithm> is only pulled
++      // into this TU on the Apple branch of its includes.
++      sx0 = sx0 < 0.f ? 0.f : sx0;
++      sy0 = sy0 < 0.f ? 0.f : sy0;
++      sx1 = sx1 > scratch_w ? scratch_w : sx1;
++      sy1 = sy1 > scratch_h ? scratch_h : sy1;
++      if (sx1 <= sx0 || sy1 <= sy0) {
++        return false;
++      }
++      // The affine map the unclamped draw would have used, applied to the
++      // clamped rect so the clamp cannot shift the image: x doubles about the
++      // eye's own left edge, y is 1:1, both anchored at the LIVE rect's origin
++      // (scratch pixel (0,0) is that origin by construction).
++      const float ox = static_cast<float>(sst.frame_rect.x() + sbs.x());
++      const float oy = static_cast<float>(sst.frame_rect.y());
++      const float ex = static_cast<float>(sbs.x());
++      const SkRect src = SkRect::MakeLTRB(sx0, sy0, sx1, sy1);
++      const SkRect dst = SkRect::MakeLTRB(ox + 2.f * (sx0 - ex), oy + sy0,
++                                          ox + 2.f * (sx1 - ex), oy + sy1);
++
++      auto srep = shared_image_representation_factory_->ProduceSkia(
++          sst.scratch_mailbox, context_state_.get());
++      if (!srep) {
++        return false;
++      }
++      std::vector<GrBackendSemaphore> sbegin, send;
++      auto saccess = srep->BeginScopedReadAccess(&sbegin, &send);
++      if (!saccess) {
++        return false;
++      }
++      sk_sp<SkImage> simg = saccess->CreateSkImage(context_state_.get());
++      if (!simg) {
++        return false;
++      }
++      if (!sbegin.empty()) {
++        output->wait(sbegin.size(), sbegin.data(),
++                     /*deleteSemaphoresAfterWait=*/false);
++      }
++      SkPaint paint;
++      paint.setBlendMode(SkBlendMode::kSrcOver);
++      // LINEAR: this is a 2x horizontal magnification of an eye half, not the
++      // device-pixel-exact 1:1 blit of an interlace lattice. Same reasoning as
++      // the canvas-resource leg below.
++      out_canvas->drawImageRect(simg.get(), src, dst,
++                                SkSamplingOptions(SkFilterMode::kLinear),
++                                &paint, SkCanvas::kStrict_SrcRectConstraint);
++      // Same lifetime rule as every other access in this function: the read
++      // must outlive the flush+submit at the end of the lambda's caller.
++      rec_reps.push_back(std::move(srep));
++      rec_accesses.push_back(std::move(saccess));
++      return true;
++    };
++
+     for (const auto& c : inline_3d_canvas_layers_) {
+       // Clipped to nothing by the window: there is no hole on screen to fill.
+       // Not counted as missing — nothing was lost.
+@@ -4582,6 +4767,24 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         ++rec_fail_no_mailbox;
+         continue;
+       }
++      // (browser#119) THE SCRATCH FIRST. This is the whole fix: ask a resource
++      // we own before asking the one the producer is writing. When the
++      // predicate says yes the draw cannot be refused by access arbitration,
++      // which is the single reason every field sample of this loop read n=0.
++      // The canvas-resource leg below stays as the fallback — it is still the
++      // right answer for a tile the weave never composed (no scratch yet), and
++      // it is the only leg Android has until its arm grows a per-target
++      // scratch of its own.
++      if (DisplayXRTargetState* sst = scratch_source_for(c.mailbox)) {
++        if (mono_from_scratch(*sst)) {
++          ++rec_drawn;
++          ++rec_from_scratch;
++          continue;
++        }
++        ++rec_fail_scratch;
++      } else {
++        ++rec_no_scratch_source;
++      }
+       // (web#12, 0074) THE RECOVERY OPENS THE SAME RESOURCE THE WEAVE JUST
+       // FAILED TO OPEN. That is why the field capture reads "recovery draw: n=0
+       // missing=2" on exactly the frames the weave declined: this loop's
+@@ -4714,7 +4917,17 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                    << " [no_mailbox=" << rec_fail_no_mailbox
+                    << " produce=" << rec_fail_produce
+                    << " read_access=" << rec_fail_read_access
+-                   << " mk_image=" << rec_fail_mk_image << "]"
++                   << " mk_image=" << rec_fail_mk_image
++                   << "]"
++                   // (browser#119) WHICH SOURCE carried each tile.
++                   // scratch=N is the fix working; no_source=M is a tile the
++                   // weave has never composed (so there is nothing of ours to
++                   // draw and the canvas leg is the only option); scratch_fail
++                   // should stay 0 — the scratch is uncontended, so a non-zero
++                   // count means the predicate and the draw disagree.
++                   << " [scratch=" << rec_from_scratch
++                   << " no_source=" << rec_no_scratch_source
++                   << " scratch_fail=" << rec_fail_scratch << "]"
+                    << " events=" << (n + 1);
+       }
+     }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index adb5fbf..40d93db 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -889,6 +889,42 @@ class SkiaOutputSurfaceImplOnGpu
+     gfx::Rect pending_rect;
+     gfx::Rect drawn_rect;
+     int absent_frames = 0;
++
++    // ---- (browser#119) THE RECOVERY SOURCE ------------------------------
++    //
++    // The mono-draw primitive sources from THIS scratch, not from the
++    // producer's live canvas SharedImage. The reason is measured, not
++    // stylistic: a canvas that is producing holds an OPEN WRITE ACCESS across
++    // its frame, and without SHARED_IMAGE_USAGE_CONCURRENT_READ_WRITE
++    // D3DImageBacking::ValidateBeginAccess refuses EVERY access including a
++    // read — so the recovery's BeginScopedReadAccess fails for exactly as long
++    // as the page is healthy enough to be drawing. The scratch has one writer,
++    // us, so it is never contended and the question "is a recovery source
++    // available for this tile" becomes a fact in hand rather than a probe.
++    //
++    // |scratch_has_clean_sbs| IS that fact — the predicate. It is set only
++    // when the scratch was composed from the CLEAN CANVAS RESOURCE (never from
++    // an |output| snapshot, which on a suppressed frame is the hole itself),
++    // and cleared whenever the scratch is destroyed or reallocated.
++    bool scratch_has_clean_sbs = false;
++    // The canvas-layer mailbox that clean compose read from. The recovery draw
++    // iterates canvas LAYERS and needs to reach the TARGET that composed each
++    // one; this is that join key, and it is exact (the compose recorded it)
++    // rather than geometric.
++    gpu::Mailbox scratch_canvas_mailbox;
++    // Where the tile's FULL side-by-side landed INSIDE the scratch, in scratch
++    // pixels. Usually (0,0,scratch_size) — it differs only for a tile clipped
++    // at a screen edge, where browser#73 expresses the crop on the destination.
++    // The eye split is at |scratch_sbs_dst|'s horizontal midpoint, so this is
++    // what makes "the left half" a well-defined rectangle.
++    gfx::Rect scratch_sbs_dst;
++    // The on-screen rect the scratch was composed AT, and the rect this target
++    // occupies THIS frame. Equal on a frame whose compose succeeded; a
++    // difference means the scratch is carrying older content, which the
++    // recovery may still draw (0074's keep-previous licence) but only at the
++    // LIVE rect, never at the stale one.
++    gfx::Rect scratch_rect;
++    gfx::Rect frame_rect;
+   };
+   base::flat_map<base::Token, DisplayXRTargetState> displayxr_targets_;
+   // Provider slots currently owned by an entry of |displayxr_targets_|. New
