@@ -205,7 +205,7 @@ ABSENT="$CACHE_DIR/$TAG/absent"
 mkdir -p "$BLOBS" "$MODES" "$ABSENT" || harness_fault "cannot create cache under $CACHE_DIR"
 : > "$WORK_DIR/hints.txt"
 
-n=0; hit=0; got=0; miss=0
+n=0; hit=0; got=0; miss=0; retries=0
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   n=$((n + 1))
@@ -259,6 +259,7 @@ while IFS= read -r path; do
     echo "      retry $attempt/$MAX_ATTEMPTS for $path in ${back}s ($reason)"
     sleep "$back"
     attempt=$((attempt + 1))
+    retries=$((retries + 1))
   done
 
   [ "$DELAY" = "0" ] || sleep "$DELAY"
@@ -267,6 +268,10 @@ done < "$WORK_DIR/touched.txt"
 rm -f "$WORK_DIR/.fetch.b64" "$WORK_DIR/.fetch.bin" "$WORK_DIR/.fetch.err" "$WORK_DIR/.fetch.hdr"
 
 echo "      exists at $TAG: $got   created by the series: $miss   (cache hits: $hit/$n)"
+# Gitiles throttles even a strictly serial fetcher — the first CI run of this gate took two
+# 429s at one-request-at-a-time. Reporting the count is what keeps a slow-but-green run from
+# looking like a hang, and keeps "gitiles was throttling us" separable from "the gate is slow".
+[ "$retries" = 0 ] || echo "      $retries transient fetch(es) were retried and recovered (429/5xx) — not a patch signal"
 [ "$got" -gt 0 ] || harness_fault "not one touched file exists at $TAG — that is a bad tag or a broken fetch, not patch drift"
 
 # Cross-check the `new file mode` headers against what the tag actually holds. This is not
