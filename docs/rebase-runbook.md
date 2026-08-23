@@ -76,6 +76,23 @@ local history to paper over a conflict. It means investigate immediately, don't 
 `patch does not apply` — that's the real, unmasked signal that the series has drifted; recapture
 from the fork branch tip (steps 1-4 above) rather than hand-splicing the offending patch.
 
+**CI runs check 2 for you, without a checkout.** `.github/workflows/patch-gate.yml` fires on every
+PR touching `patches/**` or `scripts/config.env` and runs `scripts/patch-apply-gate.sh`, which
+rebuilds the fresh-clone condition from gitiles — it fetches only the ~100 series-touched files
+that exist at `$CHROMIUM_TAG`, commits them as a synthetic baseline, and `git am --3way`s the
+series onto it. With no fork blobs in that object DB, `--3way` has nothing to build a fake
+ancestor from, so it degrades to the textual apply a fresh clone does. Run it locally the same
+way before you push (`--patch-dir` points it at a scratch copy of the series):
+
+```bash
+scripts/patch-apply-gate.sh                     # exit 0 pass · 1 patch fault · 2 harness fault
+```
+
+Exit 2 is deliberately not a patch verdict: it means the baseline could not be assembled
+(network, gitiles rate limit) and `git am` never ran. Re-run it; do not touch `patches/`.
+`verify-series.sh` is still the stronger check where a checkout exists — only it verifies the
+resulting **tree hash** equals the fork branch's, which the checkout-free gate cannot do.
+
 ## 5. Build (official static)
 ```bash
 scripts/build.sh          # brand + gn gen out/Official + autoninja chrome (retry loop; multi-hour)

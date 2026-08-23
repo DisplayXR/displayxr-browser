@@ -1,0 +1,193 @@
+name: patch-gate
+
+# Fresh-clone patch-apply gate (browser#111; the failure class is browser#106).
+#
+# Answers one question on every PR that touches the series: does patches/ still apply to a
+# FRESH clone of the pinned CHROMIUM_TAG? It does that without a Chromium checkout, by
+# fetching only the files the series names from gitiles and applying the series onto them.
+# All of the mechanism, and all of the reasoning about why it is faithful, lives in
+# scripts/patch-apply-gate.sh — this file is just the trigger, the cache and the reporting.
+#
+# Why it exists: before this, the repo had NO pull_request CI at all, and the build box was
+# not a fresh-clone gate either — do_rebase.ps1 runs `git am --3way` inside the long-lived
+# C:\cr\src clone, whose object database still holds fork blobs, which lets --3way rebuild a
+# fake ancestor and content-merge real drift away. That is exactly why browser#106 reproduced
+# on a clean Ubuntu builder and never on the box.
+#
+# Why the failure taxonomy is worth the extra script: browser#132 is the counter-example —
+# a rebase tool overflowed the Windows command line, `git am` never ran, and the tooling
+# blamed the patches anyway. This gate distinguishes exit 1 (PATCH fault: git am ran and
+# rejected a patch, and the log names the patch, the file and the rejected hunk) from exit 2
+# (HARNESS fault: the baseline could not be assembled — network, rate limit, tooling), and
+# says which one it is in plain words.
+#
+# NOT in scope: this gate is not a build. A green run means the series applies, nothing more.
+# The weave is still verified on hardware per docs/rebase-runbook.md §6 before anything ships.
+#
+# If you ever make this a REQUIRED status check: the `paths:` filter below means the job does
+# not run at all on a docs-only PR, and GitHub leaves a required-but-never-started check
+# pending forever. Either drop the filter and short-circuit inside the job (the runtime
+# repo's `docs_only` pattern), or keep it advisory. It is deliberately advisory today so it
+# stays fast and quiet on PRs that cannot possibly break the series.
+
+on:
+  pull_request:
+    paths:
+      - "patches/**"
+      - "scripts/config.env"
+      - "scripts/patch-apply-gate.sh"
+      - ".github/workflows/patch-gate.yml"
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - "scripts/config.env"
+      - "scripts/patch-apply-gate.sh"
+      - ".github/workflows/patch-gate.yml"
+  workflow_dispatch:
+    inputs:
+      chromium_tag:
+        description: "Tag to gate against (blank = the pin in scripts/config.env)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# A later push supersedes an earlier one on the same ref — nobody needs the verdict on a
+# commit that has already been replaced.
+concurrency:
+  group: patch-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    name: applies to a fresh clone of the pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The pin comes from config.env and nowhere else. A workflow_dispatch input may
+      # override it (to rehearse a milestone bump before committing it), but a BLANK input
+      # must resolve to the pin rather than to an empty tag — same trap as browser#114.
+      - name: Resolve the pin and the baseline cache key
+        id: pin
+        env:
+          INPUT_TAG: ${{ github.event.inputs.chromium_tag }}
+        run: |
+          set -euo pipefail
+          IN="${INPUT_TAG:-}"
+          if [ -n "$IN" ]; then
+            TAG="$IN"
+            echo "tag from workflow_dispatch input: $TAG"
+          else
+            # shellcheck source=/dev/null
+            source scripts/config.env
+            TAG="$CHROMIUM_TAG"
+            echo "tag from scripts/config.env: $TAG"
+          fi
+          [ -n "$TAG" ] || { echo "::error::empty CHROMIUM_TAG — refusing to gate against nothing"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Key the cache on the touched-file list produced by the gate script itself, so
+          # the key can never drift from what the fetcher actually asks for. The tag-only
+          # restore-key means adding a patch re-fetches just the new files.
+          bash scripts/patch-apply-gate.sh --tag "$TAG" --list-files > "$RUNNER_TEMP/touched.txt"
+          FILES=$(wc -l < "$RUNNER_TEMP/touched.txt")
+          HASH=$(sha256sum "$RUNNER_TEMP/touched.txt" | cut -c1-16)
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          echo "key=gitiles-$TAG-$HASH" >> "$GITHUB_OUTPUT"
+          echo "$FILES touched paths; cache key gitiles-$TAG-$HASH"
+
+      # restore/save split rather than actions/cache, so a FAILING run still saves the
+      # baseline. Otherwise every push to a red PR would re-fetch ~100 files from gitiles
+      # while the author iterates — the surest way to get people to route around the gate.
+      # Cached blobs never go stale: a git tag is immutable.
+      - name: Restore the gitiles baseline
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/dxr-gitiles
+          key: ${{ steps.pin.outputs.key }}
+          restore-keys: gitiles-${{ steps.pin.outputs.tag }}-
+
+      - name: Fresh-clone patch-apply gate
+        id: gate
+        env:
+          GATE_TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          set -uo pipefail
+          # Exported here, not in `env:` — an `env:` value is never shell-expanded, so
+          # `~/.cache/...` would create a directory literally named `~`.
+          export DXR_GATE_CACHE="$HOME/.cache/dxr-gitiles"
+          bash scripts/patch-apply-gate.sh --tag "$GATE_TAG" 2>&1 | tee "$RUNNER_TEMP/gate.log"
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # Saved before the verdict is rendered, and with if: always(), so the fetch cost is
+      # paid at most once per (tag, touched-file-list).
+      - name: Save the gitiles baseline
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/dxr-gitiles
+          key: ${{ steps.pin.outputs.key }}
+
+      # One place decides pass/fail, and it says WHICH kind of failure in the annotation —
+      # so the checks list itself distinguishes "the patches are broken" from "the gate
+      # could not run", without anyone opening the log.
+      - name: Verdict
+        if: always()
+        run: |
+          set -uo pipefail
+          RC="${{ steps.gate.outputs.rc }}"
+          TAG="${{ steps.pin.outputs.tag }}"
+          {
+            echo "## Fresh-clone patch-apply gate"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| pinned tag | \`$TAG\` |"
+            echo "| patches | $(ls patches/*.patch | wc -l) |"
+            echo "| touched paths | ${{ steps.pin.outputs.files }} |"
+            echo "| baseline cache | ${{ steps.cache.outputs.cache-matched-key || 'cold' }} |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$RC" in
+            0)
+              echo "PASS — the series applies to a fresh clone of $TAG."
+              echo "**PASS** — every patch applies to a fresh clone of \`$TAG\`, zero rejects." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            1)
+              BAD=$(grep -m1 '^FAILED PATCH: ' "$RUNNER_TEMP/gate.log" | sed 's/^FAILED PATCH: //' || echo "unknown")
+              echo "::error title=Patch series does not apply to a fresh clone of $TAG::$BAD was rejected. Re-anchor it with git format-patch (docs/rebase-runbook.md §4) — do not hand-edit the .patch. Full rejected hunk in the gate log."
+              {
+                echo "**PATCH FAULT** — \`$BAD\` does not apply to a fresh clone of \`$TAG\`."
+                echo
+                echo "Its declared pre-image is not the state its predecessors produce. Re-anchor it by"
+                echo "regenerating the series (\`docs/rebase-runbook.md\` §4) — never by hand-editing the"
+                echo "\`.patch\`. A stale \`index\` line is not the cause; \`git apply\` never reads it."
+                echo
+                echo "The rejected hunk is printed in full in the *Fresh-clone patch-apply gate* step."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+            2|"")
+              echo "::error title=Patch gate could not run (HARNESS fault, not a patch fault)::The gitiles baseline could not be assembled, so git am never ran. This says nothing about patches/. Re-run the job."
+              {
+                echo "**HARNESS FAULT** — the gate could not run. **This is not a patch failure.**"
+                echo
+                echo "The baseline checkout could not be assembled (network, gitiles rate limit, or a"
+                echo "tooling problem), so \`git am\` was never given a fair chance. Nothing here says"
+                echo "anything about \`patches/\`. Re-run the job; if it keeps failing the same way, the"
+                echo "gate itself needs fixing (browser#111)."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+            *)
+              echo "::error title=Patch gate returned an unexpected status ($RC)::Treat as a HARNESS fault until proven otherwise."
+              exit 1
+              ;;
+          esac
