@@ -97,6 +97,13 @@ try {
   $verdict = (Get-Content $done -Raw).Trim()
   Show-LogTail
   if ($verdict -like 'OK *') { Write-Output "REBASE OK: $verdict"; exit 0 }
+  # A HARNESS verdict means do_rebase.ps1 never got far enough to judge the
+  # series. Reporting that as CONFLICT is what sent someone to rewrite patches
+  # that applied perfectly (#132), so it gets its own word and its own exit code.
+  if ($verdict -like 'HARNESS*') {
+    Write-Output "HARNESS FAULT (the series was never judged, this is NOT patch drift): $verdict"
+    exit 2
+  }
   Write-Output "CONFLICT: $verdict"
   exit 1
 }
