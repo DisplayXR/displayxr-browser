@@ -1,7 +1,7 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **108 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **112 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
 
 Patch **0112** closes browser#119 + browser#120 (Windows). The browser#99/web#12 recovery draw was
@@ -61,6 +61,16 @@ default on Android exactly as the `IS_WIN` block in `chrome_main_delegate.cc` al
 preconditions so it also runs on weave-less frames. 0104 is the `[DXR-SPACE]` diagnostic
 (draw-back geometry printed as numbers) and is **temporary** — drop it once the scroll-lag item
 is closed. All four are Android-only: they touch no shared behaviour the Windows lane relies on.
+
+**Patches 0107–0110 are the SHARED viz half of the same follow-up** and are deliberately
+sequenced last so the Android arm above can ship without them. 0107 is the "lockstep"
+correction — a resolved layer is only treated as proven-suppressed once its resource is proven
+openable. 0108 (legacy inline-3D rect channel judged per FRAME rather than per surface) and
+0109 (duplicate broken by provenance rather than iteration order) were written for a scroll-lag
+hypothesis that has since been REFUTED on device, and carry no proven benefit; they touch the
+machinery browser#117's 0080/0082 depend on. 0110 is the un-latched `[DXR-SPACE]` diagnostic
+with per-slot channel tags and is **temporary**. None of 0107–0110 has been validated on
+Windows — drop them if the Windows composition matrix regresses.
 
 Patch 0111 makes the weave honour the **ancestor clip chain** (browser#130). A tile inside an
 `overflow:auto` panel, scrolled out of view within the panel, came back woven OUTSIDE the panel

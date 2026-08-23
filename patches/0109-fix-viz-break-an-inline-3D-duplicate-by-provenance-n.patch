@@ -1,0 +1,147 @@
+From 2193e8d0761d6281c23ea0d565abf4723703165d Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sun, 23 Aug 2026 01:39:33 +0000
+Subject: [PATCH] fix(viz): break an inline-3D duplicate by provenance, not
+ iteration order
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The lockstep split filters rects that this frame did not prepare; it does not
+de-duplicate. When two rects describe one element — the compositor-thread
+tracked channel, which carries identity and is projected through the layer's
+ScreenSpaceTransform at draw time, and the Blink main-thread channel, which
+carries none and is a getBoundingClientRect snapshot patched by an approximate
+impl-scroll delta — both pass the filter, and which one the weave follows was
+left to iteration order. At rest the pair is pixel-identical so either looked
+right; mid-fling the identity-less copy trails the composited pixels, and if it
+wins the woven 3D lands a beat behind the 2D page.
+
+Split the loop into prepare / tie-break / submit, and drop an identity-less
+rect whenever a PREPARED rect carrying identity already covers the same element
+(majority overlap against the smaller area, matching the aggregator's join).
+Only a prepared tracked rect displaces the twin — an unprepared one is withheld
+from the weave, and dropping the legacy copy against it would take the tile out
+of the weave instead of de-duplicating it.
+
+Belt only: the pair should never form now that the cardinality budget is judged
+per frame. It logs when it fires so a regression there cannot be silent.
+---
+ components/viz/service/display/display.cc | 89 +++++++++++++++++++++--
+ 1 file changed, 83 insertions(+), 6 deletions(-)
+
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index 1a4a91c677a98..e201dda0a7cfb 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1136,11 +1136,15 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+                               const auto& r) {
+         return !r.id.is_zero() ? l.id == r.id : l.rect == r.rect;
+       };
+-      for (const auto& r : frame.inline_3d_rects) {
+-        bool prepared = resolved_canvas.empty() && probe_canvas.empty();
++      // Pass 1: which rects this frame prepared. Kept separate from the
++      // submission below so the provenance tie-break can see the whole set.
++      std::vector<bool> prepared(frame.inline_3d_rects.size(), false);
++      for (size_t i = 0; i < frame.inline_3d_rects.size(); ++i) {
++        const auto& r = frame.inline_3d_rects[i];
++        bool ok = resolved_canvas.empty() && probe_canvas.empty();
+         for (const auto& layer : probe_canvas) {
+           if (layer_matches(layer, r)) {
+-            prepared = true;
++            ok = true;
+             break;
+           }
+         }
+@@ -1149,15 +1153,88 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+           // geometry, and Display's own tile join above uses the same pair of
+           // tests in the same order.
+           if (!r.id.is_zero() ? layer.id == r.id : layer.rect == r.rect) {
+-            prepared = true;
++            ok = true;
+             break;
+           }
+         }
+-        if (!prepared) {
++        prepared[i] = ok;
++      }
++
++      // Pass 2 (belt): BREAK A DUPLICATE BY PROVENANCE, NEVER BY ITERATION
++      // ORDER. Two rects can describe one element — the compositor-thread
++      // tracked channel carries identity and is projected through the layer's
++      // ScreenSpaceTransform at draw time, the Blink main-thread channel
++      // carries none and is a getBoundingClientRect snapshot patched by an
++      // approximate impl-scroll delta. At rest the pair is pixel-identical, so
++      // whichever survived looked correct; mid-fling the identity-less copy
++      // trails the composited pixels and the weave lands a beat behind the 2D
++      // page. The aggregator's cardinality budget is what is supposed to stop
++      // the pair ever forming, and the fix for that is the commit before this
++      // one — but the loop below must not be the thing that decides, so drop an
++      // identity-less rect whenever a PREPARED rect that carries identity
++      // already covers the same element.
++      //
++      // Only a prepared tracked rect displaces the twin: an unprepared one is
++      // withheld from the weave entirely, and dropping the legacy copy against
++      // it would take the tile out of the weave rather than de-duplicate it.
++      // Overlap is scored against the smaller area, matching the aggregator's
++      // join, and a majority overlap is the "same element" test — a scroll
++      // delta lowers the score without breaking the pairing.
++      int legacy_twins = 0;
++      for (size_t i = 0; i < frame.inline_3d_rects.size(); ++i) {
++        if (!prepared[i] || !frame.inline_3d_rects[i].id.is_zero()) {
++          continue;
++        }
++        const gfx::Rect& legacy_rect = frame.inline_3d_rects[i].rect;
++        for (size_t j = 0; j < frame.inline_3d_rects.size(); ++j) {
++          if (i == j || !prepared[j] || frame.inline_3d_rects[j].id.is_zero()) {
++            continue;
++          }
++          const gfx::Rect& tracked_rect = frame.inline_3d_rects[j].rect;
++          gfx::Rect isect = tracked_rect;
++          isect.Intersect(legacy_rect);
++          if (isect.IsEmpty()) {
++            continue;
++          }
++          const int64_t inter = static_cast<int64_t>(isect.width()) *
++                                static_cast<int64_t>(isect.height());
++          const int64_t a = static_cast<int64_t>(legacy_rect.width()) *
++                            static_cast<int64_t>(legacy_rect.height());
++          const int64_t b = static_cast<int64_t>(tracked_rect.width()) *
++                            static_cast<int64_t>(tracked_rect.height());
++          const int64_t denom = std::min(a, b);
++          if (denom > 0 && inter * 2 > denom) {
++            prepared[i] = false;
++            ++legacy_twins;
++            break;
++          }
++        }
++      }
++      if (legacy_twins > 0) {
++        // On 0073's discipline (first 3, then 1-in-300). This firing at all
++        // means the aggregator emitted a duplicate pair, so it must not be
++        // silent even though the belt handled it.
++        static int s_twins = 0;
++        const int n = s_twins++;
++        if (n < 3 || (n % 300) == 0) {
++          LOG(ERROR) << "[DisplayXR] inline-3D provenance: dropped "
++                     << legacy_twins << " identity-less rect(s) of "
++                     << frame.inline_3d_rects.size()
++                     << " that duplicate a prepared tracked rect — the "
++                        "main-thread copy trails the composited pixels during a "
++                        "fling, so the tracked copy wins (events="
++                     << (n + 1) << ")";
++        }
++      }
++
++      // Pass 3: submit.
++      for (size_t i = 0; i < frame.inline_3d_rects.size(); ++i) {
++        if (!prepared[i]) {
+           ++unprepared;
+           continue;
+         }
+-        weave_rects.push_back({r.rect, r.id});
++        weave_rects.push_back(
++            {frame.inline_3d_rects[i].rect, frame.inline_3d_rects[i].id});
+       }
+       if (unprepared > 0) {
+         // LOG(ERROR) on 0073's discipline (first 3, then 1-in-300): withholding

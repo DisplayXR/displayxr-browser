@@ -1,0 +1,272 @@
+From 1d8ba15d857a364d88ea43390b22790c398034e8 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sun, 23 Aug 2026 01:34:07 +0000
+Subject: [PATCH] fix(viz): judge the inline-3D legacy channel per FRAME, not
+ per surface
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 0094 cardinality budget compared the legacy (Blink main-thread
+getBoundingClientRect) rect count against the tracked (compositor-thread,
+draw-time projected) count inside CollectTrackedElementRects, which runs once
+per SURFACE. |tracked_begin| is a per-call watermark, so the pigeonhole
+argument the budget rests on — "the tracked channel already describes at least
+as many elements, so nothing is missing" — was evaluated over two different
+populations: a surface contributing the legacy channel for elements whose
+tracked rects were collected on another call saw tracked_count == 0 and
+admitted its entire legacy channel.
+
+The result is two rects per element: pixel-identical at rest, and mid-fling the
+main-thread copy trails the composited pixels by a frame. Both reach the weave,
+so the woven 3D lands where the page was a beat ago — the reported scroll lag.
+
+Stash the legacy rects per surface (with the clip that was applied to them) and
+run the budget ONCE per aggregation, in AdmitLegacyInline3dRects(), against the
+tracked rects of every surface. The greedy 1:1 join is unchanged; only the
+population it is counted over is corrected.
+---
+ .../viz/service/display/surface_aggregator.cc | 113 ++++++++++++------
+ .../viz/service/display/surface_aggregator.h  |  20 ++++
+ 2 files changed, 99 insertions(+), 34 deletions(-)
+
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 53026b9893e3a..eb0b04e9b13ef 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2233,6 +2233,9 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   root_surface_id_ = surface_id;
+   tracked_element_rects_ = {};
+   inline_3d_rects_ = {};
++  pending_legacy_inline_3d_rects_ = {};
++  tracked_inline_3d_count_ = 0;
++  tracked_inline_3d_metadata_count_ = 0;
+   root_resource_quads_ = {};
+   cross_pass_diag_quads_ = 0;
+ 
+@@ -2417,6 +2420,11 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     frame_annotator_->AnnotateAggregatedFrame(&frame);
+ 
+   frame.tracked_element_rects = std::move(tracked_element_rects_);
++  // DisplayXR inline-3D: every surface has now contributed, so the legacy
++  // channel can finally be judged against the WHOLE tracked channel. Must run
++  // before the sort below — an admitted legacy rect takes part in the ordering
++  // like any other.
++  AdmitLegacyInline3dRects();
+   // DisplayXR inline-3D (#625): deterministic order — the weave consumer keys
+   // per-target state by vector index, and the tracked-element and legacy paths
+   // enumerate in different orders.
+@@ -3074,22 +3082,62 @@ void SurfaceAggregator::CollectTrackedElementRects(
+   // consumers implement. Overlap is scored against the SMALLER of the two
+   // areas, so a clip or a scroll delta lowers the score without breaking the
+   // pairing, and a neighbouring tile cannot swallow one whole.
++  // Frame-wide accounting. |tracked_begin| is a per-CALL watermark, so these
++  // running totals are the only honest input to a cardinality budget.
+   const size_t tracked_end = inline_3d_rects_.size();
+-  const size_t tracked_count = tracked_end - tracked_begin;
+-
+-  std::vector<gfx::Rect> legacy_dest;
+-  legacy_dest.reserve(frame_metadata.inline_3d_rects.size());
++  tracked_inline_3d_count_ += tracked_end - tracked_begin;
++  tracked_inline_3d_metadata_count_ += tracked_metadata_count;
++
++  // Stash, do not admit. Admission moved to AdmitLegacyInline3dRects(), which
++  // runs once after every surface has contributed. Judging the two channels
++  // here compared this surface's legacy count against this CALL's tracked
++  // count, and the pigeonhole argument the budget rests on is only valid when
++  // both are counted over the same population: a surface carrying the legacy
++  // channel for elements whose tracked rects arrived on another call saw
++  // tracked_count == 0 and admitted its entire legacy channel, putting a
++  // second, main-thread-measured rect on every element. Those twins are
++  // pixel-identical at rest and trail by a frame mid-fling, which is exactly
++  // the "3D lags 2D during scroll" report.
+   for (const gfx::Rect& rect : frame_metadata.inline_3d_rects) {
+     const gfx::Rect dest = TransformRectToDestRootTargetSpace(
+         rect, target_transform, transform_to_root_target,
+         root_target_clip_rect);
+     if (!dest.IsEmpty()) {
+-      legacy_dest.push_back(dest);
++      // browser#117: an admitted legacy rect keeps the same clip the tracked
++      // channel keeps, so the consumer's join scores it against an unclipped
++      // quad rect on the same terms. Carry it with the rect, since the surface
++      // it belongs to is long gone by admission time.
++      pending_legacy_inline_3d_rects_.emplace_back(dest, root_target_clip_rect);
+     }
+   }
++}
++
++// DisplayXR inline-3D: the cardinality budget, once per aggregation.
++//
++//   * legacy_count <= tracked_count  =>  admit NOTHING. By pigeonhole the
++//     tracked channel already describes at least as many elements as the legacy
++//     one, so no element is missing from it, and any geometric disagreement is a
++//     measurement delta rather than a set difference. This is the whole steady
++//     state, scrolling included.
++//   * legacy_count >  tracked_count  =>  admit exactly the difference, and pick
++//     WHICH by a 1:1 greedy join: every legacy rect claims its best overlapping
++//     unclaimed tracked rect, and the leftovers — the ones with no partner at
++//     all — are the genuinely missing elements. A displaced rect still claims
++//     its partner (it is that partner's best match even when the centres have
++//     parted), so a scroll delta can no longer promote a duplicate to "missing".
++//
++// The join stays geometric because the legacy channel carries no token. Overlap
++// is scored against the SMALLER of the two areas, so a clip or a scroll delta
++// lowers the score without breaking the pairing, and a neighbouring tile cannot
++// swallow one whole.
++void SurfaceAggregator::AdmitLegacyInline3dRects() {
++  const size_t tracked_count = tracked_inline_3d_count_;
++  const size_t legacy_count = pending_legacy_inline_3d_rects_.size();
++  DCHECK_EQ(tracked_count, inline_3d_rects_.size())
++      << "legacy admission must run before anything else appends";
+ 
+   size_t legacy_admitted = 0;
+-  if (legacy_dest.size() > tracked_count) {
++  if (legacy_count > tracked_count) {
+     // Best partner (and its score) for each legacy rect. Scores are in [0,1];
+     // -1 means "overlaps no tracked rect at all".
+     struct Cand {
+@@ -3098,23 +3146,23 @@ void SurfaceAggregator::CollectTrackedElementRects(
+       float score = -1.f;
+     };
+     std::vector<Cand> cands;
+-    cands.reserve(legacy_dest.size());
+-    for (size_t l = 0; l < legacy_dest.size(); ++l) {
++    cands.reserve(legacy_count);
++    for (size_t l = 0; l < legacy_count; ++l) {
++      const gfx::Rect& legacy_rect = pending_legacy_inline_3d_rects_[l].first;
+       Cand c;
+       c.legacy_index = l;
+-      for (size_t i = tracked_begin; i < tracked_end; ++i) {
++      for (size_t i = 0; i < tracked_count; ++i) {
+         gfx::Rect isect = inline_3d_rects_[i].rect;
+-        isect.Intersect(legacy_dest[l]);
++        isect.Intersect(legacy_rect);
+         if (isect.IsEmpty()) {
+           continue;
+         }
+         const int64_t inter = static_cast<int64_t>(isect.width()) *
+                               static_cast<int64_t>(isect.height());
+-        const int64_t a = static_cast<int64_t>(legacy_dest[l].width()) *
+-                          static_cast<int64_t>(legacy_dest[l].height());
+-        const int64_t b =
+-            static_cast<int64_t>(inline_3d_rects_[i].rect.width()) *
+-            static_cast<int64_t>(inline_3d_rects_[i].rect.height());
++        const int64_t a = static_cast<int64_t>(legacy_rect.width()) *
++                          static_cast<int64_t>(legacy_rect.height());
++        const int64_t b = static_cast<int64_t>(inline_3d_rects_[i].rect.width()) *
++                          static_cast<int64_t>(inline_3d_rects_[i].rect.height());
+         const int64_t denom = std::min(a, b);
+         const float score =
+             denom > 0 ? static_cast<float>(inter) / static_cast<float>(denom)
+@@ -3132,12 +3180,12 @@ void SurfaceAggregator::CollectTrackedElementRects(
+                      [](const Cand& x, const Cand& y) {
+                        return x.score > y.score;
+                      });
+-    std::vector<bool> claimed(tracked_end - tracked_begin, false);
+-    std::vector<bool> admit(legacy_dest.size(), false);
+-    size_t budget = legacy_dest.size() - tracked_count;
++    std::vector<bool> claimed(tracked_count, false);
++    std::vector<bool> admit(legacy_count, false);
++    size_t budget = legacy_count - tracked_count;
+     for (const Cand& c : cands) {
+-      if (c.score > 0.f && !claimed[c.tracked_index - tracked_begin]) {
+-        claimed[c.tracked_index - tracked_begin] = true;
++      if (c.score > 0.f && !claimed[c.tracked_index]) {
++        claimed[c.tracked_index] = true;
+         continue;
+       }
+       // No partner left (or none ever). This is a genuinely missing element —
+@@ -3147,21 +3195,18 @@ void SurfaceAggregator::CollectTrackedElementRects(
+         --budget;
+       }
+     }
+-    for (size_t l = 0; l < legacy_dest.size(); ++l) {
++    for (size_t l = 0; l < legacy_count; ++l) {
+       if (!admit[l]) {
+         continue;
+       }
+       // Phase-1 identity: the legacy main-thread channel carries no element
+       // token and no layer id. Zeroes here are the documented "no identity"
+       // signal — the consumer falls back to geometric matching and to
+-      // positional per-target state, i.e. exactly today's behaviour.
+-      inline_3d_rects_.push_back(
+-          {legacy_dest[l], base::Token(), /*sqs_layer_id=*/0u,
+-           std::pair<uint32_t, uint32_t>(),
+-           // browser#117: an admitted legacy rect keeps the same clip the
+-           // tracked channel keeps, so the consumer's join scores it against
+-           // an unclipped quad rect on the same terms.
+-           root_target_clip_rect});
++      // positional per-target state.
++      inline_3d_rects_.push_back({pending_legacy_inline_3d_rects_[l].first,
++                                  base::Token(), /*sqs_layer_id=*/0u,
++                                  std::pair<uint32_t, uint32_t>(),
++                                  pending_legacy_inline_3d_rects_[l].second});
+       ++legacy_admitted;
+     }
+   }
+@@ -3169,15 +3214,14 @@ void SurfaceAggregator::CollectTrackedElementRects(
+   // Latched, and only when the two channels actually disagree — this is the
+   // shape of the bug above, so say so once rather than leaving it to be
+   // inferred from a tile that looks wrong.
+-  if (legacy_admitted > 0 && has_tracked_inline3d) {
++  if (legacy_admitted > 0 && tracked_count > 0) {
+     static bool logged_union = false;
+     if (!logged_union) {
+       logged_union = true;
+       LOG(WARNING) << "[DisplayXR] inline-3D rect union: tracked="
+-                   << tracked_count << " (of " << tracked_metadata_count
+-                   << " reported) legacy_metadata="
+-                   << frame_metadata.inline_3d_rects.size()
+-                   << " legacy_nonempty=" << legacy_dest.size()
++                   << tracked_count << " (of "
++                   << tracked_inline_3d_metadata_count_
++                   << " reported) legacy_nonempty=" << legacy_count
+                    << " legacy_admitted=" << legacy_admitted
+                    << " total=" << inline_3d_rects_.size()
+                    << " — element(s) missing from the tracked channel were "
+@@ -3185,6 +3229,7 @@ void SurfaceAggregator::CollectTrackedElementRects(
+                       "they would render as raw SBS";
+     }
+   }
++  pending_legacy_inline_3d_rects_.clear();
+ }
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index e499bb020b81e..a722890f48838 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -346,6 +346,13 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+       const std::optional<gfx::Rect> root_target_clip_rect,
+       const std::pair<uint32_t, uint32_t>& client_namespace_id);
+ 
++  // DisplayXR inline-3D: admit the stashed legacy main-thread rects, ONCE per
++  // aggregation, against the tracked rects collected from EVERY surface. See
++  // the cardinality-budget comment in the .cc — the pigeonhole argument is only
++  // sound when both channels are counted over the same population, which a
++  // per-surface admission does not do.
++  void AdmitLegacyInline3dRects();
++
+   const raw_ptr<SurfaceManager> manager_;
+   const raw_ptr<DisplayResourceProvider> provider_;
+ 
+@@ -502,6 +509,19 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+   };
+   std::vector<Inline3dTrackedRect> inline_3d_rects_;
+ 
++  // DisplayXR inline-3D: the legacy (Blink main-thread getBoundingClientRect)
++  // channel, stashed per surface in root-target space together with the clip
++  // that was applied to it, and admitted once per frame by
++  // AdmitLegacyInline3dRects(). Deferring is the whole point: the budget is a
++  // frame-wide cardinality question.
++  std::vector<std::pair<gfx::Rect, std::optional<gfx::Rect>>>
++      pending_legacy_inline_3d_rects_;
++  // How many tracked (compositor-thread) weave rects the frame collected across
++  // all surfaces, and how many the metadata reported before empties were
++  // dropped — the two numbers the admission budget and its log need.
++  size_t tracked_inline_3d_count_ = 0;
++  size_t tracked_inline_3d_metadata_count_ = 0;
++
+   // DisplayXR (browser#18): every resource-bearing quad in the ROOT pass,
+   // recorded as {parent-space ResourceId, root-space rect} during
+   // CopyQuadsToPass, then matched at Aggregate() end against inline_3d_rects_
