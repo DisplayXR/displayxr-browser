@@ -1,0 +1,76 @@
+From 6ee47e7502f7bdec49c004f65e40d2dc2776fccd Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Sun, 23 Aug 2026 04:47:11 +0000
+Subject: [PATCH] fix(android): append --inline-3d-occlusion by default, as
+ Windows does
+
+Patch 0065 put the default-append of --inline-3d-occlusion inside
+`#if BUILDFLAG(IS_WIN)`, and no Android patch (0083-0102) ever added the
+matching arm -- patch 0096's own comment says so in as many words ("inline-3D
+is not yet on by default on Android (the block above is IS_WIN-only)").
+
+So on Android the switch was never on unless a human wrote it into
+/data/local/tmp/chrome-command-line by hand, and with it off
+inline3d_occlusion_enabled_ is false in BOTH readers: DirectRenderer on the GPU
+compositor thread, which builds the plane split, and SkiaOutputSurfaceImplOnGpu
+on the GPU main thread, which composites the over-plane. The whole Phase-2
+2D-over-3D path was therefore dead code on the device, and every 2D element
+painted above an inline-3D tile was buried by the tile -- the reported defect.
+
+Mirror the IS_WIN logic rather than invent new logic. Same precedence:
+--disable-inline-3d-occlusion wins and removes the switch, an explicit
+--inline-3d-occlusion is left exactly as given, otherwise the default is
+appended. ChromeContentBrowserClient::AppendExtraCommandLineSwitches already
+forwards whatever survives to the GPU and renderer processes, so it needs no
+change.
+
+Scoped to the same `enable-inline-3d` guard as the AndroidSurfaceControl
+override it sits beside, deliberately: inline-3D itself is still opt-in on
+Android (it arrives through the command-line file, which Android parses into
+base::CommandLine before ContentMain runs). Turning the whole feature on by
+default is a different change than fixing its occlusion sub-switch, and is not
+made here.
+---
+ chrome/app/chrome_main_delegate.cc | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+index 4481cd6028f2e..d21a1097683ee 100644
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -1176,6 +1176,35 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
+       disabled += "AndroidSurfaceControl";
+       mutable_command_line->AppendSwitchASCII("disable-features", disabled);
+     }
++    // Phase-2 plane split / occlusion, mirrored from the IS_WIN block above.
++    //
++    // THE BUG THIS FIXES: patch 0065 put the default-append of
++    // --inline-3d-occlusion inside `#if BUILDFLAG(IS_WIN)`, and no Android
++    // patch ever added the matching arm — patch 0096's own comment says so in
++    // as many words. So on Android inline3d_occlusion_enabled_ was false in
++    // BOTH readers (DirectRenderer on the GPU compositor thread, which builds
++    // the split, and SkiaOutputSurfaceImplOnGpu on the GPU main thread, which
++    // composites the over-plane), the whole Phase-2 path was dead, and 2D
++    // content over a woven tile was buried by the tile. That is the
++    // device-visible "the overlay disappears and the tile shows instead".
++    //
++    // Same precedence as Windows, deliberately not reinvented:
++    // --disable-inline-3d-occlusion wins and removes the switch; an explicit
++    // --inline-3d-occlusion is left exactly as the user gave it; otherwise the
++    // default is appended. Scoped to the same `enable-inline-3d` guard as the
++    // SurfaceControl override above rather than made unconditional, because
++    // inline-3D itself is still opt-in on Android (it arrives via
++    // /data/local/tmp/chrome-command-line, parsed into base::CommandLine
++    // before ContentMain runs) — turning the whole feature on by default here
++    // would be a different change than fixing its occlusion sub-switch.
++    //
++    // ChromeContentBrowserClient::AppendExtraCommandLineSwitches forwards
++    // whatever survives to the GPU and renderer processes; it needs no change.
++    if (mutable_command_line->HasSwitch("disable-inline-3d-occlusion")) {
++      mutable_command_line->RemoveSwitch("inline-3d-occlusion");
++    } else if (!mutable_command_line->HasSwitch("inline-3d-occlusion")) {
++      mutable_command_line->AppendSwitch("inline-3d-occlusion");
++    }
+   }
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
