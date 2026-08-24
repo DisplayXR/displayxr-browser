@@ -3,8 +3,16 @@
 #
 # Expects a signed installer already built (installer/build_installer.sh + scripts/sign.sh).
 # Creates a tagged GitHub Release in THIS repo with the installer attached, the preview label,
-# and the security disclaimer in the notes. This is the download the website links to, and the
-# feed the in-browser version check reads (docs/release-and-distribution.md).
+# and the security disclaimer in the notes. This is the download the website links to
+# (docs/release-and-distribution.md), and it updates feed/feed.json — the update feed served
+# at updates.displayxr.org.
+#
+# NOTE: the in-browser version check described in docs/release-and-distribution.md is DESIGNED,
+# NOT SHIPPED (browser#154) — no version-check.js exists and nothing in the patch series polls
+# for updates. The feed is written so it is correct when a consumer arrives; do not read the
+# feed's existence as evidence that anything reads it yet.
+#
+# Set SECURITY=1 for a release whose point is a Chromium security rebase.
 #
 # Usage: scripts/release.sh <tag> <path-to-signed-installer.exe>
 #   e.g. scripts/release.sh preview-150.0.7871.24 dist/DisplayXR-Browser-Preview-Setup-150.0.7871.24.1.exe
@@ -74,5 +82,52 @@ else
 fi
 
 echo "[release] done — https://github.com/DisplayXR/displayxr-browser/releases/tag/$TAG"
-echo "[release] the in-browser version check + the website download button read this release feed."
 echo "[release] displayxr-runtime/versions.json[browser] should now read $TAG."
+
+# ── Update the published update feed (browser#154) ────────────────────────────────────
+# This script used to only PRINT that a feed was consumed, and never wrote one. The feed
+# sat at 0.1.5 / Chromium 150 through five releases and a milestone bump, because nothing
+# contradicted the message. A release that does not update the feed is a release nobody
+# installed can learn about, so writing it is part of publishing, not a follow-up chore.
+#
+# Version comes from the TAG (preview-0.1.18 -> 0.1.18), not from chrome/VERSION: the
+# marketing version is what a user compares against, and it is the number -DVERSION
+# stamped into the installer.
+VERSION="${TAG#preview-}"
+FEED="$REPO/feed/feed.json"
+if [ ! -f "$FEED" ]; then
+  echo "[release] WARNING no feed at $FEED — skipping the feed update (browser#154)"
+else
+  SHA256="$(sha256sum "$EXE" | cut -d' ' -f1)"
+  SIZE="$(wc -c < "$EXE" | tr -d ' ')"
+  RELEASED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # The permanent per-release asset URL, matching the name gh uploaded it under above.
+  URL="https://github.com/DisplayXR/displayxr-browser/releases/download/$TAG/DisplayXR-Browser-Preview-Setup.exe"
+  # SECURITY=1 marks a release whose point is a Chromium security rebase. Callers set it;
+  # defaulting it to false is the safe direction (an under-claimed release is not a lie,
+  # an over-claimed one is).
+  SECURITY="${SECURITY:-false}"
+  python - "$FEED" "$VERSION" "$CHROMIUM_TAG" "$URL" "$SHA256" "$SIZE" "$RELEASED" "$SECURITY" <<'PY'
+import json, sys
+feed_path, version, chromium, url, sha256, size, released, security = sys.argv[1:9]
+with open(feed_path, encoding='utf-8') as f:
+    feed = json.load(f)
+feed['latest'] = {
+    'version': version,
+    'chromium': chromium,
+    'url': url,
+    'sha256': sha256,
+    'size': int(size),
+    'released': released,
+    'security': security.lower() in ('1', 'true', 'yes'),
+}
+with open(feed_path, 'w', encoding='utf-8', newline='\n') as f:
+    json.dump(feed, f, indent=2)
+    f.write('\n')
+print('[release] feed updated -> %s (chromium %s, security=%s)' % (version, chromium, security))
+PY
+  echo "[release] COMMIT AND PUSH $FEED — pages.yml publishes it to updates.displayxr.org."
+  echo "[release]   git add feed/feed.json && git commit -m 'feed: $VERSION' && git push"
+fi
+echo "[release] the website download button reads /releases (NOT /releases/latest — every"
+echo "[release]   preview is a GitHub pre-release, which that alias excludes)."
