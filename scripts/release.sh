@@ -101,8 +101,25 @@ else
   SHA256="$(sha256sum "$EXE" | cut -d' ' -f1)"
   SIZE="$(wc -c < "$EXE" | tr -d ' ')"
   RELEASED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  # The permanent per-release asset URL, matching the name gh uploaded it under above.
-  URL="https://github.com/DisplayXR/displayxr-browser/releases/download/$TAG/DisplayXR-Browser-Preview-Setup.exe"
+  # ASK THE RELEASE what the asset is called; never assume it.
+  #
+  # The upload above passes "$EXE#DisplayXR-Browser-Preview-Setup.exe". That `#` suffix sets
+  # gh's DISPLAY LABEL, not the stored filename -- the asset lands under its own basename
+  # (DisplayXR-Browser-Preview-Setup-0.1.18.exe). Writing the assumed name into the feed
+  # produced a download URL that 404s, in a file whose entire job is to hand out a working
+  # download link, and nothing would have noticed until a user clicked it.
+  ASSET="$(gh release view "$TAG" -R DisplayXR/displayxr-browser --json assets \
+             --jq '.assets[] | select(.name|endswith(".exe")) | .name' | head -1)"
+  [ -n "$ASSET" ] || { echo "[release] ERROR release $TAG has no .exe asset — not writing a feed URL"; exit 1; }
+  URL="https://github.com/DisplayXR/displayxr-browser/releases/download/$TAG/$ASSET"
+  # And prove it resolves before publishing it. A feed entry is only as good as its URL.
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -L -m 60 -r 0-0 "$URL" || echo 000)"
+  case "$CODE" in
+    200|206) echo "[release] asset URL verified ($CODE): $URL" ;;
+    *) echo "[release] ERROR asset URL returned $CODE: $URL"
+       echo "[release]   refusing to write a feed that points at a download nobody can fetch."
+       exit 1 ;;
+  esac
   # SECURITY=1 marks a release whose point is a Chromium security rebase. Callers set it;
   # defaulting it to false is the safe direction (an under-claimed release is not a lie,
   # an over-claimed one is).

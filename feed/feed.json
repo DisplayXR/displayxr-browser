@@ -2,13 +2,13 @@
   "schema": 1,
   "channel": "preview",
   "latest": {
-    "version": "0.1.5",
-    "chromium": "150.0.7871.129",
-    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/preview-150.0.7871.129/DisplayXR-Browser-Preview-Setup-0.1.5.exe",
-    "sha256": "a9f139c8020ff187d2cad15b9521de109d2f4c1546ca2286d526a0e35c91d6f4",
-    "size": 371922808,
-    "released": "2026-07-20T13:53:31Z",
-    "security": false
+    "version": "0.1.18",
+    "chromium": "151.0.7922.174",
+    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/preview-0.1.18/DisplayXR-Browser-Preview-Setup-0.1.18.exe",
+    "sha256": "b195d128163439f876d305f69f3c52deb1f0936d8129f8c9a4dee5661104d2e4",
+    "size": 205716240,
+    "released": "2026-08-24T16:21:09Z",
+    "security": true
   },
   "minimum": "0.0.0",
   "rollout": 0
