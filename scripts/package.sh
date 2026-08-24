@@ -63,7 +63,19 @@ done
 # "side-by-side configuration is incorrect" without <VER>.manifest next to it).
 [ -d "$OUT/locales" ] && cp -r "$OUT/locales" "$STAGE/"
 VER="$(cat "$CHROMIUM_SRC/chrome/VERSION" | awk -F= '/MAJOR/{a=$2}/MINOR/{b=$2}/BUILD/{c=$2}/PATCH/{d=$2}END{print a"."b"."c"."d}')"
-[ -f "$OUT/$VER.manifest" ] && cp "$OUT/$VER.manifest" "$STAGE/"
+# NOT a soft copy. Without <VER>.manifest next to chrome.exe the browser does not start
+# at all -- Windows fails to build the activation context and reports "Dependent Assembly
+# <VER> could not be found" to the SideBySide event log, before chrome writes a single log
+# line. A `&& cp` that silently skips a missing manifest therefore produces a green build,
+# a signed installer, and a browser that cannot launch. Hit for real on the .174 pin bump.
+[ -f "$OUT/$VER.manifest" ] || {
+  echo "[package] FATAL no $VER.manifest in $OUT — chrome.exe will fail to start."
+  echo "[package]   present: $(ls "$OUT"/*.manifest 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+  echo "[package]   (a manifest for a DIFFERENT version means VER was derived from the wrong"
+  echo "[package]    tag, or ninja left a stale one behind from a previous build.)"
+  exit 1
+}
+cp "$OUT/$VER.manifest" "$STAGE/"
 [ -d "$OUT/$VER" ] && cp -r "$OUT/$VER" "$STAGE/" || true
 
 # Default landing page (displayxr-browser: default to the inline-3D samples).

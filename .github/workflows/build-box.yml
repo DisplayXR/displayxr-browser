@@ -293,6 +293,17 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/config.env
+          # THE TAG WE BUILT, not the one this ref happens to pin. These differ on exactly
+          # one kind of build -- a pin bump, where the branch under test carries the new tag
+          # and `main` (the workflow ref) still carries the old one. Using config.env here
+          # made package.sh name chrome/VERSION 151.0.7922.77 for a tree built at .174, so it
+          # copied a STALE leftover <old>.manifest out of the box's out dir and never copied
+          # the real one. chrome.exe then failed to start at all: "Dependent Assembly
+          # 151.0.7922.174 could not be found" (SideBySide, activation context). Green build,
+          # signed installer, browser that cannot launch.
+          CHROMIUM_TAG="${{ steps.pin.outputs.tag }}"
+          [ -n "$CHROMIUM_TAG" ] || { echo "::error::no resolved Chromium tag to stage against"; exit 1; }
+          echo "staging against the BUILT tag: $CHROMIUM_TAG"
           work="$RUNNER_TEMP/cr"; rm -rf "$work"; mkdir -p "$work/out/$OUT_DIR" "$work/chrome"
           tar xzf dist/*.tar.gz -C "$RUNNER_TEMP"
           raw="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'DisplayXR-Browser*' | head -1)"
@@ -305,6 +316,15 @@ jobs:
           stage="dist/DisplayXR-Browser"
           # The regression that started this must turn the build red, not ship quietly.
           [ -f "$stage/initial_preferences" ] || { echo "::error::initial_preferences missing from the staged tree"; exit 1; }
+          # The SxS manifest must exist AND match the tag we built, or chrome.exe does not
+          # start -- and it fails at activation-context time, before any log, so nothing
+          # downstream of here would notice. Assert it rather than hope.
+          [ -f "$stage/$CHROMIUM_TAG.manifest" ] || {
+            echo "::error::staged tree has no $CHROMIUM_TAG.manifest (found: $(ls "$stage"/*.manifest 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')) — chrome.exe would fail with 'side-by-side configuration is incorrect'"
+            exit 1
+          }
+          stray="$(ls "$stage"/*.manifest 2>/dev/null | grep -v "/$CHROMIUM_TAG.manifest\$" || true)"
+          [ -z "$stray" ] || { echo "::error::staged tree carries a manifest for another version: $stray"; exit 1; }
           echo "staged $(find "$stage" -type f | wc -l) files"
           rm -f dist/*.tar.gz
           tar -czf "dist/dxr_browser_staged.tar.gz" -C dist DisplayXR-Browser
