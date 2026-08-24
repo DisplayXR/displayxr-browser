@@ -15,6 +15,11 @@ attached (as `DisplayXR-Browser-Preview-Setup.exe`), the preview label, and the 
 the notes. That release is:
 - the **download** the website links to (below), and
 - the **feed** the in-browser version check reads (below).
+- the **pin** `displayxr-runtime/versions.json[browser]`: `release.sh` ends by dispatching a
+  `versions-bump` event at the runtime hub, which moves that field to this tag. Non-fatal — if
+  it fails, re-run `gh workflow run versions-bump.yml -R DisplayXR/displayxr-runtime -f
+  field=browser -f tag=<tag> -f source_repo=DisplayXR/displayxr-browser`. The browser's pin is
+  `preview-X.Y.Z`, which the runtime's bump validator accepts for this field only.
 
 ### Two layers of signing
 - **Inner (the installed browser):** `build_installer.sh` runs `scripts/sign.sh "$STAGE"` on the staged
