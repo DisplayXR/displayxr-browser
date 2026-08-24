@@ -45,17 +45,33 @@ requires a DisplayXR 3D display"**, and restates the disclaimer. The website's m
 The preview deliberately does **not** ship an Omaha-style silent updater (heavier, and a stronger
 security promise than a preview should make). Instead:
 
-- On launch, the browser checks the **GitHub Releases API**
-  (`https://api.github.com/repos/DisplayXR/displayxr-browser/releases/latest`) and compares the latest
-  tag to its own build version.
-- If newer, it surfaces a **"new version available → download"** prompt linking to the release — no
-  silent install.
+- On load, the **start page** fetches the update feed at `https://updates.displayxr.org/feed.json`
+  (written by `scripts/release.sh` on every publish) and compares its `chromium` field to the
+  running build's Chromium version.
+- If the feed is newer, it shows a **"new version available → download"** banner linking to the
+  release asset — no silent install. Security rebases (`"security": true` in the feed) are labelled
+  as such.
 - A monthly release cadence makes this check meaningful without an updater.
+
+**Two things here are load-bearing and are easy to get wrong:**
+
+- **NOT `/releases/latest`.** Every preview is published as a GitHub *pre-release*, and that alias
+  excludes pre-releases — it still resolves to **0.1.8** today. The feed is the source of truth.
+  (`displayxr-website` links to `/releases`, the list, for the same reason.)
+- **NOT `navigator.userAgent` for the running version.** Chromium freezes the version in the UA
+  string: a browser running `151.0.7922.174` reports `Chrome/151.0.0.0`. Comparing that against the
+  feed makes an up-to-date browser look permanently out of date and nags it on every page load. The
+  version must come from `navigator.userAgentData.getHighEntropyValues(['fullVersionList'])`, picking
+  the entry **by brand** (the list carries a GREASE decoy at a deliberately unstable index). If those
+  hints are unavailable, the check says nothing rather than guessing.
 
 Implementation: the reusable check lives in
 [`displayxr-web/js/version-check.js`](https://github.com/DisplayXR/displayxr-web/blob/main/js/version-check.js)
-(feature-detect + compare + banner). The browser's start page (a `displayxr-web`-hosted page) runs it; a
-future small patch can also surface it as a native infobar. Either way it stays a **check + link**, never
+(feature-detect + compare + banner) and **is shipping** — the browser's start page is `displayxr-web`'s
+root, which is what lets this reach users with no browser patch at all. It gates on
+`window.XRDisplayLayer`, so it is inert in every other browser; the pure comparison logic is unit-tested
+in `test/version-check.test.mjs`. A future small patch could also surface it as a native infobar. Either
+way it stays a **check + link**, never
 a silent update.
 
 ## First-run
