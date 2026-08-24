@@ -49,5 +49,30 @@ gh release create "$TAG" -R DisplayXR/displayxr-browser \
   --prerelease \
   "$EXE#DisplayXR-Browser-Preview-Setup.exe"
 
+# --- pin the release into the org's tested-together matrix -------------------
+# displayxr-runtime/versions.json is the canonical pin matrix (its
+# docs/specs/runtime/versions-json-autobump.md). The browser is a member of it,
+# so a published release has to move the `browser` field or the matrix silently
+# rots -- which is exactly the drift the auto-bump flow exists to kill.
+#
+# This runs from the release operator's own gh auth (the signing box), not a
+# GitHub App: release.sh is invoked by hand, and the operator already has push
+# on displayxr-runtime. Nothing to provision.
+#
+# Non-fatal on purpose. The release is already published and downloadable at
+# this point; a dispatch hiccup must not make a good release look failed.
+BUMP_CMD="gh workflow run versions-bump.yml -R DisplayXR/displayxr-runtime -f field=browser -f tag=$TAG -f source_repo=DisplayXR/displayxr-browser"
+echo "[release] dispatching versions.json[browser] -> $TAG"
+if gh api -X POST repos/DisplayXR/displayxr-runtime/dispatches --input - <<EOF >/dev/null
+{"event_type":"versions-bump","client_payload":{"field":"browser","tag":"$TAG","source_repo":"DisplayXR/displayxr-browser"}}
+EOF
+then
+    echo "[release]  OK  versions-bump dispatched."
+else
+    echo "[release] WARNING versions-bump dispatch failed. Bump it by hand:"
+    echo "[release]   $BUMP_CMD"
+fi
+
 echo "[release] done — https://github.com/DisplayXR/displayxr-browser/releases/tag/$TAG"
 echo "[release] the in-browser version check + the website download button read this release feed."
+echo "[release] displayxr-runtime/versions.json[browser] should now read $TAG."

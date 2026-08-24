@@ -119,6 +119,10 @@ terminated** (terminating loses the multi-hour Chromium checkout).
   applies only to external/upstream repos like Khronos).
 - **No vendor or customer names in public issues, PRs, or commits** — describe the configuration,
   not the partner.
+- **Releases pin into the org matrix.** `scripts/release.sh` dispatches a `versions-bump` at
+  `displayxr-runtime`, moving `versions.json[browser]` to the new `preview-*` tag. The browser is
+  a first-class member of that matrix (installed opt-in via `setup-displayxr --with browser`), but
+  is deliberately **not** in `DisplayXRBundle-*.exe` — the security-cadence caveat below is why.
 - Rebase policy is a **~monthly Chrome stable-milestone** rebase, deliberately not mid-cycle security
   dot-releases (`docs/maintenance-policy.md`). Every rebase re-verifies the weave on hardware before
   it ships.
