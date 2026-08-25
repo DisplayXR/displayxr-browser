@@ -51,10 +51,23 @@ EOF
 )"
 
 echo "[release] creating GitHub Release $TAG with $(basename "$EXE")"
+# NOT --prerelease, and explicitly --latest.
+#
+# Every release used to be flagged pre-release, which GitHub excludes from both
+# the repo sidebar's "Releases" panel and /releases/latest. The practical result:
+# the front page of the repo advertised 0.1.8 as the newest build for ELEVEN
+# releases, and the permanent releases/latest/download/... alias 404d the whole
+# time. "Developer preview" is communicated by the title, the notes and the
+# maintenance policy — it does not need a flag whose only mechanical effect is
+# to hide the release from everyone looking for it.
+#
+# --latest is passed explicitly rather than relying on GitHub's default: the
+# default is `legacy` inference, and it is exactly what got stuck on 0.1.8 while
+# six NEWER non-prerelease releases went by without moving the marker. State it.
 gh release create "$TAG" -R DisplayXR/displayxr-browser \
   --title "DisplayXR Browser Preview ($CHROMIUM_TAG)" \
   --notes "$NOTES" \
-  --prerelease \
+  --latest \
   "$EXE#DisplayXR-Browser-Preview-Setup.exe"
 
 # --- pin the release into the org's tested-together matrix -------------------
