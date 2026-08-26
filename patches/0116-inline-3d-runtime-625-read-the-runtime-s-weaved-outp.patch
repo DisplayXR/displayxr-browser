@@ -1,0 +1,439 @@
+From dd4b72d3dbc6f54428bbf369e2861a0376297a32 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 25 Aug 2026 22:48:56 -0700
+Subject: [PATCH 116/117] inline-3d(runtime#625): read the runtime's
+ weaved-output RING (spec v10)
+
+The runtime weaves into ONE texture that we read while it is already weaving the
+next frame into it -- xrWeaveSubmitDXR performs the weave for v+1 inside the very
+call we then read a v-or-earlier fence value from, so the producer is
+structurally a frame ahead at read time. The woven image is view-interlaced, so a
+torn read is not a displaced edge but a band where BOTH eyes get the wrong view:
+a flash.
+
+Spec v10 lets the runtime rotate between N separate woven textures instead, and
+tells us which one each frame landed in. Opt in by chaining XrWeaveRingRequestDXR
+on the submit and reading the reported index back from XrWeaveOutputSliceDXR.
+
+N SEPARATE textures rather than array slices of one: we import the woven output
+through the SharedImage layer, and `CreateSharedImage(mailbox, si_info,
+GpuMemoryBufferHandle(DXGIHandle))` takes a handle plus a 2D size with nowhere to
+name a slice. An array would at best expose slice 0. N plain 2D textures import
+unchanged, so this needs no shared-image-layer surgery.
+
+- weave_client: chain the request (gated on the runtime's reported spec version,
+  same discipline as the v8 flat-regions chain -- an older runtime must not be
+  handed a struct type it has never heard of), and carry index/count/handles out.
+- mojom + weaver_impl: |extra_outputs| carries outputs 1..N-1; output 0 IS
+  |woven|, so it is not sent twice (two handles to one texture would both need
+  closing). Non-empty only on the frames |woven| is.
+- weave_gpu: same carry-forward rule as |woven| for a dropped reply, and
+  CloseResultHandles closes the extras -- missing that leaks one NT handle per
+  extra output on every dropped reply.
+- viz: import the whole ring alongside the existing mailbox and sample the one
+  the runtime names. Index 0 IS the legacy mailbox, so a pre-v10 runtime (index 0
+  of 1, no extras) walks exactly the path it walks today.
+
+Vendored XR_DXR_weave.h synced from the runtime at spec v10.
+---
+ .../browser/displayxr_weave_client.cc         | 44 ++++++++++
+ .../browser/displayxr_weave_client.h          | 15 ++++
+ .../browser/displayxr_weaver_impl.cc          | 14 +++
+ .../displayxr/common/displayxr_weave.mojom    | 17 ++++
+ .../displayxr/gpu/displayxr_weave_gpu.cc      | 24 +++++
+ .../displayxr_weave_provider.h                |  8 ++
+ .../skia_output_surface_impl_on_gpu.cc        | 38 +++++++-
+ .../skia_output_surface_impl_on_gpu.h         |  6 ++
+ .../displayxr/include/openxr/XR_DXR_weave.h   | 87 ++++++++++++++++++-
+ 9 files changed, 251 insertions(+), 2 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index faeabb9..09b4e9e 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -1522,7 +1522,35 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchWin(
+       in.next = &flat;
+     }
+ 
++    // runtime#625 spec v10: opt into the weaved-output RING.
++    //
++    // Without it the runtime weaves into ONE texture that we read while it is
++    // already weaving the next frame into it — it performs the weave for v+1
++    // inside this very call and we then read a value it told us about earlier,
++    // so the producer is structurally a frame ahead at read time. The woven
++    // image is view-interlaced, so a torn read is not a displaced edge but a
++    // band where BOTH eyes get the wrong view: a flash.
++    //
++    // Gated on the runtime's reported spec version, same discipline as the v8
++    // flat-regions chain above: a runtime that predates 1004999199 sees a type
++    // it has never heard of, and we do not get to assume every shipped runtime
++    // walks unknown chains politely. The gate keeps the pre-v10 wire
++    // byte-identical rather than merely probably-ignored.
++    //
++    // requestedSliceCount 0 = "runtime picks"; it clamps and reports the real
++    // depth back, which is the only value we may index against.
++    XrWeaveRingRequestDXR ring = {XR_TYPE_WEAVE_RING_REQUEST_DXR};
++    if (s.weave_spec_version >= 10) {
++      ring.requestedSliceCount = 0;
++      ring.next = in.next;
++      in.next = &ring;
++    }
++
+     XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
++    // Chained unconditionally: a pre-v10 runtime leaves it untouched and our
++    // zero-init already means "slice 0 of 1", which is exactly right for it.
++    XrWeaveOutputSliceDXR out_slice = {XR_TYPE_WEAVE_OUTPUT_SLICE_DXR};
++    out.next = &out_slice;
+     const XrResult sr = s.submit(s.session, &in, &out);
+     // browser#103: the fastest edge there is — an animating page reaches this
+     // every frame, so a service that dies is classified within ~3 frames.
+@@ -1552,6 +1580,22 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchWin(
+     result.fence_value = out.fenceValue;
+     result.width = out.width;
+     result.height = out.height;
++    // v10: which output this fence value names, and (on a handback frame) the
++    // handles for all of them. outputCount 0 would be a runtime that filled
++    // nothing; treat it as the pre-v10 single buffer.
++    const uint32_t oc = out_slice.outputCount > 0 ? out_slice.outputCount : 1u;
++    result.output_count = oc;
++    result.output_index = out_slice.outputIndex < oc ? out_slice.outputIndex : 0u;
++    // Only on the frames the runtime actually hands handles back — otherwise the
++    // array is all NULL and the consumer keeps what it already imported.
++    if (out_slice.outputTextures[0] != nullptr) {
++      result.output_handles.clear();
++      result.output_handles.reserve(oc);
++      for (uint32_t i = 0; i < oc && i < XR_WEAVE_MAX_OUTPUTS_DXR; ++i) {
++        result.output_handles.push_back(
++            reinterpret_cast<uintptr_t>(UNSAFE_TODO(out_slice.outputTextures[i])));
++      }
++    }
+     result.eyes_valid = (out.eyesValid == XR_TRUE);
+     result.eyes.clear();
+     if (result.eyes_valid && out.eyeCount > 0) {
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index 66dc720..c12c234 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -60,6 +60,21 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+     uint64_t fence_value = 0;
+     uint32_t width = 0;
+     uint32_t height = 0;
++    // runtime#625 spec v10: the runtime rotates between |output_count| SEPARATE
++    // woven textures so it never overwrites the frame we are reading, and THIS
++    // frame is in |output_index|. |output_handles| carries one handle per output,
++    // non-empty only when |woven_handle| is (first submit / re-allocation); the
++    // consumer imports them all once and draws the one named per frame.
++    //
++    // They are separate textures rather than array slices because the consumer
++    // imports through Chromium's SharedImage layer, whose DXGIHandle path takes a
++    // handle plus a 2D size and has nowhere to name a slice.
++    //
++    // Defaults (index 0 of 1) are what a pre-v10 runtime yields, so these are
++    // always safe to read.
++    uint32_t output_index = 0;
++    uint32_t output_count = 1;
++    std::vector<uintptr_t> output_handles;
+     std::vector<float> eyes;  // flattened xyz triples
+     bool eyes_valid = false;
+   };
+diff --git a/components/displayxr/browser/displayxr_weaver_impl.cc b/components/displayxr/browser/displayxr_weaver_impl.cc
+index c0f0e20..25b60c9 100644
+--- a/components/displayxr/browser/displayxr_weaver_impl.cc
++++ b/components/displayxr/browser/displayxr_weaver_impl.cc
+@@ -111,6 +111,20 @@ void DisplayXRWeaverImpl::WeaveSubmit(gfx::DXGIHandle texture,
+   out->fence_value = r.fence_value;
+   out->width = r.width;
+   out->height = r.height;
++  // runtime#625 spec v10 — which of the N outputs this fence value names, plus
++  // the handles for outputs 1..N-1 on a handback frame (output 0 is |woven|).
++  out->output_index = r.output_index;
++  out->output_count = r.output_count;
++  // |extra_outputs| is a non-optional array, so wrap directly rather than through
++  // WrapHandle (which models "no handback this frame" as nullopt). A zero handle
++  // is skipped: the runtime either hands back every output or none.
++  for (size_t i = 1; i < r.output_handles.size(); ++i) {
++    if (!r.output_handles[i]) {
++      continue;
++    }
++    out->extra_outputs.push_back(gfx::DXGIHandle(
++        base::win::ScopedHandle(reinterpret_cast<HANDLE>(r.output_handles[i]))));
++  }
+   out->eyes = r.eyes;
+   out->eyes_valid = r.eyes_valid;
+   std::move(callback).Run(std::move(out));
+diff --git a/components/displayxr/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
+index 46579fe..6f7b0dd 100644
+--- a/components/displayxr/common/displayxr_weave.mojom
++++ b/components/displayxr/common/displayxr_weave.mojom
+@@ -35,6 +35,23 @@ struct DisplayXRWeaveResult {
+   // Woven texture dimensions (bound-window client area).
+   uint32 width;
+   uint32 height;
++  // runtime#625 spec v10: the runtime rotates between |output_count| SEPARATE
++  // woven textures so it never overwrites the frame the consumer is reading, and
++  // THIS frame is in |output_index|.
++  //
++  // |extra_outputs| carries outputs 1..N-1 (output 0 is |woven| itself, so it is
++  // not sent twice — two handles to one texture would both need closing). It is
++  // non-empty only on the frames |woven| is, i.e. first submit and
++  // re-allocation; on steady-state frames the consumer keeps what it imported.
++  //
++  // Separate textures rather than array slices because the consumer imports
++  // through the SharedImage layer, whose DXGIHandle path takes a handle plus a
++  // 2D size and cannot name a slice.
++  //
++  // A pre-v10 runtime yields index 0 of 1 with no extras — the single buffer.
++  uint32 output_index;
++  uint32 output_count;
++  array<gfx.mojom.DXGIHandle> extra_outputs;
+   // Current tracked eye positions (display-space metres), flattened xyz triples,
+   // for the caller's next-frame off-axis projection. Empty until tracked.
+   array<float> eyes;
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index a1fd880..86c493e 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -1421,6 +1421,21 @@ void DisplayXRWeaveGpu::OnWeaveReply(uint32_t target_id,
+     r.fence_handle = pending.result.fence_handle;
+     pending.result.fence_handle = 0;
+   }
++  // runtime#625 spec v10: which of the N woven outputs this reply names, and the
++  // extra handles on a handback frame. Same carry-forward rule as |woven| above —
++  // a steady-state reply sends none and Viz keeps what it already imported.
++  r.output_index = result->output_index;
++  r.output_count = result->output_count > 0 ? result->output_count : 1u;
++  if (!result->extra_outputs.empty()) {
++    r.extra_output_handles.reserve(result->extra_outputs.size());
++    for (auto& eo : result->extra_outputs) {
++      r.extra_output_handles.push_back(
++          reinterpret_cast<uintptr_t>(eo.TakeBufferHandle().release()));
++    }
++  } else if (pending.have && !pending.result.extra_output_handles.empty()) {
++    r.extra_output_handles = std::move(pending.result.extra_output_handles);
++    pending.result.extra_output_handles.clear();
++  }
+   // Close whatever the prior un-taken result still owns (not carried forward).
+   if (pending.have) {
+     CloseResultHandles(pending.result);
+@@ -1507,6 +1522,15 @@ void DisplayXRWeaveGpu::CloseResultHandles(Result& r) {
+     ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
+     r.fence_handle = 0;
+   }
++  // runtime#625 spec v10: the extra ring outputs are owned exactly like |woven|,
++  // so they are closed on exactly the same occasions. Missing this leaks one NT
++  // handle per extra output on every dropped reply.
++  for (uintptr_t h : r.extra_output_handles) {
++    if (h) {
++      ::CloseHandle(reinterpret_cast<HANDLE>(h));
++    }
++  }
++  r.extra_output_handles.clear();
+ }
+ 
+ }  // namespace displayxr
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index eb8901a..b3fff61 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -50,6 +50,14 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+     uint64_t fence_value = 0;
+     uint32_t width = 0;
+     uint32_t height = 0;
++    // runtime#625 spec v10: the runtime rotates between |output_count| SEPARATE
++    // woven textures so it never overwrites the frame we are reading, and THIS
++    // frame is in |output_index|. |extra_output_handles| carries outputs 1..N-1
++    // (output 0 is |woven_handle|) and is non-empty only on a handback frame.
++    // Import them all once; draw the one |output_index| names each frame.
++    uint32_t output_index = 0;
++    uint32_t output_count = 1;
++    std::vector<uintptr_t> extra_output_handles;
+   };
+ 
+   // (browser#143) ONE 1:1 copy of a repacked eye half.
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 502be05..f26d93d 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -6118,7 +6118,36 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         LOG(ERROR) << "[DisplayXR] failed to import shared woven SharedImage "
+                    << r.width << "x" << r.height;
+       }
++
++      // runtime#625 spec v10: import the REST of the ring alongside it. The
++      // handles arrive on exactly the occasions |woven_handle| does, so this
++      // block runs with it and never on a steady-state frame. Index 0 is the
++      // mailbox above — the ring and the legacy single mailbox are the same
++      // object for a pre-v10 runtime, which is what keeps that path unchanged.
++      for (const gpu::Mailbox& m : displayxr_woven_ring_mailboxes_) {
++        if (!m.IsZero() && m != displayxr_shared_woven_mailbox_) {
++          shared_image_factory_->DestroySharedImage(m);
++        }
++      }
++      displayxr_woven_ring_mailboxes_.clear();
++      displayxr_woven_ring_mailboxes_.push_back(displayxr_shared_woven_mailbox_);
++      for (uintptr_t eh : r.extra_output_handles) {
++        gpu::Mailbox em = gpu::Mailbox::Generate();
++        gfx::DXGIHandle edxgi(
++            base::win::ScopedHandle(reinterpret_cast<HANDLE>(eh)));
++        if (shared_image_factory_->CreateSharedImage(
++                em, si_info, gfx::GpuMemoryBufferHandle(std::move(edxgi)))) {
++          displayxr_woven_ring_mailboxes_.push_back(em);
++        } else {
++          LOG(ERROR) << "[DisplayXR] failed to import ring woven SharedImage "
++                     << r.width << "x" << r.height;
++        }
++      }
+     }
++    // Which output to sample this frame. Clamped: a runtime that named an index
++    // we failed to import must fall back to one we did, not read a zero mailbox.
++    displayxr_woven_ring_index_ =
++        r.output_index < displayxr_woven_ring_mailboxes_.size() ? r.output_index : 0u;
+     if (r.fence_handle) {
+       displayxr_shared_woven_fence_ = gfx::D3DSharedFence::CreateFromUnownedHandle(
+           reinterpret_cast<HANDLE>(r.fence_handle));
+@@ -6146,8 +6175,15 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+ 
+   // One read access on the shared woven; draw the whole window-sized woven output
+   // back. Access + representation stay alive until after the flush.
++  // runtime#625 spec v10: sample the output the runtime named for this fence
++  // value, not always the first one. Falls back to the legacy single mailbox
++  // when the ring is empty (pre-v10 runtime, or an import that failed).
++  const gpu::Mailbox& woven_mailbox =
++      displayxr_woven_ring_index_ < displayxr_woven_ring_mailboxes_.size()
++          ? displayxr_woven_ring_mailboxes_[displayxr_woven_ring_index_]
++          : displayxr_shared_woven_mailbox_;
+   auto woven_rep = shared_image_representation_factory_->ProduceSkia(
+-      displayxr_shared_woven_mailbox_, context_state_.get());
++      woven_mailbox, context_state_.get());
+   if (!woven_rep) {
+     return;
+   }
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index b613593..a0bf723 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -968,6 +968,12 @@ class SkiaOutputSurfaceImplOnGpu
+   // runtime's (untaggable-by-MoltenVK) woven IOSurface into, then draws from — the
+   // runtime surface can't be SharedImage-imported directly (pixel-format 0).
+   gpu::Mailbox displayxr_shared_woven_mailbox_;
++  // runtime#625 spec v10: the runtime rotates between N separate woven textures
++  // so it never overwrites the frame we are reading. We import them all once and
++  // sample the one it names per frame. Index 0 mirrors
++  // |displayxr_shared_woven_mailbox_| so the pre-v10 path is unchanged.
++  std::vector<gpu::Mailbox> displayxr_woven_ring_mailboxes_;
++  uint32_t displayxr_woven_ring_index_ = 0;
+ #if BUILDFLAG(IS_WIN)
+   scoped_refptr<gfx::D3DSharedFence> displayxr_shared_woven_fence_;
+ #endif
+diff --git a/third_party/displayxr/include/openxr/XR_DXR_weave.h b/third_party/displayxr/include/openxr/XR_DXR_weave.h
+index 45390f1..24e6fa5 100644
+--- a/third_party/displayxr/include/openxr/XR_DXR_weave.h
++++ b/third_party/displayxr/include/openxr/XR_DXR_weave.h
+@@ -191,7 +191,7 @@ extern "C" {
+ #endif
+ 
+ #define XR_DXR_weave 1
+-#define XR_DXR_weave_SPEC_VERSION 8
++#define XR_DXR_weave_SPEC_VERSION 10
+ #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
+ 
+ // Reserved 1004999190..199. Final values reconcile with the Khronos registry
+@@ -205,6 +205,14 @@ extern "C" {
+ #define XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR  ((XrStructureType)1004999196)
+ #define XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR   ((XrStructureType)1004999197)
+ #define XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR ((XrStructureType)1004999198)
++//! Cap on the weaved-output ring depth (spec v10, #625). A window-sized output is
++//! ~132 MB at 8K, so the runtime clamps a request to this and reports what it
++//! actually allocated.
++#define XR_WEAVE_MAX_OUTPUTS_DXR 4
++
++#define XR_TYPE_WEAVE_RING_REQUEST_DXR    ((XrStructureType)1004999199)
++#define XR_TYPE_WEAVE_OUTPUT_SLICE_DXR    ((XrStructureType)1004999200)
++
+ // 1004999199 is RESERVED for a spec v9 per-submit wish MASK (an R8 texture handle
+ // instead of a rect list, for callers whose flat geometry is not rectangular —
+ // rounded corners, arbitrary CSS clip paths). Do not assign it to anything else.
+@@ -489,6 +497,83 @@ typedef struct XrWeaveOutputDXR {
+     XrBool32           eyesTracking;
+ } XrWeaveOutputDXR;
+ 
++/*!
++ * @brief Opt in to a RING of weaved outputs (spec v10, #625).
++ *
++ * Chain onto XrWeaveSubmitInfoDXR::next on EVERY submit. Presence is the opt-in;
++ * absence keeps the pre-v10 behaviour byte for byte.
++ *
++ * ## Why this exists
++ *
++ * Without it the runtime weaves into ONE texture that the caller reads while the
++ * runtime is already weaving the next frame into it. That is not an unlucky
++ * interleaving, it is the steady state: xrWeaveSubmitDXR performs the weave for
++ * value `v+1` and returns, and the caller then waits the fence to a value it has
++ * already been told about (at most `v`) and reads — so the producer is always a
++ * frame ahead of the consumer at read time. The woven image is view-interlaced,
++ * so a torn read is not a displaced edge but a band in which both eyes get the
++ * wrong view, i.e. a flash rather than a tear.
++ *
++ * ## The contract
++ *
++ * When this struct is chained, the runtime allocates
++ * @ref XrWeaveOutputSliceDXR::outputCount SEPARATE window-sized output textures
++ * and composites each FRAME into one of them in rotation, reporting which one in
++ * a chained @ref XrWeaveOutputSliceDXR. Because the caller only ever reads a
++ * fence value the runtime has already published, the output it reads is never the
++ * one being written.
++ *
++ * They are separate textures rather than array slices of one texture on purpose:
++ * the consumer imports the woven output through its compositor's shared-image
++ * layer, and those import paths take a handle plus a 2D size with nowhere to name
++ * an array slice. N plain 2D textures are importable unchanged.
++ *
++ * The caller MUST therefore import ALL @c outputCount handles (they are handed
++ * back together, on the same occasions @c weavedTexture is) and draw the one
++ * named per frame.
++ *
++ * @note @p requestedSliceCount is a HINT. The runtime clamps it to what it
++ *       supports and reports the actual depth in
++ *       XrWeaveOutputSliceDXR::outputCount, which is the only value the caller
++ *       may index against. Pass 0 for "runtime picks".
++ */
++typedef struct XrWeaveRingRequestDXR {
++    XrStructureType          type;                 //!< XR_TYPE_WEAVE_RING_REQUEST_DXR
++    const void* XR_MAY_ALIAS next;
++    uint32_t                 requestedSliceCount;  //!< desired depth, or 0 for runtime default
++} XrWeaveRingRequestDXR;
++
++/*!
++ * @brief Which of the weaved outputs this frame landed in (spec v10, #625).
++ *
++ * Chain onto XrWeaveOutputDXR::next to receive it. Without the
++ * @ref XrWeaveRingRequestDXR opt-in the runtime fills `outputIndex = 0,
++ * outputCount = 1` and @c outputTextures[0] mirrors XrWeaveOutputDXR::weavedTexture
++ * — i.e. it is always safe to read, on any runtime that fills it at all.
++ *
++ * This is a CHAINED struct rather than new fields on XrWeaveOutputDXR on purpose:
++ * XrWeaveOutputDXR is fixed-size and written BY the runtime, so appending to it
++ * would write past the end of an older caller's allocation.
++ *
++ * @c outputIndex corresponds to the XrWeaveOutputDXR::fenceValue returned by the
++ * same call — draw that output once the fence reaches that value.
++ *
++ * @c outputTextures follows the same handback rule as
++ * XrWeaveOutputDXR::weavedTexture: the handles are non-NULL on the first submit
++ * and again on re-allocation (a resize, or a change of depth), and NULL on
++ * steady-state frames where the caller reuses what it already imported. The
++ * caller owns every handle it is given.
++ */
++typedef struct XrWeaveOutputSliceDXR {
++    XrStructureType    type;         //!< XR_TYPE_WEAVE_OUTPUT_SLICE_DXR
++    void* XR_MAY_ALIAS next;
++    uint32_t           outputIndex;  //!< which output this frame was woven into
++    uint32_t           outputCount;  //!< how many outputs exist (1 = not a ring)
++    //! Shared HANDLEs for each of the @c outputCount outputs, or all NULL on a
++    //! steady-state frame. Index with @c outputIndex.
++    void*              outputTextures[XR_WEAVE_MAX_OUTPUTS_DXR];
++} XrWeaveOutputSliceDXR;
++
+ /*!
+  * @brief Explicit on-screen window geometry (spec v7, #1036).
+  *

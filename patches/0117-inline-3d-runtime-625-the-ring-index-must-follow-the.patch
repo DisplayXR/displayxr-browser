@@ -1,0 +1,81 @@
+From e9c824ba361a74cb7f6d8441d310f870d0663609 Mon Sep 17 00:00:00 2001
+From: dfattal <dfattal@gmail.com>
+Date: Tue, 25 Aug 2026 23:56:53 -0700
+Subject: [PATCH 117/117] inline-3d(runtime#625): the ring index must follow
+ the newest fence value, not the last-iterated target
+
+The Windows reply loop takes stale replies BY DESIGN -- a target inside its
+prune grace period hands back the result of an older batch (dropping it would
+strand the provider's handles). The v10 ring change assigned
+displayxr_woven_ring_index_ unconditionally per taken reply, so whichever
+target iterated last won -- including a graced target carrying an old batch's
+(fence_value, output_index). The draw then sampled an output the runtime had
+already rotated onto, alternating fresh/stale outputs at composite rate:
+severe flicker on any page with staggered per-target submits (wall-3d), while
+a single-target page never showed it.
+
+Accept a pair only when its fence value exceeds the newest accepted so far,
+and reset that high-water mark when a fresh fence object is imported (service
+restart restarts the value sequence).
+---
+ .../skia_output_surface_impl_on_gpu.cc        | 23 +++++++++++++++----
+ .../skia_output_surface_impl_on_gpu.h         |  8 +++++++
+ 2 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index f26d93d..64ad4e3 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -6144,14 +6144,29 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         }
+       }
+     }
+-    // Which output to sample this frame. Clamped: a runtime that named an index
+-    // we failed to import must fall back to one we did, not read a zero mailbox.
+-    displayxr_woven_ring_index_ =
+-        r.output_index < displayxr_woven_ring_mailboxes_.size() ? r.output_index : 0u;
+     if (r.fence_handle) {
+       displayxr_shared_woven_fence_ = gfx::D3DSharedFence::CreateFromUnownedHandle(
+           reinterpret_cast<HANDLE>(r.fence_handle));
+       ::CloseHandle(reinterpret_cast<HANDLE>(r.fence_handle));
++      // A fresh fence object restarts the value sequence (service restart /
++      // session re-create). The old high-water mark belongs to the old fence and
++      // would permanently reject every new pair.
++      displayxr_woven_newest_fence_value_ = 0;
++    }
++    // runtime#625: accept the (fence_value, output_index) pair only when it is
++    // NEWER than any pair accepted so far. This loop deliberately takes stale
++    // replies too -- a target inside its prune grace period hands back the
++    // result of an OLDER batch -- and an unconditional assignment let whichever
++    // target iterated last point the draw at an output the runtime had already
++    // rotated onto. That alternated fresh/stale outputs at composite rate:
++    // severe flicker on any page with staggered per-target submits.
++    //
++    // Clamped: a runtime that named an index we failed to import must fall back
++    // to one we did, not read a zero mailbox.
++    if (r.fence_value > displayxr_woven_newest_fence_value_) {
++      displayxr_woven_newest_fence_value_ = r.fence_value;
++      displayxr_woven_ring_index_ =
++          r.output_index < displayxr_woven_ring_mailboxes_.size() ? r.output_index : 0u;
+     }
+     if (r.fence_value > latest_fence_value) {
+       latest_fence_value = r.fence_value;
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index a0bf723..b0539fe 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -974,6 +974,14 @@ class SkiaOutputSurfaceImplOnGpu
+   // |displayxr_shared_woven_mailbox_| so the pre-v10 path is unchanged.
+   std::vector<gpu::Mailbox> displayxr_woven_ring_mailboxes_;
+   uint32_t displayxr_woven_ring_index_ = 0;
++  // Newest fence value whose (value, output_index) pair has been accepted.
++  // The per-target reply loop deliberately takes STALE replies too (a target in
++  // its prune grace period holds the result of an older batch), so the ring
++  // index must follow the newest fence value ever seen -- not whichever target
++  // happens to iterate last. Without this gate a graced target's old reply
++  // pointed the draw at an output the runtime had already rotated onto, and the
++  // screen alternated fresh/stale outputs at composite rate.
++  uint64_t displayxr_woven_newest_fence_value_ = 0;
+ #if BUILDFLAG(IS_WIN)
+   scoped_refptr<gfx::D3DSharedFence> displayxr_shared_woven_fence_;
+ #endif
