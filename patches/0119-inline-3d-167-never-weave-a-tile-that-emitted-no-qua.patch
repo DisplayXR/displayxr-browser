@@ -1,0 +1,300 @@
+From 7afb1d9491d5f5002ae7e8e5bdc08c014b4dc727 Mon Sep 17 00:00:00 2001
+From: DisplayXR <dev@displayxr.invalid>
+Date: Wed, 26 Aug 2026 20:17:28 -0700
+Subject: [PATCH] inline-3d(#167): never weave a tile that emitted no quad this
+ frame
+
+An opaque sticky page header was interlaced whenever a woven tile scrolled
+underneath it -- reported as "the words Account and Sign in get woven", which
+is the whole bar: a flat colour interlaces to itself, so only the glyphs show
+it.
+
+MEASURED, on the reported page, at the moment the bar was woven (installed
+0.1.19, Leia panel, --v=1):
+
+  ID-MATCH FALLBACK: reason=layer_id stamped but NO quad anywhere in the frame
+    carries it -- the layer emitted no SharedQuadState ...
+    id=FE66...0013 layer_id=39 target=2351,358 1100x120 among 28 quads
+    (0 diagnostic-only), elsewhere=0 pass=0
+  plane-split: tiles=1 quads=31 over_set=0 tiles_without_k=1 excluded{...all 0}
+  GPU canvas-layer lookup returned NO resource: id=FE66...0013
+    rect=2351,358 1100x120 layers=0 (misses=1000)
+  batch weave: n=1 ... eyes_valid=1 flat=0
+
+Every frame, not intermittently: 1000 misses and the batch still carrying the
+rect. Page state at that instant (CDP): dpr 2.5, `#site-header` sticky,
+`rgb(18,23,21)`, backdrop-filter NONE, 0..106 CSS px; the tile's canvas at
+y=-392 h=440, i.e. 48 CSS px still on screen (48 * 2.5 = the 120 device px in
+the rect) and ALL of it under the bar. x/width map to the right-hand end of the
+header -- where "Account / Sign in" sit.
+
+MECHANISM. The tile is FULLY OCCLUDED by the opaque header, so cc drops its
+layer from the drawn list and it emits no SharedQuadState at all. No quad ->
+no canvas resource -> nothing suppressed from the page raster, and the rect
+still arrives from CollectTrackedElementRects, which walks the whole active
+tree. browser#117's lockstep gate then hits its own escape --
+
+    bool prepared = resolved_canvas.empty();
+
+-- because this page has ONE tile, so "nothing resolved at all this frame" is
+true, the rect is submitted, and the GPU stage (layers=0, the same escape
+one stage later) snapshots |output| at the rect as the weave source. That
+snapshot is the header. The runtime weaves it and draws it back over itself.
+
+So browser#117 diagnosed this exact corruption -- its own report was the
+gallery's title coming back interlaced from a tile clipped to a strip under a
+sticky header -- and closed every route to it EXCEPT the one a single-tile page
+takes. Whether an unrelated sibling tile happened to resolve cannot be what
+decides if the runtime weaves page chrome.
+
+The plane split cannot help here and no CSS on the header can either. The
+split needs k, the canvas quad's index in the live root list, and there is no
+canvas quad anywhere; tiles_without_k=1 for the whole session. Both CSS
+workarounds tried on the issue (opaque + blur(0px), opaque + blur(8px)) failed
+on hardware for that reason, and the four-configuration matrix in the issue is
+moot: this fires for any header opaque enough to occlude, filtered or not.
+
+THE FIX, in the one place that has the evidence.
+
+(1) surface_aggregator.cc -- an element whose layer id is carried by NO quad
+    anywhere in the frame (`elsewhere == 0`, the census browser#117 added) is
+    MARKED on the frame. Mark only: the geometric fallback below it still runs,
+    unchanged. browser#94 argues one branch up that it should not -- an element
+    that contributed no quad cannot be matched to one, so a quad clearing the
+    overlap bar against its rect is a stranger's -- and that argument transfers
+    word for word, but nothing in the field has shown it happening, and acting
+    on it would silently drop every tile the fallback currently rescues with an
+    unstamped quad. browser#117 withdrew a cross-pass join for exactly that
+    reason. It also costs nothing to leave: a fallback that DOES match produces
+    a canvas resource, the per-tile identity test in (2) finds it, and the tile
+    is prepared and woven exactly as before. The mark decides only the case
+    where nothing resolved at all.
+
+(2) display.cc -- the "nothing resolved at all" escape no longer applies to a
+    tile marked that way. The rect is withheld from the batch, counted on the
+    existing LOG(ERROR) with its own sub-count, and the tile simply does not
+    weave for those frames.
+
+(3) direct_renderer.cc -- comment only. The `!k.has_value()` continue still
+    claimed "Phase-1 behaviour, i.e. the page keeps painting over it"; Phase 1
+    was deleted by 0065, so that sentence described a fallback that no longer
+    exists. It now says what the two upstream gates guarantee and what
+    tiles_without_k is still worth reading for.
+
+WHAT DOES NOT CHANGE. An element with `elsewhere > 0` -- drawn, but by a quad
+in a pass the identity join does not search -- is in the page raster, so it
+keeps both the geometric fallback and the legacy snapshot weave. The legacy
+no-identity channel (`sqs_layer_id == 0`) is not censused and is untouched. The
+browser#94 offscreen branch returns before any of this.
+
+THE TRADE, stated: a tile whose resource is not ready also emits no quad, and
+now stops weaving for those frames instead of weaving the page behind it. That
+is the same direction web#12 and browser#117 both chose -- the page draws what
+it drew, and the runtime never weaves content that is not the tile's.
+
+NOT DONE HERE: samples/composition still has no opaque-sticky-bar-over-a-
+scrolling-tile case, which is why this shipped. It belongs in displayxr-web
+alongside this.
+---
+ .../viz/service/display/aggregated_frame.h    | 19 +++++++
+ .../viz/service/display/direct_renderer.cc    | 28 +++++++++--
+ components/viz/service/display/display.cc     | 33 +++++++++++-
+ .../viz/service/display/surface_aggregator.cc | 50 ++++++++++++++++++-
+ 4 files changed, 124 insertions(+), 6 deletions(-)
+
+diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
+index f996438..e7bab1b 100644
+--- a/components/viz/service/display/aggregated_frame.h
++++ b/components/viz/service/display/aggregated_frame.h
+@@ -110,6 +110,25 @@ class VIZ_SERVICE_EXPORT AggregatedFrame {
+     // the root pass does not draw.
+     static constexpr size_t kUnknownZOrder = static_cast<size_t>(-1);
+     size_t z_order = kUnknownZOrder;
++    // browser#167: this element's layer emitted NO SharedQuadState anywhere in
++    // the frame — no quad in any pass, admissible or diagnostic-only, carries
++    // its (namespace, layer id). It contributed nothing to the page raster, so
++    // the composited output at |rect| holds SOMEONE ELSE'S pixels: whatever
++    // occluded the element out of the drawn layer list (an opaque sticky
++    // header over the last strip of a scrolling tile), or what was behind it
++    // while its resource was not ready.
++    //
++    // The weave must therefore not touch the rect — snapshotting the page
++    // there and weaving it interlaces that other content. Consumed by
++    // Display::DrawAndSwap, which cannot re-derive this: the absence of a
++    // canvas resource for the tile is indistinguishable there from a page that
++    // has no canvas-resource channel at all.
++    //
++    // False whenever the aggregator has no such evidence — the legacy
++    // main-thread channel (no layer id to census), and an element that IS
++    // drawn by a quad in a pass the identity join does not search. Both keep
++    // every pre-browser#167 behaviour.
++    bool layer_emitted_no_quad = false;
+   };
+   std::vector<Inline3dTrackedRect> inline_3d_rects;
+ 
+diff --git a/components/viz/service/display/direct_renderer.cc b/components/viz/service/display/direct_renderer.cc
+index 75e50b6..07a49c9 100644
+--- a/components/viz/service/display/direct_renderer.cc
++++ b/components/viz/service/display/direct_renderer.cc
+@@ -737,9 +737,31 @@ void DirectRenderer::ComputeInline3dPlaneSplit(
+     }
+     if (!k.has_value()) {
+       // No quad for this tile in the live list (promoted to an overlay, removed
+-      // as overdraw, or no canvas resource id was resolvable). Skip the split
+-      // for this tile — Phase-1 behaviour, i.e. the page keeps painting over
+-      // it. Risk guard R1.
++      // as overdraw, or no canvas resource id was resolvable), so there is no
++      // paint position to split the page at. Skip the split for this tile.
++      // Risk guard R1.
++      //
++      // (browser#167) THE OLD WORDING HERE — "Phase-1 behaviour, i.e. the page
++      // keeps painting over it" — DESCRIBED A FALLBACK THAT NO LONGER EXISTS.
++      // Phase 1 was deleted by the patch that made occlusion the only
++      // mechanism, so "the page keeps painting over it" now means the over-tile
++      // content stays in the page raster AND the pre-blend feeds that raster to
++      // the weave as the tile's backdrop: not a fallback, an artefact.
++      //
++      // What keeps that harmless is upstream, not here. A tile reaches this
++      // point with no |k| in two shapes, and the weave has already been
++      // withheld for both by the time the split runs:
++      //   * the element emitted no quad at all this frame — the aggregator's
++      //     census marks it and Display::DrawAndSwap keeps its rect out of the
++      //     batch (browser#167);
++      //   * its canvas resource did not resolve — the same gate, one clause
++      //     earlier (browser#117).
++      // A tile that IS woven therefore always has a canvas quad in some pass,
++      // and the only way to arrive here still weaving is the case browser#117
++      // withdrew for want of evidence: the quad living in a child pass this
++      // scan does not walk. |tiles_without_k| stays the counter that would say
++      // so — read it together with the ID-MATCH FALLBACK line's |elsewhere|,
++      // which names which of the two shapes it is.
+       ++tiles_without_k;
+       continue;
+     }
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index 28d5d79..a1408f5 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1085,8 +1085,31 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+       std::vector<SkiaOutputSurface::Inline3dRect> weave_rects;
+       weave_rects.reserve(frame.inline_3d_rects.size());
+       int unprepared = 0;
++      int unprepared_undrawn = 0;
+       for (const auto& r : frame.inline_3d_rects) {
+-        bool prepared = resolved_canvas.empty();
++        // ---- (browser#167) THE "NOTHING RESOLVED AT ALL" ESCAPE IS NOT FOR A
++        // TILE THAT WAS NEVER DRAWN --------------------------------------
++        //
++        // The escape below says: with no canvas resource anywhere this frame,
++        // nothing was suppressed either, so the page raster at |rect| is the
++        // tile's own drawing and snapshotting it is the legitimate
++        // pre-browser#18 weave source. True — but ONLY while the tile is
++        // actually in that raster.
++        //
++        // |layer_emitted_no_quad| is the aggregator's census saying it is not:
++        // no quad anywhere in the frame carries this element's layer id, so it
++        // painted nothing, and |rect| holds whatever occluded it. On the
++        // reported page that is an opaque sticky header, and the weave
++        // interlaced its glyphs ("Account / Sign in") every frame the tile's
++        // last strip spent underneath it.
++        //
++        // Note what makes this the SINGLE-TILE hole in browser#117's law: with
++        // a second tile on the page |resolved_canvas| is non-empty, the escape
++        // never fires, and the rect is already withheld. Whether an unrelated
++        // sibling happens to have resolved cannot be what decides if the
++        // runtime weaves page chrome — so the undrawn tile is withheld either
++        // way now.
++        bool prepared = resolved_canvas.empty() && !r.layer_emitted_no_quad;
+         for (const auto& layer : resolved_canvas) {
+           // Identity where there is one; the legacy zero-id channel has only
+           // geometry, and Display's own tile join above uses the same pair of
+@@ -1098,6 +1121,9 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+         }
+         if (!prepared) {
+           ++unprepared;
++          if (r.layer_emitted_no_quad) {
++            ++unprepared_undrawn;
++          }
+           continue;
+         }
+         // browser#131: |z_order| rides along untouched — the GPU stage's
+@@ -1116,7 +1142,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+                      << " of " << frame.inline_3d_rects.size()
+                      << " weave rects: no canvas resource resolved, so the page"
+                         " still owns those pixels and the weave must not touch"
+-                        " them (withheld="
++                        " them (of which "
++                     << unprepared_undrawn
++                     << " emitted no quad at all this frame (browser#167);"
++                        " withheld="
+                      << (n + 1) << ")";
+         }
+       }
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 1250565..6ec9df2 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2711,7 +2711,12 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+   }
+   // Phase-1 identity: match each inline-3d canvas rect to the resource quad
+   // that draws it by IDENTITY first, geometry only as a fallback.
+-  for (const Inline3dTrackedRect& canvas : inline_3d_rects_) {
++  // browser#167: indexed, because the verdict below has to be written back
++  // onto the frame's copy of this element. |frame.inline_3d_rects| was filled
++  // from |inline_3d_rects_| in order, one entry each, just above — so the two
++  // are index-parallel by construction.
++  for (size_t ci = 0; ci < inline_3d_rects_.size(); ++ci) {
++    const Inline3dTrackedRect& canvas = inline_3d_rects_[ci];
+     std::optional<RootResourceQuad> m = id_match(canvas, root_resource_quads_);
+     if (!m) {
+       // browser#94 — the OFFSCREEN-BUT-REGISTERED tile: an expected absence,
+@@ -2813,6 +2818,49 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+                 << " diagnostic-only), elsewhere=" << elsewhere << " pass="
+                 << (elsewhere ? elsewhere_pass.GetUnsafeValue() : 0u);
+       }
++      // ---- (browser#167) RECORD THAT THIS ELEMENT DREW NOTHING ---------
++      //
++      // |elsewhere| == 0 with a layer id stamped is the strongest verdict this
++      // function can reach: NOTHING in the frame — root pass, child pass,
++      // admissible or diagnostic-only — carries this element's
++      // (namespace, layer id). The layer emitted no SharedQuadState, so it
++      // contributed no pixels to the page raster: it is not in the drawn layer
++      // list (fully OCCLUDED, e.g. the last strip of a tile scrolling under an
++      // opaque sticky header — browser#167's report) or its resource is not
++      // ready.
++      //
++      // Say so on the frame, because Display::DrawAndSwap cannot re-derive it:
++      // with no canvas resource for this tile AND none for any other tile on
++      // the page, browser#117 falls through its "nothing resolved at all this
++      // frame" escape and submits the rect anyway. That escape is sound only
++      // where it was written — the legacy no-identity channel, where the page
++      // raster IS the tile's own drawing. Here the page raster at |rect| is
++      // whatever occluded the tile, and weaving it interlaces that content:
++      // the reported "Account / Sign in get woven". A single-tile page is the
++      // whole exposure, which is why this survived browser#117 — there, a
++      // sibling tile always resolved.
++      //
++      // MARK ONLY. The geometric fallback below still runs, unchanged. There
++      // is an argument that it should not — browser#94 makes it one branch up
++      // for the offscreen tile, and it transfers word for word: an element
++      // that contributed no quad cannot be matched to one, so a quad clearing
++      // the overlap bar against its rect is a STRANGER'S, and adopting it both
++      // suppresses the stranger's resource and hands the weave the wrong
++      // pixels. It is not acted on here because nothing in the field has shown
++      // it happening, and because acting on it would silently drop every tile
++      // the fallback currently rescues with an unstamped quad. browser#117
++      // withdrew a cross-pass join for exactly that reason; this patch is not
++      // the place to reopen it. And it costs nothing to leave: a fallback that
++      // DOES match produces a canvas resource, the per-tile identity test in
++      // Display::DrawAndSwap finds it, and the tile is prepared and woven
++      // exactly as before — the mark only decides the case where nothing
++      // resolved at all.
++      //
++      // An element with |elsewhere| > 0 is drawn, just not where the join
++      // looks; its pixels ARE in the page raster, so nothing about it changes.
++      if (canvas.sqs_layer_id != 0 && elsewhere == 0) {
++        frame.inline_3d_rects[ci].layer_emitted_no_quad = true;
++      }
+       // browser#117: the fallback compares on the COMMON visible space, so a
+       // tile that is only partly on screen scores against its own quad exactly
+       // as a fully visible one does.
