@@ -1,4 +1,4 @@
-From d1a913b02096a55423008ab3527a521c4d2a93a5 Mon Sep 17 00:00:00 2001
+From 7afb1d9491d5f5002ae7e8e5bdc08c014b4dc727 Mon Sep 17 00:00:00 2001
 From: DisplayXR <dev@displayxr.invalid>
 Date: Wed, 26 Aug 2026 20:17:28 -0700
 Subject: [PATCH] inline-3d(#167): never weave a tile that emitted no quad this
@@ -58,12 +58,17 @@ THE FIX, in the one place that has the evidence.
 
 (1) surface_aggregator.cc -- an element whose layer id is carried by NO quad
     anywhere in the frame (`elsewhere == 0`, the census browser#117 added) is
-    marked on the frame, and the geometric fallback is skipped for it. That
-    skip is browser#94's argument verbatim, which already reaches the same
-    conclusion one branch up from a viewport test: an element that contributed
-    no quad cannot be matched to one, so any quad clearing the overlap bar is a
-    stranger's, and adopting it would suppress the stranger's resource and hand
-    the weave the wrong pixels.
+    MARKED on the frame. Mark only: the geometric fallback below it still runs,
+    unchanged. browser#94 argues one branch up that it should not -- an element
+    that contributed no quad cannot be matched to one, so a quad clearing the
+    overlap bar against its rect is a stranger's -- and that argument transfers
+    word for word, but nothing in the field has shown it happening, and acting
+    on it would silently drop every tile the fallback currently rescues with an
+    unstamped quad. browser#117 withdrew a cross-pass join for exactly that
+    reason. It also costs nothing to leave: a fallback that DOES match produces
+    a canvas resource, the per-tile identity test in (2) finds it, and the tile
+    is prepared and woven exactly as before. The mark decides only the case
+    where nothing resolved at all.
 
 (2) display.cc -- the "nothing resolved at all" escape no longer applies to a
     tile marked that way. The rect is withheld from the batch, counted on the
@@ -93,9 +98,9 @@ alongside this.
 ---
  .../viz/service/display/aggregated_frame.h    | 19 +++++++
  .../viz/service/display/direct_renderer.cc    | 28 +++++++++--
- components/viz/service/display/display.cc     | 33 ++++++++++++-
- .../viz/service/display/surface_aggregator.cc | 49 ++++++++++++++++++-
- 4 files changed, 123 insertions(+), 6 deletions(-)
+ components/viz/service/display/display.cc     | 33 +++++++++++-
+ .../viz/service/display/surface_aggregator.cc | 50 ++++++++++++++++++-
+ 4 files changed, 124 insertions(+), 6 deletions(-)
 
 diff --git a/components/viz/service/display/aggregated_frame.h b/components/viz/service/display/aggregated_frame.h
 index f996438..e7bab1b 100644
@@ -226,7 +231,7 @@ index 28d5d79..a1408f5 100644
          }
        }
 diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
-index 1250565..69921fe 100644
+index 1250565..6ec9df2 100644
 --- a/components/viz/service/display/surface_aggregator.cc
 +++ b/components/viz/service/display/surface_aggregator.cc
 @@ -2711,7 +2711,12 @@ AggregatedFrame SurfaceAggregator::Aggregate(
@@ -243,12 +248,11 @@ index 1250565..69921fe 100644
      std::optional<RootResourceQuad> m = id_match(canvas, root_resource_quads_);
      if (!m) {
        // browser#94 — the OFFSCREEN-BUT-REGISTERED tile: an expected absence,
-@@ -2813,6 +2818,48 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+@@ -2813,6 +2818,49 @@ AggregatedFrame SurfaceAggregator::Aggregate(
                  << " diagnostic-only), elsewhere=" << elsewhere << " pass="
                  << (elsewhere ? elsewhere_pass.GetUnsafeValue() : 0u);
        }
-+      // ---- (browser#167) AN ELEMENT THAT EMITTED NO QUAD IS NOT IN THIS
-+      // FRAME ------------------------------------------------------------
++      // ---- (browser#167) RECORD THAT THIS ELEMENT DREW NOTHING ---------
 +      //
 +      // |elsewhere| == 0 with a layer id stamped is the strongest verdict this
 +      // function can reach: NOTHING in the frame — root pass, child pass,
@@ -259,35 +263,37 @@ index 1250565..69921fe 100644
 +      // opaque sticky header — browser#167's report) or its resource is not
 +      // ready.
 +      //
-+      // Two consequences, and they are the same argument browser#94 already
-+      // makes one branch up for the offscreen tile, which is this condition
-+      // with a viewport test instead of a quad census:
++      // Say so on the frame, because Display::DrawAndSwap cannot re-derive it:
++      // with no canvas resource for this tile AND none for any other tile on
++      // the page, browser#117 falls through its "nothing resolved at all this
++      // frame" escape and submits the rect anyway. That escape is sound only
++      // where it was written — the legacy no-identity channel, where the page
++      // raster IS the tile's own drawing. Here the page raster at |rect| is
++      // whatever occluded the tile, and weaving it interlaces that content:
++      // the reported "Account / Sign in get woven". A single-tile page is the
++      // whole exposure, which is why this survived browser#117 — there, a
++      // sibling tile always resolved.
 +      //
-+      //   1. THE GEOMETRIC FALLBACK MUST NOT RUN. This element contributed no
-+      //      quad by construction, so any quad clearing the overlap bar
-+      //      against its rect is a DIFFERENT element's. Adopting it would add
-+      //      that stranger's resource to the suppression set in
-+      //      Display::DrawAndSwap — punching an on-screen hole the weave never
-+      //      fills — and hand the weave the wrong pixels for this token.
-+      //
-+      //   2. THE WEAVE MUST NOT TOUCH THE RECT. Say so on the frame, because
-+      //      Display::DrawAndSwap cannot re-derive it: with no canvas resource
-+      //      for this tile AND none for any other tile on the page, browser#117
-+      //      falls through its "nothing resolved at all this frame" escape and
-+      //      submits the rect anyway. That escape is sound only where it was
-+      //      written — the legacy no-identity channel, where the page raster
-+      //      IS the tile's own drawing. Here the page raster at |rect| is
-+      //      whatever occluded the tile, and weaving it interlaces that
-+      //      content: the reported "Account / Sign in get woven". A single-tile
-+      //      page is the whole exposure, which is why this survived
-+      //      browser#117 — there, a sibling tile always resolved.
++      // MARK ONLY. The geometric fallback below still runs, unchanged. There
++      // is an argument that it should not — browser#94 makes it one branch up
++      // for the offscreen tile, and it transfers word for word: an element
++      // that contributed no quad cannot be matched to one, so a quad clearing
++      // the overlap bar against its rect is a STRANGER'S, and adopting it both
++      // suppresses the stranger's resource and hands the weave the wrong
++      // pixels. It is not acted on here because nothing in the field has shown
++      // it happening, and because acting on it would silently drop every tile
++      // the fallback currently rescues with an unstamped quad. browser#117
++      // withdrew a cross-pass join for exactly that reason; this patch is not
++      // the place to reopen it. And it costs nothing to leave: a fallback that
++      // DOES match produces a canvas resource, the per-tile identity test in
++      // Display::DrawAndSwap finds it, and the tile is prepared and woven
++      // exactly as before — the mark only decides the case where nothing
++      // resolved at all.
 +      //
 +      // An element with |elsewhere| > 0 is drawn, just not where the join
-+      // looks; its pixels ARE in the page raster, so it keeps both the
-+      // geometric fallback and the legacy snapshot weave, unchanged.
++      // looks; its pixels ARE in the page raster, so nothing about it changes.
 +      if (canvas.sqs_layer_id != 0 && elsewhere == 0) {
 +        frame.inline_3d_rects[ci].layer_emitted_no_quad = true;
-+        continue;
 +      }
        // browser#117: the fallback compares on the COMMON visible space, so a
        // tile that is only partly on screen scores against its own quad exactly
