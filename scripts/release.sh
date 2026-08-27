@@ -68,7 +68,7 @@ gh release create "$TAG" -R DisplayXR/displayxr-browser \
   --title "DisplayXR Browser Preview ($CHROMIUM_TAG)" \
   --notes "$NOTES" \
   --latest \
-  "$EXE#DisplayXR-Browser-Preview-Setup.exe"
+  "$EXE"
 
 # --- pin the release into the org's tested-together matrix -------------------
 # displayxr-runtime/versions.json is the canonical pin matrix (its
@@ -116,11 +116,13 @@ else
   RELEASED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   # ASK THE RELEASE what the asset is called; never assume it.
   #
-  # The upload above passes "$EXE#DisplayXR-Browser-Preview-Setup.exe". That `#` suffix sets
-  # gh's DISPLAY LABEL, not the stored filename -- the asset lands under its own basename
-  # (DisplayXR-Browser-Preview-Setup-0.1.18.exe). Writing the assumed name into the feed
-  # produced a download URL that 404s, in a file whose entire job is to hand out a working
-  # download link, and nothing would have noticed until a user clicked it.
+  # The upload above no longer passes a `#label` suffix, so the asset's displayed name and
+  # its stored filename are the same thing again. Keep asking the release anyway: this
+  # lookup is what caught the label bug in the first place. When the label was set, gh's
+  # `#` suffix set the DISPLAY name, not the stored filename, and writing the assumed name
+  # into the feed produced a download URL that 404s -- in a file whose entire job is to
+  # hand out a working download link, and nothing would have noticed until a user clicked
+  # it. Never assume the asset name; the release is the only authority on it.
   ASSET="$(gh release view "$TAG" -R DisplayXR/displayxr-browser --json assets \
              --jq '.assets[] | select(.name|endswith(".exe")) | .name' | head -1)"
   [ -n "$ASSET" ] || { echo "[release] ERROR release $TAG has no .exe asset — not writing a feed URL"; exit 1; }

@@ -11,7 +11,7 @@ bash C:/displayxr-signing/sign-hook.sh dist        # outer-sign the Setup.exe (o
 scripts/release.sh preview-<ver> dist/DisplayXR-Browser-Preview-Setup-<ver>.<n>.exe
 ```
 `release.sh` creates a **prerelease** GitHub Release in `displayxr-browser` with the signed installer
-attached (as `DisplayXR-Browser-Preview-Setup.exe`), the preview label, and the security disclaimer in
+attached (as `DisplayXR-Browser-Preview-Setup-<version>.exe`), the preview label, and the security disclaimer in
 the notes. That release is:
 - the **download** the website links to (below), and
 - the **feed** the in-browser version check reads (below).
