@@ -1,4 +1,4 @@
-From b2feedbc9cefa8d14db5afbd46d4a5aebfcf0ea6 Mon Sep 17 00:00:00 2001
+From d1a913b02096a55423008ab3527a521c4d2a93a5 Mon Sep 17 00:00:00 2001
 From: DisplayXR <dev@displayxr.invalid>
 Date: Wed, 26 Aug 2026 20:17:28 -0700
 Subject: [PATCH] inline-3d(#167): never weave a tile that emitted no quad this
@@ -167,7 +167,7 @@ index 75e50b6..07a49c9 100644
        continue;
      }
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index 28d5d79..406a67e 100644
+index 28d5d79..a1408f5 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
 @@ -1085,8 +1085,31 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
@@ -220,7 +220,7 @@ index 28d5d79..406a67e 100644
 -                        " them (withheld="
 +                        " them (of which "
 +                     << unprepared_undrawn
-+                     << " emitted no quad at all this frame — browser#167;"
++                     << " emitted no quad at all this frame (browser#167);"
 +                        " withheld="
                       << (n + 1) << ")";
          }
