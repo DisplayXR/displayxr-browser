@@ -84,10 +84,18 @@ Branding is `branding/BRANDING` copied over `chrome/app/theme/chromium/BRANDING`
 profile only). CI drives the same lane on a self-hosted AWS box (`.github/workflows/build-box.yml`,
 `pipeline.yml`).
 
-**Android lane (being created).** `target_os="android"`, `chrome_public_apk`, built on an **EC2
-Linux builder**. Its coordinates live in `.env.local` as `DXR_LINUX_BOX_*` and its key in
-`.secrets/` — **both gitignored, never commit either.** The box is **STOPPED when idle and NEVER
-terminated** (terminating loses the multi-hour Chromium checkout).
+**Android lane (written, never executed).** `target_os="android"`, `chrome_public_apk`, built on
+an **EC2 Linux builder**. Same scripts, switched by `DXR_TARGET_OS=android` in `config.env`:
+`scripts/args.android.gn`, the Android branches of `fetch.sh`/`build.sh`, `scripts/aws/do_rebase.sh`
++ `do_build.sh`, and `.github/workflows/build-box-android.yml`. **The pin is still
+`scripts/config.env` and nowhere else** — there is no `CHROMIUM_TAG_ANDROID`. The APK is
+**debug-key self-signed**; a release keystore is deferred. The lane is blocked on a one-time IAM
+step (`scripts/aws/setup-oidc.sh` with `ROLE_NAME`/`GH_ENV`/`INSTANCE_ID`/`SSM_DOCUMENT` set) plus
+the repo variables `AWS_ANDROID_BUILD_ROLE_ARN` + `AWS_ANDROID_BUILD_INSTANCE_ID` —
+`docs/oidc-build-lane.md` § *Porting checklist*. The box's coordinates live in `.env.local` as
+`DXR_LINUX_BOX_*` and its key in `.secrets/` — **both gitignored, never commit either**, and
+nothing in CI needs them. The box is **STOPPED when idle and NEVER terminated** (terminating
+loses the multi-hour Chromium checkout).
 
 ## Android port status
 
