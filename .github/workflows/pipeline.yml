@@ -172,9 +172,12 @@ jobs:
       - name: Build the installer (NSIS)
         run: |
           set -euo pipefail
+          # choco's shim needs a NEW shell; resolve the absolute path instead.
           command -v makensis >/dev/null || choco install nsis -y
+          MAKENSIS="$(command -v makensis || echo '/c/Program Files (x86)/NSIS/makensis.exe')"
+          "$MAKENSIS" -VERSION >/dev/null 2>&1 || MAKENSIS='/c/Program Files (x86)/NSIS/makensis.exe'
           W=$(cygpath -w "$PWD/dist"); S=$(cygpath -w "$PWD/dist/DisplayXR-Browser")
-          makensis -DVERSION=${{ inputs.version }} -DSTAGE_DIR="$S" -DSOURCE_DIR="$S" -DOUTPUT_DIR="$W" installer/DisplayXRBrowserInstaller.nsi
+          "$MAKENSIS" -DVERSION=${{ inputs.version }} -DSTAGE_DIR="$S" -DSOURCE_DIR="$S" -DOUTPUT_DIR="$W" installer/DisplayXRBrowserInstaller.nsi
           ls dist/DisplayXR-Browser-Preview-Setup-${{ inputs.version }}.exe
       - name: Sign the installer
         env:
