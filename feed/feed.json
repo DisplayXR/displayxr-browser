@@ -11,5 +11,5 @@
     "security": false
   },
   "minimum": "0.0.0",
-  "rollout": 10
+  "rollout": 100
 }
