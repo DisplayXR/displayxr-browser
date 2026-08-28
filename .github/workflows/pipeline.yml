@@ -250,6 +250,10 @@ jobs:
       - name: Promote to full release + rollout 100
         env:
           GH_TOKEN: ${{ github.token }}
+          # PINBUMP_TOKEN (Contents RW on displayxr-runtime only) lets
+          # promote-release.sh's versions-bump dispatch cross the repo boundary;
+          # without it the script prints its manual fallback, non-fatally.
+          PINBUMP_TOKEN: ${{ secrets.PINBUMP_TOKEN }}
           BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail

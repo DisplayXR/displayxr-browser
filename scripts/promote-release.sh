@@ -51,7 +51,10 @@ PYEOF
 # the default token is repo-scoped and cannot dispatch into displayxr-runtime, so print
 # the manual command rather than failing an otherwise-complete promotion.
 echo "[promote] dispatching versions.json[browser] -> $TAG"
-if gh api -X POST repos/DisplayXR/displayxr-runtime/dispatches --input - <<EOF >/dev/null
+# In CI the default token is repo-scoped; PINBUMP_TOKEN (Contents RW on
+# displayxr-runtime only) is provided for exactly this call. Locally the
+# operator's own gh auth already reaches the runtime repo, so it is optional.
+if GH_TOKEN="${PINBUMP_TOKEN:-${GH_TOKEN:-}}" gh api -X POST repos/DisplayXR/displayxr-runtime/dispatches --input - <<EOF >/dev/null
 {"event_type":"versions-bump","client_payload":{"field":"browser","tag":"$TAG","source_repo":"DisplayXR/displayxr-browser"}}
 EOF
 then
