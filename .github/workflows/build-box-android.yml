@@ -60,7 +60,20 @@ on:
         # scheduled task). Set it to whatever account owns the checkout on the box.
         description: "Unprivileged user to run the build as (sudo -u)"
         type: string
-        default: "builder"
+        default: "ubuntu"
+      chromium_src:
+        # The box's Chromium checkout. do_rebase.sh / do_build.sh default this to
+        # $DXR_BUILD_ROOT/cr/src, which is NOT where this box keeps it: the tree fetched by
+        # hand for the 0.1.17 APK lives in the build user's home, already has
+        # target_os=["android"] in .gclient and an out/Android from a previous build. Point
+        # at the real one instead of paying for a second multi-hour checkout.
+        description: "Chromium checkout on the box"
+        type: string
+        default: "/home/ubuntu/cr/src"
+      depot_tools:
+        description: "depot_tools on the box"
+        type: string
+        default: "/home/ubuntu/depot_tools"
       timeout_minutes:
         description: "Max minutes to wait for the remote build"
         type: number
@@ -86,7 +99,20 @@ on:
       build_user:
         description: "Unprivileged user to run the build as (sudo -u)"
         type: string
-        default: "builder"
+        default: "ubuntu"
+      chromium_src:
+        # The box's Chromium checkout. do_rebase.sh / do_build.sh default this to
+        # $DXR_BUILD_ROOT/cr/src, which is NOT where this box keeps it: the tree fetched by
+        # hand for the 0.1.17 APK lives in the build user's home, already has
+        # target_os=["android"] in .gclient and an out/Android from a previous build. Point
+        # at the real one instead of paying for a second multi-hour checkout.
+        description: "Chromium checkout on the box"
+        type: string
+        default: "/home/ubuntu/cr/src"
+      depot_tools:
+        description: "depot_tools on the box"
+        type: string
+        default: "/home/ubuntu/depot_tools"
       lifecycle_only:
         # DEFAULT TRUE, exactly as the Windows lane. This is what lets anyone smoke-test the
         # OIDC + SSM + start/stop path in ~2 minutes without spending a multi-hour build —
@@ -116,7 +142,12 @@ env:
   INSTANCE_ID: ${{ inputs.instance_id || vars.AWS_ANDROID_BUILD_INSTANCE_ID }}
   ARTIFACT_BUCKET: displayxr-browser-artifacts
   BUILD_DIR: /opt/build
-  BUILD_USER: ${{ inputs.build_user || 'builder' }}
+  BUILD_USER: ${{ inputs.build_user || 'ubuntu' }}
+  # BUILD_DIR stays the staging/marker dir. The SOURCE tree and depot_tools are tracked
+  # separately because this box's checkout predates the lane and lives in the build user's
+  # home, not under BUILD_DIR.
+  CHROMIUM_SRC: ${{ inputs.chromium_src || '/home/ubuntu/cr/src' }}
+  DEPOT_TOOLS_DIR: ${{ inputs.depot_tools || '/home/ubuntu/depot_tools' }}
   # AWS-RunShellScript, never AWS-RunPowerShellScript. Read by scripts/aws/ssm-run.sh, and
   # it must match the document ARN granted by setup-oidc.sh's RunTheBuildViaSSM Sid.
   SSM_DOCUMENT: AWS-RunShellScript
@@ -213,7 +244,7 @@ jobs:
             "printf '%s' '${reb}' | base64 -d > ${BUILD_DIR}/do_rebase.sh" \
             "chown '${BUILD_USER}' ${BUILD_DIR}/do_rebase.sh" \
             "chmod 0755 ${BUILD_DIR}/do_rebase.sh" \
-            "sudo -u '${BUILD_USER}' env DXR_BUILD_ROOT='${BUILD_DIR}' DXR_JOB='${JOB}rebase' DXR_PATCH_REF='${PATCH_REF}' DXR_TARGET_TAG='${CHROMIUM_TAG_IN}' bash ${BUILD_DIR}/do_rebase.sh" \
+            "sudo -u '${BUILD_USER}' env DXR_BUILD_ROOT='${BUILD_DIR}' CHROMIUM_SRC='${CHROMIUM_SRC}' DEPOT_TOOLS='${DEPOT_TOOLS_DIR}' DXR_JOB='${JOB}rebase' DXR_PATCH_REF='${PATCH_REF}' DXR_TARGET_TAG='${CHROMIUM_TAG_IN}' bash ${BUILD_DIR}/do_rebase.sh" \
           | scripts/aws/ssm-run.sh "$INSTANCE_ID" "android rebase ${GITHUB_RUN_ID} @ ${PATCH_REF}" 180
 
       # Build chrome_public_apk. do_build.sh wraps scripts/build.sh (DXR_TARGET_OS=android)
@@ -232,7 +263,7 @@ jobs:
             "printf '%s' '${bld}' | base64 -d > ${BUILD_DIR}/do_build.sh" \
             "chown '${BUILD_USER}' ${BUILD_DIR}/do_build.sh" \
             "chmod 0755 ${BUILD_DIR}/do_build.sh" \
-            "sudo -u '${BUILD_USER}' env DXR_BUILD_ROOT='${BUILD_DIR}' DXR_JOB='${JOB}' bash ${BUILD_DIR}/do_build.sh" \
+            "sudo -u '${BUILD_USER}' env DXR_BUILD_ROOT='${BUILD_DIR}' CHROMIUM_SRC='${CHROMIUM_SRC}' DEPOT_TOOLS='${DEPOT_TOOLS_DIR}' DXR_JOB='${JOB}' bash ${BUILD_DIR}/do_build.sh" \
           | scripts/aws/ssm-run.sh "$INSTANCE_ID" "android build ${GITHUB_RUN_ID}" "$TIMEOUT_MIN"
 
       # Re-assume BEFORE the upload: the job's initial credentials last at most the role's
