@@ -217,26 +217,53 @@ it is replaced.
 
 ## Build lane
 
-Chromium's Android build is Linux-only, so the Windows box cannot do it. The lane is parallel, not
-shared:
+**AS BUILT.** This section described a plan; the lane now exists. What shipped, and where:
 
-- `target_os = "android"`, `target_cpu = "arm64"`, target `chrome_public_apk`, in a new
-  `scripts/args.android.gn` alongside `args.official.gn`.
-- `.gclient` needs `target_os = ['android']` and the checkout needs
-  `build/install-build-deps.sh --android`. `scripts/fetch.sh` grows an Android branch; the pin still
-  comes from `scripts/config.env` and nowhere else.
-- Built on the **EC2 Linux builder**. Its coordinates live in `.env.local` (`DXR_LINUX_BOX_*`) and
-  its key in `.secrets/` — **both gitignored, never commit either.** The box is **stopped when idle
-  and never terminated**; terminating loses the multi-hour checkout.
-- CI: a `build-box-android.yml` mirroring `build-box.yml`'s start → wait-for-agent → build →
-  `if: always()` stop shape, and the same "sync `patches/` from this repo" rule so the box builds
-  exactly what is committed here.
-- Signing: `chrome_public_apk` self-signs with the debug key, which is fine for bring-up. A release
-  keystore + `apksigner` step comes later, with branding; keep it out of the early milestones.
+| Piece | File |
+|---|---|
+| gn args (`target_os="android"`, `target_cpu="arm64"`, official, static, no PGO, no RBE) | `scripts/args.android.gn` |
+| checkout (`.gclient` `target_os=['android']`, `build/install-build-deps.sh --android`) | `scripts/fetch.sh`, Android branch |
+| build (`gn gen` + `autoninja chrome_public_apk`, same retry loop) | `scripts/build.sh`, Android branch |
+| lane switch + the one pin | `scripts/config.env` — `DXR_TARGET_OS=android` |
+| box-side rebase / patch sync (codeload zip, drift gate) | `scripts/aws/do_rebase.sh` |
+| box-side build wrapper (marker protocol, APK staging) | `scripts/aws/do_build.sh` |
+| CI: start → wait-for-agent → rebase → build → upload → `if: always()` stop | `.github/workflows/build-box-android.yml` |
+
+Chromium's Android build is Linux-only, so the Windows box cannot do it. The lane is parallel,
+not shared: a second EC2 instance, a second IAM role (`AWS_ANDROID_BUILD_ROLE_ARN`), a second
+GitHub environment (`build-box-android`), a second concurrency group, and `AWS-RunShellScript`
+instead of `AWS-RunPowerShellScript`. Sharing any of those would let one lane's `always()` stop
+step stop the other lane's box mid-build.
+
+**THE PIN STILL COMES FROM `scripts/config.env` AND NOWHERE ELSE.** There is deliberately no
+`CHROMIUM_TAG_ANDROID`: two pins would let the APK and the `.exe` ship different Chromium
+milestones from the same patch series. `DXR_TARGET_OS` switches the *paths and targets*
+(`/opt/build/cr/src`, `out/Android`, `chrome_public_apk`), never the tag. With `DXR_TARGET_OS`
+unset every script behaves exactly as it did before the Android lane existed.
+
+The box is **stopped when idle and never terminated**; terminating loses the multi-hour
+checkout. Its instance id is read from the repo variable `AWS_ANDROID_BUILD_INSTANCE_ID` — it is
+**not** in any tracked file. It currently lives only in the gitignored `.env.local` as
+`DXR_LINUX_BOX_INSTANCE_ID` (and its key in `.secrets/`), both of which stay a break-glass
+debugging path that CI does not need.
+
+**Signing: `chrome_public_apk` self-signs with Chromium's checked-in DEBUG key, and that is what
+ships today.** A release keystore + `apksigner` step is **deferred** — it lands with branding,
+not with this lane. Two user-visible consequences the release notes now state explicitly
+(`scripts/release.sh`): Android warns on install, and a debug-signed APK is **not**
+upgrade-compatible with a future release-signed one, so it must be uninstalled before taking a
+signed build.
+
+**NOT YET PROVEN.** The lane has never executed. It needs a one-time IAM step that cannot be run
+from CI (`scripts/aws/setup-oidc.sh` with `ROLE_NAME` / `GH_ENV` / `INSTANCE_ID` / `SSM_DOCUMENT`
+set — see `docs/oidc-build-lane.md` § *Porting checklist*), the two repo variables, and a
+confirmed SSM instance profile + agent on the Linux box. Run it with `lifecycle_only=true`
+first: that proves OIDC, SSM and start/stop in ~2 minutes without spending a build.
 
 **M0 is a vanilla build.** Build `chrome_public_apk` at the pinned tag with **no patches applied**,
 install it on the device, and confirm it runs. That separates toolchain, box, gclient, adb and
 device problems from patch problems, and it is cheap relative to debugging them together later.
+
 
 ---
 

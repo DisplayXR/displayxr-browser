@@ -21,7 +21,17 @@
 #   AWS_REGION    default us-east-1
 #   INSTANCE_ID   the Chromium build box
 #   GH_ORG/GH_REPO/GH_ENV   trust scoping
-#   ROLE_NAME / ARTIFACT_BUCKET
+#   ROLE_NAME / POLICY_NAME / ARTIFACT_BUCKET
+#   SSM_DOCUMENT  AWS-RunPowerShellScript (Windows box, the default) or AWS-RunShellScript
+#                 (the Linux/Android box). This is NOT cosmetic: the document name is part
+#                 of the RunTheBuildViaSSM resource ARN, and a mismatch surfaces as an
+#                 AccessDeniedException on SendCommand rather than "no such document" —
+#                 expensive to diagnose. Set it to match the lane you are provisioning.
+#
+# The Linux/Android twin (docs/oidc-build-lane.md "Porting checklist") is therefore:
+#   INSTANCE_ID=<linux box> GH_ENV=build-box-android \
+#   ROLE_NAME=DisplayXRBrowserAndroidBuildBox POLICY_NAME=AndroidBuildBoxAndArtifacts \
+#   SSM_DOCUMENT=AWS-RunShellScript scripts/aws/setup-oidc.sh --apply
 set -uo pipefail
 
 APPLY=0
@@ -36,6 +46,10 @@ GH_ENV="${GH_ENV:-build-box}"
 ROLE_NAME="${ROLE_NAME:-DisplayXRBrowserBuildBox}"
 POLICY_NAME="${POLICY_NAME:-BuildBoxAndArtifacts}"
 ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-displayxr-browser-artifacts}"
+# The SSM document the workflow's ssm-run.sh will SendCommand against. Windows =
+# AWS-RunPowerShellScript (the default, so the existing invocation is unchanged);
+# Linux/Android = AWS-RunShellScript. Must agree with SSM_DOCUMENT in ssm-run.sh.
+SSM_DOCUMENT="${SSM_DOCUMENT:-AWS-RunPowerShellScript}"
 # The account-standard SSM instance profile (20+ instances use it). SWE-DEV can attach an
 # EXISTING profile (ec2:AssociateIamInstanceProfile is allowed) but cannot mint a new one
 # (iam:CreateInstanceProfile / AddRoleToInstanceProfile are DENIED), so we reuse this one
@@ -59,7 +73,7 @@ ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>/dev/null
   echo "[setup-oidc] ERROR: no valid AWS session. Run: aws sso login --profile $AWS_PROFILE" >&2
   exit 1
 }
-say "account=$ACCOUNT region=$AWS_REGION instance=$INSTANCE_ID apply=$APPLY"
+say "account=$ACCOUNT region=$AWS_REGION instance=$INSTANCE_ID doc=$SSM_DOCUMENT apply=$APPLY"
 
 OIDC_ARN="arn:aws:iam::${ACCOUNT}:oidc-provider/token.actions.githubusercontent.com"
 ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/${ROLE_NAME}"
@@ -117,7 +131,8 @@ fi
 # ── 3. least-privilege permissions ───────────────────────────────────────────────────
 # Describe* cannot be resource-scoped by EC2, so it is "*" (read-only, harmless).
 # Start/Stop are pinned to the ONE build instance. SSM is pinned to that instance plus the
-# RunPowerShellScript document. S3 read is pinned to the artifact prefix.
+# $SSM_DOCUMENT document (RunPowerShellScript for the Windows lane, RunShellScript for the
+# Linux/Android one). S3 read is pinned to the artifact prefix.
 PERMS=$(cat <<JSON
 {
   "Version": "2012-10-17",
@@ -140,7 +155,7 @@ PERMS=$(cat <<JSON
       "Action": ["ssm:SendCommand"],
       "Resource": [
         "${INSTANCE_ARN}",
-        "arn:aws:ssm:${AWS_REGION}::document/AWS-RunPowerShellScript"
+        "arn:aws:ssm:${AWS_REGION}::document/${SSM_DOCUMENT}"
       ]
     },
     {

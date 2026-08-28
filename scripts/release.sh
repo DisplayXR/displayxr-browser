@@ -14,43 +14,118 @@
 #
 # Set SECURITY=1 for a release whose point is a Chromium security rebase.
 #
-# Usage: scripts/release.sh <tag> <path-to-signed-installer.exe>
+# Usage: scripts/release.sh <tag> <asset> [asset ...]
 #   e.g. scripts/release.sh preview-150.0.7871.24 dist/DisplayXR-Browser-Preview-Setup-150.0.7871.24.1.exe
+#        scripts/release.sh preview-0.1.21 dist/DisplayXR-Browser-Preview-Setup-0.1.21.exe dist/DisplayXR-Browser-0.1.21-arm64.apk
+#
+# N ASSETS, NOT ONE. The Android lane (.github/workflows/build-box-android.yml) produces an
+# APK alongside the Windows installer, so a release can carry either or both. Everything
+# platform-shaped below is derived from WHICH assets were passed:
+#   * only a PE (.exe/.msi/.dll) gets the Authenticode check — running an APK through
+#     Get-AuthenticodeSignature is meaningless and would report a scary Unknown;
+#   * the notes describe the platforms actually shipped, and never claim Windows/D3D11 on
+#     an Android-only release (preview-0.1.17 was exactly that);
+#   * the feed is Windows-only by SCHEMA (feed/feed.json's `latest` holds one url/sha256/
+#     size with no platform key), so it is written only when there is a Windows asset. A
+#     multi-platform feed is a schema change and deliberately NOT invented here.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
 # shellcheck source=/dev/null
 source "$HERE/config.env"
 
-TAG="${1:?usage: release.sh <tag> <installer.exe>}"
-EXE="${2:?usage: release.sh <tag> <installer.exe>}"
-[ -f "$EXE" ] || { echo "[release] no installer at $EXE"; exit 1; }
+TAG="${1:?usage: release.sh <tag> <asset> [asset ...]}"
+shift
+[ $# -ge 1 ] || { echo "[release] usage: release.sh <tag> <asset> [asset ...]"; exit 1; }
+ASSETS=("$@")
+
+WIN_ASSET=""     # the Windows installer, if this release carries one
+APK_ASSET=""     # the Android APK, if this release carries one
+for a in "${ASSETS[@]}"; do
+  [ -f "$a" ] || { echo "[release] no asset at $a"; exit 1; }
+  case "$a" in
+    *.exe|*.msi) [ -n "$WIN_ASSET" ] || WIN_ASSET="$a" ;;
+    *.apk)       [ -n "$APK_ASSET" ] || APK_ASSET="$a" ;;
+  esac
+done
+[ -n "$WIN_ASSET" ] || [ -n "$APK_ASSET" ] || {
+  echo "[release] none of the assets is a .exe/.msi or .apk — refusing to publish a release"
+  echo "[release]   with nothing installable in it."; exit 1; }
 
 # Warn (don't block) if the installer isn't Authenticode-signed.
 # Windows PowerShell cannot resolve an MSYS "/c/..." path, so it silently returned an
 # EMPTY status for a genuinely signed installer (hit on 0.1.5). Hand it a native path.
-EXE_NATIVE="$(cygpath -w "$EXE" 2>/dev/null || echo "$EXE")"
-SIG=$(powershell -NoProfile -Command "(Get-AuthenticodeSignature '$EXE_NATIVE').Status" 2>/dev/null | tr -d '\r') || SIG=Unknown
-[ -n "$SIG" ] || SIG=Unknown
-[ "$SIG" = "Valid" ] || echo "[release] WARNING installer signature status = $SIG (publishing anyway)"
+#
+# PE FILES ONLY. This check is meaningless on an APK — an APK is a zip signed with the
+# APK Signature Scheme, which Get-AuthenticodeSignature cannot read, so feeding it one
+# yields "Unknown" and the notes would then advertise an unsigned-looking build for a
+# reason that has nothing to do with signing. The APK's signing story is stated
+# separately, and honestly, in the notes.
+SIG=""
+if [ -n "$WIN_ASSET" ]; then
+  EXE_NATIVE="$(cygpath -w "$WIN_ASSET" 2>/dev/null || echo "$WIN_ASSET")"
+  SIG=$(powershell -NoProfile -Command "(Get-AuthenticodeSignature '$EXE_NATIVE').Status" 2>/dev/null | tr -d '\r') || SIG=Unknown
+  [ -n "$SIG" ] || SIG=Unknown
+  [ "$SIG" = "Valid" ] || echo "[release] WARNING installer signature status = $SIG (publishing anyway)"
+fi
+
+# The platform paragraph and the signing line DESCRIBE THE ASSETS, they are not boilerplate.
+#
+# The Windows-only wording below is byte-identical to what every release through 0.1.20
+# shipped — that path must not change. The other two exist because the old text was simply
+# false off Windows: an Android release has no D3D11, no DirectComposition, and above all
+# no installer that "chains/detects" the runtime. On Android the runtime is a separately
+# installed APK and the vendor display plug-in ships INSIDE it (runtime ADR-038), so there
+# is nothing to chain and saying otherwise sends users looking for a plug-in installer that
+# does not exist.
+WIN_PARA="A Chromium-based browser that renders the whole web normally **and** weaves glasses-free inline-3D for
+\`inline-3d\` WebXR pages on DisplayXR hardware. Windows / D3D11 + DirectComposition. Requires a DisplayXR
+3D display + the DisplayXR runtime and a display plug-in (the installer chains/detects them); on any
+other machine it is an ordinary browser."
+
+ANDROID_PARA="A Chromium-based browser that renders the whole web normally **and** weaves glasses-free inline-3D for
+\`inline-3d\` WebXR pages on DisplayXR hardware. Android / arm64, on a DisplayXR 3D display device.
+Requires the DisplayXR runtime APK installed separately — the vendor display plug-in ships inside that
+runtime APK, so there is nothing else to install; on any other device it is an ordinary browser."
+
+if [ -n "$WIN_ASSET" ] && [ -n "$APK_ASSET" ]; then
+  PLATFORM_PARA="$WIN_PARA
+
+**Android (arm64)** is also published in this release as an \`.apk\`. It needs the DisplayXR runtime APK
+installed separately; the vendor display plug-in ships inside that runtime APK."
+elif [ -n "$APK_ASSET" ]; then
+  PLATFORM_PARA="$ANDROID_PARA"
+else
+  PLATFORM_PARA="$WIN_PARA"
+fi
+
+# Signing, per asset. The Windows-only case emits exactly the line it always did.
+SIGNING_PARA=""
+[ -n "$WIN_ASSET" ] && SIGNING_PARA="Installer signature: **$SIG**."
+if [ -n "$APK_ASSET" ]; then
+  APK_LINE="Android APK: **debug-key self-signed** (Chromium's checked-in debug keystore). A release keystore is
+not wired up yet, so Android will warn on install and the APK is **not** upgrade-compatible with a future
+signed build — expect to uninstall before taking one."
+  if [ -n "$SIGNING_PARA" ]; then SIGNING_PARA="$SIGNING_PARA
+
+$APK_LINE"; else SIGNING_PARA="$APK_LINE"; fi
+fi
 
 NOTES="$(cat <<EOF
 **DisplayXR Browser — Developer Preview** · built on Chromium \`$CHROMIUM_TAG\`
 
-A Chromium-based browser that renders the whole web normally **and** weaves glasses-free inline-3D for
-\`inline-3d\` WebXR pages on DisplayXR hardware. Windows / D3D11 + DirectComposition. Requires a DisplayXR
-3D display + the DisplayXR runtime and a display plug-in (the installer chains/detects them); on any
-other machine it is an ordinary browser.
+$PLATFORM_PARA
 
 > ⚠️ **Developer preview.** Rebased ~monthly onto Chrome stable, but **not** maintained to Chrome's
 > mid-cycle security cadence — **don't use it for sensitive browsing**; use your primary browser for
 > banking, etc. See the [maintenance policy](https://github.com/DisplayXR/displayxr-browser/blob/main/docs/maintenance-policy.md).
 
-Installer signature: **$SIG**.
+$SIGNING_PARA
 EOF
 )"
 
-echo "[release] creating GitHub Release $TAG with $(basename "$EXE")"
+echo "[release] creating GitHub Release $TAG with ${#ASSETS[@]} asset(s):"
+for a in "${ASSETS[@]}"; do echo "[release]   $(basename "$a")"; done
 # NOT --prerelease, and explicitly --latest.
 #
 # Every release used to be flagged pre-release, which GitHub excludes from both
@@ -68,7 +143,7 @@ gh release create "$TAG" -R DisplayXR/displayxr-browser \
   --title "DisplayXR Browser Preview ($CHROMIUM_TAG)" \
   --notes "$NOTES" \
   --latest \
-  "$EXE"
+  "${ASSETS[@]}"
 
 # --- pin the release into the org's tested-together matrix -------------------
 # displayxr-runtime/versions.json is the canonical pin matrix (its
@@ -106,13 +181,25 @@ echo "[release] displayxr-runtime/versions.json[browser] should now read $TAG."
 # Version comes from the TAG (preview-0.1.18 -> 0.1.18), not from chrome/VERSION: the
 # marketing version is what a user compares against, and it is the number -DVERSION
 # stamped into the installer.
+#
+# WINDOWS ONLY, BY SCHEMA. feed/feed.json's `latest` is ONE object with one `url`, one
+# `sha256` and one `size` and no platform key (see docs/auto-update-design.md and
+# scripts/update-feed.sh, which emits that same shape). It therefore cannot describe an
+# APK at all. Rather than invent a schema here, an Android-only release SKIPS the feed and
+# says so; a mixed release writes the Windows entry exactly as a Windows-only release
+# would. Teaching the feed about platforms is tracked as follow-up work, not smuggled in.
 VERSION="${TAG#preview-}"
 FEED="$REPO/feed/feed.json"
-if [ ! -f "$FEED" ]; then
+if [ -z "$WIN_ASSET" ]; then
+  echo "[release] no Windows asset — SKIPPING the feed update."
+  echo "[release]   feed/feed.json's schema has one url/sha256/size and no platform key,"
+  echo "[release]   so it cannot represent an APK. The feed still advertises the last"
+  echo "[release]   Windows build, which is correct: that is the only thing it can describe."
+elif [ ! -f "$FEED" ]; then
   echo "[release] WARNING no feed at $FEED — skipping the feed update (browser#154)"
 else
-  SHA256="$(sha256sum "$EXE" | cut -d' ' -f1)"
-  SIZE="$(wc -c < "$EXE" | tr -d ' ')"
+  SHA256="$(sha256sum "$WIN_ASSET" | cut -d' ' -f1)"
+  SIZE="$(wc -c < "$WIN_ASSET" | tr -d ' ')"
   RELEASED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   # ASK THE RELEASE what the asset is called; never assume it.
   #

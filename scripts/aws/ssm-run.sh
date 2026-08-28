@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
-# ssm-run.sh - send PowerShell to the build box over SSM, wait for it, surface its output.
-# Reads the commands from stdin, one per line. Used by .github/workflows/build-box.yml.
+# ssm-run.sh - send a script to a build box over SSM, wait for it, surface its output.
+# Reads the commands from stdin, one per line. Used by .github/workflows/build-box.yml
+# (Windows/PowerShell) and .github/workflows/build-box-android.yml (Linux/bash).
 #
 # Usage:  printf '%s\n' 'Get-Date' | ssm-run.sh <instance-id> "<comment>" <timeout-minutes>
+#         SSM_DOCUMENT=AWS-RunShellScript printf '%s\n' 'date' | ssm-run.sh ...
+#
+# WHICH DOCUMENT. $SSM_DOCUMENT selects it: AWS-RunPowerShellScript (the default, so the
+# Windows lane is unchanged) or AWS-RunShellScript for the Linux/Android box. It must match
+# the document ARN granted in the role's RunTheBuildViaSSM Sid (scripts/aws/setup-oidc.sh,
+# same variable name) — a mismatch there fails as an AccessDeniedException on SendCommand,
+# NOT as "no such document", which makes it expensive to diagnose.
 #
 # Two things this exists to get right:
 #
@@ -12,9 +20,9 @@
 #     get `C:\build` silently becoming `C:uild`. Do not "simplify" this back to
 #     --parameters commands="[...]".
 #
-#  2. executionTimeout. AWS-RunPowerShellScript defaults to 3600s, so a 90-minute Chromium
-#     build would be killed at the one-hour mark and reported as a *build* failure. We set it
-#     from the caller's timeout plus a margin.
+#  2. executionTimeout. Both documents default to 3600s, so a 90-minute Chromium build would
+#     be killed at the one-hour mark and reported as a *build* failure. We set it from the
+#     caller's timeout plus a margin.
 #
 # Exit status mirrors the invocation: 0 only if SSM reports Success.
 set -uo pipefail
@@ -52,6 +60,8 @@ refresh_aws_creds() {
 INSTANCE_ID="${1:?instance id required}"
 COMMENT="${2:-ssm-run}"
 TIMEOUT_MIN="${3:-60}"
+# Windows lane default; the Android lane exports SSM_DOCUMENT=AWS-RunShellScript.
+SSM_DOCUMENT="${SSM_DOCUMENT:-AWS-RunPowerShellScript}"
 
 # Margin over the caller's own timeout so the *script* reports the timeout (with a status
 # tail) rather than SSM guillotining it with no diagnostics.
@@ -64,12 +74,12 @@ jq -R -s --arg t "$EXEC_TIMEOUT" \
 
 cmd_id="$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
-  --document-name "AWS-RunPowerShellScript" \
+  --document-name "$SSM_DOCUMENT" \
   --comment "$COMMENT" \
   --parameters "file://$params" \
   --query 'Command.CommandId' --output text)" || {
     echo "::error::ssm send-command failed"; exit 1; }
-echo "ssm command: $cmd_id"
+echo "ssm command: $cmd_id ($SSM_DOCUMENT)"
 
 deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 + 600 ))
 status=Pending
