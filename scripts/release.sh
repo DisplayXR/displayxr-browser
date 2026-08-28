@@ -257,7 +257,7 @@ else
   "$PYBIN" - "$FEED" "$VERSION" "$CHROMIUM_TAG" "$URL" "$SHA256" "$SIZE" "$RELEASED" "$SECURITY" "${ROLLOUT:-}" <<'PY'
 import json, sys
 feed_path, version, chromium, url, sha256, size, released, security = sys.argv[1:9]
-rollout = sys.argv[9] if len(sys.argv) > 9 else '''
+rollout = sys.argv[9] if len(sys.argv) > 9 else ''
 with open(feed_path, encoding='utf-8') as f:
     feed = json.load(f)
 feed['latest'] = {
