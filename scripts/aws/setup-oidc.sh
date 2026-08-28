@@ -22,6 +22,8 @@
 #   INSTANCE_ID   the Chromium build box
 #   GH_ORG/GH_REPO/GH_ENV   trust scoping
 #   ROLE_NAME / POLICY_NAME / ARTIFACT_BUCKET
+#   MAX_SESSION_DURATION  seconds; must be >= the workflow's role-duration-seconds (7200).
+#                 IAM defaults a NEW role to 3600 and SWE-DEV cannot raise it afterwards.
 #   BUCKET_SID    Sid of THIS lane's statement in the artifact-bucket policy. Must differ
 #                 per lane: put-bucket-policy replaces the whole document, so two lanes
 #                 sharing a Sid means provisioning one REVOKES the other's upload.
@@ -54,6 +56,13 @@ ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-displayxr-browser-artifacts}"
 # AWS-RunPowerShellScript (the default, so the existing invocation is unchanged);
 # Linux/Android = AWS-RunShellScript. Must agree with SSM_DOCUMENT in ssm-run.sh.
 SSM_DOCUMENT="${SSM_DOCUMENT:-AWS-RunPowerShellScript}"
+# MUST be >= the workflow's role-duration-seconds (both lanes ask for 7200). IAM defaults a
+# new role to 3600, and configure-aws-credentials then fails the whole run with "The requested
+# DurationSeconds exceeds the MaxSessionDuration set for this role" — before the box is even
+# started, so the `if: always()` stop step ALSO cannot authenticate and the instance is left
+# billing. Set it at CREATE time: SWE-DEV is denied iam:UpdateRole, so it cannot be raised
+# afterwards without deleting and recreating the role.
+MAX_SESSION_DURATION="${MAX_SESSION_DURATION:-7200}"
 # The account-standard SSM instance profile (20+ instances use it). SWE-DEV can attach an
 # EXISTING profile (ec2:AssociateIamInstanceProfile is allowed) but cannot mint a new one
 # (iam:CreateInstanceProfile / AddRoleToInstanceProfile are DENIED), so we reuse this one
@@ -125,10 +134,27 @@ if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
   # role (DeleteRolePolicy on every inline policy first, then DeleteRole, then re-run).
   say "role $ROLE_NAME exists -> update trust policy (expect AccessDenied under SWE-DEV)"
   run aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document "$(pathref "$TRUST_FILE")"
+  # Same denial applies to iam:UpdateRole, so a too-short MaxSessionDuration on an EXISTING
+  # role cannot be repaired in place. Report it loudly with the exact remedy rather than
+  # letting the next run die in configure-aws-credentials with the box left running.
+  CUR_DUR="$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.MaxSessionDuration' --output text 2>/dev/null || echo 0)"
+  if [ "${CUR_DUR:-0}" -lt "$MAX_SESSION_DURATION" ]; then
+    say "WARNING role $ROLE_NAME MaxSessionDuration=${CUR_DUR}s < required ${MAX_SESSION_DURATION}s."
+    say "        configure-aws-credentials will fail with 'The requested DurationSeconds exceeds"
+    say "        the MaxSessionDuration set for this role', BEFORE the box starts - and the"
+    say "        always() stop step cannot authenticate either, so the instance is left billing."
+    say "        SWE-DEV is denied iam:UpdateRole, so recreate the role:"
+    say "          aws iam delete-role-policy --role-name $ROLE_NAME --policy-name $POLICY_NAME"
+    say "          aws iam delete-role        --role-name $ROLE_NAME"
+    say "          <re-run this script with --apply>"
+  else
+    say "role MaxSessionDuration=${CUR_DUR}s (>= ${MAX_SESSION_DURATION}s required)"
+  fi
 else
   say "role $ROLE_NAME MISSING -> create"
   run aws iam create-role --role-name "$ROLE_NAME" \
     --description "GitHub Actions (browser#34): drive the Chromium build box, no long-lived secret" \
+    --max-session-duration "$MAX_SESSION_DURATION" \
     --assume-role-policy-document "$(pathref "$TRUST_FILE")"
 fi
 
