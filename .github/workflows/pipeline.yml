@@ -247,7 +247,6 @@ jobs:
       - name: Promote to full release + rollout 100
         env:
           GH_TOKEN: ${{ github.token }}
-        env:
           BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
