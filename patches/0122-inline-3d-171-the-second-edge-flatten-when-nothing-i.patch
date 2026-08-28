@@ -1,4 +1,4 @@
-From 4432d28d1332c9b2d58f305d8361bf7538c50ea4 Mon Sep 17 00:00:00 2001
+From a827748ab3ce3d3e3424ed0ba7993d9f5330af6a Mon Sep 17 00:00:00 2001
 From: DisplayXR <dev@displayxr.invalid>
 Date: Thu, 27 Aug 2026 21:07:04 -0700
 Subject: [PATCH] inline-3d(#171): the second edge -- flatten when nothing is
@@ -34,9 +34,17 @@ page at that rect, weaves it, and draws it back. That is 2D pixels interlaced
 INTO the page, and they stay until the next repaint -- exactly "until I scroll
 or hover".
 
-The escape was written for a page with no identity anywhere. On a frame that
-carries ANY identity rect, a zero-id rect is now not prepared and is withheld,
-counted on the existing LOG(ERROR). A pure-legacy page is untouched.
+The escape was written for a page with no identity anywhere. On an IDENTITY
+PAGE a zero-id rect is now not prepared and is withheld, counted on the
+existing LOG(ERROR). "Identity page" is STICKY per Display, not per frame: the
+first cut tested the frame and the transition defeated it on hardware -- on
+the frames where the zero-id rect is admitted the outgoing tile's identity
+rect is already gone and the incoming one has not appeared, so the frame
+carries ONLY the zero-id rect (measured: rect=662,881 1145x1145, misses=1..10
+with the per-frame test in place). A renderer that has stamped identity once
+stamps it always, so from then on a zero-id rect is the cardinality channel by
+construction. A genuinely legacy producer never sets the flag and keeps
+today's path.
 
 (2) NOTHING WEAVABLE => FLAT (weave client + the root-pass hook). Once the
 outgoing tile stops and the incoming one is withheld, the browser submits
@@ -60,10 +68,11 @@ rule as 0121.
  .../browser/displayxr_weave_client.h          |   9 +
  .../displayxr/gpu/displayxr_weave_gpu.cc      |   4 +
  .../displayxr/gpu/displayxr_weave_gpu.h       |   1 +
- components/viz/service/display/display.cc     |  42 +++-
+ components/viz/service/display/display.cc     |  56 ++++-
+ components/viz/service/display/display.h      |   7 +
  .../displayxr_weave_provider.h                |   5 +
  .../skia_output_surface_impl_on_gpu.cc        |  15 +-
- 7 files changed, 246 insertions(+), 58 deletions(-)
+ 8 files changed, 267 insertions(+), 58 deletions(-)
 
 diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
 index b214a30..855378e 100644
@@ -389,10 +398,10 @@ index 6b60bf4..cc5f612 100644
    // re-weaves the pixels the last successful copy left in the shared input.
    // Honoured only when |batch_last_copied_| says this exact target wrote this
 diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
-index a1408f5..ba49632 100644
+index a1408f5..c101320 100644
 --- a/components/viz/service/display/display.cc
 +++ b/components/viz/service/display/display.cc
-@@ -1086,6 +1086,34 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1086,6 +1086,48 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
        weave_rects.reserve(frame.inline_3d_rects.size());
        int unprepared = 0;
        int unprepared_undrawn = 0;
@@ -414,20 +423,34 @@ index a1408f5..ba49632 100644
 +      // storefront on "next":
 +      //   GPU canvas-layer lookup returned NO resource: id=0000...0000
 +      //     rect=2351,856 1100x1100 layers=0
-+      // So: on a frame that carries ANY identity rect, a zero-id rect is not
-+      // prepared. The legacy escape survives untouched for the page it was
-+      // written for -- one with no identity anywhere.
-+      bool any_identity = false;
++      // So: on an IDENTITY PAGE, a zero-id rect is not prepared. The legacy
++      // escape survives untouched for the page it was written for -- one with
++      // no identity anywhere.
++      //
++      // "Identity page" is STICKY, not per-frame. The first cut of this tested
++      // the current frame, and the transition it was written for defeated it
++      // on hardware: on the frames where the zero-id rect is admitted, the
++      // outgoing tile's identity rect is already gone and the incoming tile's
++      // has not appeared yet, so the frame carries ONLY the zero-id rect and
++      // reads as pure legacy. Measured, storefront "next", 0121+first-cut:
++      //   GPU canvas-layer lookup returned NO resource: id=0000...0000
++      //     rect=662,881 1145x1145 layers=0 (misses=1..10)
++      // A page that has stamped identity even once has a Phase-1 renderer,
++      // and every rect it will ever legitimately weave carries one; a zero-id
++      // rect from it is the cardinality channel by construction. A genuinely
++      // legacy producer (pre-Phase-1 renderer, TreesInViz) never stamps, so
++      // the flag never sets and it keeps today's path.
 +      for (const auto& r : frame.inline_3d_rects) {
 +        if (!r.id.is_zero()) {
-+          any_identity = true;
++          inline_3d_saw_identity_ = true;
 +          break;
 +        }
 +      }
++      const bool any_identity = inline_3d_saw_identity_;
        for (const auto& r : frame.inline_3d_rects) {
          // ---- (browser#167) THE "NOTHING RESOLVED AT ALL" ESCAPE IS NOT FOR A
          // TILE THAT WAS NEVER DRAWN --------------------------------------
-@@ -1109,7 +1137,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1109,7 +1151,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
          // sibling happens to have resolved cannot be what decides if the
          // runtime weaves page chrome — so the undrawn tile is withheld either
          // way now.
@@ -439,7 +462,7 @@ index a1408f5..ba49632 100644
          for (const auto& layer : resolved_canvas) {
            // Identity where there is one; the legacy zero-id channel has only
            // geometry, and Display's own tile join above uses the same pair of
-@@ -1124,6 +1155,9 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1124,6 +1169,9 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
            if (r.layer_emitted_no_quad) {
              ++unprepared_undrawn;
            }
@@ -449,7 +472,7 @@ index a1408f5..ba49632 100644
            continue;
          }
          // browser#131: |z_order| rides along untouched — the GPU stage's
-@@ -1144,8 +1178,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+@@ -1144,8 +1192,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
                          " still owns those pixels and the weave must not touch"
                          " them (of which "
                       << unprepared_undrawn
@@ -462,6 +485,24 @@ index a1408f5..ba49632 100644
                       << (n + 1) << ")";
          }
        }
+diff --git a/components/viz/service/display/display.h b/components/viz/service/display/display.h
+index fafc67d..a99b1dd 100644
+--- a/components/viz/service/display/display.h
++++ b/components/viz/service/display/display.h
+@@ -341,6 +341,13 @@ class VIZ_SERVICE_EXPORT Display : public DisplaySchedulerClient,
+   std::unique_ptr<OverlayProcessorInterface> overlay_processor_;
+   // `renderer_` depends on `overlay_processor_` and `resource_provider_`. It
+   // must be declared last and destroyed first.
++  // browser#171: this Display has seen at least one inline-3D rect that
++  // carries layer identity. From then on a zero-identity rect is the
++  // aggregator's cardinality channel, never a legacy page, and is withheld
++  // from the weave rather than woven from a page snapshot. Never cleared: a
++  // renderer that stamps identity does not stop.
++  bool inline_3d_saw_identity_ = false;
++
+   std::unique_ptr<DirectRenderer> renderer_;
+   // `software_renderer_` depends on `renderer_`. It must be declared last and
+   // cleared first.
 diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
 index eb8901a..3c83fa5 100644
 --- a/components/viz/service/display_embedder/displayxr_weave_provider.h
