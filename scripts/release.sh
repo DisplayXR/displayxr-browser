@@ -139,10 +139,23 @@ for a in "${ASSETS[@]}"; do echo "[release]   $(basename "$a")"; done
 # --latest is passed explicitly rather than relying on GitHub's default: the
 # default is `legacy` inference, and it is exactly what got stuck on 0.1.8 while
 # six NEWER non-prerelease releases went by without moving the marker. State it.
+#
+# STAGED=1 (browser#38, the pipeline's stage half) inverts exactly one thing: the release
+# is published as a PRE-release with the latest marker untouched, and the promotion to a
+# full latest release is a separate, human-approved step (scripts/promote-release.sh,
+# behind pipeline.yml's `go-live` environment). Everything above about why previews are
+# NOT pre-releases still holds for the END STATE — staged is a temporary state on the way
+# there, never the destination.
+if [ "${STAGED:-}" = "1" ]; then
+  RELEASE_FLAGS=(--prerelease)
+  echo "[release] STAGED=1 — publishing as a PRE-release; promote-release.sh goes wide."
+else
+  RELEASE_FLAGS=(--latest)
+fi
 gh release create "$TAG" -R DisplayXR/displayxr-browser \
   --title "DisplayXR Browser Preview ($CHROMIUM_TAG)" \
   --notes "$NOTES" \
-  --latest \
+  "${RELEASE_FLAGS[@]}" \
   "${ASSETS[@]}"
 
 # --- pin the release into the org's tested-together matrix -------------------
@@ -158,6 +171,15 @@ gh release create "$TAG" -R DisplayXR/displayxr-browser \
 # Non-fatal on purpose. The release is already published and downloadable at
 # this point; a dispatch hiccup must not make a good release look failed.
 BUMP_CMD="gh workflow run versions-bump.yml -R DisplayXR/displayxr-runtime -f field=browser -f tag=$TAG -f source_repo=DisplayXR/displayxr-browser"
+if [ "${STAGED:-}" = "1" ]; then
+  # browser#38: versions.json means "tested together and live". A staged pre-release is
+  # neither yet — the pin moves in promote-release.sh, after the go-live approval.
+  echo "[release] STAGED=1 — NOT dispatching versions-bump; promote-release.sh does."
+  BUMP_SKIPPED=1
+else
+  BUMP_SKIPPED=0
+fi
+if [ "${BUMP_SKIPPED}" = "0" ]; then
 echo "[release] dispatching versions.json[browser] -> $TAG"
 if gh api -X POST repos/DisplayXR/displayxr-runtime/dispatches --input - <<EOF >/dev/null
 {"event_type":"versions-bump","client_payload":{"field":"browser","tag":"$TAG","source_repo":"DisplayXR/displayxr-browser"}}
@@ -167,6 +189,7 @@ then
 else
     echo "[release] WARNING versions-bump dispatch failed. Bump it by hand:"
     echo "[release]   $BUMP_CMD"
+fi
 fi
 
 echo "[release] done — https://github.com/DisplayXR/displayxr-browser/releases/tag/$TAG"
@@ -226,9 +249,15 @@ else
   # defaulting it to false is the safe direction (an under-claimed release is not a lie,
   # an over-claimed one is).
   SECURITY="${SECURITY:-false}"
-  python - "$FEED" "$VERSION" "$CHROMIUM_TAG" "$URL" "$SHA256" "$SIZE" "$RELEASED" "$SECURITY" <<'PY'
+  # ROLLOUT (browser#38): a STAGED publish writes the feed at a small rollout; the
+  # go-live promote rewrites it to 100. Empty preserves whatever the feed already has.
+  # No consumer reads this field until browser#40's updater ships — exercised now so the
+  # pipeline does not change shape when it does.
+  PYBIN="$(command -v python || command -v python3)"
+  "$PYBIN" - "$FEED" "$VERSION" "$CHROMIUM_TAG" "$URL" "$SHA256" "$SIZE" "$RELEASED" "$SECURITY" "${ROLLOUT:-}" <<'PY'
 import json, sys
 feed_path, version, chromium, url, sha256, size, released, security = sys.argv[1:9]
+rollout = sys.argv[9] if len(sys.argv) > 9 else '''
 with open(feed_path, encoding='utf-8') as f:
     feed = json.load(f)
 feed['latest'] = {
@@ -240,6 +269,8 @@ feed['latest'] = {
     'released': released,
     'security': security.lower() in ('1', 'true', 'yes'),
 }
+if rollout != '':
+    feed['rollout'] = int(rollout)
 with open(feed_path, 'w', encoding='utf-8', newline='\n') as f:
     json.dump(feed, f, indent=2)
     f.write('\n')

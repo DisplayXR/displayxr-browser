@@ -24,7 +24,15 @@ on:
         type: number
         default: 10
       enable_publish:
-        description: "Run sign/release/feed. OFF until the cross-machine publish path is validated."
+        description: "Run sign/release/feed (browser#38, validated live)"
+        type: boolean
+        default: false
+      version:
+        description: "Marketing version to publish (e.g. 0.1.22). Required when enable_publish."
+        type: string
+        default: ""
+      security:
+        description: "This is a Chromium security rebase: feed gets security:true and an unsigned build HOLDS instead of shipping"
         type: boolean
         default: false
   workflow_call:
@@ -36,6 +44,12 @@ on:
         type: number
         default: 10
       enable_publish:
+        type: boolean
+        default: false
+      version:
+        type: string
+        default: ""
+      security:
         type: boolean
         default: false
 
@@ -108,38 +122,121 @@ jobs:
           if [ "$rc" -eq 0 ]; then echo "verdict=PASS" >> "$GITHUB_OUTPUT";
           else echo "verdict=HOLD (weave-bearing files changed - eyeball hardware before promote)" >> "$GITHUB_OUTPUT"; fi
 
-  # --- publish half: present for review, inert until enable_publish + live validation. ---
+  # --- publish half (browser#38, validated live) ------------------------------------
+  #
+  # sign + release run on windows-latest because scripts/sign.sh's remote path is
+  # Windows-bound on purpose (powershell Compress/Expand-Archive, cygpath, and a REAL
+  # Get-AuthenticodeSignature verify — pwsh-on-linux cannot check Authenticode at all).
+  #
+  # Signing auth: gh needs rights on the provider repo named by the DXR_SIGN_REPO repo
+  # variable — the default token is repo-scoped, so without the CODESIGN_TOKEN secret
+  # sign.sh takes its documented fail-open path and the run ships UNSIGNED with a
+  # warning. `security: true` turns that fail-open into a HOLD: a security release must
+  # never ship unsigned (handoff rule).
 
   sign:
-    needs: gate
+    needs: [build, gate]
     if: ${{ inputs.enable_publish }}
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - name: Sign first-party binaries (Leia signing box)
+      - name: Refuse to publish without a version
         run: |
-          echo "::warning::sign stage is UNVALIDATED in CI - needs DXR_SIGN_REPO + the Leia box (handoff)."
-          # scripts/sign.sh dist/DisplayXR-Browser   # cross-machine; wire in the handoff session
-          exit 1
+          [ -n "${{ inputs.version }}" ] || { echo "::error::enable_publish needs version="; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-build
+          path: dist
+      - name: Extract the staged tree
+        run: |
+          set -euo pipefail
+          tar -xzf dist/dxr_browser_staged.tar.gz -C dist
+          ls dist/DisplayXR-Browser/chrome.exe
+      - name: Sign first-party binaries (provider via DXR_SIGN_REPO)
+        env:
+          DXR_SIGN_REPO: ${{ vars.DXR_SIGN_REPO }}
+          GH_TOKEN: ${{ secrets.CODESIGN_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/sign.sh dist/DisplayXR-Browser 2>&1 | tee sign-inner.log
+          if grep -q "UNSIGNED" sign-inner.log; then
+            if [ "${{ inputs.security }}" = "true" ]; then
+              echo "::error::security release but the inner binaries are UNSIGNED — holding (add the CODESIGN_TOKEN secret)"
+              exit 1
+            fi
+            echo "::warning::inner binaries UNSIGNED (no CODESIGN_TOKEN / provider unreachable) — allowed for a non-security preview"
+          fi
+      - name: Build the installer (NSIS)
+        run: |
+          set -euo pipefail
+          command -v makensis >/dev/null || choco install nsis -y
+          W=$(cygpath -w "$PWD/dist"); S=$(cygpath -w "$PWD/dist/DisplayXR-Browser")
+          makensis -DVERSION=${{ inputs.version }} -DSTAGE_DIR="$S" -DSOURCE_DIR="$S" -DOUTPUT_DIR="$W" installer/DisplayXRBrowserInstaller.nsi
+          ls dist/DisplayXR-Browser-Preview-Setup-${{ inputs.version }}.exe
+      - name: Sign the installer
+        env:
+          DXR_SIGN_REPO: ${{ vars.DXR_SIGN_REPO }}
+          GH_TOKEN: ${{ secrets.CODESIGN_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/sign.sh dist 2>&1 | tee sign-outer.log
+          if grep -q "UNSIGNED" sign-outer.log && [ "${{ inputs.security }}" = "true" ]; then
+            echo "::error::security release but the installer is UNSIGNED — holding"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-installer
+          path: dist/DisplayXR-Browser-Preview-Setup-${{ inputs.version }}.exe
+          if-no-files-found: error
 
+  # Publish as a STAGED PRE-release + feed at the input rollout. The org pin does NOT
+  # move here — versions.json means "tested together and live", which a staged
+  # pre-release is not yet. Everything user-visible flips in `promote`.
   release:
     needs: sign
+    runs-on: windows-latest
     if: ${{ inputs.enable_publish }}
-    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - name: Publish a PRE-release + feed at staged rollout
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-installer
+          path: dist
+      - name: Publish pre-release + staged feed
         env:
+          GH_TOKEN: ${{ github.token }}
           ROLLOUT: ${{ inputs.rollout }}
+          SECURITY: ${{ inputs.security }}
         run: |
-          echo "::warning::release+feed stage is UNVALIDATED - feed host is an open #40 decision (handoff)."
-          # scripts/release.sh <tag> <signed.exe>          # as a PRE-release
-          # scripts/update-feed.sh --rollout "$ROLLOUT" ... # NOT flipped to 100 yet
-          exit 1
+          set -euo pipefail
+          STAGED=1 bash scripts/release.sh "preview-${{ inputs.version }}" \
+            "dist/DisplayXR-Browser-Preview-Setup-${{ inputs.version }}.exe"
+      - name: Commit the staged feed
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # checkout leaves a detached HEAD on a dispatch — name the ref explicitly.
+          git config user.name "displayxr-pipeline"
+          git config user.email "dev@displayxr.invalid"
+          git add feed/feed.json
+          git commit -m "feed: ${{ inputs.version }} (staged, rollout ${{ inputs.rollout }})"
+          git pull --rebase origin "$BRANCH"
+          git push origin "HEAD:$BRANCH"
 
   # THE ONE CLICK. `go-live` is a protected environment (required reviewer = maintainer).
-  # Approving promotes the staged pre-release to full rollout. The gate verdict is surfaced
-  # in the job summary so the approver sees PASS vs HOLD before clicking.
+  # Approving promotes the staged pre-release to a full latest release, flips the feed to
+  # rollout 100, and moves the org pin. The weave-gate verdict is printed so the approver
+  # sees PASS vs HOLD before clicking. (Until browser#40's updater ships, `rollout` has no
+  # consumer — the start-page check offers the newest feed entry to everyone — so promote
+  # is what makes the release REAL for users either way: it is what moves `latest`.)
   promote:
     needs: [gate, release]
     if: ${{ inputs.enable_publish }}
@@ -147,9 +244,19 @@ jobs:
     environment: go-live
     steps:
       - uses: actions/checkout@v4
-      - name: Promote to full rollout
+      - name: Promote to full release + rollout 100
+        env:
+          GH_TOKEN: ${{ github.token }}
+        env:
+          BRANCH: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           echo "weave-gate verdict: ${{ needs.gate.outputs.verdict }}"
-          echo "::warning::promote (feed rollout -> 100) is UNVALIDATED - wire with the feed host (#40)."
-          # scripts/update-feed.sh --rollout 100 ...   # the go-wide flip
-          exit 1
+          git pull --rebase origin "$BRANCH" || true
+          bash scripts/promote-release.sh "preview-${{ inputs.version }}"
+          git config user.name "displayxr-pipeline"
+          git config user.email "dev@displayxr.invalid"
+          git add feed/feed.json
+          git commit -m "feed: ${{ inputs.version }} promoted (rollout 100)"
+          git pull --rebase origin "$BRANCH"
+          git push origin "HEAD:$BRANCH"
