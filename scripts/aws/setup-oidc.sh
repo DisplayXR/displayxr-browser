@@ -22,6 +22,9 @@
 #   INSTANCE_ID   the Chromium build box
 #   GH_ORG/GH_REPO/GH_ENV   trust scoping
 #   ROLE_NAME / POLICY_NAME / ARTIFACT_BUCKET
+#   BUCKET_SID    Sid of THIS lane's statement in the artifact-bucket policy. Must differ
+#                 per lane: put-bucket-policy replaces the whole document, so two lanes
+#                 sharing a Sid means provisioning one REVOKES the other's upload.
 #   SSM_DOCUMENT  AWS-RunPowerShellScript (Windows box, the default) or AWS-RunShellScript
 #                 (the Linux/Android box). This is NOT cosmetic: the document name is part
 #                 of the RunTheBuildViaSSM resource ARN, and a mismatch surfaces as an
@@ -31,7 +34,8 @@
 # The Linux/Android twin (docs/oidc-build-lane.md "Porting checklist") is therefore:
 #   INSTANCE_ID=<linux box> GH_ENV=build-box-android \
 #   ROLE_NAME=DisplayXRBrowserAndroidBuildBox POLICY_NAME=AndroidBuildBoxAndArtifacts \
-#   SSM_DOCUMENT=AWS-RunShellScript scripts/aws/setup-oidc.sh --apply
+#   SSM_DOCUMENT=AWS-RunShellScript BUCKET_SID=AndroidBuildBoxInstanceMayUploadBuildsOnly \
+#   scripts/aws/setup-oidc.sh --apply
 set -uo pipefail
 
 APPLY=0
@@ -224,24 +228,40 @@ else
     --public-access-block-configuration \
     BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 fi
-BUCKET_POLICY=$(cat <<JSON
+# WHICH STATEMENT IS OURS. put-bucket-policy REPLACES the entire document, so a single
+# fixed Sid plus a freshly-built one-statement policy silently revokes the OTHER lane's
+# upload the moment the twin is provisioned — and nothing fails until that lane's next
+# build tries to upload, which is a long way from the cause. So the Sid is per-lane, and
+# we MERGE: drop any statement carrying our own Sid (idempotent re-run), keep every other
+# statement untouched, append ours.
+BUCKET_SID="${BUCKET_SID:-BuildBoxInstanceMayUploadBuildsOnly}"
+NEW_STMT=$(cat <<JSON
 {
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "BuildBoxInstanceMayUploadBuildsOnly",
-    "Effect": "Allow",
-    "Principal": { "AWS": "arn:aws:iam::${ACCOUNT}:role/${SSM_INSTANCE_PROFILE}" },
-    "Action": "s3:PutObject",
-    "Resource": "arn:aws:s3:::${ARTIFACT_BUCKET}/builds/*",
-    "Condition": {
-      "StringEquals": { "ec2:SourceInstanceARN": "${INSTANCE_ARN}" }
-    }
-  }]
+  "Sid": "${BUCKET_SID}",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::${ACCOUNT}:role/${SSM_INSTANCE_PROFILE}" },
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::${ARTIFACT_BUCKET}/builds/*",
+  "Condition": {
+    "StringEquals": { "ec2:SourceInstanceARN": "${INSTANCE_ARN}" }
+  }
 }
 JSON
 )
+EXISTING_POLICY="$(aws s3api get-bucket-policy --bucket "$ARTIFACT_BUCKET" \
+                     --query Policy --output text 2>/dev/null || true)"
+if [ -n "$EXISTING_POLICY" ] && [ "$EXISTING_POLICY" != "None" ]; then
+  KEPT="$(printf '%s' "$EXISTING_POLICY" | jq -r --arg sid "$BUCKET_SID" \
+    '[(.Statement // [])[] | select(.Sid != $sid) | .Sid] | join(", ")')"
+  [ -n "$KEPT" ] && say "bucket policy: PRESERVING existing statement(s): $KEPT"
+  BUCKET_POLICY="$(printf '%s' "$EXISTING_POLICY" | jq --argjson s "$NEW_STMT" --arg sid "$BUCKET_SID" \
+    '.Version = "2012-10-17"
+     | .Statement = (((.Statement // []) | map(select(.Sid != $sid))) + [$s])')"
+else
+  BUCKET_POLICY="$(jq -n --argjson s "$NEW_STMT" '{Version:"2012-10-17",Statement:[$s]}')"
+fi
 BUCKET_POLICY_FILE="$(mktemp)"; printf '%s' "$BUCKET_POLICY" > "$BUCKET_POLICY_FILE"
-say "apply instance-scoped bucket policy"
+say "apply instance-scoped bucket policy (Sid $BUCKET_SID -> $INSTANCE_ID)"
 run aws s3api put-bucket-policy --bucket "$ARTIFACT_BUCKET" \
   --policy "$(pathref "$BUCKET_POLICY_FILE")"
 
