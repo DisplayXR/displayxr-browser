@@ -219,6 +219,32 @@ jobs:
           echo "::error::SSM agent never came Online — cannot drive the build remotely."
           exit 1
 
+      # Everything the box must already have, checked in ONE cheap round-trip BEFORE a
+      # multi-hour build. The first real run built chrome_public_apk successfully and then
+      # died on `aws: not found` at the upload — an hour of compute to learn the box was
+      # missing a 60-second dependency. Fail fast instead, and say exactly how to fix it.
+      #
+      # Runs on the lifecycle_only smoke test too: it is a two-second check, and catching
+      # this class in the 2-minute path rather than the 2-hour one is the entire point.
+      - name: Preflight the box (aws CLI, checkout, depot_tools)
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'rc=0' \
+            'command -v aws >/dev/null 2>&1 || { echo "MISSING: aws CLI not on PATH"; rc=1; }' \
+            "[ -d '${CHROMIUM_SRC}/.git' ] || { echo \"MISSING: no Chromium checkout at ${CHROMIUM_SRC}\"; rc=1; }" \
+            "[ -d '${DEPOT_TOOLS_DIR}' ]  || { echo \"MISSING: no depot_tools at ${DEPOT_TOOLS_DIR}\"; rc=1; }" \
+            "id '${BUILD_USER}' >/dev/null 2>&1 || { echo \"MISSING: no such user ${BUILD_USER}\"; rc=1; }" \
+            'exit $rc' \
+          | scripts/aws/ssm-run.sh "$INSTANCE_ID" "android preflight ${GITHUB_RUN_ID}" 5 && exit 0
+
+          echo "::error::Build box preflight failed — see the MISSING lines above."
+          echo "::error::aws CLI:     curl -sSL -o /tmp/a.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip \\"
+          echo "::error::             && cd /tmp && unzip -oq a.zip && sudo ./aws/install --update"
+          echo "::error::checkout:    run scripts/fetch.sh on the box, or pass chromium_src/depot_tools inputs"
+          echo "::error::build_user:  pass build_user= an account that exists and owns the checkout"
+          exit 1
+
       # Sync patches/ from THIS repo and re-apply them at the pinned tag. A patch conflict
       # fails here and the build never runs — the drift gate.
       - name: Rebase + apply patches (SSM RunCommand -> do_rebase.sh)

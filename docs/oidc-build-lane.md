@@ -365,6 +365,18 @@ Everything above ports. What changes:
       HTTPS, unzips, clears the box's patch dir, copies `patches/*.patch` in. Same reasoning
       (payload limit, public repo, no credential, no interactive prompt), and the same
       "NO GIT HERE" rule the Windows twin learned the hard way.
+- [x] **The box needs the AWS CLI installed.** The artifact step runs `aws s3 cp` *on the box*,
+      under its instance-profile credentials — so the CLI has to exist there, which is a
+      separate question from whether the *runner* has one. The Ubuntu builder shipped without
+      it (not in apt's default set, no snap, nothing on root's PATH), and because the upload is
+      the LAST step, the first real run built `chrome_public_apk` successfully and then died on
+      `aws: not found` — an hour of compute to discover a 60-second dependency. Installed v2 to
+      `/usr/local/bin` (which is on the SSM PATH), and the lane now preflights it in one cheap
+      round-trip before the build so this class of miss costs two minutes:
+      ```
+      curl -sSL -o /tmp/a.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip \
+        && cd /tmp && unzip -oq a.zip && sudo ./aws/install --update
+      ```
 - [ ] **Artifact:** the workflow's upload step already does the box-side `aws s3 cp` to
       `builds/${GITHUB_RUN_ID}/dxr_browser_<job>.apk` under the instance's own credentials, then
       re-assume → `aws s3 cp` down → `upload-artifact`. UNVERIFIED: the bucket policy still needs
