@@ -1,4 +1,4 @@
-From c2474ce4d31ed75254279ffa7db177277544506e Mon Sep 17 00:00:00 2001
+From 5eb469a1d6ea2a1f66c2bbe30d682256110a4dae Mon Sep 17 00:00:00 2001
 From: David Fattal <dfattal@gmail.com>
 Date: Sat, 29 Aug 2026 03:53:11 +0000
 Subject: [PATCH] =?UTF-8?q?feat(android):=20browser#128=20M3=20=E2=80=94?=
@@ -54,6 +54,17 @@ while scaled the GPU provider's BatchMode() returns false: every tile routes
 to the page-owned 2D path and the runtime's no-submit timeout returns the
 panel to 2D. Unscaled again -> weaving resumes. A false positive (window
 dragged off-edge unscaled) costs 2D content, never a broken weave.
+
+OPTION 1b (field-corrected): gating BatchMode() turned off the whole arm
+including the scratch staging, so the recovery leg had no source and scaled
+tiles went BLANK — worse than the double image (field report, NP02J). The
+refusal moved down a level: the arm stays on, the scratch is staged, and
+WeaveRectAndroid/WeaveRectsAndroid refuse only the SUBMIT — the established
+submit-failure path then draws each tile MONO from the scratch (#99/#119/#120),
+so live content stays visible, just flat. Known residual, filed on the
+runtime: the lens is asserted per-weave and only released on pause/teardown,
+so with submits refused the panel stays 3D until the session ends —
+weave-idle lens release is runtime-side work.
 ---
  components/displayxr/android/BUILD.gn         |   6 +
  .../displayxr_window_geometry_android.cc      |  59 ++++++
@@ -64,8 +75,9 @@ dragged off-edge unscaled) costs 2D content, never a broken weave.
  .../displayxr/common/displayxr_weave.mojom    |  21 +++
  .../gpu/displayxr_display_mode_impl.cc        |  16 ++
  .../gpu/displayxr_display_mode_impl.h         |   3 +
- .../gpu/displayxr_weave_gpu_android.cc        |  41 +++--
- 10 files changed, 395 insertions(+), 12 deletions(-)
+ .../gpu/displayxr_weave_gpu_android.cc        |  71 ++++++--
+ .../gpu/displayxr_weave_gpu_android.h         |   1 +
+ 11 files changed, 426 insertions(+), 12 deletions(-)
  create mode 100644 components/displayxr/android/displayxr_window_geometry_android.cc
  create mode 100644 components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrWindowGeometry.java
 
@@ -563,29 +575,23 @@ index a756ac112fd11..c1988a4801b45 100644
  };
  
 diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.cc b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
-index df31e6591fdef..63993d78bd260 100644
+index df31e6591fdef..5783ff8b67787 100644
 --- a/components/displayxr/gpu/displayxr_weave_gpu_android.cc
 +++ b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
-@@ -69,6 +69,18 @@ bool DisplayXRWeaveGpuAndroid::BatchMode() const {
+@@ -69,6 +69,12 @@ bool DisplayXRWeaveGpuAndroid::BatchMode() const {
    // batch requirement is implied — but state it, because BatchMode() false
    // would silently route Viz onto a per-target flow this provider does not
    // implement.
-+  // browser#128 option 1 (detect-and-don't-weave): a container-scaled window
-+  // (OEM freeform mini-window; SurfaceFlinger tr=[0.67,0][0,0.67] measured on
-+  // NP02J) resamples the woven texture AFTER submission — every subpixel lands
-+  // on the wrong lens and the output is a uniform double image no geometry can
-+  // fix. BatchMode() is the boundary Viz consults at every weave decision
-+  // point, so false here routes every tile to the page-owned 2D path, and the
-+  // runtime's no-submit timeout returns the panel to 2D. A mid-frame flip can
-+  // make one frame's branches disagree; the next frame is consistent, and
-+  // scale transitions are human-speed window gestures.
-+  if (IsWindowContainerScaledAndroid()) {
-+    return false;
-+  }
++  // browser#128 option 1: the container-scaled refusal is NOT here. Gating
++  // BatchMode() turned off the whole arm INCLUDING the scratch staging, so the
++  // recovery leg had no source and scaled tiles went blank (field-verified on
++  // NP02J). The refusal lives in WeaveRectAndroid/WeaveRectsAndroid instead:
++  // the scratch is staged, the submit is refused, and the recovery leg draws
++  // the tile MONO from the scratch — live content, just flat.
    return DisplayXRWeaveClient::IsSupported() &&
           DisplayXRWeaveClient::WeaveSpecVersion() >= 7;
  }
-@@ -99,18 +111,23 @@ void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
+@@ -99,18 +105,23 @@ void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
    // Window geometry (ADR-036 D6 / XR_DXR_weave v7): REQUIRED on Android, and
    // published from here because this is where the client-area size is known.
    //
@@ -621,3 +627,68 @@ index df31e6591fdef..63993d78bd260 100644
  }
  
  bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
+@@ -118,6 +129,25 @@ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
+   if (!batch_open_ || window_rect.IsEmpty()) {
+     return false;
+   }
++  // browser#128 option 1 (detect-and-don't-weave): a container-scaled window
++  // (OEM freeform mini-window; SurfaceFlinger tr=[0.67,0][0,0.67] measured on
++  // NP02J) resamples the woven texture AFTER submission — every subpixel lands
++  // on the wrong lens; a uniform double image no geometry can fix. Refuse the
++  // SUBMIT — not the arm: the scratch was already staged, so the caller's
++  // recovery leg draws this tile MONO from the scratch (#99/#119/#120), which
++  // keeps live content on screen (a spinning cube spins, flat) instead of the
++  // blank tile a whole-arm gate produced. Runtime never sees a submit, so no
++  // scaled weave can reach the panel.
++  if (IsWindowContainerScaledAndroid()) {
++    static int s_scaled_refused = 0;
++    const int n = s_scaled_refused++;
++    if (n < 3 || (n % 300) == 0) {
++      LOG(WARNING) << "[DisplayXR] weave refused: window container is scaled "
++                      "(OEM mini-window) — tile drawn mono from scratch "
++                      "(refused=" << (n + 1) << ", browser#128 option 1)";
++    }
++    return false;
++  }
+   // Record only. The pixels are already where they belong: Viz Skia-drew this
+   // element's squeezed SBS into the shared window-sized staging image AT THIS
+   // RECT before calling us (see the class comment on why there is no blit).
+@@ -140,9 +170,26 @@ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
+ // before pushing the first, because a half-staged decomposition would submit
+ // some of a tile's pieces and silently drop the rest, which reads on the panel
+ // as a hole rather than as a failure.
++bool DisplayXRWeaveGpuAndroid::WeaveRectsAndroid_ScaledCheck() {
++  // See WeaveRectAndroid: shared refusal for the repacked N-piece leg.
++  if (!IsWindowContainerScaledAndroid()) {
++    return true;
++  }
++  static int s_scaled_refused_pieces = 0;
++  const int n = s_scaled_refused_pieces++;
++  if (n < 3 || (n % 300) == 0) {
++    LOG(WARNING) << "[DisplayXR] weave (pieces) refused: container scaled — "
++                    "mono recovery (browser#128 option 1)";
++  }
++  return false;
++}
++
+ bool DisplayXRWeaveGpuAndroid::WeaveRectsAndroid(
+     const std::vector<gfx::Rect>& rects,
+     uint32_t target_id) {
++  if (!WeaveRectsAndroid_ScaledCheck()) {
++    return false;
++  }
+   if (!batch_open_ || rects.empty()) {
+     return false;
+   }
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.h b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+index f0141bc84d0c7..3c8a78afbb6a9 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+@@ -83,6 +83,7 @@ class DisplayXRWeaveGpuAndroid : public viz::DisplayXRWeaveProvider {
+   bool SubmitInFlight(uint32_t target_id) const override;
+   bool WeaveRectAndroid(const gfx::Rect& window_rect,
+                         uint32_t target_id) override;
++  bool WeaveRectsAndroid_ScaledCheck();
+   bool WeaveRectsAndroid(const std::vector<gfx::Rect>& rects,
+                          uint32_t target_id) override;
+   bool SetBatchInputAndroid(uintptr_t ahardware_buffer,
