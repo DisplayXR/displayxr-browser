@@ -1,4 +1,4 @@
-From 5eb469a1d6ea2a1f66c2bbe30d682256110a4dae Mon Sep 17 00:00:00 2001
+From 232aa14f81da58aa27e1d77e362c7d69242c1c80 Mon Sep 17 00:00:00 2001
 From: David Fattal <dfattal@gmail.com>
 Date: Sat, 29 Aug 2026 03:53:11 +0000
 Subject: [PATCH] =?UTF-8?q?feat(android):=20browser#128=20M3=20=E2=80=94?=
@@ -65,6 +65,15 @@ so live content stays visible, just flat. Known residual, filed on the
 runtime: the lens is asserted per-weave and only released on pause/teardown,
 so with submits refused the panel stays 3D until the session ends —
 weave-idle lens release is runtime-side work.
+
+OPTION 1c (browser#186): the scaled refusal is OPT-IN via
+--inline-3d-refuse-scaled, default OFF. Refusing produced the right per-frame
+picture, but a freeform->fullscreen cycle through the refusal period wedged
+the process-global staging state (woven output black except intermittent
+bursts; survives page reload; cleared only by process restart — #186, 100%
+repro on NP02J). Default behaviour on a scaled container therefore reverts to
+weaving it — a double image, identical to every shipped release — and the
+refusal stays one flags-file line away for the #186 debugging sessions.
 ---
  components/displayxr/android/BUILD.gn         |   6 +
  .../displayxr_window_geometry_android.cc      |  59 ++++++
@@ -75,9 +84,9 @@ weave-idle lens release is runtime-side work.
  .../displayxr/common/displayxr_weave.mojom    |  21 +++
  .../gpu/displayxr_display_mode_impl.cc        |  16 ++
  .../gpu/displayxr_display_mode_impl.h         |   3 +
- .../gpu/displayxr_weave_gpu_android.cc        |  71 ++++++--
+ .../gpu/displayxr_weave_gpu_android.cc        |  92 ++++++++--
  .../gpu/displayxr_weave_gpu_android.h         |   1 +
- 11 files changed, 426 insertions(+), 12 deletions(-)
+ 11 files changed, 447 insertions(+), 12 deletions(-)
  create mode 100644 components/displayxr/android/displayxr_window_geometry_android.cc
  create mode 100644 components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrWindowGeometry.java
 
@@ -575,10 +584,44 @@ index a756ac112fd11..c1988a4801b45 100644
  };
  
 diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.cc b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
-index df31e6591fdef..5783ff8b67787 100644
+index df31e6591fdef..98a9c33912bfd 100644
 --- a/components/displayxr/gpu/displayxr_weave_gpu_android.cc
 +++ b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
-@@ -69,6 +69,12 @@ bool DisplayXRWeaveGpuAndroid::BatchMode() const {
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "base/command_line.h"
+ #include "components/displayxr/gpu/displayxr_weave_gpu_android.h"
+ 
+ #if BUILDFLAG(IS_ANDROID)
+@@ -63,12 +64,38 @@ DisplayXRWeaveGpuAndroid::DisplayXRWeaveGpuAndroid() {
+ 
+ DisplayXRWeaveGpuAndroid::~DisplayXRWeaveGpuAndroid() = default;
+ 
++namespace {
++
++// browser#128 / browser#186: the container-scaled weave REFUSAL is opt-in.
++// Refusing produced the right per-frame picture (mono via the recovery leg)
++// but a freeform->fullscreen cycle through the refusal period wedged the
++// process-global staging state — woven output black except intermittent
++// bursts, surviving page reload, cleared only by a process restart (#186,
++// 100% repro on NP02J). Until #186 is fixed (or Arch-C makes app-side scaled
++// weaving moot), the DEFAULT weaves a scaled window — a double image, the
++// same behaviour every shipped release has — and the refusal stays one
++// flags-file line away for the #186 debugging sessions:
++//   --inline-3d-refuse-scaled
++bool RefuseScaledEnabled() {
++  static const bool enabled = base::CommandLine::ForCurrentProcess()->HasSwitch(
++      "inline-3d-refuse-scaled");
++  return enabled;
++}
++
++}  // namespace
++
+ bool DisplayXRWeaveGpuAndroid::BatchMode() const {
+   // The Android path is batch-ONLY. v7 is the floor (AHardwareBuffer handle
+   // kind + xrWeaveBindWindow2DXR + explicit geometry), and v7 > v3, so the
    // batch requirement is implied — but state it, because BatchMode() false
    // would silently route Viz onto a per-target flow this provider does not
    // implement.
@@ -591,7 +634,7 @@ index df31e6591fdef..5783ff8b67787 100644
    return DisplayXRWeaveClient::IsSupported() &&
           DisplayXRWeaveClient::WeaveSpecVersion() >= 7;
  }
-@@ -99,18 +105,23 @@ void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
+@@ -99,18 +126,23 @@ void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
    // Window geometry (ADR-036 D6 / XR_DXR_weave v7): REQUIRED on Android, and
    // published from here because this is where the client-area size is known.
    //
@@ -627,7 +670,7 @@ index df31e6591fdef..5783ff8b67787 100644
  }
  
  bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
-@@ -118,6 +129,25 @@ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
+@@ -118,6 +150,25 @@ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
    if (!batch_open_ || window_rect.IsEmpty()) {
      return false;
    }
@@ -640,7 +683,7 @@ index df31e6591fdef..5783ff8b67787 100644
 +  // keeps live content on screen (a spinning cube spins, flat) instead of the
 +  // blank tile a whole-arm gate produced. Runtime never sees a submit, so no
 +  // scaled weave can reach the panel.
-+  if (IsWindowContainerScaledAndroid()) {
++  if (RefuseScaledEnabled() && IsWindowContainerScaledAndroid()) {
 +    static int s_scaled_refused = 0;
 +    const int n = s_scaled_refused++;
 +    if (n < 3 || (n % 300) == 0) {
@@ -653,13 +696,13 @@ index df31e6591fdef..5783ff8b67787 100644
    // Record only. The pixels are already where they belong: Viz Skia-drew this
    // element's squeezed SBS into the shared window-sized staging image AT THIS
    // RECT before calling us (see the class comment on why there is no blit).
-@@ -140,9 +170,26 @@ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
+@@ -140,9 +191,26 @@ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
  // before pushing the first, because a half-staged decomposition would submit
  // some of a tile's pieces and silently drop the rest, which reads on the panel
  // as a hole rather than as a failure.
 +bool DisplayXRWeaveGpuAndroid::WeaveRectsAndroid_ScaledCheck() {
 +  // See WeaveRectAndroid: shared refusal for the repacked N-piece leg.
-+  if (!IsWindowContainerScaledAndroid()) {
++  if (!RefuseScaledEnabled() || !IsWindowContainerScaledAndroid()) {
 +    return true;
 +  }
 +  static int s_scaled_refused_pieces = 0;
