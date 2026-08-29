@@ -1,0 +1,623 @@
+From c2474ce4d31ed75254279ffa7db177277544506e Mon Sep 17 00:00:00 2001
+From: David Fattal <dfattal@gmail.com>
+Date: Sat, 29 Aug 2026 03:53:11 +0000
+Subject: [PATCH] =?UTF-8?q?feat(android):=20browser#128=20M3=20=E2=80=94?=
+ =?UTF-8?q?=20report=20the=20compositor=20surface's=20true=20screen=20orig?=
+ =?UTF-8?q?in?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the M3 seam: the weave geometry's origin was a hardcoded (0,0)
+placeholder, correct only for a bottom-anchored full-width window. Measured on
+NP02J: a freeform window at true origin (2137,84) wove with its interlace phase
+referenced ~2137 px away, and an ordinary full-width window whose surface sat
+60 px below the panel top anchored 60 rows off for minutes at a time.
+
+The origin only exists in the Java UI — there is no window handle, and a pure
+MOVE raises no resize — so, exactly as the seam comment prescribed:
+
+  * DisplayXrWindowGeometry.java samples View.getLocationOnScreen() of the
+    compositor SurfaceView on a Choreographer cadence. The SURFACE, not
+    android.R.id.content: Chrome draws edge-to-edge, so the content view spans
+    the whole panel (measured (0,0) 2560x1600) while the woven surface is the
+    SurfaceView inset below the status bar ((0,60) 2560x1540). Change-gated
+    with a ~1 s heartbeat so a GPU restart or a missed transition self-heals.
+  * A new [EnableIf=is_android] SetWindowGeometry on the existing
+    DisplayXRDisplayMode interface carries it browser -> GPU (same pipe as
+    LocateViews, so the two stay ordered).
+  * The GPU provider adopts the ORIGIN half only; the SIZE stays the root-pass
+    size, which names the pixels actually being woven — pairing the true
+    origin with the root-pass size is correct even when the two disagree
+    mid-layout. Until the first report lands the geometry is bit-identical to
+    the old placeholder.
+
+Verified on NP02J end to end: the sampler reports (0,60) 2560x1540, the
+runtime's window rect shows 0,60, and with the matched plug-in change
+(leia-plugin: trust a nonzero reported y, no pre-applied inverse) the CNSDK
+anchor computes 1600-1540-60 = 0 — correct — with zero weave failures.
+
+MATCHED PAIR: a runtime whose Leia plug-in predates the trust change inverts
+truthful origins into a fixed error (bottom-origin 0 where 60 is correct,
+measured). Ship the plug-in first; an old browser reporting (0,0) keeps the
+old compensation path bit-for-bit.
+
+Per ADR-033 the browser reports geometry and NOTHING else; the weaver alone
+owns phase and snapping.
+
+OPTION 1 (detect-and-don't-weave): the Java feed also reports whether the
+window's CONTAINER is scaling the surface (OEM freeform mini-window;
+SurfaceFlinger tr=[0.67,0][0,0.67] measured on NP02J — window bounds exceed
+the display's maximum metrics, the app-visible tell). A woven texture
+resampled by any factor is a uniform double image no geometry can fix, so
+while scaled the GPU provider's BatchMode() returns false: every tile routes
+to the page-owned 2D path and the runtime's no-submit timeout returns the
+panel to 2D. Unscaled again -> weaving resumes. A false positive (window
+dragged off-edge unscaled) costs 2D content, never a broken weave.
+---
+ components/displayxr/android/BUILD.gn         |   6 +
+ .../displayxr_window_geometry_android.cc      |  59 ++++++
+ .../displayxr/DisplayXrRuntimeConnector.java  |   4 +
+ .../displayxr/DisplayXrWindowGeometry.java    | 171 ++++++++++++++++++
+ .../browser/displayxr_weave_client_android.cc |  59 ++++++
+ .../browser/displayxr_weave_client_android.h  |  27 +++
+ .../displayxr/common/displayxr_weave.mojom    |  21 +++
+ .../gpu/displayxr_display_mode_impl.cc        |  16 ++
+ .../gpu/displayxr_display_mode_impl.h         |   3 +
+ .../gpu/displayxr_weave_gpu_android.cc        |  41 +++--
+ 10 files changed, 395 insertions(+), 12 deletions(-)
+ create mode 100644 components/displayxr/android/displayxr_window_geometry_android.cc
+ create mode 100644 components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrWindowGeometry.java
+
+diff --git a/components/displayxr/android/BUILD.gn b/components/displayxr/android/BUILD.gn
+index 559bdb90d72fb..c52e33a9b83c2 100644
+--- a/components/displayxr/android/BUILD.gn
++++ b/components/displayxr/android/BUILD.gn
+@@ -14,6 +14,7 @@ generate_jni("jni_headers") {
+   sources = [
+     "java/src/org/chromium/components/displayxr/DisplayXrContextBridge.java",
+     "java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java",
++    "java/src/org/chromium/components/displayxr/DisplayXrWindowGeometry.java",
+   ]
+ }
+ 
+@@ -21,6 +22,7 @@ android_library("java") {
+   sources = [
+     "java/src/org/chromium/components/displayxr/DisplayXrContextBridge.java",
+     "java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java",
++    "java/src/org/chromium/components/displayxr/DisplayXrWindowGeometry.java",
+   ]
+   srcjar_deps = [ ":jni_headers" ]
+   deps = [
+@@ -34,11 +36,15 @@ source_set("android") {
+   sources = [
+     "displayxr_runtime_connector_android.cc",
+     "displayxr_runtime_connector_android.h",
++    "displayxr_window_geometry_android.cc",
+   ]
+   deps = [
+     ":jni_headers",
+     "//base",
++    "//components/displayxr/common:displayxr_weave_mojom",
+     "//content/public/browser",
++    "//mojo/public/cpp/bindings",
++    "//ui/gfx/geometry",
+   ]
+ }
+ 
+diff --git a/components/displayxr/android/displayxr_window_geometry_android.cc b/components/displayxr/android/displayxr_window_geometry_android.cc
+new file mode 100644
+index 0000000000000..e09e610face7f
+--- /dev/null
++++ b/components/displayxr/android/displayxr_window_geometry_android.cc
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// browser#128 (M3): browser-process end of the window-geometry feed. The Java
++// sampler (DisplayXrWindowGeometry.java) calls in on the UI thread; this owns
++// the mojo remote to the GPU process's DisplayXRDisplayMode and forwards the
++// frame verbatim. Same interface the LocateViews hop already uses, so the two
++// stay ordered on one pipe.
++
++#include "base/no_destructor.h"
++#include "components/displayxr/android/jni_headers/DisplayXrWindowGeometry_jni.h"
++#include "components/displayxr/common/displayxr_weave.mojom.h"
++#include "content/public/browser/gpu_service_registry.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace displayxr {
++
++namespace {
++
++mojo::Remote<mojom::DisplayXRDisplayMode>& GetRemote() {
++  static base::NoDestructor<mojo::Remote<mojom::DisplayXRDisplayMode>> remote;
++  return *remote;
++}
++
++}  // namespace
++
++// UI thread (Choreographer cadence). Binds lazily and re-binds after a GPU
++// restart (reset_on_disconnect leaves the remote unbound); the Java side's ~1 s
++// heartbeat guarantees the new process receives the origin promptly even when
++// the window is not moving.
++void JNI_DisplayXrWindowGeometry_OnGeometry(JNIEnv* env,
++                                            jint x,
++                                            jint y,
++                                            jint width,
++                                            jint height,
++                                            jint display_id,
++                                            jboolean container_scaled) {
++  mojo::Remote<mojom::DisplayXRDisplayMode>& remote = GetRemote();
++  if (!remote.is_bound()) {
++    content::BindInterfaceInGpuProcess(remote.BindNewPipeAndPassReceiver());
++    remote.reset_on_disconnect();
++  }
++  if (!remote.is_bound()) {
++    return;
++  }
++  remote->SetWindowGeometry(gfx::Rect(x, y, width, height), display_id,
++                            container_scaled);
++}
++
++}  // namespace displayxr
++
++// jni_zero registration: instantiates the JNI stub that routes the Java
++// DisplayXrWindowGeometryJni.get().onGeometry() call to
++// displayxr::JNI_DisplayXrWindowGeometry_OnGeometry above. Must be invoked at
++// file scope after the implementation (the generated header enforces this with
++// an unused-function trap).
++DEFINE_JNI_FOR_DisplayXrWindowGeometry()
+diff --git a/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java b/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java
+index ab780c60f82d0..cad119498322c 100644
+--- a/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java
++++ b/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrRuntimeConnector.java
+@@ -94,6 +94,10 @@ public class DisplayXrRuntimeConnector {
+             if (sWarmUpPosted) return;
+             sWarmUpPosted = true;
+         }
++        // browser#128: the warm-up marks the moment weaving becomes possible in
++        // this browser process, which is exactly when the window-geometry feed
++        // should begin. Idempotent, posts to the UI thread itself.
++        DisplayXrWindowGeometry.start();
+         PostTask.postTask(TaskTraits.USER_BLOCKING_MAY_BLOCK, () -> ensureConnected());
+     }
+ 
+diff --git a/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrWindowGeometry.java b/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrWindowGeometry.java
+new file mode 100644
+index 0000000000000..4ce0413fe42d6
+--- /dev/null
++++ b/components/displayxr/android/java/src/org/chromium/components/displayxr/DisplayXrWindowGeometry.java
+@@ -0,0 +1,171 @@
++// Copyright 2026 The Chromium Authors / DisplayXR
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.components.displayxr;
++
++import android.app.Activity;
++import android.graphics.Rect;
++import android.os.Build;
++import android.view.Choreographer;
++import android.view.Display;
++import android.view.SurfaceView;
++import android.view.View;
++import android.view.ViewGroup;
++import android.view.WindowManager;
++
++import org.jni_zero.JNINamespace;
++import org.jni_zero.NativeMethods;
++
++import org.chromium.base.ApplicationStatus;
++import org.chromium.base.ThreadUtils;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++/**
++ * browser#128 (M3): reports where the browser's content area ACTUALLY sits on
++ * the panel, so the GPU process's weave session can anchor the lenticular
++ * interlace phase to it.
++ *
++ * <p>Why this exists: the weave provider knows the surface SIZE (the root
++ * render pass) but not its screen ORIGIN — there is no window handle on
++ * Android, and a pure window MOVE raises no resize, so nothing on the native
++ * side ever learns the position. The placeholder origin (0,0) is correct only
++ * for a bottom-anchored full-width window; measured on NP02J, a freeform
++ * window at (2137,84) wove with its phase referenced ~2137 px away — visibly
++ * broken 3D 
++ *
++ * <p>Mechanism, exactly as the M3 seam prescribed: sample
++ * {@code View.getLocationOnScreen()} of the activity's content view on a
++ * Choreographer cadence, and forward changes over displayxr_weave.mojom.
++ * Change-gated with a ~1 s heartbeat: the heartbeat is what lets a restarted
++ * GPU process (whose mojo pipe died with the old one) recover the origin
++ * without waiting for the window to move.
++ *
++ * <p>The content view ({@code android.R.id.content}) is the right rect: the
++ * compositor SurfaceView fills it, and the browser toolbar lives INSIDE it —
++ * matching the root-pass-sized staging surface the weave actually fills.
++ *
++ * <p>Per ADR-033 this reports geometry and NOTHING else; the weaver alone owns
++ * phase and snapping. Multi-window Chrome (two activities, one weave session)
++ * follows the FOCUSED activity — a strict improvement on the fixed (0,0), and
++ * the full multi-session story is the rest of browser#128.
++ */
++@JNINamespace("displayxr")
++@NullMarked
++public final class DisplayXrWindowGeometry implements Choreographer.FrameCallback {
++    private static @Nullable DisplayXrWindowGeometry sInstance;
++
++    // ~1 s at 60 Hz. Cheap on both sides: the runtime dedupes identical
++    // geometry, so the steady-state cost is one no-op mojo message a second.
++    private static final int HEARTBEAT_FRAMES = 60;
++
++    private final int[] mLoc = new int[2];
++    private int mLastX = Integer.MIN_VALUE;
++    private int mLastY = Integer.MIN_VALUE;
++    private int mLastW;
++    private int mLastH;
++    private int mLastDisplay = -1;
++    private boolean mLastScaled;
++    private int mFramesSinceSent;
++
++    /** Starts the sampler. Idempotent; callable from any thread. */
++    public static void start() {
++        ThreadUtils.runOnUiThread(
++                () -> {
++                    if (sInstance != null) return;
++                    sInstance = new DisplayXrWindowGeometry();
++                    Choreographer.getInstance().postFrameCallback(sInstance);
++                });
++    }
++
++    private DisplayXrWindowGeometry() {}
++
++    @Override
++    public void doFrame(long frameTimeNanos) {
++        sample();
++        Choreographer.getInstance().postFrameCallback(this);
++    }
++
++    private void sample() {
++        Activity activity = ApplicationStatus.getLastTrackedFocusedActivity();
++        if (activity == null) return;
++        View root = activity.findViewById(android.R.id.content);
++        if (root == null) return;
++        // The COMPOSITOR SURFACE, not the content view: Chrome draws
++        // edge-to-edge, so android.R.id.content spans the whole panel
++        // (measured (0,0) 2560x1600 on NP02J) while the woven surface is the
++        // SurfaceView inset below the status bar ((0,60) 2560x1540). The
++        // surface is what the root render pass sizes to and what the weave
++        // fills, so its frame is the geometry the phase must anchor to.
++        View content = findSurfaceView(root);
++        if (content == null) content = root;
++        if (content.getWidth() == 0 || content.getHeight() == 0) return;
++        content.getLocationOnScreen(mLoc);
++        Display display = content.getDisplay();
++        int displayId = display != null ? display.getDisplayId() : 0;
++        int w = content.getWidth();
++        int h = content.getHeight();
++        // Container-scale detection (browser#128 option 1): an OEM freeform
++        // "mini window" renders the app at logical size and SCALES the whole
++        // surface for display (measured on NP02J: SurfaceFlinger
++        // tr=[0.67,0][0,0.67]). A woven texture resampled by ANY factor is
++        // destroyed — every subpixel lands on the wrong lens — so the weave
++        // must refuse. App-visible tell: the window's bounds exceed the
++        // display's maximum metrics (the OEM places a logical-size window in
++        // physical coordinates; measured bounds (1757,236,2837,1921) against a
++        // 2560x1600 panel). A window merely dragged off-edge unscaled would
++        // also trip this; the false positive costs 2D content, never a broken
++        // weave, which is the right direction to fail.
++        boolean scaled = false;
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++            WindowManager wm = activity.getWindowManager();
++            if (wm != null) {
++                Rect cur = wm.getCurrentWindowMetrics().getBounds();
++                Rect max = wm.getMaximumWindowMetrics().getBounds();
++                scaled = cur.right > max.right || cur.bottom > max.bottom
++                        || cur.left < max.left || cur.top < max.top;
++            }
++        }
++        boolean changed =
++                mLoc[0] != mLastX
++                        || mLoc[1] != mLastY
++                        || w != mLastW
++                        || h != mLastH
++                        || displayId != mLastDisplay
++                        || scaled != mLastScaled;
++        mFramesSinceSent++;
++        if (!changed && mFramesSinceSent < HEARTBEAT_FRAMES) return;
++        mLastX = mLoc[0];
++        mLastY = mLoc[1];
++        mLastW = w;
++        mLastH = h;
++        mLastDisplay = displayId;
++        mLastScaled = scaled;
++        mFramesSinceSent = 0;
++        DisplayXrWindowGeometryJni.get()
++                .onGeometry(mLoc[0], mLoc[1], w, h, displayId, scaled);
++    }
++
++    // First SurfaceView in hierarchy order — the compositor surface. A cached
++    // reference would dangle across tab-switcher rebuilds; a per-frame walk of
++    // Chrome's shallow view tree is cheap and always current. (If a page ever
++    // adds a second SurfaceView, first-in-order is still the compositor: it is
++    // attached at activity setup, before any content.)
++    private static @Nullable View findSurfaceView(View v) {
++        if (v instanceof SurfaceView) return v;
++        if (!(v instanceof ViewGroup)) return null;
++        ViewGroup g = (ViewGroup) v;
++        for (int i = 0; i < g.getChildCount(); i++) {
++            View found = findSurfaceView(g.getChildAt(i));
++            if (found != null) return found;
++        }
++        return null;
++    }
++
++    @NativeMethods
++    interface Natives {
++        void onGeometry(
++                int x, int y, int width, int height, int displayId, boolean containerScaled);
++    }
++}
+diff --git a/components/displayxr/browser/displayxr_weave_client_android.cc b/components/displayxr/browser/displayxr_weave_client_android.cc
+index 2384d10120b49..9c59b0ec88cfc 100644
+--- a/components/displayxr/browser/displayxr_weave_client_android.cc
++++ b/components/displayxr/browser/displayxr_weave_client_android.cc
+@@ -41,6 +41,7 @@
+ 
+ #include "components/displayxr/browser/displayxr_weave_client_android.h"
+ 
++#include <atomic>
+ #include <dlfcn.h>
+ #include <jni.h>
+ #include <stdlib.h>
+@@ -142,6 +143,17 @@ AndroidWeaveState& State() {
+   return *s;
+ }
+ 
++// browser#128: the Java-reported window origin. Deliberately OUTSIDE
++// AndroidWeaveState: that struct is single-threaded (weave thread) by
++// construction, while these are written by the mojo receiver on another
++// GPU-process thread. Relaxed atomics: a frame that reads a half-updated
++// (x,y) pair mid-move is indistinguishable from sampling one frame earlier.
++std::atomic<int32_t> g_java_origin_x{0};
++std::atomic<int32_t> g_java_origin_y{0};
++std::atomic<int32_t> g_java_display_id{0};
++std::atomic<bool> g_java_origin_valid{false};
++std::atomic<bool> g_java_container_scaled{false};
++
+ // The adopted runtime socket, published by gpu_main.cc's
+ // MaybePublishDisplayXRAdoptedFd(). Its presence is the signal that the
+ // browser-side connector worked and this process can talk to the runtime at
+@@ -680,6 +692,53 @@ void SetWindowGeometryAndroid(int32_t origin_x,
+   s.geometry_dirty = true;
+ }
+ 
++void SetWindowScreenOriginAndroid(int32_t x,
++                                  int32_t y,
++                                  int32_t display_id,
++                                  int32_t reported_w,
++                                  int32_t reported_h,
++                                  bool container_scaled) {
++  const bool was_scaled =
++      g_java_container_scaled.exchange(container_scaled, std::memory_order_relaxed);
++  if (was_scaled != container_scaled) {
++    LOG(WARNING) << "[DisplayXR] window container "
++                 << (container_scaled
++                         ? "SCALED (OEM mini-window) — weave refused, page "
++                           "content shows 2D (browser#128 option 1)"
++                         : "unscaled — weaving re-enabled");
++  }
++  const bool first = !g_java_origin_valid.load(std::memory_order_relaxed);
++  const bool changed = first ||
++                       g_java_origin_x.load(std::memory_order_relaxed) != x ||
++                       g_java_origin_y.load(std::memory_order_relaxed) != y;
++  g_java_origin_x.store(x, std::memory_order_relaxed);
++  g_java_origin_y.store(y, std::memory_order_relaxed);
++  g_java_display_id.store(display_id, std::memory_order_relaxed);
++  g_java_origin_valid.store(true, std::memory_order_release);
++  if (changed) {
++    // One line per distinct origin (a drag emits a handful) — the on-device
++    // ground truth for the #128 phase-anchor investigations.
++    LOG(WARNING) << "[DisplayXR] window origin (browser#128): (" << x << ","
++                 << y << ") display " << display_id << " java-view "
++                 << reported_w << "x" << reported_h
++                 << (first ? " (first report)" : "");
++  }
++}
++
++bool IsWindowContainerScaledAndroid() {
++  return g_java_container_scaled.load(std::memory_order_relaxed);
++}
++
++bool GetWindowScreenOriginAndroid(int32_t* x, int32_t* y, int32_t* display_id) {
++  if (!g_java_origin_valid.load(std::memory_order_acquire)) {
++    return false;
++  }
++  *x = g_java_origin_x.load(std::memory_order_relaxed);
++  *y = g_java_origin_y.load(std::memory_order_relaxed);
++  *display_id = g_java_display_id.load(std::memory_order_relaxed);
++  return true;
++}
++
+ std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectAndroid(
+     const DisplayXRWeaveClient::WeaveRect& rect,
+     float virtual_display_height) {
+diff --git a/components/displayxr/browser/displayxr_weave_client_android.h b/components/displayxr/browser/displayxr_weave_client_android.h
+index d53474223673a..c55a9fcbf4721 100644
+--- a/components/displayxr/browser/displayxr_weave_client_android.h
++++ b/components/displayxr/browser/displayxr_weave_client_android.h
+@@ -58,6 +58,33 @@ void SetWindowGeometryAndroid(int32_t origin_x,
+                               int32_t client_height,
+                               int32_t display_id);
+ 
++// browser#128 (M3): the browser process's Java-sampled truth for where the
++// content area sits on the panel (View.getLocationOnScreen, over
++// displayxr_weave.mojom). Adopted as the ORIGIN half of the geometry the GPU
++// provider publishes each batch; the SIZE half stays the root-pass size that
++// names the pixels actually woven. |reported_w/h| are the Java view's own
++// size, kept for a one-shot divergence diagnostic only. Thread-safe: the mojo
++// receiver and the weave batch run on different GPU-process threads, so the
++// store is atomic.
++void SetWindowScreenOriginAndroid(int32_t x,
++                                  int32_t y,
++                                  int32_t display_id,
++                                  int32_t reported_w,
++                                  int32_t reported_h,
++                                  bool container_scaled);
++
++// browser#128 option 1: true while the Java feed reports the window's
++// container scaling its surface (OEM freeform mini-window). The GPU provider
++// gates BatchMode() on it — a woven texture resampled by any factor is
++// destroyed, so refusing to weave (the page's 2D content shows) is the only
++// correct behaviour an app-side weave can offer.
++bool IsWindowContainerScaledAndroid();
++
++// The origin half back out (weave-thread side). False until the first Java
++// report lands; callers then use the (0,0)/display-0 legacy placeholder,
++// bit-identical to pre-#128 behaviour.
++bool GetWindowScreenOriginAndroid(int32_t* x, int32_t* y, int32_t* display_id);
++
+ // Off-axis (Kooima) views of one inline-3D element. Empty until the rig is
+ // live (M3).
+ std::vector<DisplayXRWeaveClient::RigView> LocateViewsForRectAndroid(
+diff --git a/components/displayxr/common/displayxr_weave.mojom b/components/displayxr/common/displayxr_weave.mojom
+index 46579febbf486..b4728c718ab1e 100644
+--- a/components/displayxr/common/displayxr_weave.mojom
++++ b/components/displayxr/common/displayxr_weave.mojom
+@@ -245,4 +245,25 @@ interface DisplayXRDisplayMode {
+   [EnableIf=is_android]
+   LocateViews(gfx.mojom.Rect element_window_rect, float virtual_display_height)
+       => (array<DisplayXRRigView> views);
++
++  // browser#128 (M3): the true on-screen frame of the browser's content area
++  // (android.R.id.content), absolute screen device px, plus its display id.
++  // Replaces the GPU provider's (0,0) placeholder origin, which anchored the
++  // interlace phase at the panel origin — correct only for a bottom-anchored
++  // full-width window, and measured wrong for everything else (a freeform
++  // window at (2137,84) wove with its phase referenced ~2137 px away).
++  // Sent by the browser process's Choreographer-cadence sampler
++  // (DisplayXrWindowGeometry.java): change-gated with a ~1 s heartbeat, so a
++  // GPU restart or a pure window MOVE (which raises no resize) self-heals
++  // within a second. Per ADR-033 this reports geometry and NOTHING else; the
++  // weaver alone owns phase and snapping.
++  // |container_scaled| (option 1, detect-and-don't-weave): true when the
++  // window's bounds exceed the display's maximum metrics — the app-visible
++  // tell of an OEM freeform "mini window" whose whole surface is scaled for
++  // display (measured 0.67x on NP02J). A woven texture resampled by any
++  // factor is destroyed, so the GPU provider refuses to weave while set and
++  // the page's own 2D content shows instead.
++  [EnableIf=is_android]
++  SetWindowGeometry(gfx.mojom.Rect frame, int32 display_id,
++                    bool container_scaled);
+ };
+diff --git a/components/displayxr/gpu/displayxr_display_mode_impl.cc b/components/displayxr/gpu/displayxr_display_mode_impl.cc
+index 3dea0d879d249..fe83fd6fc44f0 100644
+--- a/components/displayxr/gpu/displayxr_display_mode_impl.cc
++++ b/components/displayxr/gpu/displayxr_display_mode_impl.cc
+@@ -13,6 +13,10 @@
+ #include "components/displayxr/browser/displayxr_weave_client.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
++#if BUILDFLAG(IS_ANDROID)
++#include "components/displayxr/browser/displayxr_weave_client_android.h"
++#endif
++
+ namespace displayxr {
+ 
+ DisplayXRDisplayModeImpl::DisplayXRDisplayModeImpl() = default;
+@@ -86,6 +90,18 @@ void DisplayXRDisplayModeImpl::LocateViews(const gfx::Rect& element_window_rect,
+   }
+   std::move(callback).Run(std::move(out));
+ }
++
++void DisplayXRDisplayModeImpl::SetWindowGeometry(const gfx::Rect& frame,
++                                                 int32_t display_id,
++                                                 bool container_scaled) {
++  // browser#128: the Java-side truth for WHERE the content area sits on the
++  // panel. Only the ORIGIN (and display) is adopted — the weave input is sized
++  // by the root render pass, and geometry must keep naming those pixels, so
++  // the size half of |frame| is diagnostic only (a divergence means the
++  // surface is mid-layout; the origin is still the better anchor).
++  SetWindowScreenOriginAndroid(frame.x(), frame.y(), display_id, frame.width(),
++                               frame.height(), container_scaled);
++}
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/gpu/displayxr_display_mode_impl.h b/components/displayxr/gpu/displayxr_display_mode_impl.h
+index a756ac112fd11..c1988a4801b45 100644
+--- a/components/displayxr/gpu/displayxr_display_mode_impl.h
++++ b/components/displayxr/gpu/displayxr_display_mode_impl.h
+@@ -49,6 +49,9 @@ class DisplayXRDisplayModeImpl : public mojom::DisplayXRDisplayMode {
+   void LocateViews(const gfx::Rect& element_window_rect,
+                    float virtual_display_height,
+                    LocateViewsCallback callback) override;
++  void SetWindowGeometry(const gfx::Rect& frame,
++                         int32_t display_id,
++                         bool container_scaled) override;
+ #endif
+ };
+ 
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.cc b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+index df31e6591fdef..63993d78bd260 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+@@ -69,6 +69,18 @@ bool DisplayXRWeaveGpuAndroid::BatchMode() const {
+   // batch requirement is implied — but state it, because BatchMode() false
+   // would silently route Viz onto a per-target flow this provider does not
+   // implement.
++  // browser#128 option 1 (detect-and-don't-weave): a container-scaled window
++  // (OEM freeform mini-window; SurfaceFlinger tr=[0.67,0][0,0.67] measured on
++  // NP02J) resamples the woven texture AFTER submission — every subpixel lands
++  // on the wrong lens and the output is a uniform double image no geometry can
++  // fix. BatchMode() is the boundary Viz consults at every weave decision
++  // point, so false here routes every tile to the page-owned 2D path, and the
++  // runtime's no-submit timeout returns the panel to 2D. A mid-frame flip can
++  // make one frame's branches disagree; the next frame is consistent, and
++  // scale transitions are human-speed window gestures.
++  if (IsWindowContainerScaledAndroid()) {
++    return false;
++  }
+   return DisplayXRWeaveClient::IsSupported() &&
+          DisplayXRWeaveClient::WeaveSpecVersion() >= 7;
+ }
+@@ -99,18 +111,23 @@ void DisplayXRWeaveGpuAndroid::BeginBatchSync(const gfx::Size& window_size) {
+   // Window geometry (ADR-036 D6 / XR_DXR_weave v7): REQUIRED on Android, and
+   // published from here because this is where the client-area size is known.
+   //
+-  // M3 SEAM: the origin is a placeholder — (0,0) on display 0, i.e. "the client
+-  // area is the whole panel". That is exactly right for the fullscreen Android
+-  // browser window and wrong for nothing that ships today, but it is NOT the
+-  // real answer: there is no window handle and a pure MOVE raises no resize, so
+-  // the truth only exists in the Java UI. M3 samples
+-  // View.getLocationOnScreen() in a Choreographer callback, ships it over
+-  // displayxr_weave.mojom, and calls SetWindowGeometryAndroid() with it —
+-  // replacing this line and nothing else. Per ADR-033 the browser reports
+-  // geometry and NOTHING else; the weaver alone owns phase and snapping.
+-  SetWindowGeometryAndroid(/*origin_x=*/0, /*origin_y=*/0,
+-                           window_size.width(), window_size.height(),
+-                           /*display_id=*/0);
++  // M3 (browser#128): the ORIGIN comes from the browser process's
++  // Choreographer-sampled View.getLocationOnScreen() feed — there is no window
++  // handle, and a pure MOVE raises no resize, so the truth only exists in the
++  // Java UI. The SIZE stays this root-pass size: it names the pixels actually
++  // being woven, and pairing it with the true origin stays correct even when
++  // the two disagree mid-layout (measured on NP02J: a 2560x1468 surface under
++  // a 60 px status bar anchors correctly with origin y=60 and root-pass size,
++  // and 60 rows off with the old (0,0) placeholder). Until the first Java
++  // report lands this is (0,0)/display 0 — bit-identical to M1. Per ADR-033
++  // the browser reports geometry and NOTHING else; the weaver alone owns phase
++  // and snapping.
++  int32_t origin_x = 0;
++  int32_t origin_y = 0;
++  int32_t display_id = 0;
++  GetWindowScreenOriginAndroid(&origin_x, &origin_y, &display_id);
++  SetWindowGeometryAndroid(origin_x, origin_y, window_size.width(),
++                           window_size.height(), display_id);
+ }
+ 
+ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
