@@ -1,0 +1,465 @@
+From abeef52d660c71ff9b01d510852e04a4c2a5abf0 Mon Sep 17 00:00:00 2001
+From: v <v@v>
+Date: Sun, 23 Aug 2026 21:38:01 +0000
+Subject: [PATCH] =?UTF-8?q?inline-3d(#143):=20the=20Android=20per-piece=20?=
+ =?UTF-8?q?repack=20=E2=80=94=20lift=200114's=20gate?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 0114 gave overlapping inline-3D tiles a guillotine decomposition and a
+per-piece REPACK on Windows/macOS, and gated Android OFF: its weave input is
+not filled by a provider blit at all, so it had nowhere to hang a repack, and
+handing that arm N destination rects without one would have sliced the
+side-by-side midline (comp_multi_weave_android.c splits each submitted rect at
+its own INTEGER midpoint, half = rw / 2) and corrupted its eyes — exactly the
+defect browser#131 and #143 exist to kill. Composition case 12 therefore still
+looked broken on the device: the whole earthview row band at the helmet's
+height flat, including the parts nothing occludes.
+
+WHERE THE REPACK LIVES, AND WHY NOT IN THE PROVIDER. Android has no per-target
+scratch (0112 excludes it for that reason) and no second copy: viz Skia-DRAWS
+each element straight into the shared window-sized staging image at its own
+window rect. So the repack goes into that draw. For each WeaveCopy the caller
+already computed for the desktop arms, the staging draw is re-run CLIPPED to
+the copy's destination half and TRANSLATED so that half's source columns —
+taken from the virtual full-tile pair this draw already knows how to paint,
+never from the shared staging input, which is precisely the collision 0114
+dissolved — land in it. |rc.dst| and |rect.origin() + rc.src| are the same
+SIZE, so the map is a pure integer translation: no rescale, no resample, and
+therefore no new filtering question for either the backdrop (linear 2:1
+downscale) or the SBS (nearest 1:1). It covers the browser#30 backdrop
+pre-blend for free, which a hand-written per-piece formula would have had to
+get right twice; the backdrop snapshot is hoisted so N passes cost one
+makeImageSnapshot, not N.
+
+Clip first, translate second — the clip is stated in the untranslated space,
+which is the space |rc.dst| lives in.
+
+THE NO-OVERLAP PATH IS BYTE-IDENTICAL. |single_full_width| — one piece
+spanning the tile's full width, which is every frame with no overlap at all
+AND every tile demoted to 0113's row band — takes ZERO repack passes: one
+unclipped, untranslated draw and one WeaveRectAndroid, i.e. bit-for-bit the
+pre-patch code. That is 0113's standard, 0114's standard, and this patch's.
+
+The submit half is DisplayXRWeaveGpuAndroid::WeaveRectsAndroid: one batch entry
+per piece, srcRect == dstRect, no wire-protocol change. It validates every rect
+before pushing the first (a half-staged decomposition reads on the panel as a
+hole, not as a failure) and ERASES |batch_last_copied_| rather than updating it
+— after a repack the staging content at an address is a function of the whole
+decomposition, so replaying one recorded rect is unsound. Same reasoning, same
+shape as 0114's BatchCopyPiecesFrom.
+
+Everything else is 0114's, unchanged and deliberately not re-derived: the
+even-cut rule (DisplayXRSnapOccluderX — mandatory here, because Android is one
+of the two arms whose integer rw / 2 makes the right eye a texel wider on an
+odd width), the 8-rects-per-tile cap, the 32-rects-per-frame budget with
+largest-first demotion (ONE SubmitBatchSync per frame: every submit runs the
+runtime's process_atlas once, and N of those starve the SR predictor), the odd
+residual column going to the mono leg, and DisplayXRBuildRepack refusing a
+piece it cannot express (a piece narrower than 2px has hw == 0 and is refused,
+then demoted — an assertion with a safe landing, unreachable after the snap).
+
+SELF-VERIFICATION, because a demotion is never anonymous:
+  [DXR-REPACK] android per-piece repack (browser#143) ENABLED   (once, at startup)
+  [DXR-REPACK] tiles=N pieces=N demoted_cap=N demoted_budget=N refused_odd=N
+one line per frame while any decomposition is active, with the three demotion
+causes counted SEPARATELY because they want different fixes. Android-scoped:
+the Windows arm shipped with 0114 and its log volume is not this patch's to
+change.
+
+KILL SWITCH: --disable-inline-3d-android-repack, read once in viz (default ON)
+and forwarded to the GPU process by ChromeContentBrowserClient. Negative rather
+than positive so the escape hatch works even where nobody appended a positive
+switch; the name follows this fork's --disable-inline-3d-occlusion convention.
+
+0114's in-code gate comment is UPDATED, not deleted: it now says the repack
+exists and points at it.
+
+NOT DONE: no device testing (not this change's job), nothing pushed, no PR.
+---
+ .../browser/chrome_content_browser_client.cc  |  16 ++
+ .../gpu/displayxr_weave_gpu_android.cc        |  35 ++++
+ .../gpu/displayxr_weave_gpu_android.h         |   2 +
+ .../displayxr_weave_provider.cc               |   9 +
+ .../displayxr_weave_provider.h                |  21 +++
+ .../skia_output_surface_impl_on_gpu.cc        | 177 ++++++++++++++++--
+ 6 files changed, 247 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index cb1a0cfd47511..2f380e8f62f09 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2891,6 +2891,22 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+         !command_line->HasSwitch("inline-3d-dp-overlay")) {
+       command_line->AppendSwitch("inline-3d-dp-overlay");
+     }
++#if BUILDFLAG(IS_ANDROID)
++    // (browser#143) The Android per-piece repack kill switch. Unlike the
++    // switches above this one is NEGATIVE — the repack is default-ON in viz
++    // (DisplayXRAndroidRepackEnabled), so what has to reach the GPU process is
++    // the request to turn it OFF. Forwarded here, before any process_type
++    // branch, for the same reason --inline-3d-occlusion is: it is read in the
++    // GPU process, and on Android the command line only exists in the browser
++    // process until this function copies it down. Guarded IS_ANDROID because
++    // the only reader lives under the same guard in viz — on other platforms
++    // this would forward a switch nobody reads (browser#147 review).
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++            "disable-inline-3d-android-repack") &&
++        !command_line->HasSwitch("disable-inline-3d-android-repack")) {
++      command_line->AppendSwitch("disable-inline-3d-android-repack");
++    }
++#endif  // BUILDFLAG(IS_ANDROID)
+ #if BUILDFLAG(IS_WIN)
+     // The weave input is an NT-shared keyed-mutex D3D11 texture the DisplayXR
+     // service creates on the runtime's adapter — the high-performance discrete
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.cc b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+index c8eb11c1d69f8..df31e6591fdef 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.cc
+@@ -129,6 +129,41 @@ bool DisplayXRWeaveGpuAndroid::WeaveRectAndroid(const gfx::Rect& window_rect,
+   return true;
+ }
+ 
++// (browser#143) The N-piece form. Viz has repacked this target's eye pair into
++// each piece's own footprint inside the shared staging image (two clipped,
++// translated Skia passes per piece), so a piece is a self-contained
++// side-by-side pair exactly as wide as itself — srcRect == dstRect, and the
++// runtime's existing "split the submitted rect at its own midpoint" rule is
++// already correct on it. Nothing to copy; record one entry per piece.
++//
++// ALL OR NOTHING, like the Windows BatchCopyPiecesFrom: validate every rect
++// before pushing the first, because a half-staged decomposition would submit
++// some of a tile's pieces and silently drop the rest, which reads on the panel
++// as a hole rather than as a failure.
++bool DisplayXRWeaveGpuAndroid::WeaveRectsAndroid(
++    const std::vector<gfx::Rect>& rects,
++    uint32_t target_id) {
++  if (!batch_open_ || rects.empty()) {
++    return false;
++  }
++  for (const gfx::Rect& r : rects) {
++    if (r.IsEmpty() || r.x() < 0 || r.y() < 0) {
++      return false;
++    }
++  }
++  for (const gfx::Rect& r : rects) {
++    batch_entries_.push_back({target_id, r});
++  }
++  // (web#12 / browser#143) NOT recorded as keepable, and DROPPED if it was.
++  // |batch_last_copied_| means "this target's whole pair is at this one rect";
++  // after a repack the staging content at a given address is a function of the
++  // whole decomposition, which changes shape as the occluder moves. Replaying
++  // one recorded rect is unsound, so the record is erased rather than updated
++  // — the decline becomes structural instead of a flag someone must remember.
++  batch_last_copied_.erase(target_id);
++  return true;
++}
++
+ // (web#12, patch 0074) Stage this target's entry WITHOUT a copy, so the runtime
+ // re-weaves the pixels already sitting at |window_rect| in the shared staging
+ // image. Honoured only when |batch_last_copied_| says this exact target wrote
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu_android.h b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+index a001fa13e345a..f0141bc84d0c7 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu_android.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu_android.h
+@@ -83,6 +83,8 @@ class DisplayXRWeaveGpuAndroid : public viz::DisplayXRWeaveProvider {
+   bool SubmitInFlight(uint32_t target_id) const override;
+   bool WeaveRectAndroid(const gfx::Rect& window_rect,
+                         uint32_t target_id) override;
++  bool WeaveRectsAndroid(const std::vector<gfx::Rect>& rects,
++                         uint32_t target_id) override;
+   bool SetBatchInputAndroid(uintptr_t ahardware_buffer,
+                             int acquire_fence_fd) override;
+   bool TryTakeWovenResult(uint32_t target_id, Result* out) override;
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.cc b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+index 261891e1eeeaa..71e0f919028b5 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.cc
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.cc
+@@ -53,6 +53,15 @@ bool DisplayXRWeaveProvider::SetBatchOverlayAndroid(
+     uintptr_t ahardware_buffer) {
+   return false;
+ }
++
++// (browser#143) N-piece submit default: refuse. See the header — a provider
++// with no shared window-sized staging image has no per-piece geometry to
++// record, and the caller treats false exactly as a failed handoff.
++bool DisplayXRWeaveProvider::WeaveRectsAndroid(
++    const std::vector<gfx::Rect>& rects,
++    uint32_t target_id) {
++  return false;
++}
+ #endif
+ 
+ #if BUILDFLAG(IS_WIN)
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index 86e17a9d36a98..eb8901a1ba863 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -233,6 +233,27 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   // The provider always consumes the fd.
+   virtual bool SetBatchInputAndroid(uintptr_t ahardware_buffer,
+                                     int acquire_fence_fd) = 0;
++
++  // (browser#143) The N-piece form of WeaveRectAndroid: stage ONE batch entry
++  // per rect in |rects|, for a target whose eye pair has been REPACKED into
++  // those rects' own footprints.
++  //
++  // There is deliberately no WeaveCopy list here, and that asymmetry with the
++  // Windows/macOS WeaveCanvasPieces is the Android design showing through
++  // rather than a gap. On win/mac the provider owns the shared input and does
++  // the repack blit itself; on Android the caller ALREADY draws each element
++  // into the shared staging image with Skia (see the class comment above), so
++  // it does the repack in that same draw — two clipped, translated passes per
++  // piece instead of one full-rect pass — and by the time the provider is
++  // called the pixels are already where they belong. The provider's whole job
++  // is, as ever, to record geometry.
++  //
++  // Default REFUSES, like the Windows/macOS pieces calls: a provider with no
++  // shared, window-sized staging image has no such geometry to record, and
++  // answering "yes" would claim a submit that never happened. The caller reads
++  // false as a handoff failure and takes its pre-existing road.
++  virtual bool WeaveRectsAndroid(const std::vector<gfx::Rect>& rects,
++                                 uint32_t target_id);
+ #endif
+ 
+   // If a completed weave result for |target_id| is available and not yet taken,
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index ebcbff4ab53c6..4d1013b250d48 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2960,6 +2960,34 @@ constexpr size_t kDisplayXRMaxRectsPerTile = 8;
+ // one frame and a starved vendor motion predictor. One frame, one submit.
+ constexpr size_t kDisplayXRMaxRectsPerFrame = 32;
+ 
++#if BUILDFLAG(IS_ANDROID)
++// (browser#143) THE ANDROID REPACK KILL SWITCH.
++//
++// Default ON, disabled by --disable-inline-3d-android-repack. That shape is
++// this fork's convention for an inline-3D sub-feature that is part of the
++// product rather than an experiment (--inline-3d-occlusion is default-appended
++// in chrome_main_delegate.cc and beaten by --disable-inline-3d-occlusion); the
++// difference here is that the NEGATIVE switch is what viz reads, so the kill
++// switch works even where nobody appended a positive one.
++// ChromeContentBrowserClient::AppendExtraCommandLineSwitches forwards it to
++// the GPU process, which is where this runs.
++//
++// Read ONCE (function-local static) rather than per frame, and it logs what it
++// resolved to: a device capture must be able to prove which code path it is
++// looking at without a rebuild.
++bool DisplayXRAndroidRepackEnabled() {
++  static const bool enabled = [] {
++    const bool on = !base::CommandLine::ForCurrentProcess()->HasSwitch(
++        "disable-inline-3d-android-repack");
++    LOG(WARNING) << "[DXR-REPACK] android per-piece repack (browser#143) "
++                 << (on ? "ENABLED"
++                        : "DISABLED (--disable-inline-3d-android-repack)");
++    return on;
++  }();
++  return enabled;
++}
++#endif  // BUILDFLAG(IS_ANDROID)
++
+ }  // namespace
+ 
+ // static
+@@ -3516,21 +3544,31 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     }
+     // (browser#143) The two arms that must NOT decompose.
+     //
+-    // ANDROID: its weave input is not filled by a provider-side blit at all —
+-    // the element is SKIA-DRAWN into a shared staging image at its full window
+-    // rect and the geometry call records only the rect (see WeaveRectAndroid).
+-    // Handing that arm several destination rects without its own per-piece
+-    // repack would corrupt its eyes exactly as an unrepacked Windows submit
+-    // would. The Android repack lands with the rest of that arm (blocked on
+-    // #122 / tracked in #100); until then Android stays on 0113's row band,
+-    // gated HERE so it cannot silently regress the device samples pass.
++    // ANDROID — THE GATE IS LIFTED, and the reason it existed is worth
++    // keeping because it is also the shape of the fix. Android's weave input is
++    // not filled by a provider-side blit at all: the element is SKIA-DRAWN into
++    // the shared staging image at its full window rect and the geometry call
++    // records only the rect (see WeaveRectAndroid). The runtime then splits
++    // each submitted rect at its own integer midpoint (`half = rw / 2`,
++    // comp_multi_weave_android.c), so handing that arm several destination
++    // rects WITHOUT a per-piece repack slices the side-by-side midline and
++    // corrupts its eyes exactly as an unrepacked Windows submit would.
++    //
++    // The repack now exists, and it lives in that same Skia draw rather than in
++    // the provider (there is no second copy to hang it off): for each piece the
++    // staging draw runs TWICE more, clipped to the piece's two eye halves and
++    // TRANSLATED so the piece's own left/right source columns land in them. See
++    // "THE ANDROID PER-PIECE REPACK" further down this function, and
++    // DisplayXRWeaveGpuAndroid::WeaveRectsAndroid for the submit half.
++    // --disable-inline-3d-android-repack puts this arm back on 0113's row band.
+     //
+     // NON-BATCH PROVIDERS: the repack is a property of the ONE shared
+     // window-sized input. A spec-v2 runtime (or async mode) gives each target
+     // its own input holding exactly one pair at its origin, which N rects
+     // cannot address.
+ #if BUILDFLAG(IS_ANDROID)
+-    const bool decompose = false;
++    const bool decompose =
++        provider->BatchMode() && DisplayXRAndroidRepackEnabled();
+ #else
+     const bool decompose = provider->BatchMode();
+ #endif
+@@ -3773,6 +3811,35 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+                    << total_rects << " rect(s) (events=" << (n + 1) << ")";
+       }
+     }
++#if BUILDFLAG(IS_ANDROID)
++    // ---- (browser#143) SELF-VERIFICATION -------------------------------
++    //
++    // ONE line per frame, and only while a decomposition is actually in play
++    // (an overlapping pair is rare and transient, so this is not a per-frame
++    // log in the steady state). It is the whole device sweep in one string:
++    // that the repack path ran at all, how many tiles took it, how many rects
++    // that cost, and — separately, because they want different fixes — each
++    // way a tile was sent back to 0113's row band instead.
++    //
++    // Android-scoped deliberately: the Windows arm shipped with 0114 and its
++    // log volume is not this patch's to change.
++    {
++      size_t rp_tiles = 0;
++      size_t rp_pieces = 0;
++      for (size_t i = 0; i < own.size(); ++i) {
++        if (topmost_pieces[i].size() > 1) {
++          ++rp_tiles;
++          rp_pieces += topmost_pieces[i].size();
++        }
++      }
++      if (rp_tiles > 0 || capped > 0 || demoted > 0 || unexpressible > 0) {
++        LOG(WARNING) << "[DXR-REPACK] tiles=" << rp_tiles
++                     << " pieces=" << rp_pieces << " demoted_cap=" << capped
++                     << " demoted_budget=" << demoted
++                     << " refused_odd=" << unexpressible;
++      }
++    }
++#endif  // BUILDFLAG(IS_ANDROID)
+     if (pairs > 0) {
+       // 0073's discipline (first 3, then 1-in-300). An overlap is never
+       // silent: the SUBTRACT path costs nothing but the FALLBACK path is a
+@@ -3842,9 +3909,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+     // exactly what 0113 submitted, so it takes 0113's exact call — one
+     // contiguous source sub-rect, one destination rect — and the no-overlap
+     // path is byte-identical, which is 0113's own standard and stays 0114's.
+-    // Everything else goes through the repack. [[maybe_unused]] for the same
+-    // reason as |weave_src_y| above (browser#144): the Android arm submits a
+-    // rect and never chooses between handoff shapes.
++    // Everything else goes through the repack. [[maybe_unused]] is kept for
++    // the platforms that have no weave arm at all (browser#144); the Android
++    // arm READS it now — it picks between the plain full-rect staging draw +
++    // WeaveRectAndroid and the repacked multi-pass draw + WeaveRectsAndroid.
+     [[maybe_unused]] const bool single_full_width =
+         pieces.size() == 1 && pieces[0].x() == rect.x() &&
+         pieces[0].width() == rect.width();
+@@ -4333,9 +4401,79 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+           // Result: the tile becomes opaque (alpha = 1), which the gate handles
+           // correctly, and which also moots the premultiplied-vs-straight alpha
+           // conflict inside the tile (see displayxr-runtime#771).
++#if BUILDFLAG(IS_ANDROID)
++          // ---- (browser#143) THE ANDROID PER-PIECE REPACK -----------------
++          //
++          // On Android this draw IS the weave staging: |dst_offset| is the
++          // tile's window origin and the destination is the shared,
++          // window-sized staging image. The runtime later splits every
++          // submitted rect at its OWN integer midpoint into the two eyes, so a
++          // piece of a tile cannot simply be submitted as a sub-rect of the
++          // full-width pair — the split would land inside one eye. The piece
++          // has to be REPACKED: its own left-eye columns written into its own
++          // left half and its right-eye columns into its own right half, so the
++          // pair ends up exactly as wide as the piece and sitting at the
++          // piece's own window position (srcRect == dstRect, no protocol
++          // change, exactly as on Windows).
++          //
++          // The repack is expressed as a CLIP plus a TRANSLATION of this very
++          // draw, run once per WeaveCopy, and that is the whole trick:
++          //   * |rc.dst| is where the half goes, in window/staging px;
++          //   * |rect.origin() + rc.src| is where that content sits in the
++          //     virtual FULL-tile pair this draw already knows how to paint;
++          //   * the two are the same SIZE, so the map between them is a pure
++          //     integer translation — no rescale, no resample, and therefore
++          //     no new filtering question for either the backdrop (linear 2:1
++          //     downscale) or the SBS (nearest 1:1).
++          // Clip first, translate second: the clip is taken in the untranslated
++          // space, which is the space |rc.dst| is stated in.
++          //
++          // It also covers the BACKDROP pre-blend automatically, which a
++          // hand-written per-piece formula would have had to get right twice:
++          // the backdrop is painted into the same virtual pair space, so the
++          // same translation carries it.
++          //
++          // |single_full_width| — one piece spanning the tile's full width,
++          // which includes every frame with no overlap at all and every tile
++          // demoted to 0113's row band — takes ZERO passes of this: one
++          // unclipped, untranslated draw, i.e. bit-for-bit the pre-existing
++          // code. That is what keeps the no-overlap path byte-identical.
++          sk_sp<SkImage> repack_backdrop;
++          const size_t repack_passes =
++              single_full_width ? static_cast<size_t>(1)
++                                : topmost_copies[t].size();
++          for (size_t rp = 0; rp < repack_passes; ++rp) {
++            SkCanvas* repack_canvas = scratch_surface->getCanvas();
++            repack_canvas->save();
++            if (!single_full_width) {
++              const DisplayXRWeaveProvider::WeaveCopy& rc =
++                  topmost_copies[t][rp];
++              repack_canvas->clipRect(
++                  SkRect::MakeXYWH(static_cast<float>(rc.dst.x()),
++                                   static_cast<float>(rc.dst.y()),
++                                   static_cast<float>(rc.dst.width()),
++                                   static_cast<float>(rc.dst.height())),
++                  /*doAntiAlias=*/false);
++              repack_canvas->translate(
++                  static_cast<float>(rc.dst.x() - rect.x() - rc.src.x()),
++                  static_cast<float>(rc.dst.y() - rect.y() - rc.src.y()));
++            }
++#endif  // BUILDFLAG(IS_ANDROID)
+           if (src_from_canvas) {
++#if BUILDFLAG(IS_ANDROID)
++            // Snapshotted ONCE across all repack passes: the region is the same
++            // every pass (the translation moves the DESTINATION, not the source
++            // of the page backdrop), and a per-pass snapshot would copy rw*rh
++            // texels up to 2 * kDisplayXRMaxRectsPerTile times.
++            if (!repack_backdrop) {
++              repack_backdrop = output->makeImageSnapshot(
++                  SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
++            }
++            sk_sp<SkImage> backdrop = repack_backdrop;
++#else
+             sk_sp<SkImage> backdrop = output->makeImageSnapshot(
+                 SkIRect::MakeXYWH(rect.x(), rect.y(), rw, rh));
++#endif  // BUILDFLAG(IS_ANDROID)
+             if (backdrop) {
+               // The weave input is a side-by-side pair (the weave path is
+               // 2-view: process_atlas(..., W/2, H, 2, 1, ...)). Phase 2's
+@@ -4422,6 +4560,10 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+               src_img.get(), src, dst,
+               SkSamplingOptions(SkFilterMode::kNearest), &paint,
+               SkCanvas::kStrict_SrcRectConstraint);
++#if BUILDFLAG(IS_ANDROID)
++            repack_canvas->restore();
++          }  // (browser#143) repack pass
++#endif  // BUILDFLAG(IS_ANDROID)
+           FlushSurface(scratch_surface, send, scratch_write.get());
+           if (gr_context()) {
+             gr_context()->submit();
+@@ -4648,7 +4790,16 @@ void SkiaOutputSurfaceImplOnGpu::WeaveCompositedSurface(SkSurface* output,
+         // in the staging image too — the upper tile draws last over the
+         // overlap), but it may only SUBMIT the rows it still owns, or it would
+         // sample the neighbour's pixels into its own eyes.
+-        bool submitted = provider->WeaveRectAndroid(weave, st.slot);
++        // (browser#143) …or, when this tile owns less than its full width,
++        // the REPACKED form. The staging draw above has already written each
++        // piece's own eye pair inside that piece's own footprint, so all that
++        // is left is ONE batch entry per piece — srcRect == dstRect, no wire
++        // change, exactly as on Windows. |weave| (the bounding box) is not the
++        // submit for that case: it would re-assert the occluded region.
++        bool submitted =
++            single_full_width
++                ? provider->WeaveRectAndroid(weave, st.slot)
++                : provider->WeaveRectsAndroid(pieces, st.slot);
+ #else
+         // (3) ProduceOverlayForWeave the scratch (SCANOUT-gate-free) to get its
+         // raw ID3D11Texture2D.

@@ -1,0 +1,202 @@
+From bc21555dcee2c14964748309374e13cabfc20c03 Mon Sep 17 00:00:00 2001
+From: DisplayXR <dev@displayxr.invalid>
+Date: Wed, 26 Aug 2026 23:56:57 -0700
+Subject: [PATCH] inline-3d(#164): score the geometric join against the
+ candidate AS CLIPPED
+
+A 3D tile inside an `overflow:auto` panel drops to raw side-by-side once
+roughly 30% of it is scrolled out of the panel -- reported on an 8K/300% box,
+and now reproduced on a 4K/250% one, which rules out the DPI reading the issue
+opens with.
+
+MEASURED, composition sample case 08, sweeping the inner scroller through
+0/15/30/45/60% clipped (0.1.19 + patch 0119, Leia panel):
+
+  inline-3D NO match for target=1407,766 950x420 among 39 root quads
+    (best rejected score=532/1000, bar=700, clip=0,218 3840x1822)
+  inline-3D ID-MATCH FALLBACK: ... target=1407,766 950x420 ... elsewhere=0
+  inline-3D withheld 1 of 2 weave rects ...
+
+`clip=0,218 3840x1822` is THE VIEWPORT. The panel's clip is nowhere in it.
+
+THE ASYMMETRY. `RootResourceQuad::rect` is deliberately the UNCLIPPED quad
+rect, while a tracked element rect has ALREADY been cut by its ancestor clip
+chain -- patch 0111 (browser#130) does that in cc, on purpose, so the weave can
+never paint outside a container. `overlap_score` then normalises the
+intersection by `max(area)`, which is the unclipped area, so the ratio IS the
+element's visible fraction and the 700 overlap bar silently becomes a
+70%-VISIBILITY bar. Below it the tile matches nothing, is neither suppressed
+nor woven, and the page draws its own side-by-side buffer.
+
+That is browser#117's defect verbatim, returning through a door 0082 did not
+close. 0082 made the comparison clip-symmetric via `common_clip_for`, but the
+only clip a tracked rect carries is `root_target_clip` -- the SURFACE's
+footprint, i.e. the embedding window. A nested panel's clip never reaches it,
+so both sides get cut by the viewport and neither by the thing that actually
+cut one of them.
+
+THE FIX, from the other side, with a quantity the aggregator already has.
+Record each candidate's OWN clip (the SharedQuadState's `clip_rect`, mapped to
+root space) and cut the candidate with it before scoring. It is the SAME clip
+chain cc applied to the tracked rect, so the two become comparable by
+construction and a clipped tile scores ~1000 against its own quad at any
+visibility.
+
+Deliberately NOT the alternative: plumbing the ancestor clip from cc through
+`TrackedElementRect`, the mojom and the traits. That is the same fact travelling
+a second time, over thirty files, when it is already sitting on the quad.
+
+`clip_rect` ONLY, never `visible_rect`. A clip is a layout fact both sides
+share; visible_rect also carries OCCLUSION, which a tracked rect knows nothing
+about -- scoring against it would break joins that work today, and browser#167
+is precisely the case where a tile's visible_rect goes empty while its element
+rect does not.
+
+WHY IT CANNOT REGRESS A WORKING JOIN. Intersecting the candidate can only
+shrink `max(area)`, so scores only ever RISE: no match that clears the bar
+today can stop clearing it. Nor does it loosen the join -- the metric is still
+intersection / max(area), so a small clipped quad sitting inside a large target
+still scores its own area over the target's and is still rejected. The only
+thing that stops being punished is the case that was never a mismatch: the same
+element, cut.
+
+The miss log gains `cands_with_clip=`. Zero there, next to a near-miss score,
+would say cc folded the panel's clip into the quad geometry rather than onto
+the SharedQuadState -- the one shape this fix cannot see, and the first thing
+to check before guessing again.
+
+Standing repro: composition case 08 in displayxr-web, which is where this was
+measured.
+---
+ .../viz/service/display/surface_aggregator.cc | 55 ++++++++++++++++++-
+ .../viz/service/display/surface_aggregator.h  | 23 ++++++++
+ 2 files changed, 76 insertions(+), 2 deletions(-)
+
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 6ec9df2..7d3b9c1 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -1549,6 +1549,18 @@ void SurfaceAggregator::CopyQuadsToPass(
+           // browser#131: stamp the recording position as this quad's
+           // front-to-back index (see RootResourceQuad::order).
+           const size_t quad_order = root_resource_quads_.size();
++          // browser#164: and record the quad's OWN clip in root space. The SQS
++          // clip_rect lives in the DEST PASS's target space, not in the quad's
++          // content space, so it maps with |transform_to_root_target| ALONE —
++          // no PreConcat of quad_to_target_transform, which would apply the
++          // quad's own placement a second time. (Same distinction
++          // ComputeInline3dPlaneSplit makes when it intersects a mapped quad
++          // rect with an unmapped clip_rect.)
++          std::optional<gfx::Rect> clip_in_root;
++          if (dest_sqs && dest_sqs->clip_rect) {
++            clip_in_root = cc::MathUtil::MapEnclosingClippedRect(
++                dest_pass->transform_to_root_target, *dest_sqs->clip_rect);
++          }
+           root_resource_quads_.push_back(
+               {quad_data.remapped_resource_id,
+                cc::MathUtil::MapEnclosingClippedRect(to_root, quad->rect),
+@@ -1557,7 +1569,8 @@ void SurfaceAggregator::CopyQuadsToPass(
+                uv, dest_sqs ? dest_sqs->layer_id : 0u,
+                dest_sqs ? dest_sqs->layer_namespace_id
+                         : std::pair<uint32_t, uint32_t>(),
+-               dest_pass->id, from_root_resolved_pass, quad_order});
++               dest_pass->id, from_root_resolved_pass, quad_order,
++               clip_in_root});
+         }
+       }
+     }
+@@ -2552,6 +2565,7 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+     // when exactly one candidate qualifies — the slow-scroll/steady case.
+     int64_t best_score = -1;
+     int64_t best_rejected = -1;
++    size_t clipped_cands = 0;
+     for (const RootResourceQuad& cand : quads) {
+       // browser#117: candidates recorded for DIAGNOSIS ONLY are not join
+       // candidates. This restores the exact pool the recording condition used
+@@ -2559,7 +2573,38 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+       if (!cand.from_root_resolved_pass) {
+         continue;
+       }
+-      const gfx::Rect& qr = cand.rect;
++      // ---- (browser#164) SCORE THE CANDIDATE AS IT IS ACTUALLY CLIPPED ----
++      //
++      // |cand.rect| is the UNCLIPPED quad rect, while |target| is a tracked
++      // element rect that cc already cut with its ancestor clip chain
++      // (browser#130). Scoring one against the other normalises by the
++      // unclipped area, i.e. by the element's VISIBLE FRACTION — so the 700
++      // overlap bar silently becomes a 70%-VISIBILITY bar and a tile in an
++      // `overflow:auto` panel stops matching its own quad once ~30% of it is
++      // scrolled out. It is then neither suppressed nor woven and the page
++      // draws its raw side-by-side buffer. That is browser#117's defect
++      // exactly, returning through a door 0082 did not close: |clip| below is
++      // the SURFACE's footprint, and a nested panel's clip is not that.
++      //
++      // Measured on the composition sample's case 08, at 30% clipped:
++      //   NO match for target=1407,766 950x420 … best rejected score=532/1000,
++      //   bar=700, clip=0,218 3840x1822          <- the viewport, not the panel
++      //
++      // The candidate's own clip closes it from the other side, and it is the
++      // SAME clip chain cc applied to |target| — so the two are comparable by
++      // construction and a clipped tile scores ~1000 at any visibility.
++      //
++      // This can only RAISE scores, never lower them, so it cannot drop a
++      // match that works today. Nor does it loosen the join into false
++      // positives: the metric is still intersection / max(area), so a small
++      // clipped quad inside a big target still scores its own area over the
++      // target's and is still rejected. What it stops rewarding is the one
++      // case that was never a mismatch to begin with — the same element, cut.
++      gfx::Rect qr = cand.rect;
++      if (cand.clip_rect) {
++        ++clipped_cands;
++        qr.Intersect(*cand.clip_rect);
++      }
+       if (qr.IsEmpty()) {
+         continue;
+       }
+@@ -2593,6 +2638,12 @@ AggregatedFrame SurfaceAggregator::Aggregate(
+                 << target.ToString() << " among " << quads.size()
+                 << " root quads (best rejected score=" << best_rejected
+                 << "/1000, bar=700, clip=" << clip.ToString()
++                // browser#164: how many candidates carried a clip of their own.
++                // Zero here, with a near-miss score, says cc folded the panel's
++                // clip into the quad geometry instead of onto the SQS — the one
++                // shape this fix cannot see, and worth knowing before guessing
++                // again.
++                << ", cands_with_clip=" << clipped_cands
+                 << ") — overlay left to the page this frame";
+       }
+     }
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+index 61bf468..7452846 100644
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -547,6 +547,29 @@ class VIZ_SERVICE_EXPORT SurfaceAggregator : public SurfaceObserver {
+     // order, smaller == closer to the viewer. Recorded rather than re-derived
+     // because the joins below hand out a COPY of the entry, not its position.
+     size_t order = 0;
++    // browser#164: the quad's OWN clip, in root space — the SharedQuadState's
++    // |clip_rect| mapped through the dest pass's transform_to_root_target.
++    // Nullopt when the quad carries no clip, which is the common case.
++    //
++    // The geometric join needs it because |rect| above is deliberately the
++    // UNCLIPPED quad rect while a tracked element rect is already cut by its
++    // ancestor clip chain (browser#130 does that in cc). Comparing the two
++    // directly normalises the intersection by the UNCLIPPED area, which is the
++    // element's visible fraction — the exact degeneration browser#117 was
++    // meant to end, returning through a door 0082 did not close: that patch
++    // made the comparison symmetric in the SURFACE's clip, and a nested
++    // `overflow:auto` panel's clip is not that. Cutting the candidate with its
++    // own clip restores the symmetry from the other side, using a quantity the
++    // aggregator already has, and it is the SAME clip chain cc applied to the
++    // tracked rect — so a clipped tile scores against its own quad at ~1000
++    // again, at any visibility.
++    //
++    // |clip_rect| ONLY, never |visible_rect|: a clip is a layout fact both
++    // sides share, while visible_rect also carries OCCLUSION, which the tracked
++    // rect knows nothing about. Scoring against an occluded quad's visible_rect
++    // would break the joins that work today (and browser#167 is precisely a
++    // tile whose visible_rect goes empty while its element rect does not).
++    std::optional<gfx::Rect> clip_rect;
+   };
+   std::vector<RootResourceQuad> root_resource_quads_;
+   // browser#117: how many diagnostic-only (non-root-resolved-pass) entries are

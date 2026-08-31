@@ -21,7 +21,23 @@
 #   AWS_REGION    default us-east-1
 #   INSTANCE_ID   the Chromium build box
 #   GH_ORG/GH_REPO/GH_ENV   trust scoping
-#   ROLE_NAME / ARTIFACT_BUCKET
+#   ROLE_NAME / POLICY_NAME / ARTIFACT_BUCKET
+#   MAX_SESSION_DURATION  seconds; must be >= the workflow's role-duration-seconds (7200).
+#                 IAM defaults a NEW role to 3600 and SWE-DEV cannot raise it afterwards.
+#   BUCKET_SID    Sid of THIS lane's statement in the artifact-bucket policy. Must differ
+#                 per lane: put-bucket-policy replaces the whole document, so two lanes
+#                 sharing a Sid means provisioning one REVOKES the other's upload.
+#   SSM_DOCUMENT  AWS-RunPowerShellScript (Windows box, the default) or AWS-RunShellScript
+#                 (the Linux/Android box). This is NOT cosmetic: the document name is part
+#                 of the RunTheBuildViaSSM resource ARN, and a mismatch surfaces as an
+#                 AccessDeniedException on SendCommand rather than "no such document" —
+#                 expensive to diagnose. Set it to match the lane you are provisioning.
+#
+# The Linux/Android twin (docs/oidc-build-lane.md "Porting checklist") is therefore:
+#   INSTANCE_ID=<linux box> GH_ENV=build-box-android \
+#   ROLE_NAME=DisplayXRBrowserAndroidBuildBox POLICY_NAME=AndroidBuildBoxAndArtifacts \
+#   SSM_DOCUMENT=AWS-RunShellScript BUCKET_SID=AndroidBuildBoxInstanceMayUploadBuildsOnly \
+#   scripts/aws/setup-oidc.sh --apply
 set -uo pipefail
 
 APPLY=0
@@ -36,6 +52,17 @@ GH_ENV="${GH_ENV:-build-box}"
 ROLE_NAME="${ROLE_NAME:-DisplayXRBrowserBuildBox}"
 POLICY_NAME="${POLICY_NAME:-BuildBoxAndArtifacts}"
 ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-displayxr-browser-artifacts}"
+# The SSM document the workflow's ssm-run.sh will SendCommand against. Windows =
+# AWS-RunPowerShellScript (the default, so the existing invocation is unchanged);
+# Linux/Android = AWS-RunShellScript. Must agree with SSM_DOCUMENT in ssm-run.sh.
+SSM_DOCUMENT="${SSM_DOCUMENT:-AWS-RunPowerShellScript}"
+# MUST be >= the workflow's role-duration-seconds (both lanes ask for 7200). IAM defaults a
+# new role to 3600, and configure-aws-credentials then fails the whole run with "The requested
+# DurationSeconds exceeds the MaxSessionDuration set for this role" — before the box is even
+# started, so the `if: always()` stop step ALSO cannot authenticate and the instance is left
+# billing. Set it at CREATE time: SWE-DEV is denied iam:UpdateRole, so it cannot be raised
+# afterwards without deleting and recreating the role.
+MAX_SESSION_DURATION="${MAX_SESSION_DURATION:-7200}"
 # The account-standard SSM instance profile (20+ instances use it). SWE-DEV can attach an
 # EXISTING profile (ec2:AssociateIamInstanceProfile is allowed) but cannot mint a new one
 # (iam:CreateInstanceProfile / AddRoleToInstanceProfile are DENIED), so we reuse this one
@@ -59,7 +86,7 @@ ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>/dev/null
   echo "[setup-oidc] ERROR: no valid AWS session. Run: aws sso login --profile $AWS_PROFILE" >&2
   exit 1
 }
-say "account=$ACCOUNT region=$AWS_REGION instance=$INSTANCE_ID apply=$APPLY"
+say "account=$ACCOUNT region=$AWS_REGION instance=$INSTANCE_ID doc=$SSM_DOCUMENT apply=$APPLY"
 
 OIDC_ARN="arn:aws:iam::${ACCOUNT}:oidc-provider/token.actions.githubusercontent.com"
 ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/${ROLE_NAME}"
@@ -107,17 +134,35 @@ if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
   # role (DeleteRolePolicy on every inline policy first, then DeleteRole, then re-run).
   say "role $ROLE_NAME exists -> update trust policy (expect AccessDenied under SWE-DEV)"
   run aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document "$(pathref "$TRUST_FILE")"
+  # Same denial applies to iam:UpdateRole, so a too-short MaxSessionDuration on an EXISTING
+  # role cannot be repaired in place. Report it loudly with the exact remedy rather than
+  # letting the next run die in configure-aws-credentials with the box left running.
+  CUR_DUR="$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.MaxSessionDuration' --output text 2>/dev/null || echo 0)"
+  if [ "${CUR_DUR:-0}" -lt "$MAX_SESSION_DURATION" ]; then
+    say "WARNING role $ROLE_NAME MaxSessionDuration=${CUR_DUR}s < required ${MAX_SESSION_DURATION}s."
+    say "        configure-aws-credentials will fail with 'The requested DurationSeconds exceeds"
+    say "        the MaxSessionDuration set for this role', BEFORE the box starts - and the"
+    say "        always() stop step cannot authenticate either, so the instance is left billing."
+    say "        SWE-DEV is denied iam:UpdateRole, so recreate the role:"
+    say "          aws iam delete-role-policy --role-name $ROLE_NAME --policy-name $POLICY_NAME"
+    say "          aws iam delete-role        --role-name $ROLE_NAME"
+    say "          <re-run this script with --apply>"
+  else
+    say "role MaxSessionDuration=${CUR_DUR}s (>= ${MAX_SESSION_DURATION}s required)"
+  fi
 else
   say "role $ROLE_NAME MISSING -> create"
   run aws iam create-role --role-name "$ROLE_NAME" \
     --description "GitHub Actions (browser#34): drive the Chromium build box, no long-lived secret" \
+    --max-session-duration "$MAX_SESSION_DURATION" \
     --assume-role-policy-document "$(pathref "$TRUST_FILE")"
 fi
 
 # ── 3. least-privilege permissions ───────────────────────────────────────────────────
 # Describe* cannot be resource-scoped by EC2, so it is "*" (read-only, harmless).
 # Start/Stop are pinned to the ONE build instance. SSM is pinned to that instance plus the
-# RunPowerShellScript document. S3 read is pinned to the artifact prefix.
+# $SSM_DOCUMENT document (RunPowerShellScript for the Windows lane, RunShellScript for the
+# Linux/Android one). S3 read is pinned to the artifact prefix.
 PERMS=$(cat <<JSON
 {
   "Version": "2012-10-17",
@@ -140,7 +185,7 @@ PERMS=$(cat <<JSON
       "Action": ["ssm:SendCommand"],
       "Resource": [
         "${INSTANCE_ARN}",
-        "arn:aws:ssm:${AWS_REGION}::document/AWS-RunPowerShellScript"
+        "arn:aws:ssm:${AWS_REGION}::document/${SSM_DOCUMENT}"
       ]
     },
     {
@@ -209,24 +254,40 @@ else
     --public-access-block-configuration \
     BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 fi
-BUCKET_POLICY=$(cat <<JSON
+# WHICH STATEMENT IS OURS. put-bucket-policy REPLACES the entire document, so a single
+# fixed Sid plus a freshly-built one-statement policy silently revokes the OTHER lane's
+# upload the moment the twin is provisioned — and nothing fails until that lane's next
+# build tries to upload, which is a long way from the cause. So the Sid is per-lane, and
+# we MERGE: drop any statement carrying our own Sid (idempotent re-run), keep every other
+# statement untouched, append ours.
+BUCKET_SID="${BUCKET_SID:-BuildBoxInstanceMayUploadBuildsOnly}"
+NEW_STMT=$(cat <<JSON
 {
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "BuildBoxInstanceMayUploadBuildsOnly",
-    "Effect": "Allow",
-    "Principal": { "AWS": "arn:aws:iam::${ACCOUNT}:role/${SSM_INSTANCE_PROFILE}" },
-    "Action": "s3:PutObject",
-    "Resource": "arn:aws:s3:::${ARTIFACT_BUCKET}/builds/*",
-    "Condition": {
-      "StringEquals": { "ec2:SourceInstanceARN": "${INSTANCE_ARN}" }
-    }
-  }]
+  "Sid": "${BUCKET_SID}",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::${ACCOUNT}:role/${SSM_INSTANCE_PROFILE}" },
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::${ARTIFACT_BUCKET}/builds/*",
+  "Condition": {
+    "StringEquals": { "ec2:SourceInstanceARN": "${INSTANCE_ARN}" }
+  }
 }
 JSON
 )
+EXISTING_POLICY="$(aws s3api get-bucket-policy --bucket "$ARTIFACT_BUCKET" \
+                     --query Policy --output text 2>/dev/null || true)"
+if [ -n "$EXISTING_POLICY" ] && [ "$EXISTING_POLICY" != "None" ]; then
+  KEPT="$(printf '%s' "$EXISTING_POLICY" | jq -r --arg sid "$BUCKET_SID" \
+    '[(.Statement // [])[] | select(.Sid != $sid) | .Sid] | join(", ")')"
+  [ -n "$KEPT" ] && say "bucket policy: PRESERVING existing statement(s): $KEPT"
+  BUCKET_POLICY="$(printf '%s' "$EXISTING_POLICY" | jq --argjson s "$NEW_STMT" --arg sid "$BUCKET_SID" \
+    '.Version = "2012-10-17"
+     | .Statement = (((.Statement // []) | map(select(.Sid != $sid))) + [$s])')"
+else
+  BUCKET_POLICY="$(jq -n --argjson s "$NEW_STMT" '{Version:"2012-10-17",Statement:[$s]}')"
+fi
 BUCKET_POLICY_FILE="$(mktemp)"; printf '%s' "$BUCKET_POLICY" > "$BUCKET_POLICY_FILE"
-say "apply instance-scoped bucket policy"
+say "apply instance-scoped bucket policy (Sid $BUCKET_SID -> $INSTANCE_ID)"
 run aws s3api put-bucket-policy --bucket "$ARTIFACT_BUCKET" \
   --policy "$(pathref "$BUCKET_POLICY_FILE")"
 

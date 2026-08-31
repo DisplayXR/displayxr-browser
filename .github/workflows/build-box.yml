@@ -17,10 +17,11 @@ on:
     inputs:
       chromium_tag:
         # NOTE: do_build.ps1 does not read this - it builds whatever C:\cr\src is currently
-        # checked out at. Applying a tag is do_rebase.ps1's job (the #36 rebase lane), so
-        # this input is informational until that lane calls us. It was previously exported
-        # as $env:CHROMIUM_TAG into the build command, which nothing consumed.
-        description: "Chromium tag to build (informational; the rebase lane applies the pin)"
+        # checked out at. Applying a tag is do_rebase.ps1's job (the #36 rebase lane). It
+        # was previously exported as $env:CHROMIUM_TAG into the build command, which
+        # nothing consumed. Blank does NOT mean "skip the rebase" (#114) - it resolves to
+        # the pin in scripts/config.env.
+        description: "Chromium tag to build (blank = the pin in scripts/config.env)"
         type: string
         default: ""
       patch_ref:
@@ -142,14 +143,36 @@ jobs:
           echo "::error::SSM agent never came Online — cannot drive the build remotely."
           exit 1
 
-      # Rebase onto the target Chromium tag BEFORE building, when one is given (#36).
-      # Skipped when chromium_tag is blank (a plain rebuild of the current checkout).
+      # A blank chromium_tag used to SKIP the rebase — and because the patch series is
+      # synced from patch_ref INSIDE that step, the box then rebuilt whatever tree its
+      # last rebase left, green, with nothing in the run saying so (#114; cost two full
+      # builds). There is no useful dispatch that asks for a series and declines the only
+      # step that applies it, so a blank tag now resolves to the pin instead of disarming
+      # the rebase. The pin is scripts/config.env, the same source the patches were
+      # generated against — see its header.
+      - name: Resolve the Chromium pin
+        if: ${{ github.event_name == 'workflow_call' || !inputs.lifecycle_only }}
+        id: pin
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.chromium_tag }}" ]; then
+            tag="${{ inputs.chromium_tag }}"
+            echo "chromium_tag given explicitly: $tag"
+          else
+            tag=$(. scripts/config.env >/dev/null 2>&1; echo "${CHROMIUM_TAG:-}")
+            [ -n "$tag" ] || { echo "::error::chromium_tag is blank and scripts/config.env defines no CHROMIUM_TAG — refusing to build an unidentified tree."; exit 1; }
+            echo "chromium_tag blank -> resolved from scripts/config.env: $tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Rebase onto the target Chromium tag BEFORE building (#36). Always runs for a real
+      # build now — the tag is resolved above and is never blank there.
       # A patch conflict fails here and the build never runs — the drift gate.
       - name: Rebase onto chromium_tag (SSM RunCommand -> crbuild)
-        if: ${{ (github.event_name == 'workflow_call' || !inputs.lifecycle_only) && inputs.chromium_tag != '' }}
+        if: ${{ steps.pin.outputs.tag != '' }}
         id: rebase
         env:
-          CHROMIUM_TAG: ${{ inputs.chromium_tag }}
+          CHROMIUM_TAG: ${{ steps.pin.outputs.tag }}
           # Default to the exact commit CI checked out, so the series the box applies is
           # provably the one in this run rather than whatever was last copied to the box.
           PATCH_REF: ${{ inputs.patch_ref || github.sha }}
@@ -270,6 +293,17 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/config.env
+          # THE TAG WE BUILT, not the one this ref happens to pin. These differ on exactly
+          # one kind of build -- a pin bump, where the branch under test carries the new tag
+          # and `main` (the workflow ref) still carries the old one. Using config.env here
+          # made package.sh name chrome/VERSION 151.0.7922.77 for a tree built at .174, so it
+          # copied a STALE leftover <old>.manifest out of the box's out dir and never copied
+          # the real one. chrome.exe then failed to start at all: "Dependent Assembly
+          # 151.0.7922.174 could not be found" (SideBySide, activation context). Green build,
+          # signed installer, browser that cannot launch.
+          CHROMIUM_TAG="${{ steps.pin.outputs.tag }}"
+          [ -n "$CHROMIUM_TAG" ] || { echo "::error::no resolved Chromium tag to stage against"; exit 1; }
+          echo "staging against the BUILT tag: $CHROMIUM_TAG"
           work="$RUNNER_TEMP/cr"; rm -rf "$work"; mkdir -p "$work/out/$OUT_DIR" "$work/chrome"
           tar xzf dist/*.tar.gz -C "$RUNNER_TEMP"
           raw="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'DisplayXR-Browser*' | head -1)"
@@ -282,6 +316,15 @@ jobs:
           stage="dist/DisplayXR-Browser"
           # The regression that started this must turn the build red, not ship quietly.
           [ -f "$stage/initial_preferences" ] || { echo "::error::initial_preferences missing from the staged tree"; exit 1; }
+          # The SxS manifest must exist AND match the tag we built, or chrome.exe does not
+          # start -- and it fails at activation-context time, before any log, so nothing
+          # downstream of here would notice. Assert it rather than hope.
+          [ -f "$stage/$CHROMIUM_TAG.manifest" ] || {
+            echo "::error::staged tree has no $CHROMIUM_TAG.manifest (found: $(ls "$stage"/*.manifest 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')) — chrome.exe would fail with 'side-by-side configuration is incorrect'"
+            exit 1
+          }
+          stray="$(ls "$stage"/*.manifest 2>/dev/null | grep -v "/$CHROMIUM_TAG.manifest\$" || true)"
+          [ -z "$stray" ] || { echo "::error::staged tree carries a manifest for another version: $stray"; exit 1; }
           echo "staged $(find "$stage" -type f | wc -l) files"
           rm -f dist/*.tar.gz
           tar -czf "dist/dxr_browser_staged.tar.gz" -C dist DisplayXR-Browser

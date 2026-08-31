@@ -1,8 +1,37 @@
 # Patch series — inline-3D over Chromium `151.0.7922.77`
 
 `git format-patch --binary` of the `displayxr-inline-3d` fork over the pinned stable tag
-`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **106 commits** (~30 files are the vendored OpenXR SDK; the real
+`151.0.7922.77` (M151), as set in [`../scripts/config.env`](../scripts/config.env). **111 commits** (~30 files are the vendored OpenXR SDK; the real
 integration surface is ~100 files — see [../docs/integration-points.md](../docs/integration-points.md)).
+
+**Numbering note:** the series runs 0001–0106 then **0111**–**0115** — 0107–0110 are
+reserved by the shared viz tail (browser#141), still open. Each of 0111/0112/0113/0114/0115 took the first
+free slot above it, so nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in
+filename order and a gap is not a conflict.
+
+Patch **0112** closes browser#119 + browser#120 (Windows). The browser#99/web#12 recovery draw was
+sourcing from the producer's LIVE canvas SharedImage, which `D3DImageBacking::ValidateBeginAccess`
+refuses for as long as a write access is open — so it read `n=0` on every healthy frame. 0112 sources
+the mono draw from the **per-target weave scratch** instead (the one the fork itself composes and is the
+sole writer of), which makes `recovery_source_actually_available(tile)` answerable without probing a
+contended resource. It also gives browser#120's frosted regions their mono content **in the page raster,
+before the backdrop-filter pass samples it** (the ordering is the whole fix — repairing after the glass
+is composited would destroy the crispness D' exists to protect).
+
+**Split out, deferred:** an earlier draft of 0112 also decoupled the Phase-2 over-plane composite from
+the weave-landed gate — a latent 0057/0064 coupling that dropped the 2D repair on any frame the weave
+missed. The Android arm shipped a device-verified fix for the same defect on its own `#if` arm, and two
+competing implementations of one function is the thing to avoid, so the Windows generalization lands as
+its own follow-up. The split-out hunks are preserved verbatim, with the argument and the piece to carry
+forward (the counted log separating *"published but not composited"* from *"nothing published"*), at
+[../docs/pending/overplane-generalization.patch.txt](../docs/pending/overplane-generalization.patch.txt)
+— deliberately **not** in `patches/`, so `git am patches/*.patch` can never pick it up.
+
+**Numbering note:** the series runs 0001–0106 then **0112** — 0107–0110 are reserved by the
+shared viz tail (browser#141) and 0111 by browser#139, both open alongside this one. 0112 is the
+first free slot above both, so it is this patch's final number whether or not either lands, and
+nothing renumbers twice. `git am patches/*.patch` is unaffected: it applies in filename order and
+a gap is not a conflict.
 
 **Patches 0083–0106 are the ANDROID arm** (browser#100, design in
 [../docs/android-port.md](../docs/android-port.md), device traps in
@@ -31,6 +60,75 @@ default on Android exactly as the `IS_WIN` block in `chrome_main_delegate.cc` al
 preconditions so it also runs on weave-less frames. 0104 is the `[DXR-SPACE]` diagnostic
 (draw-back geometry printed as numbers) and is **temporary** — drop it once the scroll-lag item
 is closed. All four are Android-only: they touch no shared behaviour the Windows lane relies on.
+
+Patch 0111 makes the weave honour the **ancestor clip chain** (browser#130). A tile inside an
+`overflow:auto` panel, scrolled out of view within the panel, came back woven OUTSIDE the panel
+as soon as the PAGE scrolled — the browser#117/0081 corruption class, the weave painting a region
+the page does not own. The governing invariant is that a weave rect is the element's screen rect
+intersected with every ancestor clip. Two different notions of "clipped" meet here and only one of
+them is being added: cc deliberately SKIPS the `visible_layer_rect` intersection for
+`kInline3dWeave` (0026 — the tracked chunk lands on a layer with no drawable content, so that rect
+is empty and would zero the weave; 0079/0080–0082 then rely on the resulting raw bounds so a tile
+partly visible at the VIEWPORT edge still scores a geometric join), while the property-tree CLIP
+CHAIN is a live quantity that is correct for a non-drawing layer and was simply never applied.
+0111 walks it with cc's own `PointIsClippedByAncestorClipNode()` idiom, stopping ABOVE the viewport
+clip node so the viewport edge stays browser#117's case and an element with no clipping ancestor is
+byte-identical to before. The viz half is the other necessary edge: an empty tracked rect is no
+longer dropped by the aggregator, because after 0094 dropping it lowers the tracked cardinality, the
+per-element legacy fallback reads the element as MISSING, and Blink's UNCLIPPED
+`getBoundingClientRect` rect is admitted in its place — resurrecting the tile the panel just clipped
+away. Kept on the list it takes the path an off-window tile already takes (0028: window-bounds
+intersect empty → clear pending/drawn, submit nothing, keep the slot and its scratch images).
+
+Patch **0113** defines what OVERLAPPING inline-3D tiles do (browser#131), which until now was
+undefined and eye-INCONSISTENT. The batch weave input is one window-sized texture written per target
+at the target's own window position and never cleared, and the copy order is the aggregator's
+`base::Token` sort — so in an overlap the later copy CLOBBERS the earlier, and because the runtime
+maps a submitted rect's left half to the left eye and its right half to the right, the lower tile
+keeps a clean left eye and grows a displaced replica of its neighbour in the right. The policy is
+**topmost-wins**: the upper tile owns the overlap and the lower tile's weave rect is reduced by it.
+The reduction is always a ROW BAND — a submitted rect is a side-by-side pair whose eye split is its
+own horizontal midpoint, so trimming columns would move the split and re-create the very
+eye-inconsistency being closed. Where one row band expresses the remainder exactly the lower tile
+loses nothing; where it cannot (a corner or interior overlap) the largest clean band is kept and the
+rest is WITHHELD and drawn mono from 0112's primitive, clipped to the withheld rows — the documented
+tier-2 degradation, flat but eye-consistent. Overlapping tiles are also barred from
+`BatchKeepPrevious`, whose record can name a region the other tile has since written. With no
+overlap every computed value is bit-for-bit what the pre-patch code produced.
+
+Patch **0114** gives the lower tile back everything it still owns (browser#143). 0113's row band was
+right about the eyes and too expensive: beside a corner occluder it flattened pixels nothing covers,
+and a FULL-HEIGHT occluder flattened the tile outright. There is no protocol change here and that is
+a finding, not a shortcut — a per-entry SOURCE rect was investigated and rejected, because a
+sub-rect's two eye sources sit half a pair-width apart so a midpoint-split source rect only ever
+expresses the full-width case, and more fundamentally the shared input is already texel-overwritten
+where tiles overlap, so no wire format recovers the lost pixels. Only RE-STAGING does. So 0114
+GUILLOTINES the lower tile minus the occluder (TOP/LEFT/RIGHT/BOTTOM, ≤ 4 rects) and REPACKS each
+piece: two 1:1 box copies out of the tile's own scratch put that piece's eye pair inside the piece's
+own footprint, so the pair is exactly as wide as its destination, `srcRect == dstRect`, and today's
+protocol expresses it unchanged. Every guillotine cut lands on an EVEN column — load-bearing, because
+the three platform arms round an odd pair's halves differently (D3D11 splits `rw / 2.0f` as a float,
+macOS and Android take an integer `rw / 2`), so an odd cut is exactly the per-eye asymmetry #131/#143
+exist to kill; the occluder is snapped OUTWARD and an odd-width tile's residual column goes mono.
+A full-width piece takes the literal identity copy, so the NO-OVERLAP PATH STAYS BYTE-IDENTICAL.
+Budget: 8 rects per tile, 32 per frame (the wire cap, and one submit per frame keeps the runtime's
+motion predictor fed), largest-first demotion back to 0113's row band, logged. The ANDROID arm stages
+by Skia draw at the full rect and is gated to one rect until its own repack lands (#122/#100). Also
+closes browser#144: 0113 left `weave_src_y` unread on Android, failing `-Werror,-Wunused-variable`.
+
+Patch **0115** implements the ANDROID half of browser#143 and lifts 0114's Android one-rect gate.
+Android has no per-target scratch to repack out of, so the repack cannot live where the Windows/macOS
+one does: it lives in viz's STAGING DRAW instead — the element's own canvas draw is issued once per
+guillotine piece, clipped to that piece and translated by an INTEGER offset, so each piece's eye pair
+lands inside the piece's own footprint exactly as the provider-side box copies do on the other arms.
+0114's decomposition, budgets, even-cut rule and largest-first demotion are untouched; 0115 only
+teaches the Android arm to honour the destination rects 0114 already computes, through new provider
+virtuals. Kill-switch `--disable-inline-3d-android-repack`. Frames with no overlap keep the
+`single_full_width` short-circuit and stay BYTE-IDENTICAL. Device-verified on the reference Android
+panel: composition case 12 shows both tiles fully 3D and one-eye-at-a-time clean, with
+`[DXR-REPACK] tiles=1 pieces=2 demoted_cap=0 demoted_budget=0 refused_odd=0` and the overlap pair
+reported DECOMPOSED; the trail regression stayed 9/9 frames at baseline.
+
 Patch 0069 stops **browser-UI popups ghosting** (browser#88, Phase 3 Stage 4 item B). The omnibox
 dropdown, the autofill popups and every menu are separate OWNED top-level HWNDs that DWM composites
 ABOVE the browser window: they never enter Viz and can never be woven, yet the panel underneath stays

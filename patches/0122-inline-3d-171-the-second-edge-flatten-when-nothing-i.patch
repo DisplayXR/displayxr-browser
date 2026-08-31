@@ -1,0 +1,547 @@
+From a827748ab3ce3d3e3424ed0ba7993d9f5330af6a Mon Sep 17 00:00:00 2001
+From: DisplayXR <dev@displayxr.invalid>
+Date: Thu, 27 Aug 2026 21:07:04 -0700
+Subject: [PATCH] inline-3d(#171): the second edge -- flatten when nothing is
+ weavable, and never snapshot a zero-identity rect on an identity page
+
+Patch 0121 held the browser#159 whole-panel FLAT until the new page's first
+submit. That closes the navigation that DROPS demand. The storefront's "next"
+does not: it is an SPA route change inside one inline-3D session, demand never
+moves, no FLAT is ever latched, and the hold has nothing to hold. Measured on
+"next", header text ("Account / Sign in") lensed and staying that way until a
+scroll or a hover repainted the page:
+
+  210102.490  batch weave: keeping PREVIOUS content for target 0 at 2351,856
+  210104.249  NO match for target=2351,856 1100x1100 ... score=289/1000
+  210104.328  GPU canvas-layer lookup returned NO resource:
+                id=00000000000000000000000000000000 rect=2351,856 1100x1100
+  210104.333  withheld 1 of 1 weave rects ...
+  210105.551  batch weave: n=1                       <- new tile, ~1.2 s later
+  210107.147  GPU canvas-layer lookup returned NO resource:
+                id=00000000000000000000000000000000 rect=662,881 1145x1145
+
+Two defects on that transition, fixed here as two halves.
+
+(1) THE ZERO-IDENTITY RECT (display.cc). The `id=0000...` lines are the legacy
+main-thread channel: the aggregator admits, by cardinality (0094), the
+difference between the layers Blink reports and the layers cc tracks, with no
+identity. On an SPA route change that difference is routine -- the outgoing
+route's layer is still registered while the incoming canvas has not painted --
+and the admitted rect lands wherever getBoundingClientRect put it. It cannot
+be marked by browser#167 (no layer id), so it takes the "nothing resolved at
+all, snapshot the page" escape, the GPU has no canvas for it, snapshots the 2D
+page at that rect, weaves it, and draws it back. That is 2D pixels interlaced
+INTO the page, and they stay until the next repaint -- exactly "until I scroll
+or hover".
+
+The escape was written for a page with no identity anywhere. On an IDENTITY
+PAGE a zero-id rect is now not prepared and is withheld, counted on the
+existing LOG(ERROR). "Identity page" is STICKY per Display, not per frame: the
+first cut tested the frame and the transition defeated it on hardware -- on
+the frames where the zero-id rect is admitted the outgoing tile's identity
+rect is already gone and the incoming one has not appeared, so the frame
+carries ONLY the zero-id rect (measured: rect=662,881 1145x1145, misses=1..10
+with the per-frame test in place). A renderer that has stamped identity once
+stamps it always, so from then on a zero-id rect is the cardinality channel by
+construction. A genuinely legacy producer never sets the flag and keeps
+today's path.
+
+(2) NOTHING WEAVABLE => FLAT (weave client + the root-pass hook). Once the
+outgoing tile stops and the incoming one is withheld, the browser submits
+nothing for ~1.2 s and the runtime's sticky wish keeps the OLD rect lensed
+over the new page's 2D. The browser cannot retract the wish (a zero-rect batch
+is refused), so the GPU side now flattens itself: the root-pass hook reports,
+once per root-sized frame, whether the frame had anything weavable; after
+kAutoFlatEmptyFrames (3, ~50 ms -- one frame is a web#12 resolve hiccup and
+must not flicker the lens; this transition is ~70) the client applies the
+whole-panel FLAT on top of the tracker's latest set and records that set as
+the held release. The next successful submit releases it, exactly as 0121's
+hold does, so the lens comes back the moment the new tile does.
+
+A static page never reaches this: no frames, no empties. Only a page that is
+compositing with nothing to weave does, and for that page FLAT is the correct
+rendering. A tracker set that itself flattens supersedes the auto flat; a
+tracker set that would un-flatten while it is active is held, by the same
+rule as 0121.
+---
+ .../browser/displayxr_weave_client.cc         | 228 +++++++++++++-----
+ .../browser/displayxr_weave_client.h          |   9 +
+ .../displayxr/gpu/displayxr_weave_gpu.cc      |   4 +
+ .../displayxr/gpu/displayxr_weave_gpu.h       |   1 +
+ components/viz/service/display/display.cc     |  56 ++++-
+ components/viz/service/display/display.h      |   7 +
+ .../displayxr_weave_provider.h                |   5 +
+ .../skia_output_surface_impl_on_gpu.cc        |  15 +-
+ 8 files changed, 267 insertions(+), 58 deletions(-)
+
+diff --git a/components/displayxr/browser/displayxr_weave_client.cc b/components/displayxr/browser/displayxr_weave_client.cc
+index b214a30..855378e 100644
+--- a/components/displayxr/browser/displayxr_weave_client.cc
++++ b/components/displayxr/browser/displayxr_weave_client.cc
+@@ -1392,6 +1392,7 @@ DisplayXRWeaveClient::WeaveSubmitResult SubmitWin(uintptr_t input_handle,
+ // chunk into multiple batched calls — the runtime's weave fence is one
+ // monotonic timeline, so waiting the LAST chunk's fence value covers all.
+ void MaybePostHeldScreenFlatRelease();  // browser#171, defined below
++void NoteWeavableContentWin(bool any_weavable);  // browser#171, defined below
+ 
+ DisplayXRWeaveClient::WeaveSubmitResult SubmitBatchWin(
+     uintptr_t input_handle,
+@@ -1896,7 +1897,146 @@ bool IsDisplayModeRequestableWin() {
+ // rect set that produces the weave rects, so by the time demand has been false
+ // long enough to debounce, SubmitBatch has been early-returning on an empty
+ // rect list for many frames.
++void ApplyScreenFlatRegionsWin(
++    const std::vector<DisplayXRWeaveClient::WeaveRect>& screen_rects);
++
++namespace {
++
++bool IsWholePanelRect(const DisplayXRWeaveClient::WeaveRect& r) {
++  // Mirrors chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc
++  // WholePanelRect(): origin -(1<<20), extent 1<<21. No real screen is a
++  // million px wide, so the extent alone identifies it.
++  return r.w >= (1 << 20) && r.h >= (1 << 20);
++}
++
++bool HasWholePanelRect(
++    const std::vector<DisplayXRWeaveClient::WeaveRect>& rects) {
++  for (const DisplayXRWeaveClient::WeaveRect& r : rects) {
++    if (IsWholePanelRect(r)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++struct HeldScreenFlat {
++  base::Lock lock;
++  // Bumped by every incoming set; a held release carries the generation it was
++  // recorded under and is dropped if a newer set has since arrived.
++  uint64_t generation = 0;
++  bool valid = false;
++  bool posted = false;
++  std::vector<DisplayXRWeaveClient::WeaveRect> rects;
++  scoped_refptr<base::SequencedTaskRunner> runner;
++  // browser#171 (second edge): the GPU side flattened the panel ITSELF because
++  // the compositor was drawing frames with nothing weavable in them. Cleared
++  // by the release, and by any tracker set that flattens on its own.
++  bool auto_flat = false;
++  // Consecutive root-sized frames with an empty weavable set. Present thread.
++  int empty_frames = 0;
++};
++
++// browser#171 (second edge): how many consecutive root-pass frames with NOTHING
++// weavable it takes before the GPU side flattens the panel on its own. One
++// frame is a resolve hiccup (web#12) and must not flicker the lens; the
++// transition this is for -- an SPA route change whose new tile takes ~1 s to
++// paint its first frame -- is ~70 frames. Three frames (~50 ms at 60 Hz) is
++// well clear of the hiccup and invisible against the transition.
++constexpr int kAutoFlatEmptyFrames = 3;
++
++HeldScreenFlat& Held() {
++  static base::NoDestructor<HeldScreenFlat> held;
++  return *held;
++}
++
++void ReleaseHeldScreenFlat(uint64_t generation) {
++  std::vector<DisplayXRWeaveClient::WeaveRect> rects;
++  {
++    HeldScreenFlat& h = Held();
++    base::AutoLock lock(h.lock);
++    h.posted = false;
++    if (!h.valid || h.generation != generation) {
++      return;  // superseded, or already released
++    }
++    rects = std::move(h.rects);
++    h.rects.clear();
++    h.valid = false;
++    h.auto_flat = false;
++    h.empty_frames = 0;
++  }
++  VLOG(1) << "[DisplayXR] screen-flat latch: whole-panel FLAT released after "
++             "the new page's first weave submit (browser#171)";
++  ApplyScreenFlatRegionsWin(rects);
++}
++
++// browser#171 (second edge): flatten the panel because the compositor is
++// drawing frames with nothing weavable in them. Runs on the sequence that owns
++// WeaveClientState, posted from the present thread.
++//
++// Why this exists: an SPA route change inside ONE inline-3D session never
++// drops demand, so browser#159's whole-panel FLAT never latches and the hold
++// above has nothing to hold. The old route's tile stops submitting (its canvas
++// is gone), the new route's tile is withheld until its first paint resolves
++// (~1.2 s on the storefront's hero viewer), and for that whole window the
++// runtime's sticky wish keeps the OLD tile's rect live over the new page's 2D
++// -- measured as the header's "Account / Sign in" coming back lensed on
++// "next". A static page never reaches here (no frames, no empties): only a
++// page that is compositing and has nothing to weave does, and for that page
++// FLAT is the correct rendering. The release is the same one as the hold's --
++// the next successful submit -- so the lens comes back exactly when the new
++// tile does.
++void EngageAutoFlat() {
++  WeaveClientState& s = State();
++  std::vector<DisplayXRWeaveClient::WeaveRect> base;
++  if (s.latched_screen_flat_valid) {
++    base = s.latched_screen_flat;
++  }
++  HeldScreenFlat& h = Held();
++  {
++    base::AutoLock lock(h.lock);
++    if (!h.auto_flat || h.valid) {
++      return;  // superseded by a release, or a tracker set is already held
++    }
++    if (s.session == XR_NULL_HANDLE || HasWholePanelRect(base)) {
++      h.auto_flat = false;  // nothing to do: no session, or already flat
++      return;
++    }
++    // Hold the pre-flat set as the release, exactly as the tracker path does.
++    h.valid = true;
++    h.posted = false;
++    h.rects = base;
++    h.generation++;
++  }
++  std::vector<DisplayXRWeaveClient::WeaveRect> flat = base;
++  DisplayXRWeaveClient::WeaveRect whole;
++  whole.x = -(1 << 20);
++  whole.y = -(1 << 20);
++  whole.w = 1 << 21;
++  whole.h = 1 << 21;
++  flat.insert(flat.begin(), whole);  // largest-area-first, per the cap rule
++  VLOG(1) << "[DisplayXR] screen-flat latch: auto FLAT -- "
++          << kAutoFlatEmptyFrames
++          << " frames with nothing weavable; held until the next weave "
++             "submit (browser#171)";
++  ApplyScreenFlatRegionsWin(flat);
++}
++
++void RecordOwningRunnerLocked(HeldScreenFlat& h) {
++  if (!h.runner) {
++    h.runner = base::SequencedTaskRunner::GetCurrentDefault();
++  }
++}
++
++}  // namespace
++
+ bool RequestDisplayModeWin(bool three_d) {
++  {
++    // browser#171: demand always precedes weaving, so this is the earliest
++    // point the auto-FLAT path can learn which sequence owns the state.
++    HeldScreenFlat& h = Held();
++    base::AutoLock lock(h.lock);
++    RecordOwningRunnerLocked(h);
++  }
+   WeaveClientState& s = State();
+   if (!IsDisplayModeRequestableWin()) {
+     return false;
+@@ -2050,60 +2190,6 @@ void ApplyScreenFlatRegionsWin(
+ // WeaveClientState (the GPU main thread, where the mojo receiver lives); the
+ // submit runs on Viz's present thread and only ever POSTS the release. The
+ // held record is the one thing both touch, hence the lock.
+-namespace {
+-
+-bool IsWholePanelRect(const DisplayXRWeaveClient::WeaveRect& r) {
+-  // Mirrors chrome/browser/displayxr/displayxr_popup_occluder_tracker.cc
+-  // WholePanelRect(): origin -(1<<20), extent 1<<21. No real screen is a
+-  // million px wide, so the extent alone identifies it.
+-  return r.w >= (1 << 20) && r.h >= (1 << 20);
+-}
+-
+-bool HasWholePanelRect(
+-    const std::vector<DisplayXRWeaveClient::WeaveRect>& rects) {
+-  for (const DisplayXRWeaveClient::WeaveRect& r : rects) {
+-    if (IsWholePanelRect(r)) {
+-      return true;
+-    }
+-  }
+-  return false;
+-}
+-
+-struct HeldScreenFlat {
+-  base::Lock lock;
+-  // Bumped by every incoming set; a held release carries the generation it was
+-  // recorded under and is dropped if a newer set has since arrived.
+-  uint64_t generation = 0;
+-  bool valid = false;
+-  bool posted = false;
+-  std::vector<DisplayXRWeaveClient::WeaveRect> rects;
+-  scoped_refptr<base::SequencedTaskRunner> runner;
+-};
+-
+-HeldScreenFlat& Held() {
+-  static base::NoDestructor<HeldScreenFlat> held;
+-  return *held;
+-}
+-
+-void ReleaseHeldScreenFlat(uint64_t generation) {
+-  std::vector<DisplayXRWeaveClient::WeaveRect> rects;
+-  {
+-    HeldScreenFlat& h = Held();
+-    base::AutoLock lock(h.lock);
+-    h.posted = false;
+-    if (!h.valid || h.generation != generation) {
+-      return;  // superseded, or already released
+-    }
+-    rects = std::move(h.rects);
+-    h.rects.clear();
+-    h.valid = false;
+-  }
+-  VLOG(1) << "[DisplayXR] screen-flat latch: whole-panel FLAT released after "
+-             "the new page's first weave submit (browser#171)";
+-  ApplyScreenFlatRegionsWin(rects);
+-}
+-
+-}  // namespace
+ 
+ // The present thread calls this right after a successful non-empty batch
+ // submit. It never touches WeaveClientState; it only posts the release back to
+@@ -2125,6 +2211,29 @@ void MaybePostHeldScreenFlatRelease() {
+                    base::BindOnce(&ReleaseHeldScreenFlat, generation));
+ }
+ 
++// Present thread, once per root-sized root-pass frame. Never touches
++// WeaveClientState.
++void NoteWeavableContentWin(bool any_weavable) {
++  scoped_refptr<base::SequencedTaskRunner> runner;
++  {
++    HeldScreenFlat& h = Held();
++    base::AutoLock lock(h.lock);
++    if (any_weavable) {
++      h.empty_frames = 0;
++      return;
++    }
++    if (h.auto_flat || h.valid || !h.runner) {
++      return;  // already flat (ours or the tracker's), or nowhere to post
++    }
++    if (++h.empty_frames < kAutoFlatEmptyFrames) {
++      return;
++    }
++    h.auto_flat = true;
++    runner = h.runner;
++  }
++  runner->PostTask(FROM_HERE, base::BindOnce(&EngageAutoFlat));
++}
++
+ void SetScreenFlatRegionsWin(
+     const std::vector<DisplayXRWeaveClient::WeaveRect>& screen_rects) {
+   WeaveClientState& s = State();
+@@ -2134,7 +2243,11 @@ void SetScreenFlatRegionsWin(
+   HeldScreenFlat& h = Held();
+   {
+     base::AutoLock lock(h.lock);
++    RecordOwningRunnerLocked(h);
+     ++h.generation;
++    if (incoming_whole) {
++      h.auto_flat = false;  // the tracker is flattening; ours is moot
++    }
+     if (runtime_holds_whole && !incoming_whole) {
+       h.valid = true;
+       h.posted = false;
+@@ -3239,6 +3352,13 @@ bool DisplayXRWeaveClient::RequestDisplayMode(bool three_d) {
+ #endif
+ }
+ 
++// static
++void DisplayXRWeaveClient::NoteWeavableContent(bool any_weavable) {
++#if BUILDFLAG(IS_WIN)
++  NoteWeavableContentWin(any_weavable);
++#endif
++}
++
+ // static
+ void DisplayXRWeaveClient::SetScreenFlatRegions(
+     const std::vector<WeaveRect>& screen_rects) {
+diff --git a/components/displayxr/browser/displayxr_weave_client.h b/components/displayxr/browser/displayxr_weave_client.h
+index 66dc720..ea941cf 100644
+--- a/components/displayxr/browser/displayxr_weave_client.h
++++ b/components/displayxr/browser/displayxr_weave_client.h
+@@ -410,6 +410,15 @@ class COMPONENT_EXPORT(DISPLAYXR_WEAVE_CLIENT) DisplayXRWeaveClient {
+   // moves, the woven pixels do not. A no-op on a runtime reporting weave spec
+   // < 8, and Windows-only (a stub elsewhere).
+   static void SetScreenFlatRegions(const std::vector<WeaveRect>& screen_rects);
++
++  // browser#171: the present thread reports, once per root-sized root-pass
++  // frame, whether the frame had ANY weavable rect. After a few consecutive
++  // frames with none the GPU side latches a whole-panel FLAT on its own and
++  // releases it on the next successful submit -- the only way to stop the
++  // runtime's sticky wish lensing the previous route's rect over a new route
++  // that has not painted its tile yet. A static page (no frames) never
++  // triggers it. Windows-only; a no-op elsewhere.
++  static void NoteWeavableContent(bool any_weavable);
+ };
+ 
+ }  // namespace displayxr
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.cc b/components/displayxr/gpu/displayxr_weave_gpu.cc
+index a1fd880..6f30a61 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.cc
++++ b/components/displayxr/gpu/displayxr_weave_gpu.cc
+@@ -1224,6 +1224,10 @@ bool DisplayXRWeaveGpu::BatchKeepPrevious(const gfx::Rect& window_rect,
+   return true;
+ }
+ 
++void DisplayXRWeaveGpu::NoteWeavableContent(bool any_weavable) {
++  DisplayXRWeaveClient::NoteWeavableContent(any_weavable);
++}
++
+ bool DisplayXRWeaveGpu::SubmitBatchSync() {
+   if (!batch_open_) {
+     return false;
+diff --git a/components/displayxr/gpu/displayxr_weave_gpu.h b/components/displayxr/gpu/displayxr_weave_gpu.h
+index 6b60bf4..cc5f612 100644
+--- a/components/displayxr/gpu/displayxr_weave_gpu.h
++++ b/components/displayxr/gpu/displayxr_weave_gpu.h
+@@ -88,6 +88,7 @@ class DisplayXRWeaveGpu : public viz::DisplayXRWeaveProvider {
+   bool BatchMode() const override;
+   void BeginBatchSync(const gfx::Size& window_size) override;
+   bool SubmitBatchSync() override;
++  void NoteWeavableContent(bool any_weavable) override;
+   // (web#12) Re-submit a target's rect without copying, so the runtime
+   // re-weaves the pixels the last successful copy left in the shared input.
+   // Honoured only when |batch_last_copied_| says this exact target wrote this
+diff --git a/components/viz/service/display/display.cc b/components/viz/service/display/display.cc
+index a1408f5..c101320 100644
+--- a/components/viz/service/display/display.cc
++++ b/components/viz/service/display/display.cc
+@@ -1086,6 +1086,48 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+       weave_rects.reserve(frame.inline_3d_rects.size());
+       int unprepared = 0;
+       int unprepared_undrawn = 0;
++      int unprepared_unidentified = 0;
++      // ---- (browser#171) A ZERO-IDENTITY RECT ON A PAGE THAT HAS IDENTITY IS
++      // NOT A LEGACY PAGE -----------------------------------------------
++      //
++      // The escape below -- "nothing resolved at all, so snapshot the page" --
++      // exists for the legacy main-thread channel: a page whose canvases carry
++      // no layer identity at all, where the page raster IS the tile. But the
++      // aggregator also admits zero-id rects on an IDENTITY page, by
++      // cardinality (0094): when Blink reports more layers than cc tracks this
++      // frame, the difference is admitted with no identity. On an SPA route
++      // change that is routine -- the outgoing route's layer is still
++      // registered while the incoming route's canvas has not painted -- and
++      // the admitted rect is wherever getBoundingClientRect put it. Submitting
++      // it snapshots whatever 2D the page has there and weaves it into the
++      // page, where it stays until the next repaint. Measured on the
++      // storefront on "next":
++      //   GPU canvas-layer lookup returned NO resource: id=0000...0000
++      //     rect=2351,856 1100x1100 layers=0
++      // So: on an IDENTITY PAGE, a zero-id rect is not prepared. The legacy
++      // escape survives untouched for the page it was written for -- one with
++      // no identity anywhere.
++      //
++      // "Identity page" is STICKY, not per-frame. The first cut of this tested
++      // the current frame, and the transition it was written for defeated it
++      // on hardware: on the frames where the zero-id rect is admitted, the
++      // outgoing tile's identity rect is already gone and the incoming tile's
++      // has not appeared yet, so the frame carries ONLY the zero-id rect and
++      // reads as pure legacy. Measured, storefront "next", 0121+first-cut:
++      //   GPU canvas-layer lookup returned NO resource: id=0000...0000
++      //     rect=662,881 1145x1145 layers=0 (misses=1..10)
++      // A page that has stamped identity even once has a Phase-1 renderer,
++      // and every rect it will ever legitimately weave carries one; a zero-id
++      // rect from it is the cardinality channel by construction. A genuinely
++      // legacy producer (pre-Phase-1 renderer, TreesInViz) never stamps, so
++      // the flag never sets and it keeps today's path.
++      for (const auto& r : frame.inline_3d_rects) {
++        if (!r.id.is_zero()) {
++          inline_3d_saw_identity_ = true;
++          break;
++        }
++      }
++      const bool any_identity = inline_3d_saw_identity_;
+       for (const auto& r : frame.inline_3d_rects) {
+         // ---- (browser#167) THE "NOTHING RESOLVED AT ALL" ESCAPE IS NOT FOR A
+         // TILE THAT WAS NEVER DRAWN --------------------------------------
+@@ -1109,7 +1151,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+         // sibling happens to have resolved cannot be what decides if the
+         // runtime weaves page chrome — so the undrawn tile is withheld either
+         // way now.
+-        bool prepared = resolved_canvas.empty() && !r.layer_emitted_no_quad;
++        const bool unidentified_on_identity_page =
++            r.id.is_zero() && any_identity;
++        bool prepared = resolved_canvas.empty() && !r.layer_emitted_no_quad &&
++                        !unidentified_on_identity_page;
+         for (const auto& layer : resolved_canvas) {
+           // Identity where there is one; the legacy zero-id channel has only
+           // geometry, and Display's own tile join above uses the same pair of
+@@ -1124,6 +1169,9 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+           if (r.layer_emitted_no_quad) {
+             ++unprepared_undrawn;
+           }
++          if (unidentified_on_identity_page) {
++            ++unprepared_unidentified;
++          }
+           continue;
+         }
+         // browser#131: |z_order| rides along untouched — the GPU stage's
+@@ -1144,8 +1192,10 @@ bool Display::DrawAndSwap(const DrawAndSwapParams& params) {
+                         " still owns those pixels and the weave must not touch"
+                         " them (of which "
+                      << unprepared_undrawn
+-                     << " emitted no quad at all this frame (browser#167);"
+-                        " withheld="
++                     << " emitted no quad at all this frame (browser#167); "
++                     << unprepared_unidentified
++                     << " carried no identity on an identity page"
++                        " (browser#171); withheld="
+                      << (n + 1) << ")";
+         }
+       }
+diff --git a/components/viz/service/display/display.h b/components/viz/service/display/display.h
+index fafc67d..a99b1dd 100644
+--- a/components/viz/service/display/display.h
++++ b/components/viz/service/display/display.h
+@@ -341,6 +341,13 @@ class VIZ_SERVICE_EXPORT Display : public DisplaySchedulerClient,
+   std::unique_ptr<OverlayProcessorInterface> overlay_processor_;
+   // `renderer_` depends on `overlay_processor_` and `resource_provider_`. It
+   // must be declared last and destroyed first.
++  // browser#171: this Display has seen at least one inline-3D rect that
++  // carries layer identity. From then on a zero-identity rect is the
++  // aggregator's cardinality channel, never a legacy page, and is withheld
++  // from the weave rather than woven from a page snapshot. Never cleared: a
++  // renderer that stamps identity does not stop.
++  bool inline_3d_saw_identity_ = false;
++
+   std::unique_ptr<DirectRenderer> renderer_;
+   // `software_renderer_` depends on `renderer_`. It must be declared last and
+   // cleared first.
+diff --git a/components/viz/service/display_embedder/displayxr_weave_provider.h b/components/viz/service/display_embedder/displayxr_weave_provider.h
+index eb8901a..3c83fa5 100644
+--- a/components/viz/service/display_embedder/displayxr_weave_provider.h
++++ b/components/viz/service/display_embedder/displayxr_weave_provider.h
+@@ -288,6 +288,11 @@ class VIZ_SERVICE_EXPORT DisplayXRWeaveProvider {
+   // unchanged (the shared woven output was already the model). BatchMode() is
+   // false on spec-v2 runtimes or in async mode; the per-target flow above then
+   // applies untouched.
++  // browser#171: once per root-sized root-pass frame, whether the frame had
++  // any weavable rect at all. Default no-op; the Windows batch provider
++  // forwards it to the weave client's auto-FLAT logic.
++  virtual void NoteWeavableContent(bool any_weavable) {}
++
+   virtual bool BatchMode() const;
+   virtual void BeginBatchSync(const gfx::Size& window_size);
+   virtual bool SubmitBatchSync();
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index 64ad4e3..3af0057 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -3059,7 +3059,20 @@ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveOutput() {
+ void SkiaOutputSurfaceImplOnGpu::MaybeWeaveRootRenderPass(SkSurface* surface,
+                                                           bool is_overlay) {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+-  if (inline_3d_rects_.empty() || !surface || !is_overlay) {
++  if (!surface || !is_overlay) {
++    return;
++  }
++  // browser#171: tell the weave side, once per ROOT-SIZED pass, whether this
++  // frame has anything weavable. This has to happen before the empty-rects
++  // bail below -- that bail is precisely the frame we need to count. Root-sized
++  // only, for the same reason as the bail after it: element-sized overlay
++  // passes fire routinely and would count as false empties.
++  if (gfx::Size(surface->width(), surface->height()) == size_) {
++    if (auto* provider = GetDisplayXRWeaveProvider()) {
++      provider->NoteWeavableContent(!inline_3d_rects_.empty());
++    }
++  }
++  if (inline_3d_rects_.empty()) {
+     return;
+   }
+   // inline_3d_rects_ are window-relative device-px, so only the window-sized root

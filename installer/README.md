@@ -1,4 +1,4 @@
-# Installer — `DisplayXR-Browser-Preview-Setup.exe`
+# Installer — `DisplayXR-Browser-Preview-Setup-<version>.exe`
 
 A signed NSIS installer for the DisplayXR Browser developer preview. Reuses the runtime installer's
 patterns (two-pass signed uninstaller, 64-bit registry view, ARP entry).

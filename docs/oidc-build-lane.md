@@ -310,54 +310,93 @@ asynchronous and privileged, so a thin driver bridges the two:
 
 ## Porting checklist — a Linux + Android twin
 
+**STATUS (this section is now largely SHIPPED).** The lane exists in the repo:
+`.github/workflows/build-box-android.yml`, `scripts/aws/do_rebase.sh` +
+`scripts/aws/do_build.sh`, `scripts/args.android.gn`, and the Android branches of
+`scripts/fetch.sh` / `scripts/build.sh` (switched by `DXR_TARGET_OS=android` in
+`scripts/config.env`). What is NOT done is the **one-time IAM step** — the role, the GitHub
+environment and the two repo variables — because it needs an AWS session and cannot be done
+from CI. Everything unticked below is that step, or a consequence of it.
+
 Everything above ports. What changes:
 
-- [ ] **A second role, not a shared one.** Create `DisplayXRBrowserAndroidBuildBox` with the *same*
-      trust shape but its own `sub` — e.g.
-      `repo:DisplayXR/displayxr-browser:environment:build-box-android` — and its own instance ARN in
-      the permissions policy. A second GitHub environment (`build-box-android`) keeps the two lanes
-      from being able to drive each other's box. `setup-oidc.sh` is already parameterised for this:
-      `ROLE_NAME`, `GH_ENV`, `INSTANCE_ID`, `ARTIFACT_BUCKET` are all env overrides — run it with
-      those set, `--apply`, and paste the printed ARN into a second repo variable
-      (`AWS_ANDROID_BUILD_ROLE_ARN`).
-- [ ] **The OIDC provider is already there.** `token.actions.githubusercontent.com` exists in the
+- [x] **A second role, not a shared one.** `DisplayXRBrowserAndroidBuildBox`, same trust shape,
+      its own `sub` (`repo:DisplayXR/displayxr-browser:environment:build-box-android`) and its
+      own instance ARN. The workflow reads the ARN from the repo variable
+      `AWS_ANDROID_BUILD_ROLE_ARN` and declares `environment: build-box-android`.
+      **`setup-oidc.sh` is parameterised — but check WHICH knobs.** `ROLE_NAME`, `GH_ENV`,
+      `INSTANCE_ID`, `POLICY_NAME` and `ARTIFACT_BUCKET` were always env overrides;
+      **`SSM_DOCUMENT` was NOT** — the document name was hardcoded into the policy's resource
+      ARN, so a run of this script for the Linux box would have granted
+      `AWS-RunPowerShellScript` and every `SendCommand` would have failed with
+      `AccessDeniedException`. It is now an override too, defaulting to the Windows value.
+      **Still TODO (needs an AWS session):**
+      ```
+      INSTANCE_ID=<the linux box> GH_ENV=build-box-android \
+      ROLE_NAME=DisplayXRBrowserAndroidBuildBox POLICY_NAME=AndroidBuildBoxAndArtifacts \
+      SSM_DOCUMENT=AWS-RunShellScript scripts/aws/setup-oidc.sh --apply
+      ```
+      then paste the printed ARN into `AWS_ANDROID_BUILD_ROLE_ARN`, and the instance id into
+      `AWS_ANDROID_BUILD_INSTANCE_ID`.
+- [x] **The OIDC provider is already there.** `token.actions.githubusercontent.com` exists in the
       account (verified). Do not create a second one — IAM allows only one per URL.
-- [ ] **`--document-name AWS-RunShellScript`**, not `AWS-RunPowerShellScript` — in `ssm-run.sh`'s
-      `send-command` *and* in the role policy's `RunTheBuildViaSSM` Sid
-      (`arn:aws:ssm:<region>::document/AWS-RunShellScript`). Getting the document ARN wrong is an
-      `AccessDeniedException`, not a "no such document".
-- [ ] **The instance needs an SSM instance profile and a running SSM agent.** The Windows box shipped
-      with `IamInstanceProfile=None` and RunCommand was simply impossible (empty
-      `describe-instance-information`, `PingStatus` none). Attach the account-standard profile
-      (`AmazonSSMRoleForInstancesQuickSetup`) — SWE-DEV can associate an existing profile but cannot
-      mint a new one. On Amazon Linux/Ubuntu confirm `amazon-ssm-agent` is installed and enabled;
-      Ubuntu AMIs often ship it as a snap that needs enabling.
-- [ ] **Drop the base64/`WriteAllBytes` staging for `base64 -d`**, and stage to `/opt/build/` or
-      `~builder/` rather than `C:\build\`. The base64 wrapper is still worth keeping — it is what
-      makes the payload metacharacter-free.
-- [ ] **Privilege escalation mechanism.** No `schtasks`. Use `sudo -u builder` (RunCommand's Linux
-      agent runs as root, so you are stepping *down*, which is easier than the Windows case), or a
-      `systemd-run --unit=crbuild` one-shot polled the same way. Keep the marker protocol identical:
-      `<job>.done` written last, deleted up front, `.status`/`.log` alongside.
-- [ ] **Patch pull, not push, is unchanged** — codeload zip over HTTPS, `unzip`, copy `patches/*.patch`.
-      Same reasoning (payload limit, public repo, no credential, no interactive prompt).
-- [ ] **Artifact:** the box `aws s3 cp`s the APK to `builds/${GITHUB_RUN_ID}/...` under its own
-      instance-profile credentials; the bucket policy needs a second statement (or a second bucket)
-      with `ec2:SourceInstanceARN` pinned to the **Linux** instance. Then the same
-      re-assume → `aws s3 cp` down → `upload-artifact` tail. An APK is small enough that you could
-      base64 it back through RunCommand — **don't**; the RunCommand output cap will truncate it.
-- [ ] **Make it `workflow_dispatch` with a `lifecycle_only: true` default**, exactly as the Windows
-      lane does. That default is what lets anyone smoke-test the OIDC + start/stop path in ~2 minutes
-      without spending a build, and it makes recapture round-trips verifiable from either box.
-      Expose `patch_ref` so a run can be pinned to an exact commit of this repo.
-- [ ] **Add a `concurrency:` group** — a *different* group from `build-box`, since it is a different
-      instance, but with `cancel-in-progress: false` for the same reason: a cancelled run's
-      `always()` stop step would stop the box under the other run's live build.
-- [ ] **Keep the `if: always()` stop guard and its state assertion.** A green run with a quiet error
-      line is how you discover a month later that the box never stopped.
-- [ ] **Nothing in `.env.local` or `.secrets/` should remain load-bearing** once this lands — that is
-      the point of the port. Keep the SSH key only as a break-glass path for interactive debugging;
-      CI must not need it.
+      `setup-oidc.sh` is create-or-update, so re-running it for the second role does not touch it.
+- [x] **`--document-name AWS-RunShellScript`**, not `AWS-RunPowerShellScript`. Both places are
+      done: `ssm-run.sh` takes `$SSM_DOCUMENT` (default `AWS-RunPowerShellScript`, so the Windows
+      lane is unchanged) and the workflow exports `SSM_DOCUMENT: AWS-RunShellScript`; the role
+      policy's `RunTheBuildViaSSM` Sid interpolates the same variable. The two MUST agree —
+      getting the document ARN wrong is an `AccessDeniedException`, not a "no such document".
+- [ ] **The instance needs an SSM instance profile and a running SSM agent.** UNVERIFIED for the
+      Linux box — nobody has checked its `IamInstanceProfile` or `PingStatus`. The Windows box
+      shipped with `IamInstanceProfile=None` and RunCommand was simply impossible. Attach the
+      account-standard profile (`AmazonSSMRoleForInstancesQuickSetup`) — SWE-DEV can associate an
+      existing profile but cannot mint a new one. On Ubuntu confirm `amazon-ssm-agent` is
+      installed and enabled; Ubuntu AMIs often ship it as a snap that needs enabling. The
+      workflow's "Wait for SSM agent" step is where this surfaces, and it says so.
+- [x] **Dropped the base64/`WriteAllBytes` staging for `base64 -d`**, staging to `/opt/build/`
+      rather than `C:\build\`. The base64 wrapper is kept — it is what makes the payload
+      metacharacter-free.
+- [x] **Privilege escalation mechanism.** No `schtasks`. `sudo -u builder` (RunCommand's Linux
+      agent runs as root, so this steps *down*), with the account name exposed as the
+      `build_user` workflow input — set it to whatever account owns the checkout on the box.
+      The marker protocol is identical: `<job>.done` written last, deleted up front,
+      `.status`/`.log` alongside.
+- [x] **Patch pull, not push, is unchanged** — `do_rebase.sh` fetches a codeload zip over plain
+      HTTPS, unzips, clears the box's patch dir, copies `patches/*.patch` in. Same reasoning
+      (payload limit, public repo, no credential, no interactive prompt), and the same
+      "NO GIT HERE" rule the Windows twin learned the hard way.
+- [x] **The box needs the AWS CLI installed.** The artifact step runs `aws s3 cp` *on the box*,
+      under its instance-profile credentials — so the CLI has to exist there, which is a
+      separate question from whether the *runner* has one. The Ubuntu builder shipped without
+      it (not in apt's default set, no snap, nothing on root's PATH), and because the upload is
+      the LAST step, the first real run built `chrome_public_apk` successfully and then died on
+      `aws: not found` — an hour of compute to discover a 60-second dependency. Installed v2 to
+      `/usr/local/bin` (which is on the SSM PATH), and the lane now preflights it in one cheap
+      round-trip before the build so this class of miss costs two minutes:
+      ```
+      curl -sSL -o /tmp/a.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip \
+        && cd /tmp && unzip -oq a.zip && sudo ./aws/install --update
+      ```
+- [ ] **Artifact:** the workflow's upload step already does the box-side `aws s3 cp` to
+      `builds/${GITHUB_RUN_ID}/dxr_browser_<job>.apk` under the instance's own credentials, then
+      re-assume → `aws s3 cp` down → `upload-artifact`. UNVERIFIED: the bucket policy still needs
+      a second statement with `ec2:SourceInstanceARN` pinned to the **Linux** instance — part of
+      the same one-time `setup-oidc.sh --apply` above. The APK is deliberately NOT base64'd back
+      through RunCommand: the output cap would truncate it.
+- [x] **`workflow_dispatch` with a `lifecycle_only: true` default**, exactly as the Windows lane.
+      That default is what lets anyone smoke-test the OIDC + start/stop path in ~2 minutes without
+      spending a build. `patch_ref` is exposed so a run can be pinned to an exact commit.
+- [x] **A `concurrency:` group** — `build-box-android`, a *different* group from `build-box` since
+      it is a different instance, with `cancel-in-progress: false` for the same reason: a
+      cancelled run's `always()` stop step would stop the box under the other run's live build.
+- [x] **The `if: always()` stop guard and its state assertion** are carried over verbatim,
+      including the re-assume immediately before it. A green run with a quiet error line is how
+      you discover a month later that the box never stopped.
+- [ ] **Nothing in `.env.local` or `.secrets/` should remain load-bearing.** PARTLY DONE. CI needs
+      no SSH key and no local secret — but the instance id still lives only in `.env.local` as
+      `DXR_LINUX_BOX_INSTANCE_ID` until someone copies it into the `AWS_ANDROID_BUILD_INSTANCE_ID`
+      repo variable. It is deliberately NOT hardcoded in the workflow. Keep the SSH key only as a
+      break-glass path for interactive debugging.
 
 ---
 

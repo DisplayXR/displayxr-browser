@@ -30,14 +30,43 @@
 !ifndef OUTPUT_DIR
 	!define OUTPUT_DIR "."
 !endif
-; Oldest DisplayXR runtime this browser build actually works against (#68). The
-; browser's inline-3D panel control needs displayxr-runtime#815, which shipped in
-; v2.2.3: before it, a weave present-owner could not reach hardware 2D at all, so
-; the browser's request to flatten the panel is a SILENT no-op — the user sees the
-; display stuck in 3D and nothing tells them why. Bump this whenever a browser
-; change starts depending on a newer runtime.
+; Oldest DisplayXR runtime this browser build actually works against (#68).
+;
+; DERIVED, NOT GUESSED. This equals the first runtime release shipping the
+; highest XR_DXR_weave SPEC_VERSION the patch series lands on. Today that is
+; spec 8 (per-region hardware wish, #88), which first shipped in runtime
+; v2.8.0. Re-derive both halves with:
+;
+;   git grep -h '^+#define XR_DXR_weave_SPEC_VERSION' main -- patches | sort -u | tail -1
+;   # then, in displayxr-runtime, the earliest tag whose header has that value
+;
+; This used to read 2.2.3 -- the runtime that first let a weave present-owner
+; reach hardware 2D (runtime#815), which was the binding constraint when #68
+; added this check. The series has moved five spec revisions since and the
+; literal did not, so the check was passing runtimes the browser cannot work
+; against: the user was told the prerequisite was satisfied and got a silently
+; broken weave, which is precisely the failure #68 existed to prevent.
+;
+; displayxr-runtime's drift-audit now recomputes this weekly and reports a
+; mismatch (downstream-pins.json -> consumer_floors), so it should not silently
+; rot again. Bump it whenever the patch series starts depending on a newer spec.
+;
+; THIS FLOOR IS max(spec floor, BEHAVIOUR floor) — browser#159 / runtime#1203.
+; Expect the drift audit to report a mismatch against the spec-derived value
+; (currently 2.8.0, from XR_DXR_weave_SPEC_VERSION 8) and do NOT "correct" it
+; back down: the audit derives its number from the header the series vendors,
+; which cannot see a runtime whose header is right and whose BEHAVIOUR is wrong.
+;
+; The behaviour we depend on is the runtime retracting the hardware wish when a
+; client stops submitting. Patch 0116 latches a full-screen flat rect when
+; nothing wants 3D; on a runtime without runtime#1203 that latch is stored and
+; never acted on, so the panel STAYS PHYSICALLY 3D over ordinary 2D content
+; after leaving an inline-3D page — indefinitely, and across tabs. That is
+; exactly the symptom the warning text below has always described, so a runtime
+; that passes a 2.8.0 gate would be told it satisfies the prerequisite and then
+; exhibit the failure the gate exists to prevent. Fixed in runtime v2.13.1.
 !ifndef MIN_RUNTIME_VERSION
-	!define MIN_RUNTIME_VERSION "2.2.3"
+	!define MIN_RUNTIME_VERSION "2.13.1"
 !endif
 
 ;--------------------------------
