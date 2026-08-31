@@ -3,6 +3,31 @@
 How a DisplayXR Browser preview reaches users, and how updates work. Cadence + security posture are
 in [maintenance-policy.md](maintenance-policy.md) (the locked §6 decision).
 
+## Android release notes: state the EXACT runtime, never a floor
+
+Every Android preview's notes must name the **exact** runtime version it pairs with:
+
+> **Android:** requires runtime **vX.Y.Z exactly** — the runtime↔browser IPC check is an
+> exact version match, not a minimum.
+
+Do **not** write "requires runtime ≥ vX.Y.Z". That phrasing shipped on preview-0.1.23 and is
+actively misleading: the runtime's client↔service check
+(`ipc_client_connection.c::ipc_client_check_git_tag`) is a `strncmp` on the git tag, so a
+*newer* runtime fails exactly like an older one:
+
+```
+DisplayXR client library version <A> does not match service version <B>
+Set IPC_IGNORE_VERSION=1 to ignore this version conflict
+```
+
+**Why this is worth being pedantic about.** Android demo apps run *in-process* and never cross
+the IPC boundary, so a mismatched pair leaves every demo weaving normally and blacks out only
+the browser's inline-3D — including gallery photos, which are woven tiles sitting behind
+ordinary 2D page chrome. It reads to a tester as "the browser is broken" or even "photos don't
+load", and nothing on screen points at versions. Two testers hit this from hand-written install
+lists (runtime#1302); the fix upstream is `install-android-bundle.sh --links`, which generates a
+matched set from `versions.json`.
+
 ## The release flow
 Per monthly milestone (after the rebase runbook's build + weave-verify):
 ```bash
