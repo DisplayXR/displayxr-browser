@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David <dfattal@gmail.com>
+Date: Tue, 1 Sep 2026 15:30:00 +0000
+Subject: [PATCH] feat(android): inline-3D on by default, opt out with
+ --disable-inline-3d
+
+The Android preview shipped its headline feature switched off. inline-3D was
+reachable only via `--enable-inline-3d`, which on Android arrives through
+/data/local/tmp/chrome-command-line — a file that needs adb. Our own test
+tablets have carried it since bring-up, so every internal check passed while
+every external tester saw a browser that renders the whole web normally and
+shows nothing where the 3D should be.
+
+Two colleagues hit this independently within days of each other. Neither could
+have diagnosed it: the runtime reports a clean PASS (it is idle, nothing ever
+connects to it), the demos all weave correctly (they run in-process and never
+touch the browser's path), and the failure looks exactly like a broken browser
+rather than a feature that was never turned on. One of them went through a
+runtime reinstall, a browser reinstall and a vendor-services update chasing it.
+
+So: on Android, default the switch ON in ChromeMainDelegate::BasicStartupComplete
+unless --disable-inline-3d is given. This is the earliest callback and runs
+before the FeatureList is created, so everything downstream — including the
+SurfaceControl suppression added in 0096, which reads the same switch a few
+lines below — sees a command line indistinguishable from one where the user
+passed the flag by hand. No call site changes; `HasSwitch("enable-inline-3d")`
+keeps working everywhere, and the existing manual flag file remains a no-op
+addition rather than a conflict.
+
+Windows and macOS are untouched: they gate inline-3D on their own paths and
+this block is IS_ANDROID-only.
+
+Opt-out rather than opt-in is the right default for a device whose entire
+reason to exist is the glasses-free display. A preview whose feature is off by
+default is indistinguishable from a broken one — which is precisely how both
+testers reported it.
+---
+ chrome/app/chrome_main_delegate.cc | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -1143,6 +1143,25 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
+   }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_ANDROID)
++  // DisplayXR inline-3D is ON BY DEFAULT on Android. This device exists to show
++  // glasses-free 3D; requiring an adb-written command-line file to reach that is
++  // not a default anyone can use, and it made the preview undemoable to every
++  // tester without developer tools (displayxr-browser#190).
++  //
++  // Set here, in the earliest callback, so the rest of startup — including the
++  // SurfaceControl suppression immediately below, which reads this same switch —
++  // sees a command line identical to one where the flag was passed by hand.
++  // --disable-inline-3d opts out; an explicit --enable-inline-3d stays a no-op.
++  if (!command_line.HasSwitch(switches::kProcessType) &&
++      !command_line.HasSwitch("disable-inline-3d") &&
++      !command_line.HasSwitch("enable-inline-3d")) {
++    command_line.AppendSwitch("enable-inline-3d");
++    LOG(WARNING) << "[DisplayXR] inline-3D enabled by default "
++                    "(pass --disable-inline-3d to turn it off)";
++  }
++#endif  // BUILDFLAG(IS_ANDROID)
++
+ #if BUILDFLAG(IS_ANDROID)
+   // DisplayXR inline-3D on Android: the durable half of what has been a manual
+   // /data/local/tmp/chrome-command-line flag on the device. Same shape and same
