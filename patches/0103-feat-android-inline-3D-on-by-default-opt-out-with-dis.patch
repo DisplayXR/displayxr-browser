@@ -41,7 +41,7 @@ testers reported it.
 diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
 --- a/chrome/app/chrome_main_delegate.cc
 +++ b/chrome/app/chrome_main_delegate.cc
-@@ -1143,6 +1143,25 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
+@@ -1143,6 +1143,28 @@ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
    }
  #endif  // BUILDFLAG(IS_WIN)
  
@@ -58,7 +58,10 @@ diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegat
 +  if (!command_line.HasSwitch(switches::kProcessType) &&
 +      !command_line.HasSwitch("disable-inline-3d") &&
 +      !command_line.HasSwitch("enable-inline-3d")) {
-+    command_line.AppendSwitch("enable-inline-3d");
++    // ForCurrentProcess() for the MUTABLE handle: `command_line` here is a
++    // const ref, so AppendSwitch on it does not compile. Same idiom as 0096's
++    // --disable-features append a few lines below.
++    base::CommandLine::ForCurrentProcess()->AppendSwitch("enable-inline-3d");
 +    LOG(WARNING) << "[DisplayXR] inline-3D enabled by default "
 +                    "(pass --disable-inline-3d to turn it off)";
 +  }
