@@ -9,9 +9,11 @@ which is the source of truth. **Locked.**
 ## Cadence — pin to Chrome stable, rebase ~monthly
 - Track each new Chrome **stable milestone** (~4-week cadence) — **not** tip-of-tree, and **not** every
   mid-cycle security dot-release. The inline-3D patch is small and touches a known file set
-  ([integration-points.md](integration-points.md)), so a milestone rebase is mechanical: a monthly
-  `fetch → apply patches → resolve drift → build → verify weave → sign → release` pass
-  ([rebase-runbook.md](rebase-runbook.md)).
+  (an enumerated integration-point list, kept with the sources), so a milestone rebase is
+  mechanical: a monthly `fetch → apply patches → resolve drift → build → verify weave → sign →
+  release` pass, run from a documented runbook. Both documents moved to the private source repo
+  with the 2026-09 split (see [repo-split-plan.md](repo-split-plan.md)); this policy is public
+  because the release notes link to it.
 - **Honest caveat (keeps the disclaimer mandatory):** monthly milestone rebases do **not** pick up
   Chrome's out-of-band security patches (shipped every ~1–2 weeks between milestones), so the build is
   always some days-to-weeks behind on security fixes.

@@ -9,6 +9,33 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 > artifact with a **bounded** maintenance policy — see the packaging plan. Do not use it for sensitive
 > browsing; use your primary browser for banking, etc.
 
+## Where the source lives
+
+**This repo holds releases and issues, not source.** As of 2026-09, the Chromium patch series,
+build lanes and release automation live in a **private** repo; this public one receives the
+published builds.
+
+That is the same split the DisplayXR shell uses, and it is about contribution economics rather
+than secrecy: building this fork needs a multi-hour compile on a dedicated box, `depot_tools`,
+and a 100+ patch series rebased onto Chromium roughly monthly. Over its life this repo saw no
+external pull requests. The neutral-infrastructure argument for openness applies to the
+**runtime** — which is the thing vendors and OEMs integrate against, and which stays public and
+takes outside contributions — and does not transfer to a browser build.
+
+**This repo keeps its name deliberately.** `versions.json[browser]`, the Android install
+tooling and install instructions already sent to testers all resolve assets against
+`DisplayXR/displayxr-browser`, so nothing user-facing moved.
+
+What you can still do here:
+- **Download builds** — see [Releases](https://github.com/DisplayXR/displayxr-browser/releases).
+- **Report a bug** — issues are open and read.
+- **Read the maintenance policy** — [`docs/maintenance-policy.md`](docs/maintenance-policy.md),
+  which the release notes link to.
+- **Understand the split** — [`docs/repo-split-plan.md`](docs/repo-split-plan.md).
+
+Auto-update: shipped browsers poll the feed served from `feed/` at `updates.displayxr.org`;
+that is still published from this repo.
+
 ## What it is
 
 - It **is** Chromium — every website works. The only delta is the inline-3D surface: the `inline-3d`
@@ -23,21 +50,21 @@ pages on DisplayXR hardware. It is the productization of the **Step B** Chromium
 | Repo | Role |
 |---|---|
 | [`displayxr-runtime`](https://github.com/DisplayXR/displayxr-runtime) | The OpenXR runtime + the Step-B patch **design/spec** (`docs/roadmap/webxr-step-b-design.md` §13, `displayxr-browser-preview.md`). The actual Chromium patch is validated against this runtime + a display plug-in. |
-| **`displayxr-browser`** (this repo) | The fork productization: the inline-3D patch as a rebaseable series over a pinned Chromium milestone, plus fetch/build/brand/package/sign scripts and release automation. |
+| **`displayxr-browser`** (this repo) | **Releases, assets and user-facing issues.** The source moved to a private repo — see below. |
 | [`displayxr-web`](https://github.com/DisplayXR/displayxr-web) | Inline-3D **web samples** + optional JS helper (the analog of `immersive-web/webxr-samples`). The three.js demo the browser navigates to. |
 | [`displayxr-cef-host`](https://github.com/DisplayXR/displayxr-cef-host) | Step-A native OSR stand-in — a *different* artifact; not the browser product. |
 
 ## Status
 
-**Shipping as a developer preview.** The patch series lives here (`patches/`, applied by
-`scripts/build.sh`), CI builds it on a self-hosted box, and signed installers ship from
-[Releases](https://github.com/DisplayXR/displayxr-browser/releases).
+**Shipping as a developer preview.** The patch series is built on a self-hosted box from the
+private source repo; signed installers and Android APKs ship from
+[Releases](https://github.com/DisplayXR/displayxr-browser/releases) here.
 
 | | |
 |---|---|
-| Latest preview | [**0.1.11**](https://github.com/DisplayXR/displayxr-browser/releases/latest) — occlusion by draw order |
-| Chromium pin | **151.0.7922.174** (stable) — `scripts/config.env` |
-| Patch series | 102 patches over the pinned tag, ~190 files of real integration surface |
+| Latest preview | [see Releases](https://github.com/DisplayXR/displayxr-browser/releases/latest) |
+| Chromium pin | **151.0.7922.174** (stable) |
+| Patch series | ~120 patches over the pinned tag (private repo) |
 | Platform | Windows — D3D11 + DirectComposition |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
@@ -156,34 +183,21 @@ and the [`@displayxr/inline3d`](https://www.npmjs.com/package/@displayxr/inline3
 ## Layout
 
 ```
-patches/     the inline-3D patch series over the pinned Chromium milestone tag
-scripts/     config.env (the pin) + fetch / build / brand / package / sign / release
-branding/    product name, icons, about-page, user-agent strings
-installer/   NSIS installer (chains the runtime version check)
 feed/        the update feed published at updates.displayxr.org
-docs/        maintenance policy, rebase runbook, integration-point file list,
-             Android port design + as-built (android-port.md) and pitfalls (android-pitfalls.md)
-diagnostics/ the weave-capture harness used to debug the pipeline on hardware
+docs/        maintenance policy + the repo-split rationale
 ```
 
-## Build
+The patch series, build/brand/package/sign scripts, installer, branding and diagnostics
+harness moved to the private source repo with the 2026-09 split.
 
-```bash
-scripts/fetch.sh      # provision / sync a Chromium checkout to $CHROMIUM_TAG
-scripts/build.sh      # git am patches/* onto the tag -> brand -> official static build
-                      # (verify the weave here — rebase-runbook.md §6)
-scripts/package.sh    # stage the runnable tree into dist/DisplayXR-Browser/
-scripts/sign.sh       # EV-sign the staged tree
-installer/build_installer.sh   # NSIS installer
-scripts/release.sh    # publish the signed installer as a GitHub Release
-```
+## Building it
 
-The first official static build is multi-hour.
+Not from this repo — the sources moved (see *Where the source lives*). Builds are produced by
+CI on a self-hosted box and published here as releases.
 
-The pinned tag lives in [`scripts/config.env`](scripts/config.env); bump it there on each rebase.
-Full monthly rebase procedure — fetch → apply → resolve drift → build → **verify weave** → sign →
-release — is in [`docs/rebase-runbook.md`](docs/rebase-runbook.md). CI runs the same lane
-(`.github/workflows/pipeline.yml`) on a self-hosted build box.
+If you need a build that does not exist yet, or hit something only reproducible from source,
+open an issue rather than trying to reconstruct the series: it is a 100+ patch stack over a
+pinned Chromium milestone and a multi-hour official static build.
 
 ## Maintenance & security
 
