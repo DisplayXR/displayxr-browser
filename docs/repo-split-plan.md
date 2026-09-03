@@ -160,6 +160,25 @@ public-repo fallback (pvt #4 for Android, #5 for Windows).
 
 Giving the box a credential would have fixed the *loud* failure and left the silent one intact.
 
+### Do this WITH the strip: delete the two orphaned IAM roles
+
+The private lane runs on **new** roles (`DisplayXRBrowserPvtBuildBox`,
+`DisplayXRBrowserPvtAndroidBuildBox`). The originals are still there and still trust the
+**public** repo:
+
+    DisplayXRBrowserBuildBox         trusts repo:DisplayXR/displayxr-browser:environment:build-box
+    DisplayXRBrowserAndroidBuildBox  trusts repo:DisplayXR/displayxr-browser:environment:build-box-android
+
+Harmless today — the public repo's build workflows are disabled. But once the repo is
+stripped they are trust relationships nothing needs, and **anyone who later adds a workflow
+to the PUBLIC repo declaring one of those environment names gets AWS credentials** that can
+start and drive the build boxes. Delete them as part of the strip rather than leaving them
+to outlive their purpose.
+
+(Creating new roles instead of editing the old ones is also what removed the "needs an AWS
+admin" blocker: SWE-DEV is denied `iam:UpdateAssumeRolePolicy` but allowed `iam:CreateRole`.
+The side effect is these two orphans.)
+
 ### Traps found while provisioning, worth knowing before the next split
 
 - **GitHub emits an ID-based OIDC `sub` for newer repos** (`repo:<org>@<id>/<repo>@<id>:...`).
