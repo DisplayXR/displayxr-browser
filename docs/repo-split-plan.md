@@ -98,6 +98,65 @@ one piece of box-side work this migration creates.**
   rival browser would want.
 - Not making the runtime private. The neutrality argument genuinely applies there.
 
+## Status (2026-09-03) — executed, except the public-repo strip
+
+| # | Step | State |
+|---|---|---|
+| 1 | Create `displayxr-browser-pvt` (private) | **done** |
+| 2 | Push full history | **done** |
+| 3 | Move workflows / `patches/` / `scripts/` / internal docs | **done** |
+| 4 | **Strip the public repo** | **NOT DONE — needs a human go-ahead** |
+| 5 | `publish-browser-releases.yml` in the private repo | **done** (pvt #1) |
+| 6 | Copy secrets + `build-box*` environments | **done**, minus `PINBUMP_TOKEN` — see below |
+| 7 | Android keystore secret (browser#188) | still open |
+| 8 | Update docs naming the repo | **done** (runtime `CLAUDE.md`) |
+| 9 | `/dxr-release` gains a `browser` component | **done** |
+
+Step 4 is deliberately last and deliberately not automated: deleting source from a public
+repo is hard to reverse and outward-facing, so it wants a human decision, not an agent's.
+
+**`PINBUMP_TOKEN` was retired rather than copied** (pvt #3). It was a PAT; the publish flow
+now mints a `displayxr-publish-bot` App token scoped to `displayxr-runtime`, which
+auto-rotates, cannot outlive its installation, and needs no manual renewal. The public repo
+still holds the secret because its `pipeline.yml` still references it — both go together in
+step 4.
+
+### The "Windows build box" section above is now WRONG, in a good way
+
+It predicted the migration's one piece of box-side work would be giving the box credentials
+to read the private repo. That work **no longer exists**, because the box no longer fetches
+its own source at all.
+
+`do_rebase.{sh,ps1}` used to `codeload` a hardcoded `DisplayXR/displayxr-browser`. Left as-is
+that fails two ways after the split, and the second is the expensive one:
+
+- **Loud:** once the public repo is stripped of `patches/`, every build dies with
+  "no patches under patches/".
+- **Silent:** while the public repo still carries a *stale* `patches/`, a run against `main`
+  **succeeds and builds the old public series** — green CI for source nobody changed.
+  Anonymous `codeload` **404s** on a private repo rather than 401ing, so from the box "wrong
+  repo" and "bad ref" are indistinguishable. That is what made it quiet.
+
+The fix inverts who resolves the ref: the **runner** resolves `patch_ref` (it is the only side
+holding a repo credential), archives it, and stages the zip in the artifact bucket; the box
+pulls it with its instance profile. No GitHub credential reaches the box, none lands in an SSM
+command's logged parameters, and **the box cannot choose a source at all** — so the silent mode
+is unrepresentable rather than merely fixed. `codeload` survives only as an explicit
+public-repo fallback (pvt #4 for Android, #5 for Windows).
+
+Giving the box a credential would have fixed the *loud* failure and left the silent one intact.
+
+### Traps found while provisioning, worth knowing before the next split
+
+- **GitHub emits an ID-based OIDC `sub` for newer repos** (`repo:<org>@<id>/<repo>@<id>:...`).
+  A role trusting only the documented name form fails `AssumeRole` with a message naming
+  neither claim. Trust both forms.
+- **The SSM document name is part of the permission.** Granting `ssm:SendCommand` on
+  `AWS-RunPowerShellScript` and then sending `AWS-RunShellScript` yields `AccessDeniedException`
+  — which reads as a missing permission, not a wrong document. Derive it from the instance.
+- **Every AWS `put-*` replaces the whole document.** A bare put of one S3 lifecycle rule
+  silently deleted an existing one. Read-merge-write by Sid/ID, and log what was preserved.
+
 ## Open question for legal
 
 Chromium is predominantly BSD, but confirm nothing in the shipped configuration carries an
