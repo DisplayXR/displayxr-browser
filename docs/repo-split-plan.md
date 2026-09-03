@@ -105,7 +105,7 @@ one piece of box-side work this migration creates.**
 | 1 | Create `displayxr-browser-pvt` (private) | **done** |
 | 2 | Push full history | **done** |
 | 3 | Move workflows / `patches/` / `scripts/` / internal docs | **done** |
-| 4 | **Strip the public repo** | **NOT DONE — needs a human go-ahead** |
+| 4 | **Strip the public repo** | **NOT DONE — needs a human go-ahead** (see below: the build lanes here are now DISABLED, which removes the urgency) |
 | 5 | `publish-browser-releases.yml` in the private repo | **done** (pvt #1) |
 | 6 | Copy secrets + `build-box*` environments | **done**, minus `PINBUMP_TOKEN` — see below |
 | 7 | Android keystore secret (browser#188) | still open |
@@ -114,6 +114,20 @@ one piece of box-side work this migration creates.**
 
 Step 4 is deliberately last and deliberately not automated: deleting source from a public
 repo is hard to reverse and outward-facing, so it wants a human decision, not an agent's.
+
+**Interim measure applied 2026-09-03 — the public build lanes are disabled.** Until the
+strip happens this repo still carries `patches/`, `scripts/` and all six workflows, and
+its build lanes pointed at **the same EC2 instances** as the private repo's. Two repos
+driving one Chromium checkout is a corruption risk, and `chromium-watch` was still firing
+on schedule here (last run 2026-09-03 11:10). So `chromium-watch`, `build-box`,
+`build-box-android` and `pipeline` are now `disabled_manually` on this repo.
+
+`pages` (deploys the live site) and `patch-gate` (a harmless PR check) are left **active**
+— disabling `pages` would break the site.
+
+This is reversible with `gh workflow enable <file> -R DisplayXR/displayxr-browser`. It is
+not a substitute for the strip; it just means the stale copy cannot *do* anything while
+the strip waits.
 
 **`PINBUMP_TOKEN` was retired rather than copied** (pvt #3). It was a PAT; the publish flow
 now mints a `displayxr-publish-bot` App token scoped to `displayxr-runtime`, which
