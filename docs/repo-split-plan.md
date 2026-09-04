@@ -98,36 +98,56 @@ one piece of box-side work this migration creates.**
   rival browser would want.
 - Not making the runtime private. The neutrality argument genuinely applies there.
 
-## Status (2026-09-03) — executed, except the public-repo strip
+## Status (2026-09-04) — complete
 
 | # | Step | State |
 |---|---|---|
 | 1 | Create `displayxr-browser-pvt` (private) | **done** |
 | 2 | Push full history | **done** |
 | 3 | Move workflows / `patches/` / `scripts/` / internal docs | **done** |
-| 4 | **Strip the public repo** | **NOT DONE — needs a human go-ahead** (see below: the build lanes here are now DISABLED, which removes the urgency) |
+| 4 | **Strip the public repo** | **done** (#197) — this repo is now 9 files: README, these docs, `feed/`, `pages.yml`. No secrets, no variables, `pages` the only workflow |
 | 5 | `publish-browser-releases.yml` in the private repo | **done** (pvt #1) |
-| 6 | Copy secrets + `build-box*` environments | **done**, minus `PINBUMP_TOKEN` — see below |
-| 7 | Android keystore secret (browser#188) | still open |
+| 6 | Copy secrets + `build-box*` environments | **done**, minus `PINBUMP_TOKEN` (retired, see below) — **but NOT the environments' protection rules; see the carve-out below** |
+| 7 | Android keystore secret (browser#188) | **done** — `preview-0.1.26` is release-signed (`CN=DisplayXR Browser`), and the publish lane fails closed if the keystore secret is missing |
 | 8 | Update docs naming the repo | **done** (runtime `CLAUDE.md`) |
 | 9 | `/dxr-release` gains a `browser` component | **done** |
+| 10 | Delete the two orphaned IAM roles | **done** — `DisplayXRBrowserBuildBox` and `DisplayXRBrowserAndroidBuildBox` both return `NoSuchEntity`. The surviving `…Pvt…` roles trust only `displayxr-browser-pvt`, in both the name-based and ID-based `sub` forms, with `StringEquals` (no wildcards) |
 
-Step 4 is deliberately last and deliberately not automated: deleting source from a public
-repo is hard to reverse and outward-facing, so it wants a human decision, not an agent's.
+### The one thing step 6 did not carry: environment PROTECTION RULES
 
-**Interim measure applied 2026-09-03 — the public build lanes are disabled.** Until the
-strip happens this repo still carries `patches/`, `scripts/` and all six workflows, and
-its build lanes pointed at **the same EC2 instances** as the private repo's. Two repos
-driving one Chromium checkout is a corruption risk, and `chromium-watch` was still firing
-on schedule here (last run 2026-09-03 11:10). So `chromium-watch`, `build-box`,
-`build-box-android` and `pipeline` are now `disabled_manually` on this repo.
+Secrets and environments were copied. **Protection rules were not, and cannot be re-added
+to a private repo on this plan:**
 
-`pages` (deploys the live site) and `patch-gate` (a harmless PR check) are left **active**
-— disabling `pages` would break the site.
+```
+PUT /repos/DisplayXR/displayxr-browser-pvt/environments/go-live
+-> 422 "Failed to create the environment protection rule. Please ensure the
+        billing plan supports the required reviewers protection rule."
+```
 
-This is reversible with `gh workflow enable <file> -R DisplayXR/displayxr-browser`. It is
-not a substitute for the strip; it just means the stale copy cannot *do* anything while
-the strip waits.
+Environment protection is free on **public** repositories, which is where these workflows
+used to live. So `go-live` came across as a bare name with no required reviewer — and a job
+whose environment has no protection rules **runs without asking anyone**. `environment:
+go-live` still read like a human approval in the YAML and gated nothing at runtime.
+
+Nothing announced this, because an unprotected environment behaves exactly like a protected
+one right up to the moment it is supposed to stop something. It was found only when the
+maintenance pipeline was wired up for real (pvt #20), which is also where the fix lives: the
+human gate is now an explicit `promote.yml` dispatch rather than an approval button. See
+`docs/security-rebase-automation.md` § *The human gate* in the private repo.
+
+**Generalise it when splitting the next repo:** copying secrets and environment *names* is
+not copying an environment. Re-check every protection rule by hand on the far side, and
+treat "the plan supports it here" as a property of repo visibility, not of the org.
+
+Step 4 was deliberately last and deliberately not automated: deleting source from a public
+repo is hard to reverse and outward-facing, so it wanted a human decision, not an agent's.
+It landed in #197 once that decision was made.
+
+**Superseded 2026-09-04 by the strip itself.** Between 2026-09-03 and the strip, the public
+build lanes were disabled as an interim measure — this repo still carried `patches/`,
+`scripts/` and all six workflows, and its build lanes pointed at the *same EC2 instances*
+as the private repo's, which is a corruption risk. #197 removed those workflows outright,
+so there is nothing left to disable: `pages` is the only workflow here now.
 
 **`PINBUMP_TOKEN` was retired rather than copied** (pvt #3). It was a PAT; the publish flow
 now mints a `displayxr-publish-bot` App token scoped to `displayxr-runtime`, which
