@@ -44,7 +44,7 @@ that is still published from this repo.
 - On a DisplayXR panel with the runtime + a display plug-in installed, inline-3D pages weave glasses-free
   3D at their element rect while the surrounding 2D page stays flat. On any other machine / a 2D monitor,
   the weave silently no-ops and it is an ordinary browser.
-- Windows / D3D11 + DirectComposition only (that is where the weave path lives today).
+- Windows (D3D11 + DirectComposition) and Android arm64 (the runtime APK carries the display plug-in).
 
 ## Relationship to other repos
 
@@ -66,7 +66,7 @@ self-hosted box from the private source repo; signed installers and Android APKs
 | Latest release | [see Releases](https://github.com/DisplayXR/displayxr-browser/releases/latest) |
 | Chromium pin | **151.0.7922.174** (stable) |
 | Patch series | ~120 patches over the pinned tag (private repo) |
-| Platform | Windows — D3D11 + DirectComposition |
+| Platform | Windows (D3D11 + DirectComposition) · Android arm64 |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
 
