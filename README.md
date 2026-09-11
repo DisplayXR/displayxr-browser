@@ -1,13 +1,14 @@
 # DisplayXR Browser
 
-A **developer-preview**, Chromium-based browser that renders the whole web normally **and** weaves
+A Chromium-based browser that renders the whole web normally **and** weaves
 glasses-free inline-3D for [`inline-3d` WebXR](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-displayxr-explainer.md)
 pages on DisplayXR hardware. It is the productization of the **Step B** Chromium patch
 (`displayxr-inline-3d`) from the [runtime roadmap](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/roadmap/webxr-support.md).
 
-> **This is a developer preview, not a maintained daily driver.** It is a demo / reference-implementation
-> artifact with a **bounded** maintenance policy — see the packaging plan. Do not use it for sensitive
-> browsing; use your primary browser for banking, etc.
+> **Security updates follow Chrome stable.** Every Chrome stable point release is rebuilt and
+> published automatically when the browser's own code is untouched upstream, and verified on a
+> DisplayXR display first when it is not. Not affiliated with Google; no Google account sign-in or
+> sync. Full policy: [`docs/maintenance-policy.md`](docs/maintenance-policy.md).
 
 ## Where the source lives
 
@@ -43,7 +44,7 @@ that is still published from this repo.
 - On a DisplayXR panel with the runtime + a display plug-in installed, inline-3D pages weave glasses-free
   3D at their element rect while the surrounding 2D page stays flat. On any other machine / a 2D monitor,
   the weave silently no-ops and it is an ordinary browser.
-- Windows / D3D11 + DirectComposition only (that is where the weave path lives today).
+- Windows (D3D11 + DirectComposition) and Android arm64 (the runtime APK carries the display plug-in).
 
 ## Relationship to other repos
 
@@ -56,16 +57,16 @@ that is still published from this repo.
 
 ## Status
 
-**Shipping as a developer preview.** The patch series is built on a self-hosted box from the
-private source repo; signed installers and Android APKs ship from
+**Shipping as a full release**, tagged `vX.Y.Z` from `v1.0.0`. The patch series is built on a
+self-hosted box from the private source repo; signed installers and Android APKs ship from
 [Releases](https://github.com/DisplayXR/displayxr-browser/releases) here.
 
 | | |
 |---|---|
-| Latest preview | [see Releases](https://github.com/DisplayXR/displayxr-browser/releases/latest) |
+| Latest release | [see Releases](https://github.com/DisplayXR/displayxr-browser/releases/latest) |
 | Chromium pin | **151.0.7922.174** (stable) |
 | Patch series | ~120 patches over the pinned tag (private repo) |
-| Platform | Windows — D3D11 + DirectComposition |
+| Platform | Windows (D3D11 + DirectComposition) · Android arm64 |
 | Requires | DisplayXR runtime **v2.2.3+** (the installer enforces it); **v2.7.2+ strongly recommended** (scroll-trail + service-restart fixes) + a display plug-in for the glasses-free effect |
 | Update path | Version check against the feed at [`updates.displayxr.org`](https://updates.displayxr.org) — no silent auto-update |
 
@@ -173,7 +174,8 @@ The design and rationale live in the runtime repo:
 1. Install the [DisplayXR runtime](https://github.com/DisplayXR/displayxr-runtime/releases) (v2.2.3+
    minimum; v2.7.2+ strongly recommended) and, on Leia hardware, the
    [Leia SR plug-in](https://github.com/DisplayXR/displayxr-leia-plugin/releases).
-2. Install [`DisplayXR-Browser-Preview-Setup-*.exe`](https://github.com/DisplayXR/displayxr-browser/releases/latest).
+2. Install [`DisplayXR-Browser-Setup-*.exe`](https://github.com/DisplayXR/displayxr-browser/releases/latest)
+   — releases before `v1.0.0` name it `DisplayXR-Browser-Preview-Setup-*.exe`.
 3. Open the live samples — <https://displayxr.github.io/displayxr-web/> — which is also the browser's
    default start page. In any other browser those pages render as ordinary 2D.
 
@@ -201,9 +203,15 @@ pinned Chromium milestone and a multi-hour official static build.
 
 ## Maintenance & security
 
-Rebased ~monthly onto Chrome **stable milestones** — deliberately **not** onto Chrome's mid-cycle
-security dot-releases, so the build is always some days-to-weeks behind on security fixes. That is the
-bounded commitment that keeps this a demo/reference artifact rather than a browser-vendor obligation.
-It renders the whole web normally and *functionally* could be a daily driver; the preview label is
-about the **maintenance commitment**, not missing capability. Full policy:
+Security updates follow **Chrome stable**. A watcher polls for new Chrome stable releases twice
+daily; each one is rebased and built on both lanes automatically, and then one measurement decides
+what ships: if the files this browser patches and the files Chrome changed upstream do **not**
+intersect, the build is tagged, published and promoted to the feed with no human in the loop; if they
+do, it is held until it has been verified on a real DisplayXR display. So every Chrome stable point
+release is rebuilt and published automatically when the browser's own code is untouched upstream, and
+verified on a display first when it is not.
+
+There is no silent auto-update: the start page offers the newer installer as a download
+([#40](https://github.com/DisplayXR/displayxr-browser/issues/40) tracks a real updater). No Google
+account sign-in or sync, no Widevine DRM, and no affiliation with Google. Full policy:
 [`docs/maintenance-policy.md`](docs/maintenance-policy.md).
