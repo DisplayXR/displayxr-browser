@@ -11,5 +11,29 @@
     "security": false
   },
   "minimum": "0.0.0",
-  "rollout": 100
+  "rollout": 100,
+  "platforms": {
+    "windows": {
+      "version": "1.0.6",
+      "chromium": "154.0.8037.17",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.0.6/DisplayXR-Browser-Setup-1.0.6.exe",
+      "sha256": "7a4469274403ad8a0b77543e191cc4f5689af92869e2b19b84326a88e9899701",
+      "size": 210968360,
+      "published": "2026-09-27T01:45:31Z",
+      "security": false,
+      "rollout": 100,
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.0.6"
+    },
+    "android": {
+      "version": "1.0.6",
+      "chromium": "154.0.8037.17",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.0.6/DisplayXR-Browser-1.0.6-android-arm64.apk",
+      "sha256": "f64a7fed8dd3a0773c822b0eda7f984340b0ff5dd4e2e8500c221e0f85c2dff2",
+      "size": 343101795,
+      "published": "2026-09-27T01:45:31Z",
+      "security": false,
+      "rollout": 100,
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.0.6"
+    }
+  }
 }
