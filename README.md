@@ -185,7 +185,8 @@ and the [`@displayxr/inline3d`](https://www.npmjs.com/package/@displayxr/inline3
 ## Layout
 
 ```
-feed/        the update feed published at updates.displayxr.org
+feed/        the update feed published at updates.displayxr.org (pages.yml also assembles
+             /services/ there from draft releases; see the workflow header)
 docs/        maintenance policy + the repo-split rationale
 ```
 
