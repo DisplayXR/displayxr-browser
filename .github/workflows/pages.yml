@@ -1,11 +1,13 @@
 name: pages
 
-# Publishes ONLY `feed/` to GitHub Pages, served at https://updates.displayxr.org
-# (the CNAME file in that directory claims the host).
+# Publishes `feed/` to GitHub Pages, served at https://updates.displayxr.org
+# (the CNAME file in that directory claims the host) — plus, under /services/,
+# the vendor display services the DisplayXR Android installer fetches on 3D tablets.
 #
 # Why a dedicated directory and not the repo root or docs/: `docs/` holds internal
 # design and maintenance notes that have no business on a public site. The site is
-# exactly the update feed plus a one-page explanation of what it is.
+# exactly the update feed, a one-page explanation of what it is, and the unlisted
+# /services/ tree below.
 #
 # Why this host at all (browser#40): the feed URL is compiled into every shipped
 # browser and can essentially never change, so it must be a name we own rather than
@@ -14,17 +16,34 @@ name: pages
 #
 # The feed is NOT a trust boundary — the updater verifies SHA-256 + Authenticode
 # before executing anything (docs/auto-update-design.md §3).
+#
+# /services/cnsdk/<tag>/ (manifest.json, device-service.apk, headtracking-service.apk,
+# licence notices). The Android installer (DisplayXR/displayxr-installer, android-installer/)
+# downloads these on a 3D tablet, whose FACTORY display services cannot run DisplayXR's 3D.
+# Public hosting of them for that purpose was approved by the vendor (2026-09-29).
+#   - The bytes are NOT in git. They live in DRAFT releases of this repo named
+#     `cnsdk-services-<tag>` — a byte store invisible to the public, written by
+#     displayxr-installer's publish-cnsdk-services.yml (which also sends the
+#     `cnsdk-services` repository_dispatch below). Every deploy of this site replaces the
+#     whole site, so EVERY deploy (feed promotions included) copies every such draft back
+#     in, re-verifying each file's size and sha256 against its manifest. Reading drafts
+#     needs push access, hence `contents: write` on that one job.
+#   - A draft that fails verification fails the deploy: the previous site stays up. Never
+#     "deploy without the services", which would break every tablet install until the
+#     next publish.
+#   - Nothing links to /services/ and Pages has no directory listing. Not a trust boundary
+#     either: the installer checks size + sha256 and pins the vendor signing certificate.
 
 on:
   push:
     branches: [main]
     paths: ["feed/**", ".github/workflows/pages.yml"]
+  repository_dispatch:
+    types: [cnsdk-services]
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Never cancel a publish half-done; queue instead. A partially-written feed is worse
 # than a stale one.
@@ -33,11 +52,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  assemble:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      contents: write   # draft releases (the /services/ byte store) are visible only with push access
     steps:
       - uses: actions/checkout@v4
 
@@ -58,9 +76,111 @@ jobs:
           print(f"feed ok: {d['channel']} {d['latest']['version']} rollout={d['rollout']}")
           PY
 
-      - uses: actions/configure-pages@v5
+      - name: Assemble the site (feed + display services from the draft byte store)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          rm -rf _site && cp -a feed _site
+          [ ! -e _site/services ] || { echo "::error::feed/services exists in git — /services/ is assembled from the draft byte store only"; exit 1; }
+          python3 - <<'PY'
+          import hashlib, json, os, re, sys, urllib.request, urllib.error
+
+          API = "https://api.github.com"
+          REPO = os.environ["REPO"]
+          TOKEN = os.environ["GH_TOKEN"]
+          CAP = 900 * 1024 * 1024   # Pages sites are capped at 1 GB; fail before GitHub does
+          TAG_RE = re.compile(r"^cnsdk-services-(v\d+\.\d+\.\d+)$")
+          NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *a, **k):
+                  return None
+          opener = urllib.request.build_opener(NoRedirect)
+
+          def api(path, accept="application/vnd.github+json"):
+              req = urllib.request.Request(API + path, headers={
+                  "Authorization": f"Bearer {TOKEN}", "Accept": accept,
+                  "X-GitHub-Api-Version": "2022-11-28"})
+              try:
+                  with opener.open(req) as r:
+                      return r.read(), None
+              except urllib.error.HTTPError as e:
+                  if e.code in (301, 302, 303, 307, 308):
+                      return None, e.headers["Location"]
+                  raise
+
+          def asset_bytes(asset_id):
+              body, loc = api(f"/repos/{REPO}/releases/assets/{asset_id}", "application/octet-stream")
+              if body is not None:
+                  return body
+              # The storage URL is pre-signed: fetch it WITHOUT our token.
+              with urllib.request.urlopen(loc) as r:
+                  return r.read()
+
+          drafts, page = [], 1
+          while True:
+              body, _ = api(f"/repos/{REPO}/releases?per_page=100&page={page}")
+              batch = json.loads(body)
+              drafts += [r for r in batch if r.get("draft") and TAG_RE.match(r.get("tag_name") or "")]
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          total = 0
+          for rel in sorted(drafts, key=lambda r: r["tag_name"]):
+              tag = TAG_RE.match(rel["tag_name"]).group(1)
+              assets = {a["name"]: a for a in rel["assets"]}
+              def fail(why):
+                  sys.exit(f"::error::{rel['tag_name']}: {why}")
+              if "manifest.json" not in assets:
+                  fail("draft has no manifest.json")
+              raw = asset_bytes(assets["manifest.json"]["id"])
+              m = json.loads(raw)
+              if m.get("schema") != 1 or m.get("cnsdk_tag") != tag:
+                  fail(f"manifest is schema {m.get('schema')} / cnsdk_tag {m.get('cnsdk_tag')}, expected 1 / {tag}")
+              entries = list(m.get("services", [])) + list(m.get("licenses", []))
+              if len(m.get("services", [])) != 2:
+                  fail("manifest must list exactly two services")
+              out = os.path.join("_site", "services", "cnsdk", tag)
+              os.makedirs(out, exist_ok=True)
+              for e in entries:
+                  name = e["file"]
+                  if not NAME_RE.match(name) or name == "manifest.json":
+                      fail(f"bad file name {name!r}")
+                  if name not in assets:
+                      fail(f"manifest lists {name}, the draft has no such asset")
+                  data = asset_bytes(assets[name]["id"])
+                  got = hashlib.sha256(data).hexdigest()
+                  if len(data) != e["size"] or got != e["sha256"]:
+                      fail(f"{name} is {len(data)} bytes / {got}, manifest says {e['size']} / {e['sha256']}")
+                  with open(os.path.join(out, name), "wb") as f:
+                      f.write(data)
+                  total += len(data)
+                  print(f"  {tag}/{name}  {len(data)} bytes  {got}")
+              with open(os.path.join(out, "manifest.json"), "wb") as f:
+                  f.write(raw)
+              if total > CAP:
+                  sys.exit(f"::error::/services/ has grown past {CAP // 2**20} MB — delete the cnsdk-services-* drafts no pin uses any more")
+          print(f"services: {len(drafts)} release(s), {total} bytes")
+          PY
+          find _site -type f | sort
+
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: feed
+          path: _site
+
+  deploy:
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
       - id: deploy
         uses: actions/deploy-pages@v4
