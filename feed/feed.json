@@ -2,54 +2,54 @@
   "schema": 1,
   "channel": "stable",
   "latest": {
-    "version": "1.1.1",
+    "version": "1.2.0",
     "chromium": "155.0.8059.26",
-    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.1.1/DisplayXR-Browser-Setup-1.1.1.exe",
-    "sha256": "ff9ade11703caf2178c628de8a57c5a43b97b1dac768c5e12cfcf0d709ee56b1",
-    "size": 213067288,
-    "released": "2026-10-01T15:56:31Z",
-    "security": true
+    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.2.0/DisplayXR-Browser-Setup-1.2.0.exe",
+    "sha256": "5a976d608410c82956d4854751c2b098c14c0edcbb0d0bd4e69ef46c73177acd",
+    "size": 216180840,
+    "released": "2026-10-02T02:01:13Z",
+    "security": false
   },
   "minimum": "0.0.0",
   "rollout": 100,
   "platforms": {
     "windows": {
-      "version": "1.1.1",
+      "version": "1.2.0",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.1.1/DisplayXR-Browser-Setup-1.1.1.exe",
-      "sha256": "ff9ade11703caf2178c628de8a57c5a43b97b1dac768c5e12cfcf0d709ee56b1",
-      "size": 213067288,
-      "published": "2026-10-01T15:56:31Z",
-      "security": true,
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.2.0/DisplayXR-Browser-Setup-1.2.0.exe",
+      "sha256": "5a976d608410c82956d4854751c2b098c14c0edcbb0d0bd4e69ef46c73177acd",
+      "size": 216180840,
+      "published": "2026-10-02T02:01:13Z",
+      "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.1.1"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.2.0"
     },
     "android": {
-      "version": "1.1.1",
+      "version": "1.2.0",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.1.1/DisplayXR-Browser-1.1.1-android-arm64.apk",
-      "sha256": "4e653570ac8ee9ae152b80016ba0d6dd52faf8f73c6ddb523d70fa942493e17c",
-      "size": 346372461,
-      "published": "2026-10-01T15:56:31Z",
-      "security": true,
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.2.0/DisplayXR-Browser-1.2.0-android-arm64.apk",
+      "sha256": "d81825483d6300e44c11ffcd5e3ef54a474aab06acaf55dbf629fd77623eab91",
+      "size": 346501601,
+      "published": "2026-10-02T02:01:13Z",
+      "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.1.1"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.2.0"
     },
     "linux": {
-      "version": "1.1.1",
+      "version": "1.2.0",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.1.1/displayxr-browser_1.1.1-1_amd64.deb",
-      "sha256": "0016e83c20973c084ac97f9872698e9fdea807d936b27839850928a15783c974",
-      "size": 130732468,
-      "published": "2026-10-01T15:56:31Z",
-      "security": true,
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.2.0/displayxr-browser_1.2.0-1_amd64.deb",
+      "sha256": "5ae4faa9b7419b6721279414aa800b806ebed3571d8c5e61c77d4b3edd5bacf4",
+      "size": 133829792,
+      "published": "2026-10-02T02:01:13Z",
+      "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.1.1",
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.2.0",
       "apt": {
         "package": "displayxr-browser",
-        "deb": "displayxr-browser_1.1.1-1_amd64.deb",
+        "deb": "displayxr-browser_1.2.0-1_amd64.deb",
         "deb_pattern": "<package>_<version>_<arch>.deb (Debian convention; e.g. displayxr-browser_1.2.0-1_amd64.deb)",
-        "install": "sudo apt install ./displayxr-browser_1.1.1-1_amd64.deb",
+        "install": "sudo apt install ./displayxr-browser_1.2.0-1_amd64.deb",
         "updater": "apt/dpkg is the updater on Linux: install or upgrade with `sudo apt install ./<deb>` (a newer .deb upgrades in place). This entry is advertisement only \u2014 the browser never downloads or installs anything from it."
       }
     }
