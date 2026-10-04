@@ -36,20 +36,20 @@
       "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.3.0"
     },
     "linux": {
-      "version": "1.2.2",
+      "version": "1.3.0",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.2.2/displayxr-browser_1.2.2-1_amd64.deb",
-      "sha256": "6014062d5450f3b3f9dd61f4b642ec0f2c1ee6dda69d2b39b6052fd44eab4809",
-      "size": 133803680,
-      "published": "2026-10-02T09:52:01Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.3.0/displayxr-browser_1.3.0-1_amd64.deb",
+      "sha256": "7d529315e5de2f04c3567c84d125b5fa6aaadbc8e40c8e5fc4c3333f374fa9bd",
+      "size": 133827228,
+      "published": "2026-10-04T11:37:36Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.2.2",
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.3.0",
       "apt": {
         "package": "displayxr-browser",
-        "deb": "displayxr-browser_1.2.2-1_amd64.deb",
+        "deb": "displayxr-browser_1.3.0-1_amd64.deb",
         "deb_pattern": "<package>_<version>_<arch>.deb (Debian convention; e.g. displayxr-browser_1.2.0-1_amd64.deb)",
-        "install": "sudo apt install ./displayxr-browser_1.2.2-1_amd64.deb",
+        "install": "sudo apt install ./displayxr-browser_1.3.0-1_amd64.deb",
         "updater": "apt/dpkg is the updater on Linux: install or upgrade with `sudo apt install ./<deb>` (a newer .deb upgrades in place). This entry is advertisement only \u2014 the browser never downloads or installs anything from it."
       }
     }
