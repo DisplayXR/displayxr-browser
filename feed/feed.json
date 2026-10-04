@@ -2,38 +2,38 @@
   "schema": 1,
   "channel": "stable",
   "latest": {
-    "version": "1.2.2",
+    "version": "1.3.0",
     "chromium": "155.0.8059.26",
-    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.2.2/DisplayXR-Browser-Setup-1.2.2.exe",
-    "sha256": "b288e03b40721bb7d6fb29563e8720f0dcb79c700b0ad94fc2f718ae374a85cb",
-    "size": 216182952,
-    "released": "2026-10-02T09:52:01Z",
+    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.3.0/DisplayXR-Browser-Setup-1.3.0.exe",
+    "sha256": "56a1cabde56c49169d29821dc48f63b8036f9b84f98cdab02db22c0c346cb147",
+    "size": 216200424,
+    "released": "2026-10-04T11:37:36Z",
     "security": false
   },
   "minimum": "0.0.0",
   "rollout": 100,
   "platforms": {
     "windows": {
-      "version": "1.2.2",
+      "version": "1.3.0",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.2.2/DisplayXR-Browser-Setup-1.2.2.exe",
-      "sha256": "b288e03b40721bb7d6fb29563e8720f0dcb79c700b0ad94fc2f718ae374a85cb",
-      "size": 216182952,
-      "published": "2026-10-02T09:52:01Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.3.0/DisplayXR-Browser-Setup-1.3.0.exe",
+      "sha256": "56a1cabde56c49169d29821dc48f63b8036f9b84f98cdab02db22c0c346cb147",
+      "size": 216200424,
+      "published": "2026-10-04T11:37:36Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.2.2"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.3.0"
     },
     "android": {
-      "version": "1.2.2",
+      "version": "1.3.0",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.2.2/DisplayXR-Browser-1.2.2-android-arm64.apk",
-      "sha256": "57c03b698587d23f8c5fac931865fe93f0c01c6abfc7dafb59bef03d31c91bec",
-      "size": 346500305,
-      "published": "2026-10-02T09:52:01Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.3.0/DisplayXR-Browser-1.3.0-android-arm64.apk",
+      "sha256": "a4d3f3123ff0ee9194fb08419f66da9b704dfb8d1edd1dfd8c15146de442d9e9",
+      "size": 346500303,
+      "published": "2026-10-04T11:37:36Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.2.2"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.3.0"
     },
     "linux": {
       "version": "1.2.2",
