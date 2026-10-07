@@ -2,54 +2,54 @@
   "schema": 1,
   "channel": "stable",
   "latest": {
-    "version": "1.5.3",
+    "version": "1.5.4",
     "chromium": "155.0.8059.26",
-    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.5.3/DisplayXR-Browser-Setup-1.5.3.exe",
-    "sha256": "3ec67e5709ee30d45052d31387b452b0eee68fa44961f02a53df37e3204b35ef",
-    "size": 216242688,
-    "released": "2026-10-07T05:59:42Z",
+    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.5.4/DisplayXR-Browser-Setup-1.5.4.exe",
+    "sha256": "5f07072f30222c936a3a3ed2476d30d399a4e0410d7058da081644e102938751",
+    "size": 216240776,
+    "released": "2026-10-07T08:05:48Z",
     "security": false
   },
   "minimum": "0.0.0",
   "rollout": 100,
   "platforms": {
     "windows": {
-      "version": "1.5.3",
+      "version": "1.5.4",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.5.3/DisplayXR-Browser-Setup-1.5.3.exe",
-      "sha256": "3ec67e5709ee30d45052d31387b452b0eee68fa44961f02a53df37e3204b35ef",
-      "size": 216242688,
-      "published": "2026-10-07T05:59:42Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.5.4/DisplayXR-Browser-Setup-1.5.4.exe",
+      "sha256": "5f07072f30222c936a3a3ed2476d30d399a4e0410d7058da081644e102938751",
+      "size": 216240776,
+      "published": "2026-10-07T08:05:48Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.5.3"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.5.4"
     },
     "android": {
-      "version": "1.5.3",
+      "version": "1.5.4",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.5.3/DisplayXR-Browser-1.5.3-android-arm64.apk",
-      "sha256": "21189f758de7571ef5418b2c1c0cd211ccdeca9d09c81d276c1d6767265828b0",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.5.4/DisplayXR-Browser-1.5.4-android-arm64.apk",
+      "sha256": "e3cdd8759dabebd09bf4099f1e6750ef68b37fcb44bf6662ffcf256c957bce68",
       "size": 346499837,
-      "published": "2026-10-07T05:59:42Z",
+      "published": "2026-10-07T08:05:48Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.5.3"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.5.4"
     },
     "linux": {
-      "version": "1.5.3",
+      "version": "1.5.4",
       "chromium": "155.0.8059.26",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.5.3/displayxr-browser_1.5.3-1_amd64.deb",
-      "sha256": "2131af06a744104959a60523a57dbe7118b0dc82fc17e8da1dbca45070e22fb0",
-      "size": 133809904,
-      "published": "2026-10-07T05:59:42Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.5.4/displayxr-browser_1.5.4-1_amd64.deb",
+      "sha256": "aaa84d1bfdeca6c9d42dee1460594fdd36d4bdb28024e6dbbe67dc0ab8147849",
+      "size": 133828520,
+      "published": "2026-10-07T08:05:48Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.5.3",
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.5.4",
       "apt": {
         "package": "displayxr-browser",
-        "deb": "displayxr-browser_1.5.3-1_amd64.deb",
+        "deb": "displayxr-browser_1.5.4-1_amd64.deb",
         "deb_pattern": "<package>_<version>_<arch>.deb (Debian convention; e.g. displayxr-browser_1.2.0-1_amd64.deb)",
-        "install": "sudo apt install ./displayxr-browser_1.5.3-1_amd64.deb",
+        "install": "sudo apt install ./displayxr-browser_1.5.4-1_amd64.deb",
         "updater": "apt/dpkg is the updater on Linux: install or upgrade with `sudo apt install ./<deb>` (a newer .deb upgrades in place). This entry is advertisement only \u2014 the browser never downloads or installs anything from it."
       }
     }
