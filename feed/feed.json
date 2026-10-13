@@ -2,54 +2,54 @@
   "schema": 1,
   "channel": "stable",
   "latest": {
-    "version": "1.7.1",
+    "version": "1.7.2",
     "chromium": "156.0.8078.12",
-    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.7.1/DisplayXR-Browser-Setup-1.7.1.exe",
-    "sha256": "937787996913605cf0dd31367f848b2c841a1ddc5a71abe97f0efd840d78551c",
-    "size": 217426392,
-    "released": "2026-10-09T21:24:43Z",
+    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.7.2/DisplayXR-Browser-Setup-1.7.2.exe",
+    "sha256": "88b1a3ed7eef7784796b10226cf06b94591dc7026f88ebdc78aaf603fe5d0c43",
+    "size": 217428136,
+    "released": "2026-10-13T05:00:05Z",
     "security": false
   },
   "minimum": "0.0.0",
   "rollout": 100,
   "platforms": {
     "windows": {
-      "version": "1.7.1",
+      "version": "1.7.2",
       "chromium": "156.0.8078.12",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.7.1/DisplayXR-Browser-Setup-1.7.1.exe",
-      "sha256": "937787996913605cf0dd31367f848b2c841a1ddc5a71abe97f0efd840d78551c",
-      "size": 217426392,
-      "published": "2026-10-09T21:24:43Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.7.2/DisplayXR-Browser-Setup-1.7.2.exe",
+      "sha256": "88b1a3ed7eef7784796b10226cf06b94591dc7026f88ebdc78aaf603fe5d0c43",
+      "size": 217428136,
+      "published": "2026-10-13T05:00:05Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.7.1"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.7.2"
     },
     "android": {
-      "version": "1.7.1",
+      "version": "1.7.2",
       "chromium": "156.0.8078.12",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.7.1/DisplayXR-Browser-1.7.1-android-arm64.apk",
-      "sha256": "acf21909c468284460cfde949776119aea02fd4772a14444d8b6dc6e623d78af",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.7.2/DisplayXR-Browser-1.7.2-android-arm64.apk",
+      "sha256": "025d927545385637db2383728b1e1026858b63a50db7e857c79a238dda11587f",
       "size": 348083286,
-      "published": "2026-10-09T21:24:43Z",
+      "published": "2026-10-13T05:00:05Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.7.1"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.7.2"
     },
     "linux": {
-      "version": "1.7.1",
+      "version": "1.7.2",
       "chromium": "156.0.8078.12",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.7.1/displayxr-browser_1.7.1-1_amd64.deb",
-      "sha256": "c005e7bd4e2463bbe6550863c9e97e327494156fec185de64c8ac7ccf6f7c740",
-      "size": 134739104,
-      "published": "2026-10-09T21:24:43Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.7.2/displayxr-browser_1.7.2-1_amd64.deb",
+      "sha256": "7c24627ae7206acb49895404664596483c3875f3833689c05a4029d22e2f35f9",
+      "size": 134765396,
+      "published": "2026-10-13T05:00:05Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.7.1",
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.7.2",
       "apt": {
         "package": "displayxr-browser",
-        "deb": "displayxr-browser_1.7.1-1_amd64.deb",
+        "deb": "displayxr-browser_1.7.2-1_amd64.deb",
         "deb_pattern": "<package>_<version>_<arch>.deb (Debian convention; e.g. displayxr-browser_1.2.0-1_amd64.deb)",
-        "install": "sudo apt install ./displayxr-browser_1.7.1-1_amd64.deb",
+        "install": "sudo apt install ./displayxr-browser_1.7.2-1_amd64.deb",
         "updater": "apt/dpkg is the updater on Linux: install or upgrade with `sudo apt install ./<deb>` (a newer .deb upgrades in place). This entry is advertisement only \u2014 the browser never downloads or installs anything from it."
       }
     }
