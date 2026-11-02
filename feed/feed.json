@@ -5,8 +5,8 @@
     "version": "1.9.0",
     "chromium": "156.0.8078.80",
     "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.0/DisplayXR-Browser-Setup-1.9.0.exe",
-    "sha256": "b0f2d17c505dae82138c775f6e6b961cd53001ed75ca02f66e6376c7bbe03fc3",
-    "size": 214769840,
+    "sha256": "30cc6880f912fa7efe8a7ae612b4a823e264468034337f80efcb1314450ce58f",
+    "size": 214769824,
     "released": "2026-11-02T05:13:22Z",
     "security": false
   },
@@ -17,8 +17,8 @@
       "version": "1.9.0",
       "chromium": "156.0.8078.80",
       "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.0/DisplayXR-Browser-Setup-1.9.0.exe",
-      "sha256": "b0f2d17c505dae82138c775f6e6b961cd53001ed75ca02f66e6376c7bbe03fc3",
-      "size": 214769840,
+      "sha256": "30cc6880f912fa7efe8a7ae612b4a823e264468034337f80efcb1314450ce58f",
+      "size": 214769824,
       "published": "2026-11-02T05:13:22Z",
       "security": false,
       "rollout": 100,
@@ -52,6 +52,17 @@
         "install": "sudo apt install ./displayxr-browser_1.9.0-1_amd64.deb",
         "updater": "apt/dpkg is the updater on Linux: install or upgrade with `sudo apt install ./<deb>` (a newer .deb upgrades in place). This entry is advertisement only \u2014 the browser never downloads or installs anything from it."
       }
+    },
+    "macos": {
+      "version": "1.9.0",
+      "chromium": "156.0.8078.80",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.0/DisplayXR-Browser-1.9.0-mac-arm64.dmg",
+      "sha256": "77d65473d5a89870957518fb18cf7d0a0862926f8b6ff70c4634f807730e00a1",
+      "size": 215155497,
+      "published": "2026-11-02T05:13:22Z",
+      "security": false,
+      "rollout": 100,
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.0"
     }
   }
 }
