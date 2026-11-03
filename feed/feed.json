@@ -2,67 +2,67 @@
   "schema": 1,
   "channel": "stable",
   "latest": {
-    "version": "1.9.0",
+    "version": "1.9.1",
     "chromium": "156.0.8078.80",
-    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.0/DisplayXR-Browser-Setup-1.9.0.exe",
-    "sha256": "30cc6880f912fa7efe8a7ae612b4a823e264468034337f80efcb1314450ce58f",
-    "size": 214769824,
-    "released": "2026-11-02T05:13:22Z",
+    "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.1/DisplayXR-Browser-Setup-1.9.1.exe",
+    "sha256": "d8174390b91d91a8a0789baa9b3999f183a38388d079086b713acb46e3fc3b57",
+    "size": 214776416,
+    "released": "2026-11-03T06:13:11Z",
     "security": false
   },
   "minimum": "0.0.0",
   "rollout": 100,
   "platforms": {
     "windows": {
-      "version": "1.9.0",
+      "version": "1.9.1",
       "chromium": "156.0.8078.80",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.0/DisplayXR-Browser-Setup-1.9.0.exe",
-      "sha256": "30cc6880f912fa7efe8a7ae612b4a823e264468034337f80efcb1314450ce58f",
-      "size": 214769824,
-      "published": "2026-11-02T05:13:22Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.1/DisplayXR-Browser-Setup-1.9.1.exe",
+      "sha256": "d8174390b91d91a8a0789baa9b3999f183a38388d079086b713acb46e3fc3b57",
+      "size": 214776416,
+      "published": "2026-11-03T06:13:11Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.0"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.1"
     },
     "android": {
-      "version": "1.9.0",
+      "version": "1.9.1",
       "chromium": "156.0.8078.80",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.0/DisplayXR-Browser-1.9.0-android-arm64.apk",
-      "sha256": "747ea4d90918b5a8a63d181f57259be0095132224468743c6323dba0806acf7a",
-      "size": 348154550,
-      "published": "2026-11-02T05:13:22Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.1/DisplayXR-Browser-1.9.1-android-arm64.apk",
+      "sha256": "22085e5cb420a1939da020e7db8160698d01e883ef08858545486a88c8fc3c0a",
+      "size": 348148040,
+      "published": "2026-11-03T06:13:11Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.0"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.1"
     },
     "linux": {
-      "version": "1.9.0",
+      "version": "1.9.1",
       "chromium": "156.0.8078.80",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.0/displayxr-browser_1.9.0-1_amd64.deb",
-      "sha256": "4f291fabd9f9bc7e87b89f52c017ce94c69a2fb3687e3ed1cf512a29f7884c96",
-      "size": 132038632,
-      "published": "2026-11-02T05:13:22Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.1/displayxr-browser_1.9.1-1_amd64.deb",
+      "sha256": "29794ddf1e2fcf6ab749e1307600d1f5849ed04c30adeeeb09d4502b0f62c7d3",
+      "size": 132032268,
+      "published": "2026-11-03T06:13:11Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.0",
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.1",
       "apt": {
         "package": "displayxr-browser",
-        "deb": "displayxr-browser_1.9.0-1_amd64.deb",
+        "deb": "displayxr-browser_1.9.1-1_amd64.deb",
         "deb_pattern": "<package>_<version>_<arch>.deb (Debian convention; e.g. displayxr-browser_1.2.0-1_amd64.deb)",
-        "install": "sudo apt install ./displayxr-browser_1.9.0-1_amd64.deb",
+        "install": "sudo apt install ./displayxr-browser_1.9.1-1_amd64.deb",
         "updater": "apt/dpkg is the updater on Linux: install or upgrade with `sudo apt install ./<deb>` (a newer .deb upgrades in place). This entry is advertisement only \u2014 the browser never downloads or installs anything from it."
       }
     },
     "macos": {
-      "version": "1.9.0",
+      "version": "1.9.1",
       "chromium": "156.0.8078.80",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.0/DisplayXR-Browser-1.9.0-mac-arm64.dmg",
-      "sha256": "77d65473d5a89870957518fb18cf7d0a0862926f8b6ff70c4634f807730e00a1",
-      "size": 215155497,
-      "published": "2026-11-02T05:13:22Z",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.1/DisplayXR-Browser-1.9.1-mac-arm64.dmg",
+      "sha256": "753f644f34c5e12f28e1797c1d83ae81801d93d06763ea39fb39fcf18a1d46d7",
+      "size": 215156063,
+      "published": "2026-11-03T06:13:11Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.0"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.1"
     }
   }
 }
