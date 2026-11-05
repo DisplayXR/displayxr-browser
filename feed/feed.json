@@ -25,15 +25,15 @@
       "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.2"
     },
     "android": {
-      "version": "1.9.2",
-      "chromium": "156.0.8078.80",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.2/DisplayXR-Browser-1.9.2-android-arm64.apk",
-      "sha256": "c53583b239d93f0b39bdb06d4a0bf93f9613ee35d062d47b84f18123c96862bd",
-      "size": 348163342,
-      "published": "2026-11-03T22:18:40Z",
+      "version": "1.9.3",
+      "chromium": "157.0.8103.39",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.3/DisplayXR-Browser-1.9.3-android-arm64.apk",
+      "sha256": "062b89880cdfd464aacd7e29a998f685f77562462023bfff569083b64b7e0b7f",
+      "size": 350752573,
+      "published": "2026-11-05T08:31:30Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.2"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.3"
     },
     "linux": {
       "version": "1.9.2",
