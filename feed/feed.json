@@ -5,7 +5,7 @@
     "version": "1.10.0",
     "chromium": "158.0.8127.18",
     "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.0/DisplayXR-Browser-Setup-1.10.0.exe",
-    "sha256": "24126ea9ec833161d8e784cba2de3e936540c79516d8037cc961713bfa4473b8",
+    "sha256": "0631fc5ed6e66c3ca4bfe81e35aa0490ba53fec7547657edcccbc91ca0452a8b",
     "size": 221782960,
     "released": "2026-11-06T09:13:41Z",
     "security": false
@@ -17,7 +17,7 @@
       "version": "1.10.0",
       "chromium": "158.0.8127.18",
       "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.0/DisplayXR-Browser-Setup-1.10.0.exe",
-      "sha256": "24126ea9ec833161d8e784cba2de3e936540c79516d8037cc961713bfa4473b8",
+      "sha256": "0631fc5ed6e66c3ca4bfe81e35aa0490ba53fec7547657edcccbc91ca0452a8b",
       "size": 221782960,
       "published": "2026-11-06T09:13:41Z",
       "security": false,
@@ -54,15 +54,15 @@
       }
     },
     "macos": {
-      "version": "1.9.4",
-      "chromium": "157.0.8103.39",
-      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.9.4/DisplayXR-Browser-1.9.4-mac-arm64.dmg",
-      "sha256": "794e9614f8c14fab544d9c923323dca22d300881633837537a020dde2bcba9fa",
-      "size": 217156795,
-      "published": "2026-11-05T22:16:37Z",
+      "version": "1.10.0",
+      "chromium": "158.0.8127.18",
+      "url": "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.0/DisplayXR-Browser-1.10.0-mac-arm64.dmg",
+      "sha256": "a06a925e992276711629394368de35c19742dab4ae247c058bc10f89c5219106",
+      "size": 220916951,
+      "published": "2026-11-06T09:13:41Z",
       "security": false,
       "rollout": 100,
-      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.9.4"
+      "notes": "https://github.com/DisplayXR/displayxr-browser/releases/tag/v1.10.0"
     }
   }
 }
