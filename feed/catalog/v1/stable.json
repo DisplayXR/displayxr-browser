@@ -1,0 +1,796 @@
+{
+ "schema": 1,
+ "serial": 1794969969,
+ "generated": "2026-11-18T02:46:09Z",
+ "expires": "2026-12-18T02:46:09Z",
+ "channel": "stable",
+ "source": {
+  "versions_json_sha": "863d48de78d2ecccf540a80a1e3575590d43f387"
+ },
+ "signers": {
+  "windows": [
+   "Leia, Inc."
+  ]
+ },
+ "components": {
+  "runtime": {
+   "recommended": "2.68.2",
+   "windows": {
+    "version": "2.68.2",
+    "file": "DisplayXRSetup-2.68.2.exe",
+    "size": 50040032,
+    "sha256": "136cf9f66fb508950156af79078bd8294afe0d0161a28e4bcd2cc773e777fa27",
+    "signer": "Leia, Inc.",
+    "urls": [
+     "https://github.com/DisplayXR/displayxr-runtime/releases/download/v2.68.2/DisplayXRSetup-2.68.2.exe",
+     "https://api.github.com/repos/DisplayXR/displayxr-runtime/releases/assets/757916268"
+    ],
+    "args": [
+     "/S",
+     "/NOSTART"
+    ],
+    "registry_version": "HKLM\\Software\\DisplayXR\\Runtime\\Version"
+   }
+  },
+  "leia_plugin": {
+   "recommended": "2.21.2",
+   "kind": "display_plugin",
+   "requires": {
+    "runtime": ">=2.66.8"
+   },
+   "windows": {
+    "version": "2.21.2",
+    "file": "DisplayXRLeiaSRSetup-2.21.2.exe",
+    "size": 969752,
+    "sha256": "d91b16ccdb37a774aae511563c399827b481b454ad1a78cee2faee7854d30b28",
+    "signer": "Leia, Inc.",
+    "urls": [
+     "https://github.com/DisplayXR/displayxr-leia-plugin/releases/download/v2.21.2/DisplayXRLeiaSRSetup-2.21.2.exe",
+     "https://api.github.com/repos/DisplayXR/displayxr-leia-plugin/releases/assets/757841926"
+    ],
+    "args": [
+     "/S"
+    ],
+    "registry_version": "HKLM\\Software\\DisplayXR\\Plugins\\LeiaSR\\Version"
+   },
+   "detect": [
+    {
+     "kind": "edid",
+     "man": 44048,
+     "prod": 16711,
+     "confidence": "high",
+     "note": "DELL_8K32"
+    },
+    {
+     "kind": "edid",
+     "man": 44806,
+     "prod": 12779,
+     "confidence": "high",
+     "note": "ACER_GHIBLI"
+    },
+    {
+     "kind": "edid",
+     "man": 44806,
+     "prod": 45460,
+     "confidence": "high",
+     "note": "ACER_COLDPLAY / SPARKS / EVOQUE / GLA / SPORTAGE"
+    },
+    {
+     "kind": "edid",
+     "man": 44806,
+     "prod": 14756,
+     "confidence": "high",
+     "note": "ACER_COLDPLAY_2 / SPARKS_2 / EVOQUE_2 / GLA_2 / SPORTAGE_2"
+    },
+    {
+     "kind": "edid",
+     "man": 44557,
+     "prod": 5439,
+     "confidence": "high",
+     "note": "ACER_SPARKS_INNOLUX"
+    },
+    {
+     "kind": "edid",
+     "man": 44806,
+     "prod": 44944,
+     "confidence": "high",
+     "note": "MSI_FHD"
+    },
+    {
+     "kind": "edid",
+     "man": 44806,
+     "prod": 51614,
+     "confidence": "high",
+     "note": "DELL_3K16"
+    },
+    {
+     "kind": "edid",
+     "man": 44806,
+     "prod": 40849,
+     "confidence": "high",
+     "note": "DELL_3K16_2"
+    },
+    {
+     "kind": "edid",
+     "man": 44806,
+     "prod": 11163,
+     "confidence": "high",
+     "note": "DELL_2K14"
+    },
+    {
+     "kind": "edid",
+     "man": 44806,
+     "prod": 9627,
+     "confidence": "high",
+     "note": "DELL_WUXGA14"
+    },
+    {
+     "kind": "edid",
+     "man": 44048,
+     "prod": 61773,
+     "confidence": "high",
+     "note": "DELL_2K14_PORTABLE_P1424H_LEFT"
+    },
+    {
+     "kind": "edid",
+     "man": 44048,
+     "prod": 61772,
+     "confidence": "high",
+     "note": "DELL_2K14_PORTABLE_P1424H_RIGHT"
+    },
+    {
+     "kind": "edid",
+     "man": 44048,
+     "prod": 61740,
+     "confidence": "high",
+     "note": "DELL_2K14_PORTABLE_C1422H_LEFT"
+    },
+    {
+     "kind": "edid",
+     "man": 44048,
+     "prod": 61739,
+     "confidence": "high",
+     "note": "DELL_2K14_PORTABLE_C1422H_RIGHT"
+    },
+    {
+     "kind": "edid",
+     "man": 29188,
+     "prod": 0,
+     "confidence": "low",
+     "note": "ACR + ACER_DS1"
+    },
+    {
+     "kind": "edid",
+     "man": 29188,
+     "prod": 1,
+     "confidence": "low",
+     "note": "ACR + ACER_DS1 (alt)"
+    },
+    {
+     "kind": "edid",
+     "man": 29188,
+     "prod": 2,
+     "confidence": "low",
+     "note": "ACR + ACER_DS2"
+    },
+    {
+     "kind": "edid",
+     "man": 29188,
+     "prod": 3,
+     "confidence": "low",
+     "note": "ACR + ACER_DS2 (alt)"
+    },
+    {
+     "kind": "edid",
+     "man": 25636,
+     "prod": 9992,
+     "confidence": "high",
+     "note": "ICD + ACER_D2_4k27 / D3_4k27"
+    },
+    {
+     "kind": "edid",
+     "man": 27934,
+     "prod": 30470,
+     "confidence": "high",
+     "note": "LG_4K27"
+    },
+    {
+     "kind": "edid",
+     "man": 27934,
+     "prod": 30471,
+     "confidence": "high",
+     "note": "LG_4K27_DP"
+    },
+    {
+     "kind": "edid",
+     "man": 38956,
+     "prod": 48,
+     "confidence": "high",
+     "note": "KDX + DEEPUB_4K32"
+    },
+    {
+     "kind": "edid",
+     "man": 45830,
+     "prod": 10144,
+     "confidence": "high",
+     "note": "ASUS_4K27_HDMI"
+    },
+    {
+     "kind": "edid",
+     "man": 45830,
+     "prod": 10148,
+     "confidence": "high",
+     "note": "ASUS_4K27_DP"
+    },
+    {
+     "kind": "edid",
+     "man": 33612,
+     "prod": 16733,
+     "confidence": "high",
+     "note": "ASUS_OLEDLAPTOP"
+    },
+    {
+     "kind": "edid",
+     "man": 33612,
+     "prod": 16760,
+     "confidence": "high",
+     "note": "ASUS_3K16_OLED"
+    },
+    {
+     "kind": "edid",
+     "man": 53513,
+     "prod": 32679,
+     "confidence": "high",
+     "note": "BENQ_4k27"
+    },
+    {
+     "kind": "edid",
+     "man": 53513,
+     "prod": 32678,
+     "confidence": "high",
+     "note": "BENQ_4k32"
+    },
+    {
+     "kind": "edid",
+     "man": 44592,
+     "prod": 25291,
+     "confidence": "high",
+     "note": "LENOVO_4K27"
+    },
+    {
+     "kind": "edid",
+     "man": 44592,
+     "prod": 25062,
+     "confidence": "high",
+     "note": "LENOVO_4K28"
+    },
+    {
+     "kind": "edid",
+     "man": 44592,
+     "prod": 16710,
+     "confidence": "high",
+     "note": "LENOVO_4K16_OLED"
+    },
+    {
+     "kind": "edid",
+     "man": 28430,
+     "prod": 5673,
+     "confidence": "high",
+     "note": "LENOVO_3K16 (CSO)"
+    },
+    {
+     "kind": "edid",
+     "man": 28430,
+     "prod": 5670,
+     "confidence": "high",
+     "note": "LENOVO_3K16_2 (CSO)"
+    },
+    {
+     "kind": "edid",
+     "man": 54330,
+     "prod": 615,
+     "confidence": "high",
+     "note": "LENOVO_4K27_AIO (NVT)"
+    },
+    {
+     "kind": "edid",
+     "man": 44592,
+     "prod": 58521,
+     "confidence": "high",
+     "note": "LENOVO_4K27_AIO_2"
+    },
+    {
+     "kind": "edid",
+     "man": 25434,
+     "prod": 14019,
+     "confidence": "high",
+     "note": "REFERENCE_4K27_DP (VSC)"
+    },
+    {
+     "kind": "edid",
+     "man": 61245,
+     "prod": 12800,
+     "confidence": "high",
+     "note": "REFERENCE_4K27_HDMI (OOO)"
+    },
+    {
+     "kind": "edid",
+     "man": 37640,
+     "prod": 55040,
+     "confidence": "high",
+     "note": "BARCO_4K27_HDMI (BDS)"
+    },
+    {
+     "kind": "edid",
+     "man": 37640,
+     "prod": 179,
+     "confidence": "high",
+     "note": "BARCO_4K27_DP (BDS)"
+    },
+    {
+     "kind": "edid",
+     "man": 4173,
+     "prod": 4490,
+     "confidence": "high",
+     "note": "SHARP_8K60_HDMI"
+    },
+    {
+     "kind": "edid",
+     "man": 58633,
+     "prod": 2353,
+     "confidence": "high",
+     "note": "ONSOR_2K14 (BOE)"
+    },
+    {
+     "kind": "edid",
+     "man": 58633,
+     "prod": 3208,
+     "confidence": "high",
+     "note": "ONSOR_2K14_2 (BOE)"
+    },
+    {
+     "kind": "edid",
+     "man": 58633,
+     "prod": 2965,
+     "confidence": "high",
+     "note": "BOE0B95 (BOE)"
+    },
+    {
+     "kind": "edid",
+     "man": 58633,
+     "prod": 1751,
+     "confidence": "high",
+     "note": "JPIK_4K27 (BOE)"
+    },
+    {
+     "kind": "edid",
+     "man": 11612,
+     "prod": 9984,
+     "confidence": "high",
+     "note": "JPIK_4K27_2 (WAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 37694,
+     "prod": 10464,
+     "confidence": "high",
+     "note": "TPV_REFERENCE_4K27"
+    },
+    {
+     "kind": "edid",
+     "man": 45830,
+     "prod": 10464,
+     "confidence": "high",
+     "note": "TPV_REFERENCE_4K27 (AUS path)"
+    },
+    {
+     "kind": "edid",
+     "man": 37694,
+     "prod": 10288,
+     "confidence": "high",
+     "note": "TPV_REFERENCE_4K27_165Hz"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57447,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57448,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57449,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57450,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57451,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57452,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57453,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57454,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57455,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57456,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57457,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 57458,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57447,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57448,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57449,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57450,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57451,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57452,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57453,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57454,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57455,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57456,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57457,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 57458,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30809,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30810,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30811,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30812,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30813,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30814,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30815,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30816,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30817,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30818,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30819,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30820,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30821,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 19501,
+     "prod": 30822,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (KJL)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30809,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30810,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30811,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30812,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30813,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30814,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30815,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30816,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30817,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30818,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30819,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30820,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30821,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 11596,
+     "prod": 30822,
+     "confidence": "high",
+     "note": "SAMSUNG_4K27_144HZ_2 (SAM)"
+    },
+    {
+     "kind": "edid",
+     "man": 35658,
+     "prod": 14400,
+     "confidence": "high",
+     "note": "RTK_SRLIGHT"
+    },
+    {
+     "kind": "registry_dword_min",
+     "key": "HKLM\\SOFTWARE\\Dimenco\\Simulated Reality",
+     "value": "NConnectedDevices",
+     "min": 1,
+     "confidence": "high",
+     "note": "SR platform reports a connected SR device"
+    }
+   ]
+  },
+  "browser": {
+   "recommended": "1.10.3",
+   "requires": {
+    "runtime": ">=2.62.0"
+   },
+   "windows": {
+    "version": "1.10.3",
+    "file": "DisplayXR-Browser-Setup-1.10.3.exe",
+    "size": 221806640,
+    "sha256": "ef4b6d00723551c902d587d3f03973b9d7dbba6bd3176653998939e58a9cdd45",
+    "signer": "Leia, Inc.",
+    "urls": [
+     "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.3/DisplayXR-Browser-Setup-1.10.3.exe",
+     "https://api.github.com/repos/DisplayXR/displayxr-browser/releases/assets/752705372"
+    ],
+    "args": [
+     "/S"
+    ],
+    "registry_version": "HKLM\\Software\\DisplayXR\\Browser\\Version"
+   }
+  }
+ }
+}
