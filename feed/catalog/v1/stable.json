@@ -1,11 +1,11 @@
 {
  "schema": 1,
- "serial": 1795254221,
- "generated": "2026-11-21T09:43:41Z",
- "expires": "2026-12-21T09:43:41Z",
+ "serial": 1795338382,
+ "generated": "2026-11-22T09:06:22Z",
+ "expires": "2026-12-22T09:06:22Z",
  "channel": "stable",
  "source": {
-  "versions_json_sha": "c849eae01cb778c44e4c88b318db09b3b94da50d"
+  "versions_json_sha": "7428feaecbb9bf89bf54d79b8b8ade019df35970"
  },
  "signers": {
   "windows": [
