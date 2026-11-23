@@ -1,11 +1,11 @@
 {
  "schema": 1,
- "serial": 1795467734,
- "generated": "2026-11-23T21:02:14Z",
- "expires": "2026-12-23T21:02:14Z",
+ "serial": 1795470722,
+ "generated": "2026-11-23T21:52:02Z",
+ "expires": "2026-12-23T21:52:02Z",
  "channel": "stable",
  "source": {
-  "versions_json_sha": "e5e004f74217aadb0726252ca3e2e7f48f117319"
+  "versions_json_sha": "f3ec6bc3a076c56101628a86e83229f0efb9a280"
  },
  "signers": {
   "windows": [
@@ -14,16 +14,16 @@
  },
  "components": {
   "runtime": {
-   "recommended": "2.70.2",
+   "recommended": "2.70.3",
    "windows": {
-    "version": "2.70.2",
-    "file": "DisplayXRSetup-2.70.2.exe",
-    "size": 50486664,
-    "sha256": "982ae8251835a9c603e76cf23e960bd842a0be25517cb0bc87924f2984dc609b",
+    "version": "2.70.3",
+    "file": "DisplayXRSetup-2.70.3.exe",
+    "size": 50491480,
+    "sha256": "b8f44949950c58c4e21ab7016fac8c6415c61e87e30765773306c4807e825f4c",
     "signer": "Leia, Inc.",
     "urls": [
-     "https://github.com/DisplayXR/displayxr-runtime/releases/download/v2.70.2/DisplayXRSetup-2.70.2.exe",
-     "https://api.github.com/repos/DisplayXR/displayxr-runtime/releases/assets/783875412"
+     "https://github.com/DisplayXR/displayxr-runtime/releases/download/v2.70.3/DisplayXRSetup-2.70.3.exe",
+     "https://api.github.com/repos/DisplayXR/displayxr-runtime/releases/assets/784671796"
     ],
     "args": [
      "/S",
@@ -39,14 +39,14 @@
     "runtime": ">=2.66.8"
    },
    "windows": {
-    "version": "2.23.3",
-    "file": "DisplayXRLeiaSRSetup-2.23.3.exe",
-    "size": 974000,
-    "sha256": "af6fe85b66cdba135dc8a596fce587884f50eddb534c4c38634355b68dcdc2b2",
+    "version": "2.23.4",
+    "file": "DisplayXRLeiaSRSetup-2.23.4.exe",
+    "size": 974208,
+    "sha256": "78ae0847dd363cba043a6a06175b84de7bf12401c128e242b30910c2ffe492dc",
     "signer": "Leia, Inc.",
     "urls": [
-     "https://github.com/DisplayXR/displayxr-leia-plugin/releases/download/v2.23.3/DisplayXRLeiaSRSetup-2.23.3.exe",
-     "https://api.github.com/repos/DisplayXR/displayxr-leia-plugin/releases/assets/782406042"
+     "https://github.com/DisplayXR/displayxr-leia-plugin/releases/download/v2.23.4/DisplayXRLeiaSRSetup-2.23.4.exe",
+     "https://api.github.com/repos/DisplayXR/displayxr-leia-plugin/releases/assets/784568039"
     ],
     "args": [
      "/S"
