@@ -1,11 +1,11 @@
 {
  "schema": 1,
- "serial": 1795430362,
- "generated": "2026-11-23T10:39:22Z",
- "expires": "2026-12-23T10:39:22Z",
+ "serial": 1795432558,
+ "generated": "2026-11-23T11:15:58Z",
+ "expires": "2026-12-23T11:15:58Z",
  "channel": "stable",
  "source": {
-  "versions_json_sha": "840f2e7484e4bf8bf507cab84f2ed68907795e00"
+  "versions_json_sha": "306896d7f27f3738865e9229c2b681f5c0bedae6"
  },
  "signers": {
   "windows": [
@@ -772,19 +772,19 @@
    ]
   },
   "browser": {
-   "recommended": "1.10.5",
+   "recommended": "1.10.6",
    "requires": {
     "runtime": ">=2.62.0"
    },
    "windows": {
-    "version": "1.10.5",
-    "file": "DisplayXR-Browser-Setup-1.10.5.exe",
-    "size": 221821144,
-    "sha256": "020d01ead8956fe95efe81b6ee7fe992af36d0207997bcf1fccd351a4ec5311d",
+    "version": "1.10.6",
+    "file": "DisplayXR-Browser-Setup-1.10.6.exe",
+    "size": 222027312,
+    "sha256": "69dfcbd4bce2736bdbe9b98f971f60b9e254d3aa4609bb98d56f23c446a1741a",
     "signer": "Leia, Inc.",
     "urls": [
-     "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.5/DisplayXR-Browser-Setup-1.10.5.exe",
-     "https://api.github.com/repos/DisplayXR/displayxr-browser/releases/assets/766279790"
+     "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.6/DisplayXR-Browser-Setup-1.10.6.exe",
+     "https://api.github.com/repos/DisplayXR/displayxr-browser/releases/assets/782634429"
     ],
     "args": [
      "/S"
