@@ -1,11 +1,11 @@
 {
  "schema": 1,
- "serial": 1795474091,
- "generated": "2026-11-23T22:48:11Z",
- "expires": "2026-12-23T22:48:11Z",
+ "serial": 1795489763,
+ "generated": "2026-11-24T03:09:23Z",
+ "expires": "2026-12-24T03:09:23Z",
  "channel": "stable",
  "source": {
-  "versions_json_sha": "8f04e613b0eed2e3e96abe4a6f43b9677e7cf80a"
+  "versions_json_sha": "d0f2d06ea7cb3e7adb88704ec36d36cfc87535d6"
  },
  "signers": {
   "windows": [
@@ -14,7 +14,7 @@
  },
  "components": {
   "runtime": {
-   "recommended": "2.70.3",
+   "recommended": "2.70.4",
    "windows": {
     "version": "2.70.3",
     "file": "DisplayXRSetup-2.70.3.exe",
