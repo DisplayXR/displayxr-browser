@@ -1,8 +1,8 @@
 {
  "schema": 1,
- "serial": 1795489763,
- "generated": "2026-11-24T03:09:23Z",
- "expires": "2026-12-24T03:09:23Z",
+ "serial": 1795490002,
+ "generated": "2026-11-24T03:13:22Z",
+ "expires": "2026-12-24T03:13:22Z",
  "channel": "stable",
  "source": {
   "versions_json_sha": "d0f2d06ea7cb3e7adb88704ec36d36cfc87535d6"
