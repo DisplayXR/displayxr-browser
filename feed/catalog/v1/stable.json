@@ -1,11 +1,11 @@
 {
  "schema": 1,
- "serial": 1795490002,
- "generated": "2026-11-24T03:13:22Z",
- "expires": "2026-12-24T03:13:22Z",
+ "serial": 1795490202,
+ "generated": "2026-11-24T03:16:42Z",
+ "expires": "2026-12-24T03:16:42Z",
  "channel": "stable",
  "source": {
-  "versions_json_sha": "d0f2d06ea7cb3e7adb88704ec36d36cfc87535d6"
+  "versions_json_sha": "b01e1ec679534879f15b69340ee4b9887dec0204"
  },
  "signers": {
   "windows": [
@@ -16,14 +16,14 @@
   "runtime": {
    "recommended": "2.70.4",
    "windows": {
-    "version": "2.70.3",
-    "file": "DisplayXRSetup-2.70.3.exe",
-    "size": 50491480,
-    "sha256": "b8f44949950c58c4e21ab7016fac8c6415c61e87e30765773306c4807e825f4c",
+    "version": "2.70.4",
+    "file": "DisplayXRSetup-2.70.4.exe",
+    "size": 50491544,
+    "sha256": "0404bacf1cb4f62afc5a0268a5cad6246b5ac915df479f60c71e8f3c89660e37",
     "signer": "Leia, Inc.",
     "urls": [
-     "https://github.com/DisplayXR/displayxr-runtime/releases/download/v2.70.3/DisplayXRSetup-2.70.3.exe",
-     "https://api.github.com/repos/DisplayXR/displayxr-runtime/releases/assets/784671796"
+     "https://github.com/DisplayXR/displayxr-runtime/releases/download/v2.70.4/DisplayXRSetup-2.70.4.exe",
+     "https://api.github.com/repos/DisplayXR/displayxr-runtime/releases/assets/785506506"
     ],
     "args": [
      "/S",
