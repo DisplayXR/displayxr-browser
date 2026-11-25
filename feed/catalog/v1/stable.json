@@ -1,8 +1,8 @@
 {
  "schema": 1,
- "serial": 1795645224,
- "generated": "2026-11-25T22:20:24Z",
- "expires": "2026-12-25T22:20:24Z",
+ "serial": 1795645815,
+ "generated": "2026-11-25T22:30:15Z",
+ "expires": "2026-12-25T22:30:15Z",
  "channel": "stable",
  "source": {
   "versions_json_sha": "adaa6528ae0b43d4c9f18cd0c50048684d2303cf"
@@ -779,12 +779,12 @@
    "windows": {
     "version": "1.10.8",
     "file": "DisplayXR-Browser-Setup-1.10.8.exe",
-    "size": 222037472,
-    "sha256": "6948d1187684d4580253b51b2af3ee450a179813ab085de7c40623c208b496b5",
+    "size": 222037464,
+    "sha256": "25857b868c4eccbbba7bb36f2728deeaeca75d51427e45450fe0fc554da015e6",
     "signer": "Leia, Inc.",
     "urls": [
      "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.8/DisplayXR-Browser-Setup-1.10.8.exe",
-     "https://api.github.com/repos/DisplayXR/displayxr-browser/releases/assets/793361520"
+     "https://api.github.com/repos/DisplayXR/displayxr-browser/releases/assets/793388920"
     ],
     "args": [
      "/S"
