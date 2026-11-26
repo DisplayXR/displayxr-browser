@@ -1,11 +1,11 @@
 {
  "schema": 2,
- "serial": 1795572527,
- "generated": "2026-11-25T02:08:47Z",
- "expires": "2026-12-25T02:08:47Z",
+ "serial": 1795665514,
+ "generated": "2026-11-26T03:58:34Z",
+ "expires": "2026-12-26T03:58:34Z",
  "channel": "stable",
  "source": {
-  "versions_json_sha": "e58fe4da0095f3baf6d0d7a8480d2a10a79654f5"
+  "versions_json_sha": "4e8809d468d065b8d9050156c5a8d40e2c360a83"
  },
  "publishers": {
   "displayxr": {
@@ -27,16 +27,16 @@
    "class": "runtime",
    "name": "DisplayXR Runtime",
    "publisher": "displayxr",
-   "version": "2.70.7",
+   "version": "2.70.8",
    "assets": {
     "windows-x64": {
-     "version": "2.70.6",
-     "file": "DisplayXRSetup-2.70.6.exe",
-     "size": 50494960,
-     "sha256": "bce36a89afc88e211c80a506fdce336bc8ebeab2e182901c38ed3d87f5a4c85e",
+     "version": "2.70.8",
+     "file": "DisplayXRSetup-2.70.8.exe",
+     "size": 50592032,
+     "sha256": "e99b7ae75689bd2cf708186398acd9c35b0e9e93128ece99faff60c655c40066",
      "urls": [
-      "https://github.com/DisplayXR/displayxr-runtime/releases/download/v2.70.6/DisplayXRSetup-2.70.6.exe",
-      "https://api.github.com/repos/DisplayXR/displayxr-runtime/releases/assets/786733844"
+      "https://github.com/DisplayXR/displayxr-runtime/releases/download/v2.70.8/DisplayXRSetup-2.70.8.exe",
+      "https://api.github.com/repos/DisplayXR/displayxr-runtime/releases/assets/793127519"
      ],
      "signature": {
       "kind": "authenticode",
@@ -832,7 +832,7 @@
    "class": "app",
    "name": "DisplayXR Browser",
    "publisher": "displayxr",
-   "version": "1.10.7",
+   "version": "1.10.8",
    "requires": [
     {
      "kind": "runtime",
@@ -841,13 +841,13 @@
    ],
    "assets": {
     "windows-x64": {
-     "version": "1.10.7",
-     "file": "DisplayXR-Browser-Setup-1.10.7.exe",
-     "size": 222037976,
-     "sha256": "dfbe8fa32a2023d29a7d3ccc2b690ec0ea75438a5b6601249d70746759328e22",
+     "version": "1.10.8",
+     "file": "DisplayXR-Browser-Setup-1.10.8.exe",
+     "size": 222037464,
+     "sha256": "25857b868c4eccbbba7bb36f2728deeaeca75d51427e45450fe0fc554da015e6",
      "urls": [
-      "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.7/DisplayXR-Browser-Setup-1.10.7.exe",
-      "https://api.github.com/repos/DisplayXR/displayxr-browser/releases/assets/785868643"
+      "https://github.com/DisplayXR/displayxr-browser/releases/download/v1.10.8/DisplayXR-Browser-Setup-1.10.8.exe",
+      "https://api.github.com/repos/DisplayXR/displayxr-browser/releases/assets/793388920"
      ],
      "signature": {
       "kind": "authenticode",
@@ -885,7 +885,35 @@
    "name": "Open conversion provider",
    "summary": "2D-to-3D conversion with open models. Needs no vendor software.",
    "publisher": "displayxr",
-   "version": "0.2.0",
+   "version": "0.2.2",
+   "assets": {
+    "windows-x64": {
+     "version": "0.2.2",
+     "file": "DisplayXROpenConversionSetup-0.2.2.exe",
+     "size": 50946664,
+     "sha256": "68e9c038a23382d4f6045f528792c02849df41304f50de6b9feafe21fbb1c8c4",
+     "urls": [
+      "https://github.com/DisplayXR/displayxr-conversion-open/releases/download/v0.2.2/DisplayXROpenConversionSetup-0.2.2.exe",
+      "https://api.github.com/repos/DisplayXR/displayxr-conversion-open/releases/assets/793997655"
+     ],
+     "signature": {
+      "kind": "authenticode",
+      "signer": "Leia, Inc."
+     },
+     "installer": {
+      "kind": "exe",
+      "args": [
+       "/S"
+      ],
+      "scope": "machine",
+      "elevation": "required"
+     },
+     "installed": {
+      "kind": "registry_sz",
+      "path": "HKLM\\Software\\DisplayXR\\Plugins\\OpenConversion\\Version"
+     }
+    }
+   },
    "recommended": true
   },
   {
@@ -944,6 +972,59 @@
      "installed": {
       "kind": "registry_sz",
       "path": "HKLM\\Software\\DisplayXR\\Plugins\\LeiaConversion\\Version"
+     }
+    }
+   }
+  },
+  {
+   "id": "displayxr-shell",
+   "aliases": [
+    "shell"
+   ],
+   "class": "workspace_controller",
+   "registered_id": "shell",
+   "name": "DisplayXR Shell",
+   "summary": "Spatial desktop: several 3D apps side by side in one workspace, opened with a keyboard shortcut.",
+   "publisher": "displayxr",
+   "version": "2.4.2",
+   "requires": [
+    {
+     "kind": "runtime",
+     "version": ">=2.36.0"
+    }
+   ],
+   "assets": {
+    "windows-x64": {
+     "version": "2.4.2",
+     "file": "DisplayXRShellSetup-2.4.2.exe",
+     "size": 19014360,
+     "sha256": "476788b54aed85ca1dd58e67d0ed65bdf020c3be2b060bafce30f65e4dcd69ee",
+     "urls": [
+      "https://github.com/DisplayXR/displayxr-shell-releases/releases/download/v2.4.2/DisplayXRShellSetup-2.4.2.exe",
+      "https://api.github.com/repos/DisplayXR/displayxr-shell-releases/releases/assets/645960229"
+     ],
+     "signature": {
+      "kind": "authenticode",
+      "signer": "Leia, Inc."
+     },
+     "installer": {
+      "kind": "exe",
+      "args": [
+       "/S"
+      ],
+      "scope": "machine",
+      "elevation": "required"
+     },
+     "installed": {
+      "kind": "registry_sz",
+      "path": "HKLM\\Software\\DisplayXR\\WorkspaceControllers\\shell\\Version"
+     },
+     "uninstall": {
+      "kind": "registry_command",
+      "path": "HKLM\\Software\\DisplayXR\\WorkspaceControllers\\shell\\UninstallString",
+      "args": [
+       "/S"
+      ]
      }
     }
    }
