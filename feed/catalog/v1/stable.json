@@ -1,11 +1,11 @@
 {
  "schema": 1,
- "serial": 1795680345,
- "generated": "2026-11-26T08:05:45Z",
- "expires": "2026-12-26T08:05:45Z",
+ "serial": 1795719485,
+ "generated": "2026-11-26T18:58:05Z",
+ "expires": "2026-12-26T18:58:05Z",
  "channel": "stable",
  "source": {
-  "versions_json_sha": "7eb02ef21d38b13736678e15bd0bf57587d06f56"
+  "versions_json_sha": "e90f6b80e901ffca89ee1cbe1ab05212e9019362"
  },
  "signers": {
   "windows": [
@@ -33,7 +33,7 @@
    }
   },
   "leia_plugin": {
-   "recommended": "2.24.1",
+   "recommended": "2.24.2",
    "kind": "display_plugin",
    "requires": {
     "runtime": ">=2.66.8"
